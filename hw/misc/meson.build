@@ -158,6 +158,15 @@ specific_ss.add(when: 'CONFIG_MAC_VIA', if_true: files('mac_via.c'))
 specific_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('mips_cmgcr.c', 'mips_cpc.c'))
 specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
 
+# SGI devices
+system_ss.add(when: 'CONFIG_SGI_MC', if_true: files('sgi_mc.c'))
+system_ss.add(when: 'CONFIG_SGI_HPC3', if_true: files('sgi_hpc3.c'))
+system_ss.add(when: 'CONFIG_SGI_ARCS', if_true: files('sgi_arcs.c'))
+system_ss.add(when: 'CONFIG_SGI_CRIME', if_true: files('sgi_crime.c'))
+system_ss.add(when: 'CONFIG_SGI_CRIME_RE', if_true: files('sgi_crime_re.c'))
+system_ss.add(when: 'CONFIG_SGI_MACE', if_true: files('sgi_mace.c'))
+system_ss.add(when: 'CONFIG_SGI_BOOTDISK', if_true: files('sgi_bootdisk.c'))
+
 specific_ss.add(when: 'CONFIG_RISCV_MIPS_CMGCR', if_true: files('riscv_cmgcr.c'))
 specific_ss.add(when: 'CONFIG_RISCV_MIPS_CPC', if_true: files('riscv_cpc.c'))
 

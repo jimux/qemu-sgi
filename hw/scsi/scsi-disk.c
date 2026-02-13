@@ -26,6 +26,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/hw-version.h"
+#include "qemu/log.h"
 #include "qemu/memalign.h"
 #include "hw/scsi/scsi.h"
 #include "migration/qemu-file-types.h"
@@ -134,6 +135,11 @@ static void scsi_free_request(SCSIRequest *req)
 /* Helper function for command completion with sense.  */
 static void scsi_check_condition(SCSIDiskReq *r, SCSISense sense)
 {
+    qemu_log_mask(LOG_UNIMP, "scsi-disk: check_condition cmd=%s (0x%02x) "
+                  "sense=%d/%d/%d\n",
+                  scsi_command_name(r->req.cmd.buf[0]),
+                  r->req.cmd.buf[0],
+                  sense.key, sense.asc, sense.ascq);
     trace_scsi_disk_check_condition(r->req.tag, sense.key, sense.asc,
                                     sense.ascq);
     scsi_req_build_sense(&r->req, sense);
@@ -1130,9 +1136,11 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
 {
     static const int mode_sense_valid[0x3f] = {
         [MODE_PAGE_VENDOR_SPECIFIC]        = (1 << TYPE_DISK) | (1 << TYPE_ROM),
+        [0x03 /* FORMAT DEVICE */]          = (1 << TYPE_DISK),
         [MODE_PAGE_HD_GEOMETRY]            = (1 << TYPE_DISK),
         [MODE_PAGE_FLEXIBLE_DISK_GEOMETRY] = (1 << TYPE_DISK),
         [MODE_PAGE_CACHING]                = (1 << TYPE_DISK) | (1 << TYPE_ROM),
+        [MODE_PAGE_CONTROL]                = (1 << TYPE_DISK) | (1 << TYPE_ROM),
         [MODE_PAGE_R_W_ERROR]              = (1 << TYPE_DISK) | (1 << TYPE_ROM),
         [MODE_PAGE_AUDIO_CTL]              = (1 << TYPE_ROM),
         [MODE_PAGE_CAPABILITIES]           = (1 << TYPE_ROM),
@@ -1160,6 +1168,19 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
      * 2-byte and 4-byte headers.
      */
     switch (page) {
+    case 0x03: /* FORMAT DEVICE */
+        if (s->qdev.type != TYPE_DISK) {
+            return -1;
+        }
+        length = 0x16;
+        if (page_control == 1) { /* Changeable Values */
+            break;
+        }
+        /* Bytes per physical sector (offset 10-11 in page data) */
+        p[10] = (s->qdev.blocksize >> 8) & 0xff;
+        p[11] = s->qdev.blocksize & 0xff;
+        break;
+
     case MODE_PAGE_HD_GEOMETRY:
         length = 0x16;
         if (page_control == 1) { /* Changeable Values */
@@ -1235,6 +1256,16 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
         }
         break;
 
+    case MODE_PAGE_CONTROL:
+        length = 10;
+        if (page_control == 1) { /* Changeable Values */
+            break;
+        }
+        /* RLEC=0, GLTSD=0, D_SENSE=0 */
+        /* Queue Algorithm Modifier = 0 (restricted reordering) */
+        /* QERR=0, DQue=0, RAC=0 */
+        break;
+
     case MODE_PAGE_R_W_ERROR:
         length = 10;
         if (page_control == 1) { /* Changeable Values */
@@ -1306,6 +1337,15 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
             if (page_control == 1) { /* Changeable Values */
                 p[0] = 0xff;
                 p[1] = 0xff;
+                break;
+            }
+            p[0] = 0;
+            p[1] = 0;
+            break;
+        } else if (s->qdev.type == TYPE_DISK) {
+            /* Return empty vendor-specific page for non-Apple disks */
+            length = 0x2;
+            if (page_control == 1) { /* Changeable Values */
                 break;
             }
             p[0] = 0;
@@ -1420,6 +1460,10 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
     } else {
         ret = mode_sense_page(s, page, &p, page_control);
         if (ret == -1) {
+            qemu_log_mask(LOG_UNIMP,
+                          "scsi-disk: MODE_SENSE unsupported page 0x%02x "
+                          "(page_control=%d, dbd=%d, dev_type=%d)\n",
+                          page, page_control, dbd, s->qdev.type);
             return -1;
         }
     }
@@ -1680,6 +1724,17 @@ static void scsi_disk_emulate_mode_select(SCSIDiskReq *r, uint8_t *inbuf)
         if (bs && !(bs & ~0xfe00) && bs != s->qdev.blocksize) {
             s->qdev.blocksize = bs;
             trace_scsi_disk_mode_select_set_blocksize(s->qdev.blocksize);
+
+            /* Recalculate max_lba with new blocksize */
+            {
+                uint64_t nb_sectors;
+                blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
+                nb_sectors /= s->qdev.blocksize / BDRV_SECTOR_SIZE;
+                if (nb_sectors) {
+                    nb_sectors--;
+                }
+                s->qdev.max_lba = nb_sectors;
+            }
         }
     }
 

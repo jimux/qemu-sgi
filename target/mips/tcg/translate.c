@@ -2499,6 +2499,7 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
         tcg_gen_ext32s_tl(cpu_gpr[rt], t0);
         break;
     case OPC_SRA:
+        tcg_gen_ext32s_tl(t0, t0);
         tcg_gen_sari_tl(cpu_gpr[rt], t0, uimm);
         break;
     case OPC_SRL:
@@ -2850,6 +2851,7 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
         tcg_gen_ext32s_tl(cpu_gpr[rd], t0);
         break;
     case OPC_SRAV:
+        tcg_gen_ext32s_tl(t1, t1);
         tcg_gen_andi_tl(t0, t0, 0x1f);
         tcg_gen_sar_tl(cpu_gpr[rd], t1, t0);
         break;
@@ -7261,7 +7263,9 @@ static void gen_dmfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
         case CP0_REG28__TAGLO1:
         case CP0_REG28__TAGLO2:
         case CP0_REG28__TAGLO3:
-            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_TagLo));
+            /* dmfc0 returns full 64-bit TagLo (used by R10000 cache diags) */
+            tcg_gen_ld_tl(arg, tcg_env,
+                          offsetof(CPUMIPSState, CP0_TagLo));
             register_name = "TagLo";
             break;
         case CP0_REG28__DATALO:
@@ -13469,7 +13473,7 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
         break;
     case R6_OPC_CACHE:
         check_cp0_enabled(ctx);
-        if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
+        if ((ctx->hflags & MIPS_HFLAG_ITC_CACHE) || ctx->scache) {
             gen_cache_operation(ctx, rt, rs, imm);
         }
         break;
@@ -14199,7 +14203,7 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         case OPC_CACHEE:
             check_eva(ctx);
             check_cp0_enabled(ctx);
-            if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
+            if ((ctx->hflags & MIPS_HFLAG_ITC_CACHE) || ctx->scache) {
                 gen_cache_operation(ctx, rt, rs, imm);
             }
             return;
@@ -14663,7 +14667,7 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_CACHE:
         check_cp0_enabled(ctx);
         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
-        if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
+        if ((ctx->hflags & MIPS_HFLAG_ITC_CACHE) || ctx->scache) {
             gen_cache_operation(ctx, rt, rs, imm);
         }
         /* Treat as NOP. */
@@ -15100,6 +15104,11 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->mi = (env->CP0_Config5 >> CP0C5_MI) & 1;
     ctx->gi = (env->CP0_Config5 >> CP0C5_GI) & 3;
     ctx->crcp = (env->CP0_Config5 >> CP0C5_CRCP) & 1;
+#ifndef CONFIG_USER_ONLY
+    ctx->scache = env->scache_size > 0;
+#else
+    ctx->scache = false;
+#endif
     restore_cpu_state(env, ctx);
 #ifdef CONFIG_USER_ONLY
         ctx->mem_idx = MIPS_HFLAG_UM;

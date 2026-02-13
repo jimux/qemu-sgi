@@ -484,6 +484,21 @@ static void mips_cpu_realizefn(DeviceState *dev, Error **errp)
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
     mmu_init(env, env->cpu_model);
+
+    /* Allocate secondary cache arrays if CPU has L2 cache */
+    if (env->cpu_model->scache_size > 0) {
+        uint32_t line_size = env->cpu_model->scache_line_size;
+        uint32_t num_lines = env->cpu_model->scache_size / line_size;
+        uint32_t dwords_per_line = line_size / 8;
+
+        env->scache_size = env->cpu_model->scache_size;
+        env->scache_line_size = line_size;
+        env->scache_tag = g_new0(uint64_t, num_lines);
+        env->scache_data = g_new0(uint64_t,
+                                  (uint64_t)num_lines * dwords_per_line);
+        env->scache_ecc = g_new0(uint16_t,
+                                 (uint64_t)num_lines * dwords_per_line);
+    }
 #endif
     fpu_init(env, env->cpu_model);
     mvp_init(env);
@@ -511,6 +526,18 @@ static void mips_cpu_initfn(Object *obj)
         address_space_init(&env->iocsr.as,
                             &env->iocsr.mr, "IOCSR");
     }
+#endif
+}
+
+static void mips_cpu_finalizefn(Object *obj)
+{
+#if !defined(CONFIG_USER_ONLY)
+    MIPSCPU *cpu = MIPS_CPU(obj);
+    CPUMIPSState *env = &cpu->env;
+
+    g_free(env->scache_tag);
+    g_free(env->scache_data);
+    g_free(env->scache_ecc);
 #endif
 }
 
@@ -632,6 +659,7 @@ static const TypeInfo mips_cpu_type_info = {
     .instance_size = sizeof(MIPSCPU),
     .instance_align = __alignof(MIPSCPU),
     .instance_init = mips_cpu_initfn,
+    .instance_finalize = mips_cpu_finalizefn,
     .abstract = true,
     .class_size = sizeof(MIPSCPUClass),
     .class_init = mips_cpu_class_init,

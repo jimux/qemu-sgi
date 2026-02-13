@@ -645,6 +645,21 @@ void ps2_write_keyboard(PS2KbdState *s, int val)
                          KBD_REPLY_POR);
             break;
         case KBD_CMD_SET_TYPEMATIC:
+        case 0xF7:  /* Set All Keys Typematic */
+        case 0xF8:  /* Set All Keys Make/Break */
+        case 0xF9:  /* Set All Keys Make */
+        case 0xFB:  /* Set All Keys Typematic/Make/Break */
+            /*
+             * "Set All Keys" commands implicitly enable scanning per the
+             * IBM PS/2 Technical Reference ("starts scanning if not
+             * already started").  SGI PROMs send F5 (disable) to
+             * configure scancode set 3, then FA (Set All Typematic/
+             * Make/Break) expecting scanning to resume.
+             */
+            s->scan_enabled = 1;
+            ps2_cqueue_1(ps2, KBD_REPLY_ACK);
+            break;
+        case 0xFD:  /* Set Key Type Make (per-key, scancode set 3) */
             ps2_cqueue_1(ps2, KBD_REPLY_ACK);
             break;
         default:

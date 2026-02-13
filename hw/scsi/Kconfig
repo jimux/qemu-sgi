@@ -69,3 +69,7 @@ config VHOST_USER_SCSI
     default y if VIRTIO_PCI
     select VHOST_SCSI_COMMON
     depends on VIRTIO && VHOST_USER && LINUX
+
+config WD33C93
+    bool
+    select SCSI

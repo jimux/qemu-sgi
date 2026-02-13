@@ -83,6 +83,8 @@ struct mips_def_t {
     uint32_t lcsr_cpucfg2;
     uint64_t insn_flags;
     enum mips_mmu_types mmu_type;
+    uint32_t scache_size;       /* L2 cache size in bytes (0 = none) */
+    uint32_t scache_line_size;  /* L2 cache line size in bytes */
 };
 
 extern const char regnames[32][3];

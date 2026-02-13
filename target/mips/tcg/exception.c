@@ -67,7 +67,6 @@ static void raise_exception(CPUMIPSState *env, uint32_t exception)
 void helper_wait(CPUMIPSState *env)
 {
     CPUState *cs = env_cpu(env);
-
     cs->halted = 1;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
     /*

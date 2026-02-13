@@ -554,7 +554,7 @@ const mips_def_t mips_defs[] =
         .CP0_Config0 = (2 << CP0C0_Impl) | (1 << CP0C0_IC) | (1 << CP0C0_DC) |
                        (2 << CP0C0_K0),
         /* Note: Config1 is only used internally, the R4000 has only Config0. */
-        .CP0_Config1 = (1 << CP0C1_FP) | (47 << CP0C1_MMU),
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) | (47 << CP0C1_MMU),
         .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
         .CP0_LLAddr_shift = 4,
         .SYNCI_Step = 16,
@@ -568,6 +568,84 @@ const mips_def_t mips_defs[] =
         .PABITS = 36,
         .insn_flags = CPU_MIPS3,
         .mmu_type = MMU_TYPE_R4000,
+    },
+    {
+        /* R4600 - Used in SGI Indy */
+        .name = "R4600",
+        .CP0_PRid = 0x00002020,
+        /* No L2 cache, icache size 16k, dcache size 16k, uncached coherency. */
+        .CP0_Config0 = (2 << CP0C0_Impl) | (2 << CP0C0_IC) | (2 << CP0C0_DC) |
+                       (2 << CP0C0_K0),
+        /* Note: Config1 is only used internally, the R4600 has only Config0. */
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) | (47 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 32,
+        .CCRes = 2,
+        .CP0_Status_rw_bitmask = 0x3678FFFF,
+        .CP1_fcr0 = (0x20 << FCR0_PRID) | (0x0 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 40,
+        .PABITS = 36,
+        .insn_flags = CPU_MIPS3,
+        .mmu_type = MMU_TYPE_R4000,
+    },
+    {
+        /* R5000 - Used in SGI Indy and O2 */
+        .name = "R5000",
+        .CP0_PRid = 0x00002320,
+        /* No L2 cache, 32k icache, 32k dcache, 32-byte lines, uncached. */
+        .CP0_Config0 = (2 << CP0C0_Impl) | (3 << CP0C0_IC) | (3 << CP0C0_DC) |
+                       (1 << CP0C0_IB) | (1 << CP0C0_DB) | (2 << CP0C0_K0),
+        /* Note: Config1 is only used internally, the R5000 has only Config0. */
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) | (47 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 32,
+        .CCRes = 2,
+        .CP0_Status_rw_bitmask = 0x3678FFFF,
+        .CP1_fcr0 = (0x23 << FCR0_PRID) | (0x0 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 40,
+        .PABITS = 36,
+        .insn_flags = CPU_MIPS4,
+        .mmu_type = MMU_TYPE_R4000,
+    },
+    {
+        /* R10000 - Used in SGI Indigo2 Impact (IP28), Origin, Octane */
+        .name = "R10000",
+        .CP0_PRid = 0x00000900,
+        /*
+         * R10000 Config register (pre-Release 1 format):
+         *   SC (bit 19): 0 = secondary cache present
+         *   SS (bits 18:16): 1 = 2^(1+19) = 1MB L2
+         *   SB (bits 15:14): 3 = 128-byte L2 block size
+         *   IC (bits 11:9): 3 = 32KB I-cache
+         *   DC (bits 8:6): 3 = 32KB D-cache
+         *   K0 (bits 2:0): 2 = uncached coherency
+         */
+        .CP0_Config0 = (1 << 16) | (3 << 14) |
+                       (3 << CP0C0_IC) | (3 << CP0C0_DC) |
+                       (2 << CP0C0_K0),
+        /* Note: Config1 is only used internally, the R10000 has only Config0. */
+        .CP0_Config1 = (1 << CP0C1_FP) | (1 << CP0C1_WR) | (1 << CP0C1_PC) |
+                       (63 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 64,
+        .CCRes = 2,
+        .CP0_Status_rw_bitmask = 0x3678FFFF,
+        .CP1_fcr0 = (0x9 << FCR0_PRID) | (0x0 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 44,
+        .PABITS = 40,
+        .insn_flags = CPU_MIPS4 | ISA_MIPS_R1,
+        .mmu_type = MMU_TYPE_R4000,
+        .scache_size = 1 * 1024 * 1024,  /* 1MB L2 cache */
+        .scache_line_size = 128,         /* 128-byte lines */
     },
     {
         .name = "VR5432",

@@ -122,9 +122,7 @@ void cpu_mips_stop_count(CPUMIPSState *env)
 
 static void mips_timer_cb(void *opaque)
 {
-    CPUMIPSState *env;
-
-    env = opaque;
+    CPUMIPSState *env = opaque;
 
     if (env->CP0_Cause & (1 << CP0Ca_DC)) {
         return;

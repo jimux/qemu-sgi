@@ -419,3 +419,38 @@ iommu_testdev_dma_read(uint64_t gva, uint32_t len) "gva=0x%" PRIx64 " len=%u"
 iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actual=0x%x"
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
+
+# sgi_mc.c (MC memory controller — mirrors MAME mc.cpp LOG_READS/WRITES/RPSS/MEMCFG/DMA)
+sgi_mc_read(uint64_t addr, uint64_t val) "read 0x%"PRIx64" val 0x%"PRIx64
+sgi_mc_write(uint64_t addr, uint64_t val) "write 0x%"PRIx64" val 0x%"PRIx64
+sgi_mc_rpss(uint32_t val) "RPSS counter 0x%08x"
+sgi_mc_memcfg(int bank, uint32_t val, uint32_t base_mb, uint32_t size_mb) "bank%d cfg=0x%08x base=%uMB size=%uMB"
+sgi_mc_dma(uint64_t addr, uint32_t len) "DMA addr 0x%"PRIx64" len %u"
+
+# sgi_hpc3.c (HPC3 — mirrors MAME hpc3.cpp LOG_SCSI/SCSI_DMA/SCSI_IRQ/CHAIN/ETHERNET/EEPROM)
+sgi_hpc3_read(uint64_t addr, uint64_t val) "read 0x%"PRIx64" val 0x%"PRIx64
+sgi_hpc3_write(uint64_t addr, uint64_t val) "write 0x%"PRIx64" val 0x%"PRIx64
+sgi_hpc3_scsi_dma(int ch, uint32_t addr, uint32_t len, int write) "SCSI%d DMA 0x%08x len=%u wr=%d"
+sgi_hpc3_scsi_dma_chain(int ch, uint32_t desc, uint32_t nbp, int eox) "SCSI%d chain @0x%08x nbp=0x%08x eox=%d"
+sgi_hpc3_scsi_irq(int ch, uint32_t status) "SCSI%d IRQ status=0x%08x"
+sgi_hpc3_int3(int level, uint32_t stat, uint32_t mask) "INT3 local%d stat=0x%02x mask=0x%02x"
+sgi_hpc3_int3_map(int irq, int ip) "INT3 mapped irq%d -> IP%d"
+sgi_hpc3_pit(int timer, uint32_t count) "PIT timer%d count=%u"
+sgi_hpc3_scc_tx(int ch, uint8_t data) "SCC ch%d TX 0x%02x"
+sgi_hpc3_scc_rx(int ch, uint8_t data) "SCC ch%d RX 0x%02x"
+sgi_hpc3_nvram(uint32_t addr, uint8_t val, int write) "NVRAM 0x%04x val=0x%02x wr=%d"
+sgi_hpc3_enet_tx(uint32_t nbdp, uint32_t cbp, uint32_t bc) "tx desc nbdp=0x%08x cbp=0x%08x bc=0x%08x"
+sgi_hpc3_enet_tx_packet(int len) "tx packet len=%d"
+sgi_hpc3_enet_rx(int len, uint32_t nbdp) "rx packet len=%d nbdp=0x%08x"
+sgi_hpc3_enet_rx_drop(int len, const char *reason) "rx drop len=%d reason=%s"
+sgi_hpc3_enet_irq(uint32_t misc, uint32_t rx_ctrl, uint32_t tx_ctrl) "irq misc=0x%x rx_ctrl=0x%x tx_ctrl=0x%x"
+sgi_hpc3_enet_seeq_read(int reg, uint32_t val) "seeq read reg=%d val=0x%02x"
+sgi_hpc3_enet_seeq_write(int reg, uint32_t val) "seeq write reg=%d val=0x%02x"
+sgi_hpc3_hal2_read(uint32_t reg, uint32_t val) "HAL2 read  reg 0x%02x val 0x%04x"
+sgi_hpc3_hal2_write(uint32_t reg, uint32_t val) "HAL2 write reg 0x%02x val 0x%04x"
+sgi_hpc3_hal2_iar(uint32_t iar) "HAL2 indirect addr 0x%05x"
+sgi_hpc3_hal2_volume(const char *ch, uint32_t val) "HAL2 volume %s = %u"
+sgi_hpc3_kbd_status(uint32_t status) "KBD status=0x%02x"
+sgi_hpc3_kbd_data_read(uint8_t data, int source) "KBD read data=0x%02x source=%d"
+sgi_hpc3_kbd_cmd(uint8_t cmd) "KBD cmd=0x%02x"
+sgi_hpc3_kbd_irq(int kbd_level, int mouse_level, uint32_t map_status) "KBD irq kbd=%d mouse=%d map=0x%02x"

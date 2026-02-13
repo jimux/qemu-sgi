@@ -1180,6 +1180,13 @@ typedef struct CPUArchState {
     qemu_irq irq[8];
     MemoryRegion *itc_tag; /* ITC Configuration Tags */
 
+    /* Secondary cache simulation (R10000) */
+    uint32_t scache_size;       /* L2 cache size in bytes (0 = none) */
+    uint32_t scache_line_size;  /* L2 cache line size in bytes */
+    uint64_t *scache_tag;       /* Tag array [num_lines] */
+    uint64_t *scache_data;      /* Data array [num_lines * dwords_per_line] */
+    uint16_t *scache_ecc;       /* ECC array [num_lines * dwords_per_line] */
+
     /* Loongson IOCSR memory */
     struct {
         AddressSpace as;

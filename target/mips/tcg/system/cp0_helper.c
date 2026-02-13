@@ -1381,6 +1381,12 @@ void helper_mtc0_performance0(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_errctl(CPUMIPSState *env, target_ulong arg1)
 {
+    if (env->scache_size > 0) {
+        /* R10000: CP0 register 26 is the ECC register, fully writable */
+        env->CP0_ErrCtl = arg1;
+        return;
+    }
+
     int32_t wst = arg1 & (1 << CP0EC_WST);
     int32_t spr = arg1 & (1 << CP0EC_SPR);
     int32_t itc = env->itc_tag ? (arg1 & (1 << CP0EC_ITC)) : 0;
@@ -1396,11 +1402,13 @@ void helper_mtc0_errctl(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_taglo(CPUMIPSState *env, target_ulong arg1)
 {
-    if (env->hflags & MIPS_HFLAG_ITC_CACHE) {
+    if ((env->hflags & MIPS_HFLAG_ITC_CACHE) || env->scache_size > 0) {
         /*
-         * If CACHE instruction is configured for ITC tags then make all
-         * CP0.TagLo bits writable. The actual write to ITC Configuration
-         * Tag will take care of the read-only bits.
+         * If CACHE instruction is configured for ITC tags, or the CPU
+         * has secondary cache (R10000), make all CP0.TagLo bits writable.
+         * For ITC, the actual write to ITC Configuration Tag will take
+         * care of the read-only bits. For scache diagnostics, TagLo is
+         * used as a general-purpose data register.
          */
         env->CP0_TagLo = arg1;
     } else {

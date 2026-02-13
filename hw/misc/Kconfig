@@ -126,6 +126,29 @@ config MIPS_ITU
     bool
     depends on TCG
 
+config SGI_MC
+    bool
+
+config SGI_HPC3
+    bool
+    select NMC93XX_EEPROM
+    select PS2
+
+config SGI_ARCS
+    bool
+
+config SGI_CRIME
+    bool
+
+config SGI_CRIME_RE
+    bool
+
+config SGI_MACE
+    bool
+
+config SGI_BOOTDISK
+    bool
+
 config RISCV_MIPS_CMGCR
     bool
 

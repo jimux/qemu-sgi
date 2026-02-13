@@ -86,3 +86,27 @@ config MIPS_BOSTON
 
 config FW_CFG_MIPS
     bool
+
+config SGI_INDY
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select SGI_MC
+    select SGI_HPC3
+    select SGI_ARCS
+    select SGI_NEWPORT
+    select WD33C93
+    select SERIAL_MM
+    select UNIMP
+
+config SGI_O2
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select SGI_CRIME
+    select SGI_CRIME_RE
+    select SGI_MACE
+    select SGI_GBE
+    select SGI_BOOTDISK
+    select SERIAL_MM
+    select UNIMP

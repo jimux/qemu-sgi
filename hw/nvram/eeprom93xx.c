@@ -183,11 +183,11 @@ void eeprom93xx_write(eeprom_t *eeprom, int eecs, int eesk, int eedi)
             } else if (tick >= 2 + 2 + eeprom->addrbits + 16) {
                 if (command == 1) {
                     /* Write word. */
-                    eeprom->contents[address] &= eeprom->data;
+                    eeprom->contents[address] = eeprom->data;
                 } else if (command == 0 && subcommand == 1) {
                     /* Write all. */
                     for (address = 0; address < eeprom->size; address++) {
-                        eeprom->contents[address] &= eeprom->data;
+                        eeprom->contents[address] = eeprom->data;
                     }
                 }
             }

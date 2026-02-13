@@ -144,4 +144,7 @@ endif
 
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
+system_ss.add(when: 'CONFIG_SGI_NEWPORT', if_true: files('sgi_newport.c'))
+system_ss.add(when: 'CONFIG_SGI_GBE', if_true: files('sgi_gbe.c'))
+
 modules += { 'hw-display': hw_display_modules }
