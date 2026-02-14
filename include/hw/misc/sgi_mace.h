@@ -155,9 +155,12 @@ struct SGIMACEState {
         int rx_fifo_count;
     } serial_port[MACE_NUM_SERIAL];
 
-    /* DS17287 RTC */
-    uint8_t rtc_index;          /* Address register */
-    uint8_t rtc_ram[128];       /* RTC RAM (includes time registers + NVRAM) */
+    /*
+     * DS17287 RTC — direct-mapped with 256-byte stride (IP32).
+     * Register N is accessed at MACE_RTC_OFFSET + N*256 (+7 for BE byte lane).
+     * 128 registers: 0-13 = time/status, 14-127 = NVRAM/extended.
+     */
+    uint8_t rtc_regs[128];
 
     /* PCI stub registers */
     uint32_t pci_error_addr;

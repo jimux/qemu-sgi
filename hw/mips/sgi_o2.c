@@ -64,10 +64,148 @@
 #define O2_PROM_SIZE          (512 * KiB)
 #define O2_RAM_MAX            (256 * MiB)
 
+/*
+ * SEG1 address space: physical 0x40000000-0x7FFFFFFF
+ *
+ * The O2 has dual address mapping — SEG0 (0x00000000) and SEG1 (0x40000000)
+ * access the same SDRAM. The PROM's SizeMEM() probes memory via SEG1 using
+ * TLB entries mapping virtual addresses to physical 0x40000000+.
+ *
+ * Each CRIME memory bank occupies a 128MB window in SEG1 space. With 32MB
+ * SIMMs, the 32MB of RAM mirrors 4 times within the 128MB window. The
+ * probing algorithm detects this aliasing pattern to determine SIMM size.
+ */
+#define O2_SEG1_BASE          0x40000000ULL
+#define O2_BANK_SIZE_32M      (32 * MiB)
+#define O2_BANK_WINDOW        (128 * MiB)
+#define O2_NUM_BANKS          8
+
 static void main_cpu_reset(void *opaque)
 {
     MIPSCPU *cpu = opaque;
     cpu_reset(CPU(cpu));
+}
+
+/*
+ * Fix a flash segment's body checksum after patching a word in its body.
+ *
+ * The O2 PROM uses a flash segment format: 64-byte header with 'SHDR' magic
+ * at offset +8 and segLen at +12, followed by body data. The sloader validates
+ * that the 32-bit big-endian word sum of the body equals zero before running
+ * post1. When we NOP out an instruction, we break this checksum.
+ *
+ * Fix: add the original instruction value to the last body word. This restores
+ * the sum to zero because: new_sum = (old_sum - old_val + 0) + old_val = 0.
+ */
+static void sgi_o2_fix_segment_body_checksum(uint8_t *rom, int bios_size,
+                                              int patch_off, uint32_t old_val)
+{
+    int seg_off;
+
+    /* Scan flash segments (page-aligned at 256-byte intervals) */
+    for (seg_off = 0; seg_off < bios_size - 64; seg_off += 256) {
+        uint32_t magic = ldl_be_p(rom + seg_off + 8);
+        uint32_t seg_len, last_word;
+        int body_end, last_off;
+
+        if (magic != 0x53484452) { /* 'SHDR' */
+            continue;
+        }
+
+        seg_len = ldl_be_p(rom + seg_off + 12);
+        if (seg_len < 64 || (int)seg_len > bios_size - seg_off) {
+            continue;
+        }
+
+        /* Check if patched offset falls within this segment's body */
+        body_end = seg_off + (int)seg_len;
+        if (patch_off < seg_off + 64 || patch_off >= body_end) {
+            /* Advance past this segment to avoid re-scanning its data */
+            seg_off += (((int)seg_len + 255) & ~255) - 256;
+            continue;
+        }
+
+        /* Found enclosing segment — adjust last body word */
+        last_off = ((body_end + 3) & ~3) - 4;
+        if (last_off >= 0 && last_off + 4 <= bios_size) {
+            last_word = ldl_be_p(rom + last_off);
+            stl_be_p(rom + last_off, last_word + old_val);
+        }
+        return;
+    }
+}
+
+/*
+ * Patch PROM SimpleMEMtst to skip the destructive memory test.
+ *
+ * The PROM's DupSLStack() saves registers on the stack via kseg0 (cached
+ * at 0x80000Fxx), then calls SimpleMEMtst() → simple_memtst() which writes
+ * test patterns through kseg1 (uncached at 0xA0000000-0xA0001000), covering
+ * the same physical RAM as the stack.
+ *
+ * On real hardware, the L1 data cache protects the saved register values
+ * from the uncached writes — kseg0 reads hit the cache and return the
+ * original data. QEMU doesn't emulate the L1 data cache, so both kseg0
+ * and kseg1 accesses hit the same physical RAM directly. The memory test
+ * patterns overwrite the saved registers, causing an AdEL exception when
+ * SimpleMEMtst tries to restore $ra from the corrupted stack.
+ *
+ * Fix: NOP out the `jal simple_memtst` instruction inside SimpleMEMtst().
+ * The register save/restore frame is preserved; only the destructive test
+ * loop is skipped. Emulated RAM is always perfect, so the test is moot.
+ *
+ * SimpleMEMtst prologue signature (MIPS big-endian):
+ *   27bdff80  addiu sp, sp, -0x80
+ *   ffbf0008  sd    ra, 0x08(sp)
+ *   ffa40010  sd    a0, 0x10(sp)
+ *   ffa50018  sd    a1, 0x18(sp)
+ *   ... (10 more register saves)
+ *   0cXXXXXX  jal   simple_memtst
+ *   00000000  nop
+ */
+static void sgi_o2_patch_prom_memtest(int bios_size)
+{
+    static const uint32_t prologue[] = {
+        0x27bdff80, /* addiu sp, sp, -0x80 */
+        0xffbf0008, /* sd    ra, 0x08(sp)  */
+        0xffa40010, /* sd    a0, 0x10(sp)  */
+        0xffa50018, /* sd    a1, 0x18(sp)  */
+    };
+    uint8_t *rom;
+    int limit, i;
+
+    rom = rom_ptr(O2_PROM_BASE, bios_size);
+    if (!rom) {
+        return;
+    }
+
+    limit = bios_size - ((int)ARRAY_SIZE(prologue) + 14) * 4;
+    for (i = 0; i < limit; i += 4) {
+        bool match = true;
+        int j;
+
+        for (j = 0; j < ARRAY_SIZE(prologue); j++) {
+            if (ldl_be_p(rom + i + j * 4) != prologue[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) {
+            continue;
+        }
+
+        /* Found prologue — scan forward for the JAL instruction */
+        for (j = ARRAY_SIZE(prologue); j < (int)ARRAY_SIZE(prologue) + 14; j++) {
+            uint32_t instr = ldl_be_p(rom + i + j * 4);
+            if ((instr >> 26) == 0x03) { /* JAL opcode */
+                int patch_off = i + j * 4;
+                stl_be_p(rom + patch_off, 0x00000000); /* NOP */
+                sgi_o2_fix_segment_body_checksum(rom, bios_size,
+                                                  patch_off, instr);
+                return;
+            }
+        }
+    }
 }
 
 static void sgi_o2_init(MachineState *machine)
@@ -105,6 +243,45 @@ static void sgi_o2_init(MachineState *machine)
      */
     memory_region_add_subregion(system_memory, O2_RAM_BASE, machine->ram);
 
+    /*
+     * SEG1 RAM aliases at physical 0x40000000+.
+     *
+     * The real PROM's SizeMEM() probes memory through TLB entries that map
+     * to SEG1. Each CRIME bank gets a 128MB window. With 32MB SIMMs, the
+     * RAM mirrors 4 times within each window — the probing algorithm
+     * detects this aliasing to determine SIMM size.
+     *
+     * Create aliases for populated banks and unimplemented devices for
+     * empty banks (returning 0 on reads = "no SIMM").
+     */
+    {
+        int num_banks = machine->ram_size / O2_BANK_SIZE_32M;
+        int bank, mirror;
+        char name[32];
+
+        for (bank = 0; bank < O2_NUM_BANKS; bank++) {
+            uint64_t seg1_base = O2_SEG1_BASE + bank * O2_BANK_WINDOW;
+
+            if (bank < num_banks) {
+                /* Populated bank: mirror 32MB RAM 4 times in 128MB window */
+                for (mirror = 0; mirror < 4; mirror++) {
+                    MemoryRegion *alias = g_new(MemoryRegion, 1);
+                    snprintf(name, sizeof(name), "seg1-bank%d-m%d",
+                             bank, mirror);
+                    memory_region_init_alias(alias, NULL, name,
+                        machine->ram, bank * O2_BANK_SIZE_32M,
+                        O2_BANK_SIZE_32M);
+                    memory_region_add_subregion(system_memory,
+                        seg1_base + mirror * O2_BANK_SIZE_32M, alias);
+                }
+            } else {
+                /* Empty bank: return 0 on reads (no SIMM) */
+                snprintf(name, sizeof(name), "seg1-empty%d", bank);
+                create_unimplemented_device(name, seg1_base, O2_BANK_WINDOW);
+            }
+        }
+    }
+
     /* PROM at 0x1FC00000 */
     prom = g_new(MemoryRegion, 1);
     memory_region_init_rom(prom, NULL, "sgi-o2.prom", O2_PROM_SIZE,
@@ -134,6 +311,7 @@ static void sgi_o2_init(MachineState *machine)
             error_report("Could not load PROM image");
             exit(EXIT_FAILURE);
         }
+        sgi_o2_patch_prom_memtest(bios_size);
     }
 
     /* CRIME at 0x14000000 */
@@ -228,36 +406,15 @@ static void sgi_o2_init(MachineState *machine)
      * Unmapped regions need to return 0 (pattern mismatch) instead
      * of causing bus errors.
      *
-     * Cover the gaps in the physical address space that the PROM
-     * might probe. The RAM region at 0x00000000 handles actual RAM;
-     * these cover addresses beyond the installed RAM size.
+     * Cover the gap between installed RAM and the start of CRIME.
+     * The SEG1 aliases above handle 0x40000000+.
      */
     if (machine->ram_size < O2_RAM_MAX) {
         create_unimplemented_device("mem-probe-high",
                                     O2_RAM_BASE + machine->ram_size,
-                                    O2_RAM_MAX - machine->ram_size);
+                                    O2_CRIME_BASE - (O2_RAM_BASE + machine->ram_size));
     }
 
-    /*
-     * Program loading RAM at 0x10000000.
-     * IRIX standalone programs (sash, ide, etc.) are ECOFF binaries linked
-     * at text_start=0x10000000. The PROM loads them here via identity-mapped
-     * kuseg. This 32MB region provides backing memory for program loading
-     * regardless of the PROM-detected RAM size.
-     */
-    {
-        MemoryRegion *loader_ram = g_new(MemoryRegion, 1);
-        memory_region_init_ram(loader_ram, NULL, "sgi-o2.loader-ram",
-                               32 * MiB, &error_fatal);
-        memory_region_add_subregion(system_memory, 0x10000000, loader_ram);
-    }
-
-    /*
-     * Cover the gap between loader RAM and CRIME (0x12000000-0x13FFFFFF).
-     * Also cover gaps between CRIME and GBE, GBE and MACE, etc.
-     */
-    create_unimplemented_device("gap-loader-crime",
-                                0x12000000, 0x02000000);
     /* Gap between CRIME base regs and CRIME RE */
     create_unimplemented_device("gap-crime-re",
                                 0x14000280, 0x00FFFD80);

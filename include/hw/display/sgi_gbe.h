@@ -78,8 +78,60 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGBEState, SGI_GBE)
 #define GBE_FRM_INHWCTRL    0x030008
 #define GBE_FRM_CTRL        0x03000C
 
+/*
+ * Video timing registers (0x10000-0x1004C)
+ * These control sync, blanking, and pixel enable timing.
+ */
+#define GBE_VT_VSYNC         0x010008
+#define GBE_VT_HSYNC         0x01000C
+#define GBE_VT_VBLANK        0x010010
+#define GBE_VT_HBLANK        0x010014
+#define GBE_VT_FLAGS         0x010018
+#define GBE_VT_F2RF_LOCK     0x01001C
+#define GBE_VT_INTR01        0x010020
+#define GBE_VT_INTR23        0x010024
+#define GBE_VT_HPIXEN        0x010028
+#define GBE_VT_VPIXEN        0x01002C
+#define GBE_VT_HCMAP         0x010030
+#define GBE_VT_VCMAP         0x010034
+#define GBE_VT_DIDSTARTXY    0x010038
+#define GBE_VT_CRSSTARTXY    0x01003C
+#define GBE_VT_VCSTARTXY     0x010040
+#define GBE_VT_VCENDXY       0x010044
+#define GBE_VT_HPIXENF      0x010048
+#define GBE_VT_VPIXENF      0x01004C
+
+/* DID channel (0x40000-0x4FFFF) */
 #define GBE_DID_INHWCTRL    0x040000
 #define GBE_DID_CTRL        0x040004
+
+/* Mode registers (0x48000-0x4807F) — 32 entries at 4-byte spacing */
+#define GBE_MODE_REGS_BASE  0x048000
+#define GBE_MODE_REGS_SIZE  32
+
+/* CMAP (color map) entries (0x50000-0x54800) — up to 0x1200 entries */
+#define GBE_CMAP_BASE       0x050000
+#define GBE_CMAP_SIZE       0x1200
+
+/* CMAP FIFO status (0x58000) */
+#define GBE_CM_FIFO         0x058000
+
+/* GMAP (gamma map) entries (0x60000-0x603FF) — 256 entries */
+#define GBE_GMAP_BASE       0x060000
+#define GBE_GMAP_SIZE       256
+
+/* Cursor registers (0x70000-0x70010) */
+#define GBE_CRS_POS         0x070000
+#define GBE_CRS_CTRL        0x070004
+#define GBE_CRS_CMAP0       0x070008
+#define GBE_CRS_CMAP1       0x07000C
+#define GBE_CRS_CMAP2       0x070010
+
+/* GBE device ID value (from crime_gbe.h) */
+#define GBE_ID_VALUE        0x00000666
+
+/* Number of video timing registers */
+#define GBE_VT_REG_COUNT    18
 
 struct SGIGBEState {
     SysBusDevice parent_obj;
@@ -98,6 +150,23 @@ struct SGIGBEState {
     uint32_t vt_xymax;       /* Maximum raster coords */
     bool vt_frozen;          /* Bit 31 of VT_XY freezes counter */
     uint32_t vt_read_count;  /* Counter for simulating raster sweep */
+
+    /* Video timing registers (vsync, hsync, blanking, pixel enable, etc.) */
+    uint32_t vt_regs[GBE_VT_REG_COUNT];
+
+    /* Mode registers */
+    uint32_t mode_regs[GBE_MODE_REGS_SIZE];
+
+    /* CMAP entries */
+    uint32_t cmap[GBE_CMAP_SIZE];
+
+    /* GMAP entries */
+    uint32_t gmap[GBE_GMAP_SIZE];
+
+    /* Cursor registers */
+    uint32_t crs_pos;
+    uint32_t crs_ctrl;
+    uint32_t crs_cmap[3];
 };
 
 #endif /* HW_DISPLAY_SGI_GBE_H */

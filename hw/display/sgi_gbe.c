@@ -63,6 +63,7 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGBEState *s = SGI_GBE(opaque);
 
+    /* Control block (0x00000-0x0001F) */
     switch (offset) {
     case GBE_CTRLSTAT:
         return s->ctrlstat;
@@ -71,7 +72,7 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
         return s->dotclock;
 
     case GBE_ID:
-        return 0;
+        return GBE_ID_VALUE;
 
     case GBE_I2C:
     case GBE_I2CFP:
@@ -113,12 +114,59 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
     case GBE_DID_CTRL:
         return s->did_control;
 
+    /* CMAP FIFO status: return 0x3F = FIFO has space for 63 entries */
+    case GBE_CM_FIFO:
+        return 0x3F;
+
+    /* Cursor registers */
+    case GBE_CRS_POS:
+        return s->crs_pos;
+    case GBE_CRS_CTRL:
+        return s->crs_ctrl;
+    case GBE_CRS_CMAP0:
+        return s->crs_cmap[0];
+    case GBE_CRS_CMAP1:
+        return s->crs_cmap[1];
+    case GBE_CRS_CMAP2:
+        return s->crs_cmap[2];
+
     default:
-        qemu_log_mask(LOG_UNIMP,
-                      "sgi_gbe: read at offset 0x%06" HWADDR_PRIx
-                      " (size %d)\n", offset, size);
-        return 0;
+        break;
     }
+
+    /* Video timing registers (0x10008-0x1004C) */
+    if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VPIXENF) {
+        int idx = (offset - GBE_VT_VSYNC) / 4;
+        if (idx < GBE_VT_REG_COUNT) {
+            return s->vt_regs[idx];
+        }
+    }
+
+    /* Mode registers (0x48000-0x4807F) */
+    if (offset >= GBE_MODE_REGS_BASE &&
+        offset < GBE_MODE_REGS_BASE + GBE_MODE_REGS_SIZE * 4) {
+        int idx = (offset - GBE_MODE_REGS_BASE) / 4;
+        return s->mode_regs[idx];
+    }
+
+    /* CMAP entries (0x50000-0x54800) */
+    if (offset >= GBE_CMAP_BASE &&
+        offset < GBE_CMAP_BASE + GBE_CMAP_SIZE * 4) {
+        int idx = (offset - GBE_CMAP_BASE) / 4;
+        return s->cmap[idx];
+    }
+
+    /* GMAP entries (0x60000-0x603FF) */
+    if (offset >= GBE_GMAP_BASE &&
+        offset < GBE_GMAP_BASE + GBE_GMAP_SIZE * 4) {
+        int idx = (offset - GBE_GMAP_BASE) / 4;
+        return s->gmap[idx];
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "sgi_gbe: read at offset 0x%06" HWADDR_PRIx
+                  " (size %d)\n", offset, size);
+    return 0;
 }
 
 static void sgi_gbe_write(void *opaque, hwaddr offset,
@@ -129,11 +177,11 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     switch (offset) {
     case GBE_CTRLSTAT:
         s->ctrlstat = (uint32_t)value;
-        break;
+        return;
 
     case GBE_DOTCLOCK:
         s->dotclock = (uint32_t)value;
-        break;
+        return;
 
     case GBE_VT_XY:
         s->vt_frozen = (value & 0x80000000) != 0;
@@ -141,29 +189,29 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
             s->vt_read_count = 0;
         }
         s->vt_xy = (uint32_t)value;
-        break;
+        return;
 
     case GBE_VT_XYMAX:
         s->vt_xymax = (uint32_t)value;
-        break;
+        return;
 
     /* OVR channel: both CTRL and INHWCTRL writes accepted */
     case GBE_OVR_CTRL:
     case GBE_OVR_INHWCTRL:
         s->ovr_control = (uint32_t)value;
-        break;
+        return;
 
     /* FRM channel: both CTRL and INHWCTRL writes accepted */
     case GBE_FRM_CTRL:
     case GBE_FRM_INHWCTRL:
         s->frm_control = (uint32_t)value;
-        break;
+        return;
 
     /* DID channel: both CTRL and INHWCTRL writes accepted */
     case GBE_DID_CTRL:
     case GBE_DID_INHWCTRL:
         s->did_control = (uint32_t)value;
-        break;
+        return;
 
     case GBE_SYSCLK:
     case GBE_I2C:
@@ -171,15 +219,70 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     case GBE_FRM_SIZE_TILE:
     case GBE_FRM_SIZE_PIXEL:
     case GBE_OVR_WIDTH_TILE:
-        break;
+        return;
+
+    /* Cursor registers */
+    case GBE_CRS_POS:
+        s->crs_pos = (uint32_t)value;
+        return;
+    case GBE_CRS_CTRL:
+        s->crs_ctrl = (uint32_t)value;
+        return;
+    case GBE_CRS_CMAP0:
+        s->crs_cmap[0] = (uint32_t)value;
+        return;
+    case GBE_CRS_CMAP1:
+        s->crs_cmap[1] = (uint32_t)value;
+        return;
+    case GBE_CRS_CMAP2:
+        s->crs_cmap[2] = (uint32_t)value;
+        return;
+
+    /* CMAP FIFO status — read-only */
+    case GBE_CM_FIFO:
+        return;
 
     default:
-        qemu_log_mask(LOG_UNIMP,
-                      "sgi_gbe: write at offset 0x%06" HWADDR_PRIx
-                      " value 0x%08" PRIx64 " (size %d)\n",
-                      offset, value, size);
         break;
     }
+
+    /* Video timing registers (0x10008-0x1004C) */
+    if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VPIXENF) {
+        int idx = (offset - GBE_VT_VSYNC) / 4;
+        if (idx < GBE_VT_REG_COUNT) {
+            s->vt_regs[idx] = (uint32_t)value;
+        }
+        return;
+    }
+
+    /* Mode registers (0x48000-0x4807F) */
+    if (offset >= GBE_MODE_REGS_BASE &&
+        offset < GBE_MODE_REGS_BASE + GBE_MODE_REGS_SIZE * 4) {
+        int idx = (offset - GBE_MODE_REGS_BASE) / 4;
+        s->mode_regs[idx] = (uint32_t)value;
+        return;
+    }
+
+    /* CMAP entries (0x50000-0x54800) */
+    if (offset >= GBE_CMAP_BASE &&
+        offset < GBE_CMAP_BASE + GBE_CMAP_SIZE * 4) {
+        int idx = (offset - GBE_CMAP_BASE) / 4;
+        s->cmap[idx] = (uint32_t)value;
+        return;
+    }
+
+    /* GMAP entries (0x60000-0x603FF) */
+    if (offset >= GBE_GMAP_BASE &&
+        offset < GBE_GMAP_BASE + GBE_GMAP_SIZE * 4) {
+        int idx = (offset - GBE_GMAP_BASE) / 4;
+        s->gmap[idx] = (uint32_t)value;
+        return;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "sgi_gbe: write at offset 0x%06" HWADDR_PRIx
+                  " value 0x%08" PRIx64 " (size %d)\n",
+                  offset, value, size);
 }
 
 static const MemoryRegionOps sgi_gbe_ops = {

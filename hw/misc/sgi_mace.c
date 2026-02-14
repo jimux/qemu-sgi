@@ -305,7 +305,7 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
         }
     }
 
-    /* ISA interface (0x310000-0x31FFFF) */
+    /* ISA interface (0x310000-0x31FFFF) — includes DMA channels */
     if (offset >= MACE_ISA_OFFSET &&
         offset < MACE_ISA_OFFSET + 0x10000) {
         hwaddr isa_off = offset - MACE_ISA_OFFSET;
@@ -323,11 +323,16 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
         case ISA_INT_MSK_REG + 4:
             return s->isa_int_mask;
         default:
-            qemu_log_mask(LOG_UNIMP,
-                          "sgi_mace: ISA read at offset 0x%06" HWADDR_PRIx "\n",
-                          offset);
+            /* ISA DMA channel config and other ISA registers — return 0 */
             return 0;
         }
+    }
+
+    /* Keyboard/mouse (0x320000-0x32FFFF) */
+    if (offset >= MACE_KBDMS_OFFSET &&
+        offset < MACE_KBDMS_OFFSET + 0x10000) {
+        /* kbdinit() probes this region — return 0 for no device */
+        return 0;
     }
 
     /* UST/MSC timer (0x340000-0x34FFFF) */
@@ -380,30 +385,32 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
 
-    /* RTC (0x3A0000-0x3A7FFF) */
+    /* RTC (0x3A0000-0x3A7FFF) — DS17287 direct-mapped, 256-byte stride */
     if (offset >= MACE_RTC_OFFSET &&
         offset < MACE_RTC_OFFSET + 0x8000) {
         hwaddr rtc_off = offset - MACE_RTC_OFFSET;
         /*
-         * DS17287 RTC is accessed via address/data port pair.
-         * The PROM accesses at ISA_RTC_BASE+7, using byte accesses
-         * within 8-byte doublewords. We decode the register from
-         * the offset within the RTC region.
-         *
-         * Register 0 (index): at base
-         * Register 1 (data):  at base + 1 (or base + 8 in 8-byte spacing)
+         * DS17287 RTC on IP32 is direct-mapped with 256-byte register stride.
+         * Register N is at offset N*256 within the RTC region.
+         * The PROM accesses at ISA_RTC_BASE+7 (BE byte lane within 8-byte
+         * doubleword), so effective offset = N*256+7. We derive the register
+         * index by dividing the full offset by 256.
          */
-        int rtc_reg = (rtc_off >> 3) & 0x1;  /* 0 = index, 1 = data */
-        if (rtc_reg == 0) {
-            return s->rtc_index;
-        } else {
-            /* Data port - read from indexed register */
-            uint8_t idx = s->rtc_index & 0x7f;
-            if (idx < sizeof(s->rtc_ram)) {
-                return s->rtc_ram[idx];
+        int rtc_reg = rtc_off / 256;
+        if (rtc_reg < 128) {
+            uint8_t val = s->rtc_regs[rtc_reg];
+            /* Register D bit 7 = VRT (Valid RAM and Time) = battery OK */
+            if (rtc_reg == 13) {
+                val |= 0x80;
             }
-            return 0;
+            /* Register C: reading clears interrupt flags */
+            if (rtc_reg == 12) {
+                s->rtc_regs[12] = 0;
+            }
+            MACE_DPRINTF("RTC read reg %d = 0x%02x\n", rtc_reg, val);
+            return val;
         }
+        return 0;
     }
 
     /* All other accesses return 0 with a log message */
@@ -436,7 +443,7 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
         return;
     }
 
-    /* ISA interface */
+    /* ISA interface — includes DMA channels */
     if (offset >= MACE_ISA_OFFSET &&
         offset < MACE_ISA_OFFSET + 0x10000) {
         hwaddr isa_off = offset - MACE_ISA_OFFSET;
@@ -459,11 +466,16 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
             s->isa_int_mask = value;
             break;
         default:
-            qemu_log_mask(LOG_UNIMP,
-                          "sgi_mace: ISA write at offset 0x%06" HWADDR_PRIx
-                          " value 0x%08" PRIx64 "\n", offset, value);
+            /* ISA DMA channel config (0x8000/0x8020/0xC000/0xC020 etc.) */
             break;
         }
+        return;
+    }
+
+    /* Keyboard/mouse (0x320000-0x32FFFF) */
+    if (offset >= MACE_KBDMS_OFFSET &&
+        offset < MACE_KBDMS_OFFSET + 0x10000) {
+        /* kbdinit() writes here — accept silently */
         return;
     }
 
@@ -513,18 +525,15 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
         return;
     }
 
-    /* RTC */
+    /* RTC — DS17287 direct-mapped, 256-byte stride */
     if (offset >= MACE_RTC_OFFSET &&
         offset < MACE_RTC_OFFSET + 0x8000) {
         hwaddr rtc_off = offset - MACE_RTC_OFFSET;
-        int rtc_reg = (rtc_off >> 3) & 0x1;
-        if (rtc_reg == 0) {
-            s->rtc_index = value & 0x7f;
-        } else {
-            uint8_t idx = s->rtc_index & 0x7f;
-            if (idx < sizeof(s->rtc_ram)) {
-                s->rtc_ram[idx] = value & 0xff;
-            }
+        int rtc_reg = rtc_off / 256;
+        if (rtc_reg < 128) {
+            MACE_DPRINTF("RTC write reg %d = 0x%02x\n", rtc_reg,
+                         (uint8_t)value);
+            s->rtc_regs[rtc_reg] = value & 0xff;
         }
         return;
     }
@@ -584,8 +593,25 @@ static void sgi_mace_reset(DeviceState *dev)
     s->pci_rev_info = 0;
     s->pci_config_addr = 0;
 
-    s->rtc_index = 0;
-    memset(s->rtc_ram, 0, sizeof(s->rtc_ram));
+    memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
+
+    /*
+     * DS17287 RTC reset values:
+     *   Reg A (10): 0x20 = oscillator running, divider chain on
+     *   Reg B (11): 0x06 = binary mode (bit 2), 24-hour (bit 1)
+     *   Reg D (13): 0x80 = VRT (Valid RAM and Time, battery OK)
+     * Set a sensible time: 2026-02-14 12:00:00 Saturday (day=7)
+     */
+    s->rtc_regs[0]  = 0x00;    /* seconds */
+    s->rtc_regs[2]  = 0x00;    /* minutes */
+    s->rtc_regs[4]  = 0x12;    /* hours (12, binary mode) */
+    s->rtc_regs[6]  = 0x07;    /* day of week (Saturday=7) */
+    s->rtc_regs[7]  = 0x14;    /* date (14) */
+    s->rtc_regs[8]  = 0x02;    /* month (February) */
+    s->rtc_regs[9]  = 0x26;    /* year (26 = 2026 with century byte) */
+    s->rtc_regs[10] = 0x20;    /* Register A: oscillator on */
+    s->rtc_regs[11] = 0x06;    /* Register B: binary, 24h */
+    s->rtc_regs[13] = 0x80;    /* Register D: VRT */
 
     for (i = 0; i < MACE_NUM_SERIAL; i++) {
         memset(&s->serial_port[i], 0, sizeof(s->serial_port[i]));
