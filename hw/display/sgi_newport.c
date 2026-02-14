@@ -770,7 +770,6 @@ static void newport_draw_block(SGINewportState *s)
 
     trace_sgi_newport_draw_block(start_x, start_y, end_x, end_y);
     color = newport_get_default_color(s);
-    /* Debug logging is now via trace events — removed static counter */
 
     /* Select pattern source — MAME ref: newport.cpp:3444-3445 */
     if (s->dm0_zpattern) {
@@ -801,10 +800,23 @@ static void newport_draw_block(SGINewportState *s)
         }
     }
 
+    /*
+     * Block fill outer/inner loop — matches MAME structure exactly.
+     *
+     * MAME uses start_x/start_y directly (modified in-place). We use
+     * separate sx/sy variables but follow the same flow:
+     * - Inner loop advances sx until prim_end_x, end_x, or !stop_on_x
+     * - Y only advances when X completes a full row (reaches end_x)
+     * - sx is NOT reset at the top of the outer loop; it carries forward
+     *   so that partial rows (rwpacked, LENGTH32) continue where they
+     *   left off on the next host data write.
+     *
+     * MAME ref: newport.cpp lines 3449-3487
+     */
+    sx = start_x;
     sy = start_y;
     do {
-        sx = start_x;
-        pat_bit = 31; /* Reset pattern bit at start of each scanline */
+        pat_bit = 31; /* Reset pattern bit — MAME ref: line 3451 */
         do {
             if (lr_abort) {
                 break;
@@ -829,25 +841,31 @@ static void newport_draw_block(SGINewportState *s)
             sx += dx;
         } while (sx != prim_end_x && sx != end_x && stop_on_x);
 
-        /* When X reaches end, reset to x_save — MAME ref: line 3484 */
+        /*
+         * Y advance is conditional on X reaching end of row.
+         * This is critical for rwpacked/LENGTH32 modes where the X server
+         * writes one host word at a time: each write draws a partial row
+         * (e.g. 8 pixels), and the hardware must NOT advance Y until the
+         * full row is complete.
+         * MAME ref: lines 3478-3486
+         */
         if ((dx > 0 && sx >= end_x) || (dx < 0 && sx <= end_x) || lr_abort) {
             newport_reset_curr_colors(s);
             sx = s->x_save_int;
-            start_x = sx;
+            sy += dy;
+            /* Recalculate prim_end_x for the new row */
             prim_end_x = end_x;
-            if ((s->drawmode0 & DM0_LENGTH32) && abs(end_x - start_x) >= 32) {
-                prim_end_x = start_x + 32 * dx;
+            if ((s->drawmode0 & DM0_LENGTH32) && abs(end_x - sx) >= 32) {
+                prim_end_x = sx + 32 * dx;
             }
             if (s->dm0_colorhost && s->dm1_rwpacked) {
                 int16_t ml = rwpacked_max_len[s->dm1_rwdouble ? 1 : 0]
                                              [s->dm1_hostdepth];
-                if (abs(prim_end_x - start_x) > ml) {
-                    prim_end_x = start_x + dx * ml;
+                if (abs(prim_end_x - sx) > ml) {
+                    prim_end_x = sx + dx * ml;
                 }
             }
         }
-
-        sy += dy;
     } while (sy != end_y && stop_on_y);
 
     /* Update coordinate registers — MAME ref: lines 3489-3490 */
@@ -1505,6 +1523,60 @@ static uint32_t newport_dcb_read(SGINewportState *s)
 }
 
 /*
+ * Convert packed RGB pixel to 24-bit RGB based on pixel size.
+ *
+ * Newport RGB modes pack R, G, B into fewer than 24 bits for small
+ * pixel sizes.  The BIT_SEL field (bit 0 of the XMAP mode entry)
+ * selects which portion of the 32-bit VRAM word contains the pixel.
+ *
+ * MAME ref: convert_{4,8,12}bpp_bgr_to_24bpp_rgb()
+ */
+static uint32_t newport_rgb_unpack(uint32_t pixel, uint8_t pix_size,
+                                   uint32_t mode_entry)
+{
+    /* BIT_SEL: selects upper or lower portion of VRAM word */
+    int bit_sel = mode_entry & 1;
+
+    switch (pix_size) {
+    case 0: { /* 4bpp — 1-2-1 BGR */
+        int shift = bit_sel ? 4 : 0;
+        uint8_t p = (pixel >> shift) & 0xf;
+        uint8_t r = (p & 1) ? 0xff : 0x00;
+        uint8_t g = ((p >> 1) & 3) * 0x55;
+        uint8_t b = (p & 8) ? 0xff : 0x00;
+        return (r << 16) | (g << 8) | b;
+    }
+    case 1: { /* 8bpp — 3-3-2 BGR */
+        int shift = bit_sel ? 8 : 0;
+        uint8_t p = (pixel >> shift) & 0xff;
+        uint8_t r = (0x92 * ((p >> 2) & 1)) |
+                    (0x49 * ((p >> 1) & 1)) |
+                    (0x24 * (p & 1));
+        uint8_t g = (0x92 * ((p >> 5) & 1)) |
+                    (0x49 * ((p >> 4) & 1)) |
+                    (0x24 * ((p >> 3) & 1));
+        uint8_t b = (0xaa * ((p >> 7) & 1)) |
+                    (0x55 * ((p >> 6) & 1));
+        return (r << 16) | (g << 8) | b;
+    }
+    case 2: { /* 12bpp — 4-4-4 BGR */
+        int shift = bit_sel ? 12 : 0;
+        uint16_t p = (pixel >> shift) & 0xfff;
+        uint8_t r = (p & 0xf) * 0x11;
+        uint8_t g = ((p >> 4) & 0xf) * 0x11;
+        uint8_t b = ((p >> 8) & 0xf) * 0x11;
+        return (r << 16) | (g << 8) | b;
+    }
+    default: { /* 24bpp — full BGR bytes in VRAM word */
+        uint8_t r = pixel & 0xff;
+        uint8_t g = (pixel >> 8) & 0xff;
+        uint8_t b = (pixel >> 16) & 0xff;
+        return (r << 16) | (g << 8) | b;
+    }
+    }
+}
+
+/*
  * Handle DCB write to sub-devices.
  */
 static void newport_dcb_write(SGINewportState *s, uint32_t val)
@@ -1620,6 +1692,9 @@ static void newport_dcb_write(SGINewportState *s, uint32_t val)
             s->cmap_palette_idx = (uint16_t)masked_val;
             break;
         case 2: /* Palette data write (MAME CRS=2) */
+            trace_sgi_newport_cmap_palette_write(s->cmap_palette_idx,
+                                                  val, masked_val,
+                                                  masked_val >> 8, dw);
             if (s->cmap_palette_idx < 8192) {
                 s->cmap0_palette[s->cmap_palette_idx] = masked_val >> 8;
                 s->display_dirty = true;
@@ -2271,10 +2346,14 @@ static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
             } else {
                 s->dcb_data_msw = (uint32_t)val & 0xffff;
             }
+            trace_sgi_newport_dcbdata0_subword(size, byte_offset,
+                                                val, s->dcb_data_msw);
         } else if (size == 1) {
             s->dcb_data_msw = 0;
             uint32_t shift = (3 - byte_offset) * 8;
             s->dcb_data_msw = ((uint32_t)val & 0xff) << shift;
+            trace_sgi_newport_dcbdata0_subword(size, byte_offset,
+                                                val, s->dcb_data_msw);
         }
         trace_sgi_newport_rex3_write(REX3_DCBDATA0, s->dcb_data_msw);
         newport_dcb_write(s, s->dcb_data_msw);
@@ -2398,6 +2477,8 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
         uint8_t pix_mode = 0;
         uint8_t pix_size = 1;
         uint16_t ci_msb = 0;
+        uint16_t aux_msb = 0;
+        uint32_t mode_entry = 0;
         uint8_t aux_pix_mode = 0;
         uint16_t did_line_ptr = 0;
         uint16_t next_did_entry = 0;
@@ -2406,10 +2487,11 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
             uint16_t frame_ptr = did_entry_ptr + (uint16_t)y;
             did_line_ptr = s->vc2_ram[frame_ptr & 0x7fff];
             uint16_t entry = s->vc2_ram[did_line_ptr & 0x7fff];
-            uint32_t mode_entry = s->xmap_mode_table[entry & 0x1f];
+            mode_entry = s->xmap_mode_table[entry & 0x1f];
             pix_mode = (mode_entry >> 8) & 3;
             pix_size = (mode_entry >> 10) & 3;
             aux_pix_mode = (mode_entry >> 16) & 7;
+            aux_msb = (mode_entry >> 11) & 0x1f00;
             switch (pix_mode) {
             case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
             case 1: ci_msb = 0x1d00; break;
@@ -2427,11 +2509,12 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
             uint8_t r, g, b;
 
             if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
-                uint32_t mode_entry =
+                mode_entry =
                     s->xmap_mode_table[next_did_entry & 0x1f];
                 pix_mode = (mode_entry >> 8) & 3;
                 pix_size = (mode_entry >> 10) & 3;
                 aux_pix_mode = (mode_entry >> 16) & 7;
+                aux_msb = (mode_entry >> 11) & 0x1f00;
                 switch (pix_mode) {
                 case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
                 case 1: ci_msb = 0x1d00; break;
@@ -2445,21 +2528,54 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
             if (cidaux & 0xcc) {
                 uint8_t popup_ci = (cidaux >> 2) & 3;
                 rgb = s->cmap0_palette[(popup_msb | popup_ci) & 0x1fff];
-            } else if (aux_pix_mode != 0
-                       && ((cidaux & 0xff) != 0
-                           || aux_pix_mode == 1 || aux_pix_mode == 7)) {
-                /*
-                 * Overlay modes (2,3,4,5,6): zero aux pixel is transparent,
-                 * falls through to main CI/RGB path below.
-                 * Underlay modes (1,7): always draw from aux planes.
-                 * MAME ref: newport.cpp lines 1350-1420
-                 */
-                uint8_t aux_ci = cidaux & 0xff;
-                uint16_t aux_msb = ((s->xmap_mode_table[
-                    use_did ? (s->vc2_ram[(did_line_ptr - 1) & 0x7fff] & 0x1f)
-                            : 0] >> 11) & 0x1f) << 8;
-                rgb = s->cmap0_palette[(aux_msb | aux_ci) & 0x1fff];
-            } else if (pix_mode == 0) {
+            } else if (aux_pix_mode != 0) {
+                bool overlay_hit = false;
+                switch (aux_pix_mode) {
+                case 1:
+                    rgb = s->cmap0_palette[
+                        (aux_msb | ((cidaux >> 8) & 3)) & 0x1fff];
+                    overlay_hit = true;
+                    break;
+                case 2: {
+                    uint32_t ovl = (cidaux >> 8) & 3;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 6: {
+                    uint32_t shift = (mode_entry & 2) ? 9 : 8;
+                    uint32_t ovl = (cidaux >> shift) & 1;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 7: {
+                    uint32_t ovl = (cidaux >> 8) & 1;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                    } else {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ((cidaux >> 9) & 1)) & 0x1fff];
+                    }
+                    overlay_hit = true;
+                    break;
+                }
+                default:
+                    break;
+                }
+                if (!overlay_hit) {
+                    goto ppm_main_pixel;
+                }
+            } else {
+            ppm_main_pixel:
+            if (pix_mode == 0) {
                 uint16_t ci;
                 switch (pix_size) {
                 case 0: ci = pixel & 0xf; break;
@@ -2469,7 +2585,8 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
                 }
                 rgb = s->cmap0_palette[(ci_msb | ci) & 0x1fff];
             } else {
-                rgb = pixel & 0xffffff;
+                rgb = newport_rgb_unpack(pixel, pix_size, mode_entry);
+            }
             }
 
             r = s->ramdac_lut_r[(rgb >> 16) & 0xff];
@@ -2724,6 +2841,8 @@ static void newport_update_display(void *opaque)
         uint8_t pix_mode = 0;   /* 0=CI, 1=RGB Map0, 2=Map1, 3=Map2 */
         uint8_t pix_size = 1;   /* 0=4bpp, 1=8bpp, 2=12bpp, 3=24bpp */
         uint16_t ci_msb = 0;
+        uint16_t aux_msb = 0;
+        uint32_t mode_entry = 0;
         uint8_t aux_pix_mode = 0;
         uint16_t did_line_ptr = 0;
         uint16_t next_did_entry = 0;
@@ -2738,10 +2857,11 @@ static void newport_update_display(void *opaque)
             uint16_t frame_ptr = did_entry_ptr + (uint16_t)y;
             did_line_ptr = s->vc2_ram[frame_ptr & 0x7fff];
             uint16_t entry = s->vc2_ram[did_line_ptr & 0x7fff];
-            uint32_t mode_entry = s->xmap_mode_table[entry & 0x1f];
+            mode_entry = s->xmap_mode_table[entry & 0x1f];
             pix_mode = (mode_entry >> 8) & 3;
             pix_size = (mode_entry >> 10) & 3;
             aux_pix_mode = (mode_entry >> 16) & 7;
+            aux_msb = (mode_entry >> 11) & 0x1f00;
             switch (pix_mode) {
             case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
             case 1: ci_msb = 0x1d00; break;
@@ -2764,11 +2884,12 @@ static void newport_update_display(void *opaque)
              * MAME ref: screen_update() at newport.cpp:1298-1312
              */
             if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
-                uint32_t mode_entry =
+                mode_entry =
                     s->xmap_mode_table[next_did_entry & 0x1f];
                 pix_mode = (mode_entry >> 8) & 3;
                 pix_size = (mode_entry >> 10) & 3;
                 aux_pix_mode = (mode_entry >> 16) & 7;
+                aux_msb = (mode_entry >> 11) & 0x1f00;
                 switch (pix_mode) {
                 case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
                 case 1: ci_msb = 0x1d00; break;
@@ -2786,26 +2907,69 @@ static void newport_update_display(void *opaque)
              *  3. Overlay/aux planes (underlay 1,7 always; overlay 2-6
              *     only when aux pixel is non-zero — zero is transparent)
              *  4. Main RGBCI pixel
+             *
+             * XL8 cidaux bit layout (8-bit mode, xmap_config bit 2):
+             *   [3:0] = CID (per-window visual mode tag)
+             *   [7:4] = popup planes (bits 2,3) + reserved (bits 6,7)
+             *   [9:8] = overlay/underlay planes
              */
             if (cidaux & 0xcc) {
                 /* Popup planes active — MAME ref: lines 1343-1347 */
                 uint8_t popup_ci = (cidaux >> 2) & 3;
                 rgb = s->cmap0_palette[(popup_msb | popup_ci) & 0x1fff];
-            } else if (aux_pix_mode != 0
-                       && ((cidaux & 0xff) != 0
-                           || aux_pix_mode == 1 || aux_pix_mode == 7)) {
+            } else if (aux_pix_mode != 0) {
                 /*
-                 * Overlay modes (2,3,4,5,6): zero aux pixel is transparent,
-                 * falls through to main CI/RGB path below.
-                 * Underlay modes (1,7): always draw from aux planes.
-                 * MAME ref: newport.cpp lines 1350-1420
+                 * Overlay/underlay compositing — per-mode handling.
+                 * XL8 (8-bit mode): overlay bits at cidaux[9:8].
+                 * MAME ref: newport.cpp lines 1350-1393
                  */
-                uint8_t aux_ci = cidaux & 0xff;
-                uint16_t aux_msb = ((s->xmap_mode_table[
-                    use_did ? (s->vc2_ram[(did_line_ptr - 1) & 0x7fff] & 0x1f)
-                            : 0] >> 11) & 0x1f) << 8;
-                rgb = s->cmap0_palette[(aux_msb | aux_ci) & 0x1fff];
-            } else if (pix_mode == 0) {
+                bool overlay_hit = false;
+                switch (aux_pix_mode) {
+                case 1: /* 2-Bit Underlay — always drawn */
+                    rgb = s->cmap0_palette[
+                        (aux_msb | ((cidaux >> 8) & 3)) & 0x1fff];
+                    overlay_hit = true;
+                    break;
+                case 2: /* 2-Bit Overlay — zero is transparent */ {
+                    uint32_t ovl = (cidaux >> 8) & 3;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 6: /* 1-Bit Overlay */ {
+                    uint32_t shift = (mode_entry & 2) ? 9 : 8;
+                    uint32_t ovl = (cidaux >> shift) & 1;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 7: /* 1-Bit Overlay + 1-Bit Underlay */ {
+                    uint32_t ovl = (cidaux >> 8) & 1;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                    } else {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ((cidaux >> 9) & 1)) & 0x1fff];
+                    }
+                    overlay_hit = true;
+                    break;
+                }
+                default:
+                    break;
+                }
+                if (!overlay_hit) {
+                    goto main_pixel;
+                }
+            } else {
+            main_pixel:
+            if (pix_mode == 0) {
                 /* CI mode — look up in CMAP palette */
                 uint16_t ci;
                 switch (pix_size) {
@@ -2816,8 +2980,10 @@ static void newport_update_display(void *opaque)
                 }
                 rgb = s->cmap0_palette[(ci_msb | ci) & 0x1fff];
             } else {
-                /* RGB mode — direct 24-bit color through CMAP MSB region */
-                rgb = pixel & 0xffffff;
+                /* RGB mode — unpack packed BGR pixel (MAME ref:
+                 * convert_{4,8,12}bpp_bgr_to_24bpp_rgb()) */
+                rgb = newport_rgb_unpack(pixel, pix_size, mode_entry);
+            }
             }
 
             /* RAMDAC gamma correction — MAME ref: ramdac_remap() line 1550 */
@@ -3183,19 +3349,43 @@ static char *newport_get_diag_vc2(Object *obj, Error **errp)
         g_string_append_c(buf, '\n');
     }
 
-    /* DID table summary: first few entries with full line table */
+    /* DID table summary: show all unique line patterns */
     uint16_t did_entry = s->vc2_reg[VC2_DID_ENTRY];
     if (did_entry != 0) {
-        g_string_append(buf, "DID table (first 8 line pointers):\n");
-        for (int i = 0; i < 8 && (did_entry + i) < 32768; i++) {
+        /* Collect unique DID line pointer values with line ranges */
+        uint16_t unique_ptrs[64];
+        int unique_first[64], unique_last[64];
+        int n_unique = 0;
+
+        for (int i = 0; i < 1024 && (did_entry + i) < 32768; i++) {
             uint16_t line_ptr = s->vc2_ram[(did_entry + i) & 0x7fff];
-            g_string_append_printf(buf, "  line %d: ptr=0x%04x entries:", i, line_ptr);
-            /* Show up to 8 DID line table entries */
-            for (int j = 0; j < 8; j++) {
-                uint16_t e = s->vc2_ram[(line_ptr + j) & 0x7fff];
+            int found = -1;
+            for (int u = 0; u < n_unique; u++) {
+                if (unique_ptrs[u] == line_ptr) {
+                    found = u;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                unique_last[found] = i;
+            } else if (n_unique < 64) {
+                unique_ptrs[n_unique] = line_ptr;
+                unique_first[n_unique] = i;
+                unique_last[n_unique] = i;
+                n_unique++;
+            }
+        }
+
+        g_string_append_printf(buf, "DID table (%d unique line patterns):\n",
+                               n_unique);
+        for (int u = 0; u < n_unique; u++) {
+            g_string_append_printf(buf, "  lines %d-%d: ptr=0x%04x entries:",
+                                   unique_first[u], unique_last[u],
+                                   unique_ptrs[u]);
+            for (int j = 0; j < 16; j++) {
+                uint16_t e = s->vc2_ram[(unique_ptrs[u] + j) & 0x7fff];
                 g_string_append_printf(buf, " 0x%04x(did=%d,x=%d)",
                                        e, e & 0x1f, e >> 5);
-                /* Stop at end-of-line marker (X >= screen width) */
                 if ((e >> 5) >= 1280) break;
             }
             g_string_append_c(buf, '\n');

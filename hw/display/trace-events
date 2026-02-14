@@ -233,6 +233,8 @@ sgi_newport_rex3_cmd(uint32_t drawmode0, uint32_t drawmode1) "REX3 cmd dm0=0x%08
 sgi_newport_dcb_write(uint32_t slave, uint32_t val) "DCB slave=%u val=0x%08x"
 sgi_newport_vc2(uint32_t reg, uint32_t val, int write) "VC2 reg=0x%02x val=0x%04x wr=%d"
 sgi_newport_cmap(uint32_t addr, uint32_t val) "CMAP addr=0x%04x val=0x%06x"
+sgi_newport_cmap_palette_write(uint32_t idx, uint32_t raw_val, uint32_t masked_val, uint32_t stored, uint32_t dw) "CMAP palette[%u] raw=0x%08x masked=0x%08x stored=0x%06x dw=%u"
+sgi_newport_dcbdata0_subword(uint32_t size, uint32_t byte_offset, uint64_t val, uint32_t assembled) "DCBDATA0 subword size=%u offset=%u val=0x%08"PRIx64" assembled=0x%08x"
 sgi_newport_xmap(uint32_t reg, uint32_t val) "XMAP reg=0x%02x val=0x%08x"
 sgi_newport_draw_block(int x0, int y0, int x1, int y1) "block (%d,%d)-(%d,%d)"
 sgi_newport_draw_line(int x0, int y0, int x1, int y1, int octant) "line (%d,%d)-(%d,%d) oct=%d"
