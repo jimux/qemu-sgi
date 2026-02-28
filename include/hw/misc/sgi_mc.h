@@ -87,6 +87,15 @@ typedef struct SGIMCBankState {
 #define MC_DMA_TLB_HI3         0x01b0
 #define MC_DMA_TLB_LO3         0x01b8
 
+/*
+ * QEMU extension: host real-time microseconds counter.
+ * Returns QEMU_CLOCK_REALTIME microseconds, wrapping at 2^32 (~71 min).
+ * Unlike MC_RPSS_CTR (virtual clock), this never races under -icount sleep=off.
+ * Used by patched IRIX kernel for networking/animation timing.
+ * Offset 0x0050 is unused in real SGI MC hardware (gap between MC_REFCNT and MC_GIO64_ARB).
+ */
+#define MC_REALTIME_CTR        0x0050
+
 /* RPSS counter is in a separate page */
 #define MC_RPSS_CTR            0x1000
 

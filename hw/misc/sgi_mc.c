@@ -278,6 +278,16 @@ static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
     case MC_REFCNT:
         val = s->refcnt;
         break;
+    case MC_REALTIME_CTR:
+        /*
+         * QEMU extension: host wall-clock microseconds (QEMU_CLOCK_REALTIME).
+         * Advances at true real-time speed regardless of -icount sleep=off.
+         * Used by patched IRIX kernel for networking/animation timing so that
+         * select() timeouts, nanosleep(), and TCP retransmit timers use real
+         * time rather than racing virtual time.
+         */
+        val = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) & 0xFFFFFFFF);
+        break;
     case MC_GIO64_ARB:
         val = s->gio64_arb;
         break;
@@ -465,6 +475,9 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case MC_REFCNT:
         s->refcnt = val;
+        break;
+    case MC_REALTIME_CTR:
+        /* Read-only QEMU extension — ignore writes */
         break;
     case MC_GIO64_ARB:
         s->gio64_arb = val;
