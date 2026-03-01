@@ -47,6 +47,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEState, SGI_CRIME)
 #define CRM_CPU_ERROR_ENA       0x050
 #define CRM_VICE_ERROR_ADDR     0x058
 
+/*
+ * QEMU extension: host real-time microseconds counter (QEMU_CLOCK_REALTIME).
+ * Same semantics as MC_REALTIME_CTR for IP2x machines.
+ * Offset 0x060 is unused in real CRIME hardware (gap before memory regs).
+ */
+#define CRM_REALTIME_CTR        0x060
+
 #define CRM_MEM_CONTROL         0x200
 #define CRM_MEM_BANK_CTRL0      0x208
 /* Banks 0-7 at 0x208, 0x210, 0x218, ..., 0x240 (8-byte stride) */
@@ -81,8 +88,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEState, SGI_CRIME)
 
 /*
  * Memory bank control register format:
- *   Bits [4:0]: Bank base address (physical >> 25)
- *   Bit  [8]:   SDRAM size (0 = 32MB, 1 = 64MB per bank)
+ *   Bits [4:0]: Bank base address (physical >> 25, units of 32MB)
+ *   Bit  [8]:   SDRAM size (0 = 32MB per bank, 1 = 128MB per bank)
  */
 #define CRM_BANK_CTRL_ADDR_MASK 0x1f
 #define CRM_BANK_CTRL_SDRAM_SIZE 0x100

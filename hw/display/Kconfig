@@ -155,3 +155,6 @@ config SGI_NEWPORT
 
 config SGI_GBE
     bool
+
+config SGI_GLACCEL
+    bool

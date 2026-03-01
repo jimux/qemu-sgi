@@ -110,3 +110,20 @@ config SGI_O2
     select SGI_BOOTDISK
     select SERIAL_MM
     select UNIMP
+    select SGI_PVMEM
+    select SGI_PVNET
+    select SGI_GLACCEL
+    select SGI_SMP
+
+config SGI_OCTANE
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select SGI_HEART
+    select SGI_BRIDGE
+    select SGI_GBE
+    select SGI_BOOTDISK
+    select SGI_ARCS
+    select SERIAL_MM
+    select UNIMP
+    select SGI_SMP

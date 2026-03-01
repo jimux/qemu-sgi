@@ -29,10 +29,13 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
+#include "qemu/log.h"
 
 static uint64_t serial_mm_read(void *opaque, hwaddr addr, unsigned size)
 {
     SerialMM *s = SERIAL_MM(opaque);
+    qemu_log_mask(LOG_UNIMP, "SERIAL-MM: read offset=0x%" HWADDR_PRIx " (reg=0x%" HWADDR_PRIx ")\n",
+                  addr, addr >> s->regshift);
     return serial_io_ops.read(&s->serial, addr >> s->regshift, 1);
 }
 
@@ -40,6 +43,8 @@ static void serial_mm_write(void *opaque, hwaddr addr,
                             uint64_t value, unsigned size)
 {
     SerialMM *s = SERIAL_MM(opaque);
+    qemu_log_mask(LOG_UNIMP, "SERIAL-MM: write offset=0x%" HWADDR_PRIx " (reg=0x%" HWADDR_PRIx ") value=0x%" PRIx64 "\n",
+                  addr, addr >> s->regshift, value);
     value &= 255;
     serial_io_ops.write(&s->serial, addr >> s->regshift, value, 1);
 }

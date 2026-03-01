@@ -174,6 +174,16 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
         CRIME_DPRINTF("read  CRM_VICE_ERROR_ADDR = 0x%" PRIx64 "\n", val);
         return val;
 
+    case CRM_REALTIME_CTR:
+        /*
+         * QEMU extension: host wall-clock microseconds (QEMU_CLOCK_REALTIME).
+         * Advances at true real-time speed regardless of -icount sleep=off.
+         * Used by patched IRIX kernel for networking/animation timing.
+         */
+        val = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) & 0xFFFFFFFF);
+        CRIME_DPRINTF("read  CRM_REALTIME_CTR = 0x%" PRIx64 "\n", val);
+        return val;
+
     case CRM_MEM_CONTROL:
         val = s->mem_control;
         CRIME_DPRINTF("read  CRM_MEM_CONTROL = 0x%" PRIx64 "\n", val);
@@ -183,8 +193,9 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
     {
         int bank = (offset - CRM_MEM_BANK_CTRL0) / 8;
         val = s->mem_bank_ctrl[bank];
-        CRIME_DPRINTF("read  CRM_MEM_BANK_CTRL[%d] = 0x%" PRIx64 "\n",
-                      bank, val);
+        CRIME_DPRINTF("read  CRM_MEM_BANK_CTRL[%d] = 0x%" PRIx64
+                      " (ram_size=%uMB)\n",
+                      bank, val, s->ram_size / (1024 * 1024));
         return val;
     }
 
@@ -311,6 +322,10 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
         s->vice_error_addr = value;
         break;
 
+    case CRM_REALTIME_CTR:
+        /* Read-only QEMU extension — ignore writes */
+        break;
+
     case CRM_MEM_CONTROL:
         CRIME_DPRINTF("write CRM_MEM_CONTROL = 0x%" PRIx64 "\n", value);
         s->mem_control = value & 0x3ULL;
@@ -418,20 +433,31 @@ static void sgi_crime_reset(DeviceState *dev)
      *   bit 8 set → 128 MB, bit 8 clear → 32 MB.
      *
      * So unused banks MUST have the same ctrl as bank 0 to be skipped.
-     * We use 32 MB banks (bit 8 clear) for all configurations.
      *
-     * 64MB  = 2 × 32MB: bank0=0x00, bank1=0x01, others=0x00
-     * 128MB = 4 × 32MB: bank0=0x00, bank1=0x01, bank2=0x02, bank3=0x03
-     * 256MB = 8 × 32MB: bank0..7 = 0x00..0x07
+     * For ≤256MB, use 32MB banks (max 8 × 32MB = 256MB):
+     *   64MB  = 2 × 32MB: bank0=0x000, bank1=0x001, others=0x000
+     *   256MB = 8 × 32MB: bank0..7 = 0x000..0x007
+     *
+     * For >256MB, switch to 128MB banks (max 8 × 128MB = 1GB):
+     *   512MB = 4 × 128MB: bank0=0x100, bank1=0x104, bank2=0x108, bank3=0x10C
+     *   (base_unit steps by 4 since each 128MB = 4 × 32MB units)
      */
     uint32_t remaining = s->ram_size;
     int bank = 0;
     uint32_t base_unit = 0;  /* in units of 32MB */
+    CRIME_DPRINTF("reset: ram_size=%u (%uMB)\n", s->ram_size,
+                  s->ram_size / (1024 * 1024));
+    uint32_t bank_size = (s->ram_size > (uint32_t)(8 * 32 * 1024 * 1024))
+                         ? (128 * 1024 * 1024) : (32 * 1024 * 1024);
+    uint64_t size_flag = (bank_size == 128 * 1024 * 1024)
+                         ? CRM_BANK_CTRL_SDRAM_SIZE : 0;
+    uint32_t bank_step = bank_size / (32 * 1024 * 1024);
 
-    while (remaining >= 32 * 1024 * 1024 && bank < CRIME_NUM_BANKS) {
-        s->mem_bank_ctrl[bank] = base_unit & CRM_BANK_CTRL_ADDR_MASK;
-        remaining -= 32 * 1024 * 1024;
-        base_unit++;
+    while (remaining >= bank_size && bank < CRIME_NUM_BANKS) {
+        s->mem_bank_ctrl[bank] = (base_unit & CRM_BANK_CTRL_ADDR_MASK)
+                                 | size_flag;
+        remaining -= bank_size;
+        base_unit += bank_step;
         bank++;
     }
 

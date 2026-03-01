@@ -31,8 +31,10 @@
 #include "migration/vmstate.h"
 #include "system/rtc.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
 #include "qemu/guest-random.h"
 #include "hw/core/cpu.h"
+#include "ui/input.h"
 #include "trace.h"
 
 /*
@@ -825,7 +827,7 @@ static void sgi_hpc3_kbd_data_write(SGIHPC3State *s, uint8_t data)
     switch (s->kbd_cmd) {
     case KBD_CMD_WRITE_CTRL:  /* 0x60 - Writing command byte */
         s->kbd_cmd_byte = data;
-        ps2_keyboard_set_translation(&s->ps2kbd,
+        ps2_keyboard_set_translation(&s->ps2kbd.parent_obj,
                                      (s->kbd_cmd_byte & KBD_MODE_KCC) != 0);
         s->kbd_cmd = 0;
         sgi_hpc3_kbd_update_map_irq(s);  /* fire pending IRQ if now enabled */
@@ -852,7 +854,7 @@ static void sgi_hpc3_kbd_data_write(SGIHPC3State *s, uint8_t data)
 
     default:
         /* No pending controller command — send directly to keyboard */
-        ps2_write_keyboard(&s->ps2kbd, data);
+        ps2_write_keyboard(&s->ps2kbd.parent_obj, data);
         break;
     }
 }
@@ -3257,7 +3259,7 @@ static void sgi_hpc3_init(Object *obj)
                             "gio-retrace", 1);
 
     /* Initialize PS/2 keyboard and mouse child devices */
-    object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_PS2_KBD_DEVICE);
+    object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_SGI_PS2_KBD);
     object_initialize_child(obj, "ps2mouse", &s->ps2mouse,
                             TYPE_PS2_MOUSE_DEVICE);
 
@@ -3389,8 +3391,537 @@ static const TypeInfo sgi_hpc3_info = {
     .class_init    = sgi_hpc3_class_init,
 };
 
+/* -----------------------------------------------------------------------
+ * SGI PS/2 keyboard subtype — hardware typematic repeat
+ * -----------------------------------------------------------------------
+ *
+ * The standard QEMU ps2_keyboard_event() forwards ALL host key events
+ * (including host-OS autorepeat) to the PS/2 scancode queue.  Under
+ * -icount shift=0,sleep=off the guest virtual clock races far ahead of
+ * real time, causing the X11 server's autorepeat timer to fire many
+ * times per physical key press and producing unwanted repeated chars.
+ *
+ * This SGI-specific subtype of TYPE_PS2_KBD_DEVICE replaces the input
+ * event handler to implement PS/2 typematic behaviour driven by
+ * QEMU_CLOCK_REALTIME:
+ *   - Host OS repeat events are suppressed (typematic_qcode already set).
+ *   - QEMU fires its own REALTIME-timed repeat after typematic_delay_ms,
+ *     then at typematic_period_ms intervals (~10.9 Hz, 500 ms delay).
+ *   - On key-up the timer is cancelled and typematic_qcode cleared.
+ *
+ * Default rates: 500 ms initial delay, 91 ms period (~10.9 Hz, per
+ * PS/2 spec default 0x2B encoding).
+ */
+
+/* Modifier bit flags — mirror of the file-scope values in ps2.c */
+#define SGI_PS2_MOD_CTRL_L  (1u << 0)
+#define SGI_PS2_MOD_SHIFT_L (1u << 1)
+#define SGI_PS2_MOD_ALT_L   (1u << 2)
+#define SGI_PS2_MOD_CTRL_R  (1u << 3)
+#define SGI_PS2_MOD_SHIFT_R (1u << 4)
+#define SGI_PS2_MOD_ALT_R   (1u << 5)
+
+/*
+ * AT set-2 → XT set-1 translation table.
+ * Mirrors translate_table[] from qemu/hw/input/ps2.c.
+ */
+static const uint8_t sgi_ps2_translate[256] = {
+    0xff, 0x43, 0x41, 0x3f, 0x3d, 0x3b, 0x3c, 0x58,
+    0x64, 0x44, 0x42, 0x40, 0x3e, 0x0f, 0x29, 0x59,
+    0x65, 0x38, 0x2a, 0x70, 0x1d, 0x10, 0x02, 0x5a,
+    0x66, 0x71, 0x2c, 0x1f, 0x1e, 0x11, 0x03, 0x5b,
+    0x67, 0x2e, 0x2d, 0x20, 0x12, 0x05, 0x04, 0x5c,
+    0x68, 0x39, 0x2f, 0x21, 0x14, 0x13, 0x06, 0x5d,
+    0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5e,
+    0x6a, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5f,
+    0x6b, 0x33, 0x25, 0x17, 0x18, 0x0b, 0x0a, 0x60,
+    0x6c, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0c, 0x61,
+    0x6d, 0x73, 0x28, 0x74, 0x1a, 0x0d, 0x62, 0x6e,
+    0x3a, 0x36, 0x1c, 0x1b, 0x75, 0x2b, 0x63, 0x76,
+    0x55, 0x56, 0x77, 0x78, 0x79, 0x7a, 0x0e, 0x7b,
+    0x7c, 0x4f, 0x7d, 0x4b, 0x47, 0x7e, 0x7f, 0x6f,
+    0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45,
+    0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
+    0x80, 0x81, 0x82, 0x41, 0x54, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+    0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+    0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+    0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
+    0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7,
+    0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
+    0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
+    0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+    0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+};
+
+/* Return the modifier bitmask for a given qcode (0 for non-modifiers). */
+static unsigned int sgi_ps2_modifier_bit(QKeyCode key)
+{
+    switch (key) {
+    case Q_KEY_CODE_CTRL:    return SGI_PS2_MOD_CTRL_L;
+    case Q_KEY_CODE_CTRL_R:  return SGI_PS2_MOD_CTRL_R;
+    case Q_KEY_CODE_SHIFT:   return SGI_PS2_MOD_SHIFT_L;
+    case Q_KEY_CODE_SHIFT_R: return SGI_PS2_MOD_SHIFT_R;
+    case Q_KEY_CODE_ALT:     return SGI_PS2_MOD_ALT_L;
+    case Q_KEY_CODE_ALT_R:   return SGI_PS2_MOD_ALT_R;
+    default:                 return 0;
+    }
+}
+
+/*
+ * Queue one raw PS/2 byte, applying XT translation if translate mode is on.
+ * Mirrors ps2_put_keycode() from ps2.c.
+ */
+static void sgi_ps2_put_keycode(PS2KbdState *ps2, int keycode)
+{
+    PS2State *ps = PS2_DEVICE(ps2);
+
+    if (ps2->translate) {
+        if (keycode == 0xf0) {
+            ps2->need_high_bit = true;
+        } else if (ps2->need_high_bit) {
+            ps2_queue(ps, sgi_ps2_translate[keycode] | 0x80);
+            ps2->need_high_bit = false;
+        } else {
+            ps2_queue(ps, sgi_ps2_translate[keycode]);
+        }
+    } else {
+        ps2_queue(ps, keycode);
+    }
+}
+
+/*
+ * Emit a PS/2 make code for qcode (used by the typematic timer callback).
+ * PAUSE and PRINT are skipped — they do not repeat on real hardware.
+ */
+static void sgi_ps2_emit_make(SGIPs2KbdState *s, int qcode)
+{
+    PS2KbdState *ps2 = &s->parent_obj;
+    uint16_t keycode = 0;
+
+    if (qcode == Q_KEY_CODE_PAUSE || qcode == Q_KEY_CODE_PRINT) {
+        return;
+    }
+
+    if (ps2->scancode_set == 1) {
+        if (qcode < (int)qemu_input_map_qcode_to_atset1_len) {
+            keycode = qemu_input_map_qcode_to_atset1[qcode];
+        }
+        if (keycode) {
+            if (keycode & 0xff00) {
+                sgi_ps2_put_keycode(ps2, keycode >> 8);
+            }
+            sgi_ps2_put_keycode(ps2, keycode & 0xff);
+        }
+    } else if (ps2->scancode_set == 2) {
+        if (qcode < (int)qemu_input_map_qcode_to_atset2_len) {
+            keycode = qemu_input_map_qcode_to_atset2[qcode];
+        }
+        if (keycode) {
+            if (keycode & 0xff00) {
+                sgi_ps2_put_keycode(ps2, keycode >> 8);
+            }
+            sgi_ps2_put_keycode(ps2, keycode & 0xff);
+        }
+    } else if (ps2->scancode_set == 3) {
+        if (qcode < (int)qemu_input_map_qcode_to_atset3_len) {
+            keycode = qemu_input_map_qcode_to_atset3[qcode];
+        }
+        if (keycode) {
+            ps2_queue(PS2_DEVICE(ps2), keycode);
+        }
+    }
+}
+
+/* Typematic repeat timer callback — fires on QEMU_CLOCK_REALTIME. */
+static void sgi_ps2_kbd_typematic(void *opaque)
+{
+    SGIPs2KbdState *s = opaque;
+
+    if (s->typematic_qcode < 0) {
+        return;
+    }
+    sgi_ps2_emit_make(s, s->typematic_qcode);
+    timer_mod(s->typematic_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+              (int64_t)s->typematic_period_ms * SCALE_MS);
+}
+
+/*
+ * SGI PS/2 keyboard event handler with typematic support.
+ *
+ * This replaces the upstream ps2_keyboard_event() and implements the
+ * full scancode emission for all three scancode sets, plus:
+ *   - Host OS repeat events are suppressed.
+ *   - A REALTIME timer drives repeat at the programmed typematic rate.
+ */
+static void sgi_ps2_keyboard_event(DeviceState *dev, QemuConsole *src,
+                                   InputEvent *evt)
+{
+    SGIPs2KbdState *s = (SGIPs2KbdState *)dev;
+    PS2KbdState *ps2 = &s->parent_obj;
+    InputKeyEvent *key = evt->u.key.data;
+    int qcode;
+    uint16_t keycode = 0;
+    unsigned int mod;
+
+    if (!ps2->scan_enabled) {
+        return;
+    }
+
+    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+    assert(evt->type == INPUT_EVENT_KIND_KEY);
+    qcode = qemu_input_key_value_to_qcode(key->key);
+    mod = sgi_ps2_modifier_bit(qcode);
+
+    if (key->down) {
+        ps2->modifiers |= mod;
+
+        /*
+         * Suppress host OS repeat events: if this qcode is already the
+         * held key, our REALTIME timer is already generating repeats.
+         */
+        if (s->typematic_qcode == qcode) {
+            return;
+        }
+
+        /* New key: cancel any existing typematic and record the new key. */
+        timer_del(s->typematic_timer);
+        s->typematic_qcode = qcode;
+
+        /* Emit initial make code (full logic for all three scancode sets). */
+        if (ps2->scancode_set == 1) {
+            if (qcode == Q_KEY_CODE_PAUSE) {
+                if (ps2->modifiers & (SGI_PS2_MOD_CTRL_L | SGI_PS2_MOD_CTRL_R)) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x46);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xc6);
+                } else {
+                    sgi_ps2_put_keycode(ps2, 0xe1);
+                    sgi_ps2_put_keycode(ps2, 0x1d);
+                    sgi_ps2_put_keycode(ps2, 0x45);
+                    sgi_ps2_put_keycode(ps2, 0xe1);
+                    sgi_ps2_put_keycode(ps2, 0x9d);
+                    sgi_ps2_put_keycode(ps2, 0xc5);
+                }
+            } else if (qcode == Q_KEY_CODE_PRINT) {
+                if (ps2->modifiers & SGI_PS2_MOD_ALT_L) {
+                    sgi_ps2_put_keycode(ps2, 0xb8);
+                    sgi_ps2_put_keycode(ps2, 0x38);
+                    sgi_ps2_put_keycode(ps2, 0x54);
+                } else if (ps2->modifiers & SGI_PS2_MOD_ALT_R) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xb8);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x38);
+                    sgi_ps2_put_keycode(ps2, 0x54);
+                } else if (ps2->modifiers & (SGI_PS2_MOD_SHIFT_L | SGI_PS2_MOD_CTRL_L |
+                                             SGI_PS2_MOD_SHIFT_R | SGI_PS2_MOD_CTRL_R)) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x37);
+                } else {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x2a);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x37);
+                }
+            } else if (qcode == Q_KEY_CODE_LANG1 || qcode == Q_KEY_CODE_LANG2) {
+                /* make only, no break emitted on key-up */
+                if (qcode < (int)qemu_input_map_qcode_to_atset1_len) {
+                    keycode = qemu_input_map_qcode_to_atset1[qcode];
+                }
+                if (keycode) {
+                    if (keycode & 0xff00) {
+                        sgi_ps2_put_keycode(ps2, keycode >> 8);
+                    }
+                    sgi_ps2_put_keycode(ps2, keycode & 0xff);
+                }
+            } else {
+                if (qcode < (int)qemu_input_map_qcode_to_atset1_len) {
+                    keycode = qemu_input_map_qcode_to_atset1[qcode];
+                }
+                if (keycode) {
+                    if (keycode & 0xff00) {
+                        sgi_ps2_put_keycode(ps2, keycode >> 8);
+                    }
+                    sgi_ps2_put_keycode(ps2, keycode & 0xff);
+                } else {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-ps2: ignoring key with qcode %d\n", qcode);
+                }
+            }
+        } else if (ps2->scancode_set == 2) {
+            if (qcode == Q_KEY_CODE_PAUSE) {
+                if (ps2->modifiers & (SGI_PS2_MOD_CTRL_L | SGI_PS2_MOD_CTRL_R)) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x7e);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x7e);
+                } else {
+                    sgi_ps2_put_keycode(ps2, 0xe1);
+                    sgi_ps2_put_keycode(ps2, 0x14);
+                    sgi_ps2_put_keycode(ps2, 0x77);
+                    sgi_ps2_put_keycode(ps2, 0xe1);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x14);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x77);
+                }
+            } else if (qcode == Q_KEY_CODE_PRINT) {
+                if (ps2->modifiers & SGI_PS2_MOD_ALT_L) {
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                    sgi_ps2_put_keycode(ps2, 0x84);
+                } else if (ps2->modifiers & SGI_PS2_MOD_ALT_R) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                    sgi_ps2_put_keycode(ps2, 0x84);
+                } else if (ps2->modifiers & (SGI_PS2_MOD_SHIFT_L | SGI_PS2_MOD_CTRL_L |
+                                             SGI_PS2_MOD_SHIFT_R | SGI_PS2_MOD_CTRL_R)) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x7c);
+                } else {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x12);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x7c);
+                }
+            } else if (qcode == Q_KEY_CODE_LANG1 || qcode == Q_KEY_CODE_LANG2) {
+                /* make only */
+                if (qcode < (int)qemu_input_map_qcode_to_atset2_len) {
+                    keycode = qemu_input_map_qcode_to_atset2[qcode];
+                }
+                if (keycode) {
+                    if (keycode & 0xff00) {
+                        sgi_ps2_put_keycode(ps2, keycode >> 8);
+                    }
+                    sgi_ps2_put_keycode(ps2, keycode & 0xff);
+                }
+            } else {
+                if (qcode < (int)qemu_input_map_qcode_to_atset2_len) {
+                    keycode = qemu_input_map_qcode_to_atset2[qcode];
+                }
+                if (keycode) {
+                    if (keycode & 0xff00) {
+                        sgi_ps2_put_keycode(ps2, keycode >> 8);
+                    }
+                    sgi_ps2_put_keycode(ps2, keycode & 0xff);
+                } else {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-ps2: ignoring key with qcode %d\n", qcode);
+                }
+            }
+        } else if (ps2->scancode_set == 3) {
+            if (qcode < (int)qemu_input_map_qcode_to_atset3_len) {
+                keycode = qemu_input_map_qcode_to_atset3[qcode];
+            }
+            if (keycode) {
+                ps2_queue(PS2_DEVICE(ps2), keycode);
+            } else {
+                qemu_log_mask(LOG_UNIMP,
+                              "sgi-ps2: ignoring key with qcode %d\n", qcode);
+            }
+        }
+
+        /* Start typematic delay timer (PAUSE and PRINT do not repeat). */
+        if (qcode != Q_KEY_CODE_PAUSE && qcode != Q_KEY_CODE_PRINT) {
+            timer_mod(s->typematic_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                      (int64_t)s->typematic_delay_ms * SCALE_MS);
+        }
+    } else {
+        /* Key up: cancel typematic and emit break code. */
+        ps2->modifiers &= ~mod;
+
+        if (s->typematic_qcode == qcode) {
+            timer_del(s->typematic_timer);
+            s->typematic_qcode = -1;
+        }
+
+        if (ps2->scancode_set == 1) {
+            if (qcode == Q_KEY_CODE_PAUSE) {
+                /* No break code for PAUSE in set 1 */
+            } else if (qcode == Q_KEY_CODE_PRINT) {
+                if (ps2->modifiers & SGI_PS2_MOD_ALT_L) {
+                    sgi_ps2_put_keycode(ps2, 0xd4);
+                    sgi_ps2_put_keycode(ps2, 0xb8);
+                    sgi_ps2_put_keycode(ps2, 0x38);
+                } else if (ps2->modifiers & SGI_PS2_MOD_ALT_R) {
+                    sgi_ps2_put_keycode(ps2, 0xd4);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xb8);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x38);
+                } else if (ps2->modifiers & (SGI_PS2_MOD_SHIFT_L | SGI_PS2_MOD_CTRL_L |
+                                             SGI_PS2_MOD_SHIFT_R | SGI_PS2_MOD_CTRL_R)) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xb7);
+                } else {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xb7);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xaa);
+                }
+            } else if (qcode == Q_KEY_CODE_LANG1 || qcode == Q_KEY_CODE_LANG2) {
+                /* Ignore release for these keys */
+            } else {
+                if (qcode < (int)qemu_input_map_qcode_to_atset1_len) {
+                    keycode = qemu_input_map_qcode_to_atset1[qcode];
+                }
+                if (keycode) {
+                    if (keycode & 0xff00) {
+                        sgi_ps2_put_keycode(ps2, keycode >> 8);
+                    }
+                    keycode |= 0x80;
+                    sgi_ps2_put_keycode(ps2, keycode & 0xff);
+                } else {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-ps2: ignoring key with qcode %d\n", qcode);
+                }
+            }
+        } else if (ps2->scancode_set == 2) {
+            if (qcode == Q_KEY_CODE_PAUSE) {
+                /* No break code for PAUSE in set 2 */
+            } else if (qcode == Q_KEY_CODE_PRINT) {
+                if (ps2->modifiers & SGI_PS2_MOD_ALT_L) {
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x84);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                } else if (ps2->modifiers & SGI_PS2_MOD_ALT_R) {
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x84);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0x11);
+                } else if (ps2->modifiers & (SGI_PS2_MOD_SHIFT_L | SGI_PS2_MOD_CTRL_L |
+                                             SGI_PS2_MOD_SHIFT_R | SGI_PS2_MOD_CTRL_R)) {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x7c);
+                } else {
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x7c);
+                    sgi_ps2_put_keycode(ps2, 0xe0);
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, 0x12);
+                }
+            } else if (qcode == Q_KEY_CODE_LANG1 || qcode == Q_KEY_CODE_LANG2) {
+                /* Ignore release for these keys */
+            } else {
+                if (qcode < (int)qemu_input_map_qcode_to_atset2_len) {
+                    keycode = qemu_input_map_qcode_to_atset2[qcode];
+                }
+                if (keycode) {
+                    if (keycode & 0xff00) {
+                        sgi_ps2_put_keycode(ps2, keycode >> 8);
+                    }
+                    sgi_ps2_put_keycode(ps2, 0xf0);
+                    sgi_ps2_put_keycode(ps2, keycode & 0xff);
+                } else {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-ps2: ignoring key with qcode %d\n", qcode);
+                }
+            }
+        } else if (ps2->scancode_set == 3) {
+            if (qcode < (int)qemu_input_map_qcode_to_atset3_len) {
+                keycode = qemu_input_map_qcode_to_atset3[qcode];
+            }
+            if (keycode) {
+                ps2_queue(PS2_DEVICE(ps2), 0xf0);
+                ps2_queue(PS2_DEVICE(ps2), keycode);
+            } else {
+                qemu_log_mask(LOG_UNIMP,
+                              "sgi-ps2: ignoring key with qcode %d\n", qcode);
+            }
+        }
+    }
+}
+
+static const QemuInputHandler sgi_ps2_keyboard_handler = {
+    .name  = "SGI PS/2 Keyboard (typematic)",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = sgi_ps2_keyboard_event,
+};
+
+/*
+ * Static capture of parent hold function pointer. We cannot use
+ * PS2_DEVICE_GET_CLASS(obj)->parent_phases because that macro always returns
+ * the leaf class object; when the parent (ps2_kbd_reset_hold) then calls
+ * PS2_DEVICE_GET_CLASS(obj)->parent_phases.hold it retrieves the same pointer
+ * again — infinite recursion. Instead we capture rc->phases.hold once at
+ * class_init time (before we override it) and call it directly here.
+ */
+static ResettableHoldPhase sgi_ps2_parent_hold_fn;
+
+/* Reset hold: call upstream ps2_kbd_reset_hold, then reset typematic state. */
+static void sgi_ps2_kbd_reset_hold(Object *obj, ResetType type)
+{
+    SGIPs2KbdState *s = (SGIPs2KbdState *)obj;
+
+    if (sgi_ps2_parent_hold_fn) {
+        sgi_ps2_parent_hold_fn(obj, type);
+    }
+    timer_del(s->typematic_timer);
+    s->typematic_qcode    = -1;
+    s->typematic_delay_ms  = 500;
+    s->typematic_period_ms = 91;
+}
+
+static void sgi_ps2_kbd_realize(DeviceState *dev, Error **errp)
+{
+    SGIPs2KbdState *s = (SGIPs2KbdState *)dev;
+
+    s->typematic_qcode    = -1;
+    s->typematic_delay_ms  = 500;
+    s->typematic_period_ms = 91;
+    s->typematic_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                      sgi_ps2_kbd_typematic, s);
+    /* Register our typematic-aware handler instead of the parent's. */
+    qemu_input_handler_register(dev, &sgi_ps2_keyboard_handler);
+}
+
+static void sgi_ps2_kbd_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    dc->realize = sgi_ps2_kbd_realize;
+    /* Capture the parent hold (ps2_kbd_reset_hold) before overriding.
+     * We do NOT use resettable_class_set_parent_phases because it stores the
+     * saved pointer in ps2dc->parent_phases, which ps2_kbd_reset_hold then
+     * looks up via PS2_DEVICE_GET_CLASS(obj) — always the leaf class — causing
+     * infinite recursion. A file-static capture breaks the cycle cleanly. */
+    sgi_ps2_parent_hold_fn = rc->phases.hold;
+    rc->phases.hold = sgi_ps2_kbd_reset_hold;
+}
+
+static const TypeInfo sgi_ps2_kbd_info = {
+    .name          = TYPE_SGI_PS2_KBD,
+    .parent        = TYPE_PS2_KBD_DEVICE,
+    .instance_size = sizeof(SGIPs2KbdState),
+    .class_init    = sgi_ps2_kbd_class_init,
+};
+
 static void sgi_hpc3_register_types(void)
 {
+    type_register_static(&sgi_ps2_kbd_info);
     type_register_static(&sgi_hpc3_info);
 }
 

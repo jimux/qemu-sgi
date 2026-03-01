@@ -24,6 +24,25 @@
  */
 #define HPC3_DMA_ADDR(a)  ((uint32_t)(a) & 0x1fffffffU)
 
+/*
+ * SGI-specific PS/2 keyboard subtype with real-time typematic repeat.
+ *
+ * Under -icount shift=0,sleep=off guest virtual time races far ahead of real
+ * time, so the X11 server's autorepeat timer fires many times per physical
+ * key press.  This subtype drives typematic from QEMU_CLOCK_REALTIME so
+ * repeat rates are correct regardless of icount speed.
+ */
+#define TYPE_SGI_PS2_KBD "sgi-ps2-kbd"
+OBJECT_DECLARE_SIMPLE_TYPE(SGIPs2KbdState, SGI_PS2_KBD)
+
+struct SGIPs2KbdState {
+    PS2KbdState parent_obj;         /* must be first — QOM/C inheritance */
+    QEMUTimer  *typematic_timer;    /* drives repeat on QEMU_CLOCK_REALTIME */
+    int         typematic_qcode;    /* held key qcode, or -1 if none held */
+    uint32_t    typematic_delay_ms; /* initial delay before first repeat */
+    uint32_t    typematic_period_ms;/* interval between repeats */
+};
+
 #define TYPE_SGI_HPC3 "sgi-hpc3"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIHPC3State, SGI_HPC3)
 
@@ -454,7 +473,7 @@ struct SGIHPC3State {
      * Embeds QEMU PS/2 keyboard and mouse devices which register
      * input handlers automatically, so host events flow through.
      */
-    PS2KbdState ps2kbd;           /* PS/2 keyboard device */
+    SGIPs2KbdState ps2kbd;        /* PS/2 keyboard device (SGI typematic subtype) */
     PS2MouseState ps2mouse;       /* PS/2 mouse device */
     uint8_t kbd_cmd;              /* Last 8042 controller command written */
     uint8_t kbd_cmd_byte;         /* 8042 controller command byte (via 0x60) */

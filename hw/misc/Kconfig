@@ -149,6 +149,21 @@ config SGI_MACE
 config SGI_BOOTDISK
     bool
 
+config SGI_SMP
+    bool
+
+config SGI_PVMEM
+    bool
+
+config SGI_PVNET
+    bool
+
+config SGI_HEART
+    bool
+
+config SGI_BRIDGE
+    bool
+
 config RISCV_MIPS_CMGCR
     bool
 
