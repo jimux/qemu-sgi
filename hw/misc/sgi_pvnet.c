@@ -47,6 +47,8 @@ static uint64_t sgi_pvnet_read(void *opaque, hwaddr addr, unsigned size) {
     return (uint64_t)s->conf.macaddr.a[2] << 24 |
            (uint64_t)s->conf.macaddr.a[3] << 16 |
            (uint64_t)s->conf.macaddr.a[4] << 8 | (uint64_t)s->conf.macaddr.a[5];
+  case SGI_PVNET_RX_ACTUAL:
+    return s->rx_actual;
   default:
     qemu_log_mask(LOG_GUEST_ERROR,
                   "%s: Bad register offset 0x%" HWADDR_PRIx "\n", __func__,
@@ -134,6 +136,7 @@ static ssize_t sgi_pvnet_receive(NetClientState *nc, const uint8_t *buf,
 
   dma_memory_write(&address_space_memory, s->rx_base, buf, size,
                    MEMTXATTRS_UNSPECIFIED);
+  s->rx_actual = size;
   s->intr_status |= PVNET_INTR_RX_DONE;
   sgi_pvnet_update_irq(s);
 
@@ -172,6 +175,7 @@ static void sgi_pvnet_reset(DeviceState *dev) {
   s->tx_len = 0;
   s->rx_base = 0;
   s->rx_len = 0;
+  s->rx_actual = 0;
   sgi_pvnet_update_irq(s);
 }
 

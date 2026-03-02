@@ -34,12 +34,83 @@
 #define HEART_DPRINTF(fmt, ...) do {} while (0)
 #endif
 
+/* Forward declaration */
+static void sgi_heart_update_irq(SGIHEARTState *s);
+
 /* HEART timer runs at 12.5MHz (80ns period) */
 #define HEART_COUNT_FREQ 12500000
 #define HEART_COUNT_PERIOD_NS (1000000000ULL / HEART_COUNT_FREQ)
 
 /* HEART register region size */
 #define HEART_REG_SIZE 0x70000
+
+/*
+ * Get current HEART_COUNT value from virtual clock.
+ */
+static uint64_t sgi_heart_get_count(SGIHEARTState *s)
+{
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t count = (ns + s->time_offset) / HEART_COUNT_PERIOD_NS;
+    return count & 0xffffffffffffULL;  /* 52-bit mask */
+}
+
+/*
+ * Schedule the COMPARE timer to fire when COUNT reaches COMPARE value.
+ */
+static void sgi_heart_rearm_compare(SGIHEARTState *s)
+{
+    uint64_t now_count = sgi_heart_get_count(s);
+    uint64_t compare = s->compare & 0xffffffffffffULL;
+    uint64_t delta;
+
+    if (compare == 0) {
+        /* compare == 0 disables the timer */
+        timer_del(s->compare_timer);
+        return;
+    }
+
+    if (compare > now_count) {
+        delta = compare - now_count;
+    } else {
+        /* Wrapped: distance is (max - now) + compare */
+        delta = (0x1000000000000ULL - now_count) + compare;
+    }
+
+    int64_t fire_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (int64_t)(delta * HEART_COUNT_PERIOD_NS);
+    timer_mod(s->compare_timer, fire_ns);
+}
+
+/*
+ * COMPARE timer callback: fire HEART_INT_TIMER (bit 50) into ISR.
+ */
+static void sgi_heart_compare_cb(void *opaque)
+{
+    SGIHEARTState *s = opaque;
+
+    s->isr |= HEART_INT_TIMER;
+    sgi_heart_update_irq(s);
+}
+
+/*
+ * GPIO input handler: device IRQ lines → HEART ISR bits.
+ * Each line N maps to ISR bit N. Level=1 sets the bit, level=0 clears it.
+ */
+static void sgi_heart_set_irq(void *opaque, int n, int level)
+{
+    SGIHEARTState *s = opaque;
+
+    if (n < 0 || n >= HEART_NUM_IRQS) {
+        return;
+    }
+
+    if (level) {
+        s->isr |= (1ULL << n);
+    } else {
+        s->isr &= ~(1ULL << n);
+    }
+    sgi_heart_update_irq(s);
+}
 
 /*
  * Update HEART interrupt line based on current state.
@@ -212,25 +283,14 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
 
     /* Timer registers */
     case HEART_COUNT:
-        {
-            /* Get current count value */
-            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            val = (ns + s->time_offset) / HEART_COUNT_PERIOD_NS;
-            val &= 0xffffffffffffULL;  /* 52-bit mask */
-        }
+        val = sgi_heart_get_count(s);
         break;
     case HEART_COUNT + 4:
         /*
          * Low 32 bits of HEART_COUNT when accessed as a 4-byte read.
-         * Normally the PROM uses LD (8-byte) and the .impl.max_access_size=8
-         * ensures QEMU passes it as a single 8-byte access.  This case is a
-         * belt-and-suspenders fallback for any 32-bit kernel accesses.
+         * Belt-and-suspenders fallback for 32-bit kernel accesses.
          */
-        {
-            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            uint64_t count = (ns + s->time_offset) / HEART_COUNT_PERIOD_NS;
-            val = count & 0xFFFFFFFFULL;  /* low 32 bits */
-        }
+        val = sgi_heart_get_count(s) & 0xFFFFFFFFULL;
         break;
     case HEART_COMPARE:
         val = s->compare;
@@ -382,7 +442,7 @@ static void sgi_heart_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case HEART_COMPARE:
         s->compare = val;
-        /* Timer comparison is checked on each read */
+        sgi_heart_rearm_compare(s);
         break;
     case HEART_TRIGGER:
         s->trigger = val;
@@ -466,6 +526,10 @@ static void sgi_heart_reset(DeviceState *dev)
     s->sync = 0;
 
     s->time_offset = 0;
+
+    if (s->compare_timer) {
+        timer_del(s->compare_timer);
+    }
 }
 
 static void sgi_heart_realize(DeviceState *dev, Error **errp)
@@ -480,6 +544,13 @@ static void sgi_heart_realize(DeviceState *dev, Error **errp)
     for (int i = 0; i < 5; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cpu_irq[i]);
     }
+
+    /* Input IRQ lines from devices → HEART ISR bits */
+    qdev_init_gpio_in(dev, sgi_heart_set_irq, HEART_NUM_IRQS);
+
+    /* COMPARE timer */
+    s->compare_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     sgi_heart_compare_cb, s);
 }
 
 static const Property sgi_heart_properties[] = {
@@ -487,9 +558,20 @@ static const Property sgi_heart_properties[] = {
     DEFINE_PROP_UINT32("num-cpus", SGIHEARTState, num_cpus, 1),
 };
 
+static int sgi_heart_post_load(void *opaque, int version_id)
+{
+    SGIHEARTState *s = opaque;
+
+    /* Rearm compare timer if compare was set */
+    if (s->compare != 0) {
+        sgi_heart_rearm_compare(s);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_sgi_heart = {
     .name = "sgi-heart",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(mode, SGIHEARTState),
@@ -522,8 +604,10 @@ static const VMStateDescription vmstate_sgi_heart = {
         VMSTATE_UINT64(prid, SGIHEARTState),
         VMSTATE_UINT64(sync, SGIHEARTState),
         VMSTATE_INT64(time_offset, SGIHEARTState),
+        VMSTATE_TIMER_PTR_V(compare_timer, SGIHEARTState, 2),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .post_load = sgi_heart_post_load,
 };
 
 static void sgi_heart_class_init(ObjectClass *klass, const void *data)

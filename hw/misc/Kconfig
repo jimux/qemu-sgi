@@ -130,6 +130,9 @@ config SGI_MC
     bool
 
 config SGI_HPC3
+
+config SGI_HPC1
+    bool
     bool
     select NMC93XX_EEPROM
     select PS2
@@ -156,6 +159,9 @@ config SGI_PVMEM
     bool
 
 config SGI_PVNET
+    bool
+
+config SGI_PVAUDIO
     bool
 
 config SGI_HEART

@@ -23,6 +23,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIPVNetState, SGI_PVNET)
 #define SGI_PVNET_RX_LEN 0x38
 #define SGI_PVNET_MAC_HI 0x40
 #define SGI_PVNET_MAC_LO 0x48
+#define SGI_PVNET_RX_ACTUAL 0x50  /* actual byte count of last received packet */
 
 /* Commands */
 #define PVNET_CMD_TX_START (1 << 0)
@@ -50,6 +51,7 @@ struct SGIPVNetState {
 
   uint64_t rx_base;
   uint64_t rx_len;
+  uint64_t rx_actual;  /* actual byte count of last received packet */
 };
 
 #endif /* SGI_PVNET_H */

@@ -92,6 +92,7 @@ config SGI_INDY
     default y
     depends on MIPS64 && TCG
     select SGI_MC
+    select SGI_HPC1
     select SGI_HPC3
     select SGI_ARCS
     select SGI_NEWPORT
@@ -127,3 +128,7 @@ config SGI_OCTANE
     select SERIAL_MM
     select UNIMP
     select SGI_SMP
+    select SGI_PVMEM
+    select SGI_PVNET
+    select SGI_GLACCEL
+    select SGI_PVAUDIO

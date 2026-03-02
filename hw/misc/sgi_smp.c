@@ -95,7 +95,7 @@ static void sgi_smp_write(void *opaque, hwaddr addr, uint64_t val,
 static const MemoryRegionOps sgi_smp_ops = {
     .read = sgi_smp_read,
     .write = sgi_smp_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid =
         {
             .min_access_size = 4,

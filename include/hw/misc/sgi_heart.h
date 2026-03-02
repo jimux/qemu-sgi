@@ -20,6 +20,7 @@
 #define HW_MISC_SGI_HEART_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_HEART "sgi-heart"
@@ -157,6 +158,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHEARTState, SGI_HEART)
 #define HEART_INT_L0_LOCAL       (0xfff8ULL)    /* Level 0 - vectors 15-3 */
 #define HEART_INT_IRQ            (1ULL << 0)    /* Level 0 - vector 0 */
 
+/* Number of HEART interrupt vectors (input lines from devices) */
+#define HEART_NUM_IRQS 64
+
 struct SGIHEARTState {
     SysBusDevice parent_obj;
 
@@ -164,6 +168,9 @@ struct SGIHEARTState {
 
     /* CPU interrupt output (HEART -> CPU IP7/IP6/IP5/IP4/IP3) */
     qemu_irq cpu_irq[5];
+
+    /* COMPARE timer */
+    QEMUTimer *compare_timer;
 
     /* Configuration */
     uint32_t ram_size;
