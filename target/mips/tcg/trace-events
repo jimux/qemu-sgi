@@ -3,3 +3,13 @@
 # translate.c
 mips_translate_c0(const char *instr, const char *rn, int reg, int sel) "%s %s (reg %d sel %d)"
 mips_translate_tr(const char *instr, int rt, int u, int sel, int h) "%s (reg %d u %d sel %d h %d)"
+
+# system/tlb_helper.c — MMU fault / exception tracing (debug toolkit Layer 1)
+# Fires for every TLB/address fault as the exception is raised.  access: 0=load 1=store 2=fetch.
+mips_mmu_fault(uint64_t addr, uint64_t pc, int exc, int access, int tlberr, uint64_t entryhi) "badva=0x%016"PRIx64" pc=0x%016"PRIx64" exc=%d access=%d tlberr=%d entryhi=0x%016"PRIx64
+# Fires when an exception is actually vectored (after EPC/Cause committed).
+mips_mmu_interrupt(int excp, uint64_t pc, uint64_t epc, uint64_t badvaddr, uint32_t cause) "excp=%d pc=0x%016"PRIx64" epc=0x%016"PRIx64" badva=0x%016"PRIx64" cause=0x%08x"
+# Low-noise: only fires for faults on genuinely-wild addresses (above the 32-bit
+# userland range and not in kseg0/1/sseg), which are always bugs on this n32 system.
+# Safe to leave enabled — ideal for catching wild-pointer dereferences.
+mips_mmu_wildfault(uint64_t addr, uint64_t pc, int exc, int access, uint64_t entryhi) "WILD badva=0x%016"PRIx64" pc=0x%016"PRIx64" exc=%d access=%d entryhi=0x%016"PRIx64

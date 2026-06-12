@@ -28,6 +28,7 @@
 #include "accel/tcg/cpu-ldst.h"
 #include "exec/log.h"
 #include "exec/helper-proto.h"
+#include "trace.h"
 
 /* TLB management */
 static void r4k_mips_tlb_flush_extra(CPUMIPSState *env, int first)
@@ -573,6 +574,29 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
 #endif
     cs->exception_index = exception;
     env->error_code = error_code;
+
+    trace_mips_mmu_fault((uint64_t)address, (uint64_t)env->active_tc.PC,
+                         exception, (int)access_type, tlb_error,
+                         (uint64_t)env->CP0_EntryHi);
+
+    /*
+     * Low-noise wild-address detector.  On this n32 IRIX system legitimate
+     * faults are on user VAs (< 0x80000000), kseg0/1 (0x80000000-0xBFFFFFFF),
+     * or the sign-extended kernel range (>= 0xFFFFFFFF80000000).  Anything in
+     * between — e.g. a ~16 GB pointer or a non-sign-extended high address — is
+     * a wild dereference (the fm/MMU bug's original fault, and a generally
+     * useful bug detector).  Safe to leave enabled; near-zero hit rate.
+     */
+    {
+        uint64_t a = (uint64_t)address;
+        bool normal = (a < 0x0000000080000000ULL) ||
+                      (a >= 0x0000000080000000ULL && a <= 0x00000000ffffffffULL) ||
+                      (a >= 0xffffffff80000000ULL);
+        if (!normal) {
+            trace_mips_mmu_wildfault(a, (uint64_t)env->active_tc.PC, exception,
+                                     (int)access_type, (uint64_t)env->CP0_EntryHi);
+        }
+    }
 }
 
 #if !defined(TARGET_MIPS64)
@@ -1036,6 +1060,11 @@ void mips_cpu_do_interrupt(CPUState *cs)
     target_ulong offset;
     int cause = -1;
     uint64_t last_pc = env->active_tc.PC;
+
+    trace_mips_mmu_interrupt(cs->exception_index, (uint64_t)env->active_tc.PC,
+                             (uint64_t)env->CP0_EPC,
+                             (uint64_t)env->CP0_BadVAddr,
+                             (uint32_t)env->CP0_Cause);
 
     if (qemu_loglevel_mask(CPU_LOG_INT)
         && cs->exception_index != EXCP_EXT_INTERRUPT) {
