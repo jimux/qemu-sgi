@@ -129,7 +129,16 @@ static void pvclock_raise_work(CPUState *cs, run_on_cpu_data data)
 {
     PVClockState *s = data.host_ptr;
 
-    /* Write cause_ip5_count = 1 into guest RAM (MIPS big-endian) */
+    /*
+     * Write cause_ip5_count = 1 (one pending clock tick) into guest RAM,
+     * MIPS big-endian.  NB: this OVERWRITES rather than accumulates — if the
+     * guest holds IP5 masked across more than one 10 ms event the extra ticks
+     * merge, so the guest clock can slip slightly under load.  Accumulating
+     * (+=, capped) was tried and made NO difference to the steady-state rate
+     * (the ~0.47x guest:host ratio is TCG emulation speed, not tick loss) while
+     * letting a large backlog build during early boot and drain in a burst —
+     * which produced a boot-time stack-overflow panic.  =1 is the safe choice.
+     */
     uint32_t one = cpu_to_be32(1);
     cpu_physical_memory_write(IP54PV_CAUSE_IP5_COUNT_PA, &one, sizeof(one));
 
