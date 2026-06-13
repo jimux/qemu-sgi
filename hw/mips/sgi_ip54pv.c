@@ -302,12 +302,13 @@ static void ip54_heart_update_irq(IP54HeartShimState *s)
 {
     uint64_t imsr = s->isr & s->imr[0];  /* CPU 0 only */
 
-    /* ISR bit 20 (pvnet) → dedicated CPU IP3 line.
+    /* ISR bits 20 (pvnet) and 23 (8042 kbd/mouse) → dedicated CPU IP3 line.
      * Routed to IP3 (not IP4) because:
      *   IP4 → c0vec_tbl[5] (clock handler) which crashes in semaphore code
      *   IP3 → c0vec_tbl[4] (INT2/INT3 handler, safe to replace on IP54)
-     * The PROM patches c0vec_tbl[4].isr = pvnet_intr. */
-    bool pvnet_level = (imsr & (1ULL << 20)) != 0;
+     * The PROM patches c0vec_tbl[4].isr = a trampoline dispatching pvnet_intr
+     * (bit 20) / pckm_intr via lcl2vec_tbl[5] (bit 23, the 8042). */
+    bool pvnet_level = (imsr & ((1ULL << 20) | (1ULL << 23))) != 0;
     if (pvnet_level != s->irq_level_pvnet) {
         s->irq_level_pvnet = pvnet_level;
         if (pvnet_level) {
@@ -317,8 +318,8 @@ static void ip54_heart_update_irq(IP54HeartShimState *s)
         }
     }
 
-    /* Remaining LEVEL1 bits (16-31 except 20) → IP4 */
-    bool level = (imsr & 0xFFFF0000ULL & ~(1ULL << 20)) != 0;
+    /* Remaining LEVEL1 bits (16-31 except 20, 23) → IP4 */
+    bool level = (imsr & 0xFFFF0000ULL & ~(1ULL << 20) & ~(1ULL << 23)) != 0;
     if (level != s->irq_level) {
         s->irq_level = level;
         if (level) {
@@ -696,8 +697,9 @@ static void sgi_ip54pv_init(MachineState *machine)
         memory_region_add_subregion_overlap(system_memory, IP54PV_HEART_BASE,
                                             heart_mem, 1);
 
-        /* Create 3 GPIO inputs for PV device IRQs → HEART ISR bits 20-22 */
-        heart_irqs = qemu_allocate_irqs(ip54_heart_irq_handler, &heart_shim, 3);
+        /* Create 4 GPIO inputs for PV device IRQs → HEART ISR bits 20-23.
+         * bit 23 (n=3) = sgi-ioc2-kbd 8042 keyboard/mouse → IP3 (see update_irq). */
+        heart_irqs = qemu_allocate_irqs(ip54_heart_irq_handler, &heart_shim, 4);
     }
 
     /* HEART widget config space at PA 0x18000000.
@@ -831,15 +833,16 @@ static void sgi_ip54pv_init(MachineState *machine)
      * IOC2-style 8042 PS/2 keyboard/mouse controller at 0x1FBD9840,
      * overlapping the sgi-mace-isa unimp region (priority 1 wins).
      * The stock IRIX pckm driver probes these fixed addresses
-     * (data 0x1FBD9843, status/cmd 0x1FBD9847).  IRQ output is left
-     * unconnected: the kernel drains the controller from the pvuart
-     * callout poll, so no interrupt wiring is needed.
+     * (data 0x1FBD9843, status/cmd 0x1FBD9847).  IRQ output → HEART ISR
+     * bit 23 → IP3 → c0vec_tbl[4] trampoline → pckm_intr (interrupt-driven
+     * keyboard/mouse); the pvuart callout poll remains as a fallback.
      */
     {
         DeviceState *kbd_dev = qdev_new(TYPE_SGI_IOC2_KBD);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(kbd_dev), &error_fatal);
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(kbd_dev), 0,
                                 0x1FBD9840ULL, 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(kbd_dev), 0, heart_irqs[3]);
     }
 
     /*
