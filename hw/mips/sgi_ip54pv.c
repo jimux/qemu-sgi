@@ -99,11 +99,16 @@ static void main_cpu_reset(void *opaque)
  * silently corrupts whatever kernel variable now lives there (manifested as
  * the .dt-desktop zone_shake / kernel-stack / userspace crashes — see
  * progress_notes/ip54/dt_desktop_zone_corruption.md).  When the kernel is
- * rebuilt, re-derive from ip54_kernel_symbols_disk.json:
- *     cause_ip5_count VA 0x8829EDC0 → PA 0x0829EDC0  (golden disk kernel, 2026-06).
- * (Older builds had it at 0x8829ED00 / 0x8829F150 — those constants rotted.)
+ * rebuilt, re-derive: `nm /unix.new | grep cause_ip5_count`, mask VA & 0x1FFFFFFF.
+ *     cause_ip5_count VA 0x8829FEE0 → PA 0x0829FEE0  (golden disk /unix.new, 2026-06-17).
+ * (Older builds: 0x8829ED00 / 0x8829F150 / 0x8829EDC0 — those constants all rotted.)
+ *
+ * ROBUSTNESS: the address is overridable at runtime via the env var
+ * IP54_CAUSE_IP5_COUNT_PA (the launch harness derives it from the booting kernel
+ * with nm, so a kernel rebuild no longer requires recompiling QEMU).  The constant
+ * below is only the fallback default.
  * ----------------------------------------------------------------------- */
-#define IP54PV_CAUSE_IP5_COUNT_PA  0x0829EDC0ULL
+#define IP54PV_CAUSE_IP5_COUNT_PA  0x0829FEE0ULL
 #define IP54PV_PVCLOCK_INTERVAL_NS 10000000ULL  /* 10 ms = 100 Hz */
 #define IP54PV_PVCLOCK_LOWER_NS     2000000ULL  /* 2 ms lower pulse */
 #define IP54PV_CAUSE_SW2_BIT       (1u << 9)    /* CP0 Cause SW2 */
@@ -112,7 +117,28 @@ typedef struct {
     QEMUTimer *raise_timer;
     QEMUTimer *lower_timer;
     CPUMIPSState *env;
+    uint64_t cause_pa;          /* guest PA of cause_ip5_count (see warning above) */
 } PVClockState;
+
+/* Resolve cause_ip5_count's guest PA: env override (set by the launch harness from
+ * `nm /unix.new`) wins, else the compiled-in fallback default.  Logged once so a
+ * mismatch is visible in the boot log instead of silently corrupting memory. */
+static uint64_t ip54pv_resolve_cause_pa(void)
+{
+    const char *e = getenv("IP54_CAUSE_IP5_COUNT_PA");
+    if (e && *e) {
+        uint64_t v = (uint64_t)strtoull(e, NULL, 0);
+        if (v) {
+            fprintf(stderr, "[ip54 pvclock] cause_ip5_count PA = 0x%llx (from "
+                    "IP54_CAUSE_IP5_COUNT_PA env)\n", (unsigned long long)v);
+            return v;
+        }
+    }
+    fprintf(stderr, "[ip54 pvclock] cause_ip5_count PA = 0x%llx (compiled default; "
+            "set IP54_CAUSE_IP5_COUNT_PA if the kernel was rebuilt)\n",
+            (unsigned long long)IP54PV_CAUSE_IP5_COUNT_PA);
+    return IP54PV_CAUSE_IP5_COUNT_PA;
+}
 
 /*
  * CP0_Cause bits 8-9 (SW0/SW1) are guest-writable: IRIX's softint
@@ -124,6 +150,18 @@ typedef struct {
  * dispatch (processes resuming at EPC 0, spurious vectors).  All Cause
  * manipulation therefore runs ON the vCPU thread via async_run_on_cpu,
  * which executes at a translation-block boundary with the CPU halted.
+ *
+ * RECORD/REPLAY: this path is deterministic under -icount and needs NO
+ * change to support rr=record/replay (validated 2026-06: a boot recorded
+ * and replayed produced byte-identical serial output).  The raise/lower
+ * timers fire on QEMU_CLOCK_VIRTUAL, which is icount-driven, so they fire
+ * at fixed instruction counts.  async_run_on_cpu's only non-determinism is
+ * WHICH cpu / ordering relative to other vCPUs — irrelevant here
+ * (default_cpus = 1), so the work drains at a fixed TB boundary.  The
+ * cpu_physical_memory_write below runs on the vCPU thread and is therefore
+ * a re-executed guest write, not a recorded input.  Do NOT "fix" this by
+ * routing through replay_bh_schedule_oneshot_event: that runs the BH on the
+ * iothread, reintroducing the CP0_Cause/mtc0 race described above.
  */
 static void pvclock_raise_work(CPUState *cs, run_on_cpu_data data)
 {
@@ -140,7 +178,7 @@ static void pvclock_raise_work(CPUState *cs, run_on_cpu_data data)
      * which produced a boot-time stack-overflow panic.  =1 is the safe choice.
      */
     uint32_t one = cpu_to_be32(1);
-    cpu_physical_memory_write(IP54PV_CAUSE_IP5_COUNT_PA, &one, sizeof(one));
+    cpu_physical_memory_write(s->cause_pa, &one, sizeof(one));
 
     /* Assert SW2 to drive intr() at the next TB boundary */
     s->env->CP0_Cause |= IP54PV_CAUSE_SW2_BIT;
@@ -771,6 +809,19 @@ static void sgi_ip54pv_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(pvnet_dev), 0, heart_irqs[0]);
     }
 
+    /* sgi-pvrex3 at 0x1F490000 (8KB REX3 register space), IRQ → HEART ISR bit 21 → IP4.
+     * Created FIRST among the graphic devices so it owns QEMU graphic console index 0 — the console
+     * `-display cocoa`/gtk shows by default. (glaccel, below, also calls graphic_console_init but is
+     * dormant on IP54 — its fb_base is never programmed — so if it took console 0 the live window
+     * would show only the "Guest has not initialized the display (yet)" placeholder while the real
+     * desktop sat on console 1.) */
+    {
+        DeviceState *pvrex3_dev = qdev_new(TYPE_SGI_PVREX3);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(pvrex3_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(pvrex3_dev), 0, IP54PV_PV_REX3);
+        sysbus_connect_irq(SYS_BUS_DEVICE(pvrex3_dev), 0, heart_irqs[1]);
+    }
+
     /* sgi-glaccel at PV_BASE+0x300, IRQ → HEART ISR bit 21 → IP4 */
     {
         DeviceState *glaccel_dev = qdev_new(TYPE_SGI_GLACCEL);
@@ -787,13 +838,7 @@ static void sgi_ip54pv_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(pvaudio_dev), 0, heart_irqs[2]);
     }
 
-    /* sgi-pvrex3 at 0x1F490000 (8KB REX3 register space), IRQ → HEART ISR bit 21 → IP4 */
-    {
-        DeviceState *pvrex3_dev = qdev_new(TYPE_SGI_PVREX3);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(pvrex3_dev), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(pvrex3_dev), 0, IP54PV_PV_REX3);
-        sysbus_connect_irq(SYS_BUS_DEVICE(pvrex3_dev), 0, heart_irqs[1]);
-    }
+    /* (sgi-pvrex3 moved above sgi-glaccel so it owns graphic console 0 — see comment there) */
 
     /*
      * Absorb IP32/MACE legacy addresses that the IP54 kernel (compiled from
@@ -892,6 +937,7 @@ static void sgi_ip54pv_init(MachineState *machine)
     {
         PVClockState *pvc = g_new0(PVClockState, 1);
         pvc->env = &cpus[0]->env;
+        pvc->cause_pa = ip54pv_resolve_cause_pa();
         pvc->raise_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pvclock_raise_cb, pvc);
         pvc->lower_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pvclock_lower_cb, pvc);
         /* First tick fires 100ms after boot to give kernel time to initialize */
