@@ -5883,6 +5883,9 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
         check_insn(ctx, ISA_MIPS_R1);
     }
 
+    /* MTC0 uses GPR[rt][31:0] sign-extended to 64 bits per MIPS64 PRA */
+    tcg_gen_ext32s_tl(arg, arg);
+
     icount = translator_io_start(&ctx->base);
 
     switch (reg) {

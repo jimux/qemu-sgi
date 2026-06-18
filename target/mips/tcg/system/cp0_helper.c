@@ -1111,7 +1111,17 @@ void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_compare(CPUMIPSState *env, target_ulong arg1)
 {
+    /*
+     * cpu_mips_store_compare clears Cause.IP7 — a read-modify-write of
+     * CP0_Cause.  Device/timer code mutates CP0_Cause from the iothread
+     * (under BQL) via cpu_mips_irq_request; without the BQL here a
+     * concurrent guest write can erase a just-asserted IP bit or
+     * resurrect a deasserted one (lost/spurious interrupts).  Guests
+     * that hammer Cause (IRIX softints) hit this constantly.
+     */
+    bql_lock();
     cpu_mips_store_compare(env, arg1);
+    bql_unlock();
 }
 
 void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
@@ -1170,7 +1180,11 @@ void helper_mtc0_srsctl(CPUMIPSState *env, target_ulong arg1)
 
 void helper_mtc0_cause(CPUMIPSState *env, target_ulong arg1)
 {
+    /* BQL: serialize the whole-register RMW of CP0_Cause against
+     * iothread writers (cpu_mips_irq_request) — see mtc0_compare. */
+    bql_lock();
     cpu_mips_store_cause(env, arg1);
+    bql_unlock();
 }
 
 void helper_mttc0_cause(CPUMIPSState *env, target_ulong arg1)
@@ -1178,7 +1192,9 @@ void helper_mttc0_cause(CPUMIPSState *env, target_ulong arg1)
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
     CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
 
+    bql_lock();
     cpu_mips_store_cause(other, arg1);
+    bql_unlock();
 }
 
 target_ulong helper_mftc0_epc(CPUMIPSState *env)
