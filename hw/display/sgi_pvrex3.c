@@ -1362,6 +1362,17 @@ static void pvrex3_vblank_timer(void *opaque)
                   now + 500 * 1000);  /* 500us */
     }
 
+    /*
+     * Drive display refresh at 60 Hz like a real RAMDAC scanout would.
+     * pvrex3_update_display() short-circuits when display_dirty is
+     * false, so without this an idle X server (no cursor-blink writes
+     * to REX3, no client redraws) leaves the GTK window frozen on
+     * its last-drawn state — user observed "screen only updates when
+     * I type". Setting dirty on every vblank guarantees the
+     * framebuffer is composited + flushed at least once per frame.
+     */
+    s->display_dirty = true;
+
     /* Re-arm at 60Hz */
     timer_mod(s->vblank_timer, now + NANOSECONDS_PER_SECOND / 60);
 }
