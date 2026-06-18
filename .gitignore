@@ -20,3 +20,14 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# Linux build dir
+/build-linux/
+/build-mac/
+/build-new/
+
+# Local logs / scratch
+qemu.log
+
+# macOS
+.DS_Store

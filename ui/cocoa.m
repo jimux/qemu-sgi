@@ -1306,7 +1306,14 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         [window setTitle:qemu_name ? [NSString stringWithFormat:@"QEMU %s", qemu_name] : @"QEMU"];
         [window setContentView:cocoaView];
-        [window makeKeyAndOrderFront:self];
+        /* DEV CONVENIENCE ONLY (QEMU_COCOA_BG, see cocoa_display_init): open the window at the BACK
+         * of the stack without making it key, so it doesn't grab focus on launch. Click it to focus
+         * + use it normally. Default = makeKeyAndOrderFront (foreground). Not shipped behavior. */
+        if (getenv("QEMU_COCOA_BG") != NULL) {
+            [window orderBack:self];
+        } else {
+            [window makeKeyAndOrderFront:self];
+        }
         [window center];
         [window setDelegate: self];
 
@@ -2094,9 +2101,19 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
     COCOA_DEBUG("qemu_cocoa: cocoa_display_init\n");
 
     // Pull this console process up to being a fully-fledged graphical
-    // app with a menubar and Dock icon
+    // app with a menubar and Dock icon.
+    //
+    // DEV CONVENIENCE ONLY (not part of the shipped behavior): when the
+    // QEMU_COCOA_BG environment variable is set, come up as a UI-element
+    // (accessory) app instead — no Dock icon, and the window does NOT steal
+    // focus or jump to the front of the window stack when it opens. Used so a
+    // long-running background VM window during development doesn't interrupt
+    // whatever the developer is doing. Default (unset) = normal foreground app.
     ProcessSerialNumber psn = { 0, kCurrentProcess };
-    TransformProcessType(&psn, kProcessTransformToForegroundApplication);
+    bool cocoa_bg = getenv("QEMU_COCOA_BG") != NULL;
+    TransformProcessType(&psn, cocoa_bg
+                         ? kProcessTransformToUIElementApplication
+                         : kProcessTransformToForegroundApplication);
 
     [QemuApplication sharedApplication];
 
