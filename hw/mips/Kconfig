@@ -132,3 +132,19 @@ config SGI_OCTANE
     select SGI_PVNET
     select SGI_GLACCEL
     select SGI_PVAUDIO
+
+config SGI_IP54PV
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select SGI_PVTIMER
+    select SGI_PVUART
+    select SGI_BOOTDISK
+    select SGI_SMP
+    select SGI_PVMEM
+    select SGI_PVNET
+    select SGI_GLACCEL
+    select SGI_PVAUDIO
+    select SGI_PVREX3
+    select SGI_IOC2_KBD
+    select UNIMP

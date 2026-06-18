@@ -18,6 +18,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"
+#include "qemu/sockets.h"
 #include "hw/display/sgi_pvrex3.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
@@ -2079,6 +2081,8 @@ static uint64_t sgi_pvrex3_read(void *opaque, hwaddr addr, unsigned size)
         newport_do_rex3_command(s);
     }
 
+    trace_sgi_pvrex3_reg_read(reg, is_go, val, size);
+
     /*
      * Handle sub-word reads: extract the appropriate byte(s) from the
      * 32-bit register value. The PROM uses lbu/lhu to read specific
@@ -2401,6 +2405,64 @@ static void sgi_pvrex3_write(void *opaque, hwaddr addr, uint64_t val,
         /* Reset DCB bus and flush BFIFO — write-only command, no-op */
         break;
 
+    /*
+     * GL window clip channel (VirGL Step 4): the kernel pvfb_gf_ValidateClip hook
+     * stages a window's geometry + visible clip pieces here, then latches with COMMIT.
+     */
+    case REX3_CLIP_WID:
+        s->clip_wid = (int32_t)val;
+        break;
+    case REX3_CLIP_XORG:
+        s->clip_xorg = (int32_t)val;
+        break;
+    case REX3_CLIP_YORG:
+        s->clip_yorg = (int32_t)val;
+        break;
+    case REX3_CLIP_XSIZE:
+        s->clip_xsize = (int32_t)val;
+        break;
+    case REX3_CLIP_YSIZE:
+        s->clip_ysize = (int32_t)val;
+        break;
+    case REX3_CLIP_OBSCURED:
+        s->clip_obscured = (int32_t)val;
+        break;
+    case REX3_CLIP_NUMPIECES:
+        s->clip_numpieces = (int32_t)val;
+        if (s->clip_numpieces < 0) {
+            s->clip_numpieces = 0;
+        }
+        if (s->clip_numpieces > PVREX3_CLIP_MAX_PIECES) {
+            s->clip_numpieces = PVREX3_CLIP_MAX_PIECES;
+        }
+        break;
+    case REX3_CLIP_PIECE_X:
+        s->clip_stage[0] = (int32_t)val;
+        break;
+    case REX3_CLIP_PIECE_Y:
+        s->clip_stage[1] = (int32_t)val;
+        break;
+    case REX3_CLIP_PIECE_W:
+        s->clip_stage[2] = (int32_t)val;
+        break;
+    case REX3_CLIP_PIECE_H:
+        s->clip_stage[3] = (int32_t)val;
+        break;
+    case REX3_CLIP_PIECE_PUSH: {
+        int32_t idx = (int32_t)val;
+        if (idx >= 0 && idx < PVREX3_CLIP_MAX_PIECES) {
+            s->clip_pieces[idx * 4 + 0] = s->clip_stage[0];
+            s->clip_pieces[idx * 4 + 1] = s->clip_stage[1];
+            s->clip_pieces[idx * 4 + 2] = s->clip_stage[2];
+            s->clip_pieces[idx * 4 + 3] = s->clip_stage[3];
+        }
+        break;
+    }
+    case REX3_CLIP_COMMIT:
+        s->clip_valid = (val != 0);
+        s->display_dirty = true;       /* re-composite with the new clip */
+        break;
+
     default:
         qemu_log_mask(LOG_UNIMP,
                       "newport: unimplemented write at 0x%04" HWADDR_PRIx
@@ -2436,6 +2498,7 @@ static const MemoryRegionOps sgi_pvrex3_ops = {
 /* Forward decl: composite the hardware cursor (defined later) so the PPM
  * dump can overlay the pointer exactly as the live display does. */
 static void pvrex3_draw_cursor(SGIPVRex3State *s, uint32_t *dest);
+static void pvrex3_composite_gl(SGIPVRex3State *s, uint32_t *dest);
 
 /*
  * Dump raw VRAM through the full compositing pipeline to a PPM file.
@@ -2631,7 +2694,8 @@ static void pvrex3_dump_vram_ppm(SGIPVRex3State *s, const char *path)
         }
     }
 
-    /* Overlay the VC2 hardware cursor (same compositor as the live display). */
+    /* Accelerated-graphics GL overlay + VC2 cursor (same compositor as live display). */
+    pvrex3_composite_gl(s, fb);
     pvrex3_draw_cursor(s, fb);
 
     /* Emit the composited buffer as PPM RGB triples. */
@@ -2885,6 +2949,85 @@ static void pvrex3_draw_cursor(SGIPVRex3State *s, uint32_t *dest)
  * RAMDAC gamma correction.
  * MAME ref: screen_update() at newport.cpp:1282-1529
  */
+
+/*
+ * Is screen pixel (sx, sy) — top-left origin — inside the window's visible clip region?
+ *
+ * The kernel pvfb_gf_ValidateClip hook (Step 4) delivers the occlusion-aware visible
+ * pieces via the clip channel. A pixel is visible iff it lies in at least one piece.
+ * When clip_valid is false (no kernel hook active yet) everything is visible, preserving
+ * the pre-Step-4 behaviour. numpieces==0 with clip_valid means "single unclipped rect"
+ * (RRM convention: piecelist may be NULL when numpieces<=1) → use the window rect.
+ *
+ * NOTE: piece rects are taken as top-left screen coordinates to match the frame-channel
+ * window position (which is verified correct). If live validation (the Step 4 gate) shows
+ * RRM delivers bottom-left GL coordinates, flip here: sy' = (PVREX3_SCREEN_H-1) - sy.
+ */
+static bool pvrex3_clip_visible(SGIPVRex3State *s, int sx, int sy)
+{
+    int i;
+
+    if (!s->clip_valid) {
+        return true;
+    }
+    if (s->clip_numpieces <= 0) {
+        /* single rect = the whole window */
+        return sx >= s->clip_xorg && sx < s->clip_xorg + s->clip_xsize &&
+               sy >= s->clip_yorg && sy < s->clip_yorg + s->clip_ysize;
+    }
+    for (i = 0; i < s->clip_numpieces; i++) {
+        int px = s->clip_pieces[i * 4 + 0];
+        int py = s->clip_pieces[i * 4 + 1];
+        int pw = s->clip_pieces[i * 4 + 2];
+        int ph = s->clip_pieces[i * 4 + 3];
+        if (sx >= px && sx < px + pw && sy >= py && sy < py + ph) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Accelerated-graphics compositor (VirGL roadmap Step 3): overlay a host-rendered
+ * RGBA frame for a GL window onto the final display surface, on top of the desktop
+ * and under the cursor. Clipped to the screen; the visible-region clip (occlusion)
+ * comes from the kernel ValidateClip hook via the clip channel (Step 4): a fully
+ * obscured window is skipped, and each pixel is gated by pvrex3_clip_visible().
+ */
+static void pvrex3_composite_gl(SGIPVRex3State *s, uint32_t *dest)
+{
+    int px, py;
+
+    if (!s->gl_overlay_active || s->gl_overlay_rgba == NULL) {
+        return;
+    }
+    if (s->clip_valid && s->clip_obscured) {
+        return;                 /* window fully occluded — draw nothing */
+    }
+    for (py = 0; py < s->gl_overlay_h; py++) {
+        int sy = s->gl_overlay_y + py;
+        if (sy < 0 || sy >= PVREX3_SCREEN_H) {
+            continue;
+        }
+        for (px = 0; px < s->gl_overlay_w; px++) {
+            int sx = s->gl_overlay_x + px;
+            uint32_t rgba;
+            uint8_t r, g, b;
+            if (sx < 0 || sx >= PVREX3_SCREEN_W) {
+                continue;
+            }
+            if (!pvrex3_clip_visible(s, sx, sy)) {
+                continue;       /* occluded by another window */
+            }
+            rgba = s->gl_overlay_rgba[py * s->gl_overlay_w + px];
+            r = (rgba >> 16) & 0xff;
+            g = (rgba >> 8) & 0xff;
+            b = rgba & 0xff;
+            dest[sy * PVREX3_SCREEN_W + sx] = rgb_to_pixel32(r, g, b);
+        }
+    }
+}
+
 static void pvrex3_update_display(void *opaque)
 {
     SGIPVRex3State *s = opaque;
@@ -3069,6 +3212,9 @@ static void pvrex3_update_display(void *opaque)
             dest[y * PVREX3_SCREEN_W + x] = rgb_to_pixel32(r, g, b);
         }
     }
+
+    /* Accelerated-graphics: host-rendered GL window frame, under the cursor */
+    pvrex3_composite_gl(s, dest);
 
     /* Cursor overlay (drawn on top of everything) */
     pvrex3_draw_cursor(s, dest);
@@ -3326,6 +3472,11 @@ static void sgi_pvrex3_realize(DeviceState *dev, Error **errp)
     s->vram_cidaux = g_malloc0(PVREX3_VRAM_W * PVREX3_VRAM_H *
                                sizeof(uint32_t));
     s->global_mask = 0xff; /* XL8 (Indy default) */
+
+    /* Live GL frame channel — idle until "gl-listen" is set */
+    s->gl_listen_fd = -1;
+    s->gl_conn_fd = -1;
+    s->gl_rxbuf = NULL;
 
     /* DCB bus timeout timer */
     s->dcb_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
@@ -3807,6 +3958,142 @@ static void pvrex3_set_fb_dump(Object *obj, const char *value, Error **errp)
     }
 }
 
+/*
+ * gl-overlay-test: qom-set to "x,y,w,h" to inject a recognizable test overlay (red
+ * border + green/blue gradient fill) at that screen rect, or "off" to clear it.
+ * Independent verification of the Step-3 compositor path via newport_screendump,
+ * before the sgi_pvgl frame channel + ValidateClip are wired.
+ */
+static void pvrex3_set_gl_overlay_test(Object *obj, const char *value, Error **errp)
+{
+    SGIPVRex3State *s = SGI_PVREX3(obj);
+    int x, y, w, h, px, py;
+
+    if (value == NULL || value[0] == '\0' || strcmp(value, "off") == 0) {
+        s->gl_overlay_active = false;
+        s->display_dirty = true;
+        return;
+    }
+    if (sscanf(value, "%d,%d,%d,%d", &x, &y, &w, &h) != 4 ||
+        w <= 0 || h <= 0 || w > PVREX3_SCREEN_W || h > PVREX3_SCREEN_H) {
+        error_setg(errp, "gl-overlay-test: expected 'x,y,w,h' (or 'off')");
+        return;
+    }
+    g_free(s->gl_overlay_rgba);
+    s->gl_overlay_rgba = g_new(uint32_t, (size_t)w * h);
+    for (py = 0; py < h; py++) {
+        for (px = 0; px < w; px++) {
+            uint8_t r, g, b;
+            if (px < 3 || py < 3 || px >= w - 3 || py >= h - 3) {
+                r = 255; g = 0; b = 0;                 /* red border */
+            } else {
+                r = 0; g = (px * 255) / w; b = (py * 255) / h;  /* gradient */
+            }
+            s->gl_overlay_rgba[py * w + px] = ((uint32_t)r << 16) | (g << 8) | b;
+        }
+    }
+    s->gl_overlay_x = x;
+    s->gl_overlay_y = y;
+    s->gl_overlay_w = w;
+    s->gl_overlay_h = h;
+    s->gl_overlay_active = true;
+    s->display_dirty = true;
+}
+
+/*
+ * gl-clip-test: qom-set to drive the clip channel from the monitor, so the Step-4
+ * compositor clip logic (obscured skip + visible-piece clipping) can be verified
+ * host-side WITHOUT the kernel ValidateClip hook (which needs an lboot). Format:
+ *   "wid,xorg,yorg,xsize,ysize,obscured[;px,py,pw,ph[;px,py,pw,ph...]]"
+ * The pieces (if any) are the visible sub-rects; "off" clears clip_valid.
+ * This mirrors exactly what pvfb_gf_ValidateClip writes via the MMIO clip registers.
+ */
+static void pvrex3_set_gl_clip_test(Object *obj, const char *value, Error **errp)
+{
+    SGIPVRex3State *s = SGI_PVREX3(obj);
+    const char *p;
+    int wid, xo, yo, xs, ys, obsc, n = 0;
+
+    if (value == NULL || value[0] == '\0' || strcmp(value, "off") == 0) {
+        s->clip_valid = false;
+        s->display_dirty = true;
+        return;
+    }
+    if (sscanf(value, "%d,%d,%d,%d,%d,%d", &wid, &xo, &yo, &xs, &ys, &obsc) != 6) {
+        error_setg(errp, "gl-clip-test: expected 'wid,xorg,yorg,xsize,ysize,obscured"
+                         "[;x,y,w,h...]' (or 'off')");
+        return;
+    }
+    s->clip_wid = wid;
+    s->clip_xorg = xo;
+    s->clip_yorg = yo;
+    s->clip_xsize = xs;
+    s->clip_ysize = ys;
+    s->clip_obscured = obsc;
+
+    /* parse optional ';'-separated visible pieces */
+    p = value;
+    while ((p = strchr(p, ';')) != NULL && n < PVREX3_CLIP_MAX_PIECES) {
+        int px, py, pw, ph;
+        p++;
+        if (sscanf(p, "%d,%d,%d,%d", &px, &py, &pw, &ph) == 4) {
+            s->clip_pieces[n * 4 + 0] = px;
+            s->clip_pieces[n * 4 + 1] = py;
+            s->clip_pieces[n * 4 + 2] = pw;
+            s->clip_pieces[n * 4 + 3] = ph;
+            n++;
+        }
+    }
+    s->clip_numpieces = n;
+    s->clip_valid = true;
+    s->display_dirty = true;
+}
+
+/*
+ * gl-overlay-file: qom-set to "x,y,w,h,/path" to composite a host-rendered RGBA frame
+ * (raw w*h*4 bytes, R,G,B,A order) read from /path at the given screen rect. This is the
+ * file-based frame channel that joins the OSMesa render half to the compositor (the live
+ * socket frame channel is the streaming follow-on).
+ */
+static void pvrex3_set_gl_overlay_file(Object *obj, const char *value, Error **errp)
+{
+    SGIPVRex3State *s = SGI_PVREX3(obj);
+    int x, y, w, h;
+    char path[1024];
+    FILE *fp;
+    size_t npix, i;
+    uint32_t *buf;
+
+    if (sscanf(value, "%d,%d,%d,%d,%1023s", &x, &y, &w, &h, path) != 5 ||
+        w <= 0 || h <= 0 || w > PVREX3_SCREEN_W || h > PVREX3_SCREEN_H) {
+        error_setg(errp, "gl-overlay-file: expected 'x,y,w,h,/path'");
+        return;
+    }
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        error_setg(errp, "gl-overlay-file: cannot open %s", path);
+        return;
+    }
+    npix = (size_t)w * h;
+    buf = g_new0(uint32_t, npix);
+    for (i = 0; i < npix; i++) {
+        unsigned char px[4];
+        if (fread(px, 1, 4, fp) != 4) {
+            break;
+        }
+        buf[i] = ((uint32_t)px[0] << 16) | ((uint32_t)px[1] << 8) | px[2];
+    }
+    fclose(fp);
+    g_free(s->gl_overlay_rgba);
+    s->gl_overlay_rgba = buf;
+    s->gl_overlay_x = x;
+    s->gl_overlay_y = y;
+    s->gl_overlay_w = w;
+    s->gl_overlay_h = h;
+    s->gl_overlay_active = true;
+    s->display_dirty = true;
+}
+
 static int sgi_pvrex3_post_load(void *opaque, int version_id)
 {
     SGIPVRex3State *s = SGI_PVREX3(opaque);
@@ -3951,6 +4238,198 @@ static const VMStateDescription vmstate_sgi_pvrex3 = {
     }
 };
 
+/*
+ * ============================================================
+ * Live GL frame channel (socket) — VirGL roadmap Step 3 (streaming)
+ * ============================================================
+ * The host renderer connects and streams PVGL frames; pvrex3 reassembles them in
+ * the QEMU main loop and composites them live (no per-frame qom-set).
+ *   header: "PVGL"(4) + int32 x,y,w,h (little-endian) ; then w*h*4 RGBA bytes.
+ *   w == 0 clears the overlay.
+ */
+static void pvrex3_gl_apply_frame(SGIPVRex3State *s, int x, int y, int w, int h,
+                                  const uint8_t *rgba)
+{
+    size_t npix = (size_t)w * h, i;
+    uint32_t *b;
+
+    if (w <= 0 || h <= 0 || w > PVREX3_SCREEN_W || h > PVREX3_SCREEN_H) {
+        return;
+    }
+    b = g_new0(uint32_t, npix);
+    for (i = 0; i < npix; i++) {
+        b[i] = ((uint32_t)rgba[i * 4] << 16) |
+               ((uint32_t)rgba[i * 4 + 1] << 8) | rgba[i * 4 + 2];
+    }
+    g_free(s->gl_overlay_rgba);
+    s->gl_overlay_rgba = b;
+    s->gl_overlay_x = x;
+    s->gl_overlay_y = y;
+    s->gl_overlay_w = w;
+    s->gl_overlay_h = h;
+    s->gl_overlay_active = true;
+    s->display_dirty = true;
+}
+
+/* Apply a host-driven clip record (#80): the renderer sends the visible sub-rects of the GL window
+ * (window rect minus windows stacked above it) so the compositor draws the single full overlay
+ * clipped per-pixel via pvrex3_clip_visible(). obscured!=0 => draw nothing; numpieces==0 =>
+ * unclipped. This drives the same clip_* state the Step-4 kernel/0x1C00 path would have. */
+static void pvrex3_gl_apply_clip(SGIPVRex3State *s, int32_t obscured, int32_t np,
+                                 const uint8_t *p)
+{
+    int32_t i;
+
+    if (np < 0) {
+        np = 0;
+    }
+    if (np > PVREX3_CLIP_MAX_PIECES) {
+        np = PVREX3_CLIP_MAX_PIECES;
+    }
+    s->clip_obscured = obscured ? 1 : 0;
+    s->clip_numpieces = np;
+    for (i = 0; i < np; i++) {
+        s->clip_pieces[i * 4 + 0] = ldl_le_p(p + i * 16 + 0);
+        s->clip_pieces[i * 4 + 1] = ldl_le_p(p + i * 16 + 4);
+        s->clip_pieces[i * 4 + 2] = ldl_le_p(p + i * 16 + 8);
+        s->clip_pieces[i * 4 + 3] = ldl_le_p(p + i * 16 + 12);
+    }
+    s->clip_valid = true;
+    s->display_dirty = true;
+}
+
+static void pvrex3_gl_parse(SGIPVRex3State *s)
+{
+    GByteArray *rx = s->gl_rxbuf;
+
+    while (rx->len >= 12) {
+        const uint8_t *p = rx->data;
+        int32_t x, y, w, h;
+        size_t payload, total;
+
+        if (memcmp(p, "PVCL", 4) == 0) {           /* clip record (#80) */
+            int32_t obscured = ldl_le_p(p + 4);
+            int32_t np = ldl_le_p(p + 8);
+            size_t need;
+            if (np < 0) {
+                np = 0;
+            }
+            need = 12 + (size_t)np * 16;
+            if (rx->len < need) {
+                break;                             /* wait for the rest */
+            }
+            pvrex3_gl_apply_clip(s, obscured, np, p + 12);
+            g_byte_array_remove_range(rx, 0, need);
+            continue;
+        }
+        if (memcmp(p, "PVGL", 4) != 0) {
+            g_byte_array_remove_range(rx, 0, 1);   /* resync */
+            continue;
+        }
+        if (rx->len < 20) {
+            break;
+        }
+        x = ldl_le_p(p + 4);
+        y = ldl_le_p(p + 8);
+        w = ldl_le_p(p + 12);
+        h = ldl_le_p(p + 16);
+        if (w == 0) {
+            s->gl_overlay_active = false;
+            s->display_dirty = true;
+            g_byte_array_remove_range(rx, 0, 20);
+            continue;
+        }
+        payload = (size_t)w * h * 4;
+        total = 20 + payload;
+        if (rx->len < total) {
+            break;                                 /* wait for the rest */
+        }
+        pvrex3_gl_apply_frame(s, x, y, w, h, rx->data + 20);
+        g_byte_array_remove_range(rx, 0, total);
+    }
+}
+
+static void pvrex3_gl_read(void *opaque)
+{
+    SGIPVRex3State *s = opaque;
+    uint8_t buf[65536];
+    ssize_t n = recv(s->gl_conn_fd, (void *)buf, sizeof(buf), 0);
+
+    if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+        qemu_set_fd_handler(s->gl_conn_fd, NULL, NULL, NULL);
+        close(s->gl_conn_fd);
+        s->gl_conn_fd = -1;
+        return;
+    }
+    g_byte_array_append(s->gl_rxbuf, buf, n);
+    pvrex3_gl_parse(s);
+}
+
+static void pvrex3_gl_accept(void *opaque)
+{
+    SGIPVRex3State *s = opaque;
+    int fd = accept(s->gl_listen_fd, NULL, NULL);
+
+    if (fd < 0) {
+        return;
+    }
+    if (s->gl_conn_fd >= 0) {                       /* one renderer at a time */
+        qemu_set_fd_handler(s->gl_conn_fd, NULL, NULL, NULL);
+        close(s->gl_conn_fd);
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    s->gl_conn_fd = fd;
+    if (s->gl_rxbuf == NULL) {
+        s->gl_rxbuf = g_byte_array_new();
+    } else {
+        g_byte_array_set_size(s->gl_rxbuf, 0);
+    }
+    qemu_set_fd_handler(fd, pvrex3_gl_read, NULL, s);
+}
+
+/* gl-listen: qom-set to a port number to listen for the renderer on 127.0.0.1:port */
+static void pvrex3_set_gl_listen(Object *obj, const char *value, Error **errp)
+{
+    SGIPVRex3State *s = SGI_PVREX3(obj);
+    int port, fd, on = 1;
+    struct sockaddr_in addr;
+
+    if (s->gl_listen_fd >= 0) {
+        qemu_set_fd_handler(s->gl_listen_fd, NULL, NULL, NULL);
+        close(s->gl_listen_fd);
+        s->gl_listen_fd = -1;
+    }
+    if (value == NULL || value[0] == '\0' || strcmp(value, "off") == 0) {
+        return;
+    }
+    if (sscanf(value, "%d", &port) != 1 || port < 1 || port > 65535) {
+        error_setg(errp, "gl-listen: expected a port number");
+        return;
+    }
+    fd = qemu_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "gl-listen: socket");
+        return;
+    }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *)&on, sizeof(on));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 1) < 0) {
+        error_setg_errno(errp, errno, "gl-listen: bind/listen %d", port);
+        close(fd);
+        return;
+    }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    s->gl_listen_fd = fd;
+    qemu_set_fd_handler(fd, pvrex3_gl_accept, NULL, s);
+}
+
 static void sgi_pvrex3_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -3963,6 +4442,26 @@ static void sgi_pvrex3_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_str(klass, "fb-dump",
                                   pvrex3_get_fb_dump,
                                   pvrex3_set_fb_dump);
+
+    /* gl-overlay-test: qom-set "x,y,w,h" to inject a test GL overlay (Step 3) */
+    object_class_property_add_str(klass, "gl-overlay-test",
+                                  NULL,
+                                  pvrex3_set_gl_overlay_test);
+
+    /* gl-overlay-file: qom-set "x,y,w,h,/path" to composite a host-rendered RGBA frame */
+    object_class_property_add_str(klass, "gl-overlay-file",
+                                  NULL,
+                                  pvrex3_set_gl_overlay_file);
+
+    /* gl-clip-test: qom-set to drive the clip channel from the monitor (Step 4 test) */
+    object_class_property_add_str(klass, "gl-clip-test",
+                                  NULL,
+                                  pvrex3_set_gl_clip_test);
+
+    /* gl-listen: qom-set a port to stream live PVGL frames from the renderer */
+    object_class_property_add_str(klass, "gl-listen",
+                                  NULL,
+                                  pvrex3_set_gl_listen);
 
     /* Runtime diagnostic properties — read-only via qom-get */
     object_class_property_add_str(klass, "diag-cmap",

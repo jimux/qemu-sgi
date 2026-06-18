@@ -238,4 +238,16 @@ sgi_newport_dcbdata0_subword(uint32_t size, uint32_t byte_offset, uint64_t val, 
 sgi_newport_xmap(uint32_t reg, uint32_t val) "XMAP reg=0x%02x val=0x%08x"
 sgi_newport_draw_block(int x0, int y0, int x1, int y1) "block (%d,%d)-(%d,%d)"
 sgi_newport_draw_line(int x0, int y0, int x1, int y1, int octant) "line (%d,%d)-(%d,%d) oct=%d"
+sgi_newport_draw_span(int x0, int y0, int x1) "span (%d,%d)-(%d)"
+sgi_newport_draw_scr2scr(int x0, int y0, int x1, int y1, int mx, int my) "scr2scr (%d,%d)-(%d,%d) move (%d,%d)"
+
+# sgi_pvrex3.c (IP54 paravirtual REX3)
+sgi_pvrex3_draw_block(int x0, int y0, int x1, int y1, uint32_t dm0, uint32_t dm1) "block (%d,%d)-(%d,%d) dm0=0x%08x dm1=0x%08x"
+sgi_pvrex3_draw_span(int x0, int y0, int x1, uint32_t dm0) "span (%d,%d)-(%d) dm0=0x%08x"
+sgi_pvrex3_draw_scr2scr(int x0, int y0, int x1, int y1, int mx, int my) "scr2scr (%d,%d)-(%d,%d) move (%d,%d)"
+sgi_pvrex3_reg_write(uint32_t reg, int go, uint32_t val, unsigned size) "reg 0x%04x go=%d val=0x%08x sz=%u"
+sgi_pvrex3_reg_read(uint32_t reg, int go, uint32_t val, unsigned size) "reg 0x%04x go=%d val=0x%08x sz=%u"
+sgi_pvrex3_dcb_write(uint32_t slave, uint32_t reg, uint32_t dw, uint32_t val) "dcb slave=%u crs=%u dw=%u val=0x%08x"
+sgi_pvrex3_dcb_read(uint32_t slave, uint32_t reg, uint32_t dw, uint32_t val) "dcb slave=%u crs=%u dw=%u val=0x%08x"
+sgi_pvrex3_vc2(uint32_t reg, uint32_t val, int write) "vc2 reg=0x%02x val=0x%04x write=%d"
 

@@ -239,12 +239,13 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
             /*
              * Trigger an immediate framebuffer update and signal completion.
              * OpenGL command-list processing is deferred to a future phase.
+             * Don't raise IRQ — kernel driver polls STATUS_DONE. Raising
+             * the IRQ before the kernel installs a handler causes a hang.
              */
             if (s->fb_base && s->width && s->height) {
                 sgi_glaccel_update(s);
             }
             s->status |= GLACCEL_STATUS_DONE;
-            qemu_irq_raise(s->irq);
         }
         break;
     default:

@@ -22,9 +22,61 @@ static void sgi_pvnet_update_irq(SGIPVNetState *s) {
   }
 }
 
+/*
+ * TX bottom half — runs outside the MMIO write handler so that
+ * qemu_send_packet() / SLIRP can safely call sgi_pvnet_receive()
+ * without reentering the MMIO dispatch path.  TX_DONE is NOT set
+ * here: the CMD handler already set it after copying the frame, so
+ * the guest's TX-completion spin never waits on this BH.
+ */
+static void sgi_pvnet_tx_bh(void *opaque) {
+  SGIPVNetState *s = opaque;
+
+  while (s->tx_ring_tail != s->tx_ring_head) {
+    unsigned slot = s->tx_ring_tail % PVNET_TX_RING_SLOTS;
+    qemu_send_packet(qemu_get_queue(s->nic), s->tx_ring[slot],
+                     s->tx_ring_len[slot]);
+    s->tx_ring_tail++;
+  }
+}
+
+/*
+ * Copy the frame out of guest memory and complete TX immediately.
+ * Called from the CMD MMIO write handler; the copy makes it safe to
+ * signal TX_DONE before the BH has actually sent the packet.  If the
+ * ring is full (BH starved), the frame is dropped — acceptable
+ * Ethernet semantics, and the guest can't tell.
+ */
+static void sgi_pvnet_tx_start(SGIPVNetState *s) {
+  if (s->tx_len == 0 || s->tx_len > PVNET_TX_SLOT_SIZE) {
+    return;
+  }
+
+  if (s->tx_ring_head - s->tx_ring_tail < PVNET_TX_RING_SLOTS) {
+    unsigned slot = s->tx_ring_head % PVNET_TX_RING_SLOTS;
+    MemTxResult r = dma_memory_read(&address_space_memory, s->tx_base,
+                                    s->tx_ring[slot], s->tx_len,
+                                    MEMTXATTRS_UNSPECIFIED);
+    if (r != MEMTX_OK) {
+      qemu_log_mask(LOG_GUEST_ERROR,
+                    "pvnet: TX DMA read failed at 0x%" PRIx64 "\n",
+                    s->tx_base);
+    } else {
+      s->tx_ring_len[slot] = s->tx_len;
+      s->tx_ring_head++;
+      qemu_bh_schedule(s->tx_bh);
+    }
+  } else {
+    qemu_log_mask(LOG_GUEST_ERROR, "pvnet: TX ring full, frame dropped\n");
+  }
+
+  s->intr_status |= PVNET_INTR_TX_DONE;
+  sgi_pvnet_update_irq(s);
+}
+
 static uint64_t sgi_pvnet_read(void *opaque, hwaddr addr, unsigned size) {
   SGIPVNetState *s = opaque;
-  addr &= ~7ULL; /* 64-bit aligned offsets */
+  addr &= ~7ULL;
 
   switch (addr) {
   case SGI_PVNET_STATUS:
@@ -46,7 +98,8 @@ static uint64_t sgi_pvnet_read(void *opaque, hwaddr addr, unsigned size) {
   case SGI_PVNET_MAC_LO:
     return (uint64_t)s->conf.macaddr.a[2] << 24 |
            (uint64_t)s->conf.macaddr.a[3] << 16 |
-           (uint64_t)s->conf.macaddr.a[4] << 8 | (uint64_t)s->conf.macaddr.a[5];
+           (uint64_t)s->conf.macaddr.a[4] << 8 |
+           (uint64_t)s->conf.macaddr.a[5];
   case SGI_PVNET_RX_ACTUAL:
     return s->rx_actual;
   default:
@@ -67,18 +120,11 @@ static void sgi_pvnet_write(void *opaque, hwaddr addr, uint64_t val,
     if (val & PVNET_CMD_RESET) {
       s->intr_status = 0;
       s->status = 0;
+      s->tx_ring_head = s->tx_ring_tail = 0;
       sgi_pvnet_update_irq(s);
     }
     if (val & PVNET_CMD_TX_START) {
-      if (s->tx_len > 0) {
-        uint8_t *buf = g_malloc(s->tx_len);
-        dma_memory_read(&address_space_memory, s->tx_base, buf, s->tx_len,
-                        MEMTXATTRS_UNSPECIFIED);
-        qemu_send_packet(qemu_get_queue(s->nic), buf, s->tx_len);
-        g_free(buf);
-        s->intr_status |= PVNET_INTR_TX_DONE;
-        sgi_pvnet_update_irq(s);
-      }
+      sgi_pvnet_tx_start(s);
     }
     break;
   case SGI_PVNET_INTR_STATUS:
@@ -100,6 +146,11 @@ static void sgi_pvnet_write(void *opaque, hwaddr addr, uint64_t val,
     break;
   case SGI_PVNET_RX_LEN:
     s->rx_len = val;
+    if (val > 0) {
+      /* RX buffer re-armed — deliver any packets queued while
+       * can_receive() returned false (rx_len was 0). */
+      qemu_flush_queued_packets(qemu_get_queue(s->nic));
+    }
     break;
   default:
     qemu_log_mask(LOG_GUEST_ERROR,
@@ -125,22 +176,34 @@ static const MemoryRegionOps sgi_pvnet_ops = {
         },
 };
 
+static bool sgi_pvnet_can_receive(NetClientState *nc) {
+  SGIPVNetState *s = qemu_get_nic_opaque(nc);
+  return s->rx_len > 0;
+}
+
 static ssize_t sgi_pvnet_receive(NetClientState *nc, const uint8_t *buf,
                                  size_t size) {
   SGIPVNetState *s = qemu_get_nic_opaque(nc);
 
-  /* If no RX buffer, drop packet */
-  if (s->rx_len < size) {
+  if (s->rx_len == 0) {
+    return 0;  /* buffer not armed — queue for retry via flush */
+  }
+  if ((uint64_t)size > s->rx_len) {
+    return size;  /* too large — drop */
+  }
+
+  MemTxResult r = dma_memory_write(&address_space_memory, s->rx_base, buf,
+                                    size, MEMTXATTRS_UNSPECIFIED);
+  if (r != MEMTX_OK) {
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "pvnet: RX DMA write failed at 0x%" PRIx64 "\n", s->rx_base);
     return size;
   }
 
-  dma_memory_write(&address_space_memory, s->rx_base, buf, size,
-                   MEMTXATTRS_UNSPECIFIED);
   s->rx_actual = size;
   s->intr_status |= PVNET_INTR_RX_DONE;
   sgi_pvnet_update_irq(s);
 
-  /* Consume the buffer, expecting driver to update RX_BASE and RX_LEN */
   s->rx_len = 0;
   return size;
 }
@@ -148,6 +211,7 @@ static ssize_t sgi_pvnet_receive(NetClientState *nc, const uint8_t *buf,
 static NetClientInfo net_sgi_pvnet_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
+    .can_receive = sgi_pvnet_can_receive,
     .receive = sgi_pvnet_receive,
 };
 
@@ -159,9 +223,12 @@ static void sgi_pvnet_realize(DeviceState *dev, Error **errp) {
   sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->mmio);
   sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 
+  s->tx_bh = qemu_bh_new(sgi_pvnet_tx_bh, s);
+
   qemu_macaddr_default_if_unset(&s->conf.macaddr);
   s->nic = qemu_new_nic(&net_sgi_pvnet_info, &s->conf,
-                        object_get_typename(OBJECT(dev)), dev->id, NULL, s);
+                        object_get_typename(OBJECT(dev)), dev->id,
+                        &s->reentrancy_guard, s);
   qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
 }
 
@@ -176,6 +243,7 @@ static void sgi_pvnet_reset(DeviceState *dev) {
   s->rx_base = 0;
   s->rx_len = 0;
   s->rx_actual = 0;
+  s->tx_ring_head = s->tx_ring_tail = 0;
   sgi_pvnet_update_irq(s);
 }
 

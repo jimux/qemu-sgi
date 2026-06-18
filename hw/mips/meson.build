@@ -13,6 +13,7 @@ mips_ss.add(when: 'CONFIG_MIPS_BOSTON', if_true: files('boston.c'))
 mips_ss.add(when: 'CONFIG_SGI_INDY', if_true: files('sgi_indy.c'))
 mips_ss.add(when: 'CONFIG_SGI_O2', if_true: files('sgi_o2.c'))
 mips_ss.add(when: 'CONFIG_SGI_OCTANE', if_true: files('sgi_octane.c'))
+mips_ss.add(when: 'CONFIG_SGI_IP54PV', if_true: files('sgi_ip54pv.c'))
 endif
 
 hw_arch += {'mips': mips_ss}

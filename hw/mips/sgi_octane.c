@@ -288,12 +288,6 @@ static const TypeInfo sgi_octane_type = {
     .class_init = sgi_octane_class_init,
 };
 
-static const TypeInfo sgi_ip54_type = {
-    .name = MACHINE_TYPE_NAME("sgi-ip54"),
-    .parent = TYPE_MACHINE,
-    .class_init = sgi_ip54_class_init,
-};
-
 static const TypeInfo sgi_ip55_type = {
     .name = MACHINE_TYPE_NAME("sgi-ip55"),
     .parent = TYPE_MACHINE,
@@ -302,7 +296,6 @@ static const TypeInfo sgi_ip55_type = {
 
 static void sgi_octane_machine_init(void) {
     type_register_static(&sgi_octane_type);
-    type_register_static(&sgi_ip54_type);
     type_register_static(&sgi_ip55_type);
 }
 

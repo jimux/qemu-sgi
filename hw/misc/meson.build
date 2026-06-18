@@ -173,6 +173,8 @@ system_ss.add(when: 'CONFIG_SGI_PVNET', if_true: files('sgi_pvnet.c'))
 system_ss.add(when: 'CONFIG_SGI_HEART', if_true: files('sgi_heart.c'))
 system_ss.add(when: 'CONFIG_SGI_BRIDGE', if_true: files('sgi_bridge.c'))
 system_ss.add(when: 'CONFIG_SGI_PVAUDIO', if_true: files('sgi_pvaudio.c'))
+system_ss.add(when: 'CONFIG_SGI_PVTIMER', if_true: files('sgi_pvtimer.c'))
+system_ss.add(when: 'CONFIG_SGI_IOC2_KBD', if_true: files('sgi_ioc2_kbd.c'))
 
 specific_ss.add(when: 'CONFIG_RISCV_MIPS_CMGCR', if_true: files('riscv_cmgcr.c'))
 specific_ss.add(when: 'CONFIG_RISCV_MIPS_CPC', if_true: files('riscv_cpc.c'))

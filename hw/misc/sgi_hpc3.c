@@ -3891,7 +3891,15 @@ static void sgi_ps2_kbd_realize(DeviceState *dev, Error **errp)
     s->typematic_qcode    = -1;
     s->typematic_delay_ms  = 500;
     s->typematic_period_ms = 91;
-    s->typematic_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+    /*
+     * Must be a _ns timer: both arm sites pass absolute nanosecond expiry
+     * (qemu_clock_get_ns() + delay * SCALE_MS).  With timer_new_ms the
+     * scale multiply inside timer_mod() overflows int64 once host
+     * CLOCK_MONOTONIC exceeds ~2.5h; a negative expiry makes the timer
+     * permanently "expired" and timerlist_run_timers() spins the main
+     * loop forever on the first keypress.
+     */
+    s->typematic_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
                                       sgi_ps2_kbd_typematic, s);
     /* Register our typematic-aware handler instead of the parent's. */
     qemu_input_handler_register(dev, &sgi_ps2_keyboard_handler);

@@ -896,6 +896,7 @@ static void newport_draw_span(SGINewportState *s)
     bool shade = !!(s->drawmode0 & DM0_SHADE);
     bool lr_abort = !!(s->drawmode0 & DM0_LR_ABORT) && dx < 0;
 
+    trace_sgi_newport_draw_span(start_x, y, end_x);
     color = newport_get_default_color(s);
 
     /* Select pattern source — MAME ref: newport.cpp:3379-3380 */
@@ -1104,6 +1105,9 @@ static void newport_draw_scr2scr(SGINewportState *s)
     bool stop_on_y = s->dm0_stopony;
     int src_wx, src_wy;
     uint32_t src_addr, pixel;
+
+    trace_sgi_newport_draw_scr2scr(start_x, start_y, end_x, end_y,
+                                   move_x, move_y);
 
     end_x += dx;
     end_y += dy;

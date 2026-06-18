@@ -4,6 +4,7 @@
 #include "exec/cpu-common.h"
 #include "hw/core/sysbus.h"
 #include "net/net.h"
+#include "qemu/main-loop.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_PVNET "sgi-pvnet"
@@ -52,6 +53,21 @@ struct SGIPVNetState {
   uint64_t rx_base;
   uint64_t rx_len;
   uint64_t rx_actual;  /* actual byte count of last received packet */
+
+  /*
+   * TX ring: frames are copied out of guest memory and TX_DONE is set
+   * immediately in the CMD write handler (so the guest never spins on
+   * the BH); the BH drains the ring with qemu_send_packet().
+   */
+#define PVNET_TX_RING_SLOTS 8
+#define PVNET_TX_SLOT_SIZE 2048
+  uint8_t tx_ring[PVNET_TX_RING_SLOTS][PVNET_TX_SLOT_SIZE];
+  uint16_t tx_ring_len[PVNET_TX_RING_SLOTS];
+  unsigned tx_ring_head;  /* next slot to fill (CMD handler) */
+  unsigned tx_ring_tail;  /* next slot to send (BH) */
+  QEMUBH *tx_bh;
+
+  MemReentrancyGuard reentrancy_guard;
 };
 
 #endif /* SGI_PVNET_H */

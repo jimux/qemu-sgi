@@ -107,10 +107,49 @@ static void sgi_bootdisk_write(void *opaque, hwaddr addr,
             } else {
                 s->status = STATUS_READY;
             }
+            fprintf(stderr, "BDRD sec=%" PRIu64 " d=%02x%02x%02x%02x\n",
+                    sector, s->data[0], s->data[1],
+                    s->data[2], s->data[3]);
+        } else if ((uint32_t)val == CMD_WRITE) {
+            if (!s->blk) {
+                fprintf(stderr, "sgi_bootdisk: CMD_WRITE but no blk!\n");
+                s->status = STATUS_READY | STATUS_ERROR;
+                break;
+            }
+
+            uint64_t sector = ((uint64_t)s->sector_hi << 32) | s->sector_lo;
+            int64_t offset = sector * SGI_BOOTDISK_SECTOR_SIZE;
+
+            if (blk_pwrite(s->blk, offset, SGI_BOOTDISK_SECTOR_SIZE,
+                           s->data, 0) < 0) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "sgi_bootdisk: write error at sector %"
+                              PRIu64 "\n", sector);
+                s->status = STATUS_READY | STATUS_ERROR;
+            } else {
+                s->status = STATUS_READY;
+            }
         }
         break;
 
     default:
+        /* Data window writes: kernel fills the sector buffer before CMD_WRITE */
+        if (addr >= REG_DATA_BASE &&
+            addr < REG_DATA_BASE + SGI_BOOTDISK_SECTOR_SIZE) {
+            uint32_t offset = addr - REG_DATA_BASE;
+            if (size == 1) {
+                s->data[offset] = (uint8_t)val;
+            } else if (size == 2) {
+                s->data[offset]     = (uint8_t)(val >> 8);
+                s->data[offset + 1] = (uint8_t)(val & 0xFF);
+            } else {
+                s->data[offset]     = (uint8_t)(val >> 24);
+                s->data[offset + 1] = (uint8_t)(val >> 16);
+                s->data[offset + 2] = (uint8_t)(val >> 8);
+                s->data[offset + 3] = (uint8_t)(val & 0xFF);
+            }
+            break;
+        }
         qemu_log_mask(LOG_UNIMP, "sgi_bootdisk: write 0x%08" PRIx64
                       " to 0x%03" HWADDR_PRIx "\n", val, addr);
         break;
@@ -140,7 +179,7 @@ static void sgi_bootdisk_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
 
     if (s->blk) {
-        uint64_t perm = BLK_PERM_CONSISTENT_READ;
+        uint64_t perm = BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE;
         int ret;
 
         ret = blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp);

@@ -43,6 +43,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBootDiskState, SGI_BOOTDISK)
 
 /* Commands */
 #define CMD_READ         1
+#define CMD_WRITE        2
 
 /* Status bits */
 #define STATUS_READY     (1U << 31)
