@@ -15118,9 +15118,16 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 #else
         ctx->mem_idx = hflags_mmu_index(ctx->hflags);
 #endif
-    ctx->default_tcg_memop_mask = (!(ctx->insn_flags & ISA_NANOMIPS32) &&
-                                  (ctx->insn_flags & (ISA_MIPS_R6 |
-                                  INSN_LOONGSON3A))) ? MO_UNALN : MO_ALIGN;
+    /*
+     * sgi-ip54 IRIX userland (IRIS malloc, csh, xkbcomp, iaf/scheme) intermittently
+     * does unaligned lw on heap pointers. On real MIPS-III the kernel's AdEL
+     * handler would emulate the unaligned access; the IP54 emulated kernel
+     * SIGBUSes which kills login helpers. Default unaligned loads to silently
+     * succeed, so userspace survives. Doesn't affect lwl/lwr (explicit unaligned
+     * opcodes). MIPS-R6/nanoMIPS native-strict-align ISA keeps MO_ALIGN.
+     */
+    ctx->default_tcg_memop_mask = (ctx->insn_flags & ISA_NANOMIPS32) ? MO_ALIGN :
+                                  MO_UNALN;
 
     /*
      * Execute a branch and its delay slot as a single instruction.
