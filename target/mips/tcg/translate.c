@@ -15125,9 +15125,25 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
      * SIGBUSes which kills login helpers. Default unaligned loads to silently
      * succeed, so userspace survives. Doesn't affect lwl/lwr (explicit unaligned
      * opcodes). MIPS-R6/nanoMIPS native-strict-align ISA keeps MO_ALIGN.
+     *
+     * Escape hatch (2026-06-19): MIPSpro `fec` on Indy gold disks may
+     * segfault during compile under MO_UNALN if its front-end relies on
+     * AdEL-trap side effects.  Setting QEMU_MIPS_FORCE_ALIGN=1 reverts to
+     * the upstream MO_ALIGN default so Indy-machine kernel builds succeed
+     * while sgi-ip54 boots stay on MO_UNALN.
      */
-    ctx->default_tcg_memop_mask = (ctx->insn_flags & ISA_NANOMIPS32) ? MO_ALIGN :
-                                  MO_UNALN;
+    {
+        static int force_align = -1;
+        if (force_align < 0) {
+            const char *e = getenv("QEMU_MIPS_FORCE_ALIGN");
+            force_align = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (force_align || (ctx->insn_flags & ISA_NANOMIPS32)) {
+            ctx->default_tcg_memop_mask = MO_ALIGN;
+        } else {
+            ctx->default_tcg_memop_mask = MO_UNALN;
+        }
+    }
 
     /*
      * Execute a branch and its delay slot as a single instruction.
