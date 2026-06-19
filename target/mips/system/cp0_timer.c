@@ -26,11 +26,35 @@
 #include "system/kvm.h"
 #include "internal.h"
 
+/*
+ * On real R4000-class hardware CP0_Count advances at a fixed hardware rate
+ * regardless of how busy the CPU is.  QEMU's QEMU_CLOCK_VIRTUAL is fine for
+ * a CPU keeping up with its modeled frequency, but on sgi-ip54 (and any host
+ * where icount sleep=off is needed for UI smoothness) virtual time races
+ * ahead of wall time and dilates everything the kernel reads — networking
+ * timeouts, lbolt-derived gettimeofday(), animations.
+ *
+ * Setting QEMU_MIPS_COUNT_REALTIME=1 makes COUNT/COMPARE-IRQ7 read
+ * QEMU_CLOCK_REALTIME (host monotonic) instead, so wall time is the source
+ * of truth for the guest's perception of time.  Default keeps VIRTUAL to
+ * preserve behaviour for other MIPS machines under test.
+ * See progress_notes/time_decoupling_investigation_2026-06-19.md.
+ */
+static QEMUClockType mips_count_clock_type(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("QEMU_MIPS_COUNT_REALTIME");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
+}
+
 /* MIPS R4K timer */
 static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
 {
     int64_t now_ns;
-    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now_ns = qemu_clock_get_ns(mips_count_clock_type());
     return env->CP0_Count +
             (uint32_t)clock_ns_to_ticks(env->count_clock, now_ns);
 }
@@ -40,7 +64,7 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     uint64_t now_ns, next_ns;
     uint32_t wait;
 
-    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now_ns = qemu_clock_get_ns(mips_count_clock_type());
     wait = env->CP0_Compare - cpu_mips_get_count_val(env);
     /* Clamp interval to overflow if virtual time had not progressed */
     if (!wait) {
@@ -67,7 +91,7 @@ uint32_t cpu_mips_get_count(CPUMIPSState *env)
     } else {
         uint64_t now_ns;
 
-        now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        now_ns = qemu_clock_get_ns(mips_count_clock_type());
         if (timer_pending(env->timer)
             && timer_expired(env->timer, now_ns)) {
             /* The timer has already expired.  */
@@ -90,7 +114,7 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
     } else {
         /* Store new count register */
         env->CP0_Count = count - (uint32_t)clock_ns_to_ticks(env->count_clock,
-                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                        qemu_clock_get_ns(mips_count_clock_type()));
         /* Update timer timer */
         cpu_mips_timer_update(env);
     }
@@ -117,7 +141,7 @@ void cpu_mips_stop_count(CPUMIPSState *env)
 {
     /* Store the current value */
     env->CP0_Count += (uint32_t)clock_ns_to_ticks(env->count_clock,
-                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                        qemu_clock_get_ns(mips_count_clock_type()));
 }
 
 static void mips_timer_cb(void *opaque)
@@ -140,6 +164,7 @@ void cpu_mips_clock_init(MIPSCPU *cpu)
      * kernel.
      */
     if (!kvm_enabled()) {
-        env->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, &mips_timer_cb, env);
+        env->timer = timer_new_ns(mips_count_clock_type(),
+                                  &mips_timer_cb, env);
     }
 }
