@@ -110,6 +110,29 @@ static void sgi_bootdisk_write(void *opaque, hwaddr addr,
             fprintf(stderr, "BDRD sec=%" PRIu64 " d=%02x%02x%02x%02x\n",
                     sector, s->data[0], s->data[1],
                     s->data[2], s->data[3]);
+            /*
+             * INODE BUFFER DETECTOR: if any 256-byte slot in this sector has
+             * 'IN' magic (0x494e) AND any other slot has magic 0x0000, log
+             * it as suspicious. This catches the "Bad magic in XFS inode
+             * buffer" pattern at the point of issue (read return).
+             */
+            {
+                int has_ino_magic = 0, has_zero_slot = 0;
+                for (int k = 0; k < SGI_BOOTDISK_SECTOR_SIZE; k += 256) {
+                    if (s->data[k] == 0x49 && s->data[k+1] == 0x4e) {
+                        has_ino_magic = 1;
+                    } else if (s->data[k] == 0 && s->data[k+1] == 0
+                               && s->data[k+2] == 0 && s->data[k+3] == 0) {
+                        has_zero_slot = 1;
+                    }
+                }
+                if (has_ino_magic && has_zero_slot) {
+                    fprintf(stderr, "BDRD-MIX sec=%" PRIu64
+                            " slot0=%02x%02x slot1=%02x%02x\n",
+                            sector, s->data[0], s->data[1],
+                            s->data[256], s->data[257]);
+                }
+            }
         } else if ((uint32_t)val == CMD_WRITE) {
             if (!s->blk) {
                 fprintf(stderr, "sgi_bootdisk: CMD_WRITE but no blk!\n");
