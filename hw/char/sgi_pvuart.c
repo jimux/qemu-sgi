@@ -24,7 +24,31 @@
 #include "qemu/log.h"
 #include "qom/object.h"
 
-static int pvuart_debug_countdown = 200; /* first N reads traced */
+/* RX ring helpers. One slot is kept empty to distinguish full from empty. */
+static bool rxfifo_empty(SGIPVUARTState *s)
+{
+    return s->rx_head == s->rx_tail;
+}
+
+static bool rxfifo_full(SGIPVUARTState *s)
+{
+    return ((s->rx_head + 1) % SGI_PVUART_RXFIFO_SIZE) == s->rx_tail;
+}
+
+static void rxfifo_push(SGIPVUARTState *s, uint8_t ch)
+{
+    if (!rxfifo_full(s)) {
+        s->rx_fifo[s->rx_head] = ch;
+        s->rx_head = (s->rx_head + 1) % SGI_PVUART_RXFIFO_SIZE;
+    }
+}
+
+static uint8_t rxfifo_pop(SGIPVUARTState *s)
+{
+    uint8_t ch = s->rx_fifo[s->rx_tail];
+    s->rx_tail = (s->rx_tail + 1) % SGI_PVUART_RXFIFO_SIZE;
+    return ch;
+}
 
 static uint64_t sgi_pvuart_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -32,26 +56,15 @@ static uint64_t sgi_pvuart_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (addr) {
     case SGI_PVUART_THR_RBR:
-        if (s->rx_ready) {
-            uint8_t ch = s->rx_byte;
-            s->rx_ready = false;
+        if (!rxfifo_empty(s)) {
+            uint8_t ch = rxfifo_pop(s);
             qemu_chr_fe_accept_input(&s->chr);
-            fprintf(stderr, "[PVUART] RBR read: 0x%02x '%c'\n",
-                    ch, (ch >= 0x20 && ch < 0x7f) ? ch : '.');
             return ch;
         }
         return 0;
     case SGI_PVUART_LSR:
-        {
-            uint8_t lsr = SGI_PVUART_LSR_THRE; /* TX always ready */
-            if (s->rx_ready) {
-                lsr |= SGI_PVUART_LSR_DR;
-                fprintf(stderr, "[PVUART] LSR read: 0x%02x (DR set)\n", lsr);
-            } else if (pvuart_debug_countdown > 0) {
-                pvuart_debug_countdown--;
-            }
-            return lsr;
-        }
+        return SGI_PVUART_LSR_THRE |
+               (rxfifo_empty(s) ? 0 : SGI_PVUART_LSR_DR);
     default:
         return 0;
     }
@@ -68,6 +81,13 @@ static void sgi_pvuart_write(void *opaque, hwaddr addr, uint64_t val,
             uint8_t ch = val & 0xFF;
             qemu_chr_fe_write_all(&s->chr, &ch, 1);
         }
+        break;
+    case SGI_PVUART_RXINJECT:
+        /* Host RX-inject: a write here (e.g. via the gdbstub) pushes a byte
+         * into the RX FIFO exactly as if it had arrived on the wire. The guest
+         * console input path delivers it normally — no serial backend, no TFTP.
+         */
+        rxfifo_push(s, val & 0xFF);
         break;
     default:
         break;
@@ -91,20 +111,16 @@ static const MemoryRegionOps sgi_pvuart_ops = {
 static int sgi_pvuart_can_rx(void *opaque)
 {
     SGIPVUARTState *s = opaque;
-    return !s->rx_ready;
+    return rxfifo_full(s) ? 0 : 1;
 }
 
 static void sgi_pvuart_rx(void *opaque, const uint8_t *buf, int size)
 {
     SGIPVUARTState *s = opaque;
+    int i;
 
-    fprintf(stderr, "[PVUART] RX: size=%d byte=0x%02x '%c' rx_ready=%d\n",
-            size, size > 0 ? buf[0] : 0,
-            (size > 0 && buf[0] >= 0x20 && buf[0] < 0x7f) ? buf[0] : '.',
-            s->rx_ready);
-    if (size > 0 && !s->rx_ready) {
-        s->rx_byte = buf[0];
-        s->rx_ready = true;
+    for (i = 0; i < size; i++) {
+        rxfifo_push(s, buf[i]);
     }
 }
 
