@@ -1581,6 +1581,17 @@ static uint32_t newport_rgb_unpack(uint32_t pixel, uint8_t pix_size,
 }
 
 /*
+ * True for the VC2 registers that move/enable the hardware cursor. Writing
+ * these changes no VRAM, so the display must be forced dirty for the cursor
+ * to track at the refresh rate (see newport_update_display's dirty gate).
+ */
+static inline bool vc2_reg_affects_cursor(uint8_t idx)
+{
+    return idx == VC2_CURSOR_X || idx == VC2_CURSOR_Y ||
+           idx == VC2_CURSOR_ENTRY || idx == VC2_DC_CONTROL;
+}
+
+/*
  * Handle DCB write to sub-devices.
  */
 static void newport_dcb_write(SGINewportState *s, uint32_t val)
@@ -1664,12 +1675,27 @@ static void newport_dcb_write(SGINewportState *s, uint32_t val)
                     if (s->vc2_reg_idx == VC2_RAM_ADDR) {
                         s->vc2_ram_addr = (val >> 8) & 0x7fff;
                     }
+                    if (vc2_reg_affects_cursor(s->vc2_reg_idx)) {
+                        s->display_dirty = true;
+                    }
                 }
                 break;
             case 1: /* Register data write */
                 s->vc2_reg_data = val;
                 if (s->vc2_reg_idx < 32) {
                     s->vc2_reg[s->vc2_reg_idx] = vc2_data;
+                    /*
+                     * The VC2 hardware cursor is moved by writing CURSOR_X/Y
+                     * (and enabled via DC_CONTROL). These touch no VRAM, so
+                     * without forcing a redraw the periodic display update
+                     * (gated on display_dirty) would never re-composite the
+                     * cursor at its new position — the pointer would only
+                     * "jump" when X redraws its shape. Mark dirty so the
+                     * cursor tracks at the display refresh rate.
+                     */
+                    if (vc2_reg_affects_cursor(s->vc2_reg_idx)) {
+                        s->display_dirty = true;
+                    }
                 }
                 break;
             case 2: /* RAM address */
