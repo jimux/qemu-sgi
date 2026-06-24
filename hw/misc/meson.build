@@ -160,8 +160,10 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
 
 # SGI devices
 system_ss.add(when: 'CONFIG_SGI_MC', if_true: files('sgi_mc.c'))
+system_ss.add(when: 'CONFIG_SGI_MC_VIRTUIX', if_true: files('sgi_mc_virtuix.c'))
 system_ss.add(when: 'CONFIG_SGI_HPC1', if_true: files('sgi_hpc1.c'))
 system_ss.add(when: 'CONFIG_SGI_HPC3', if_true: files('sgi_hpc3.c'))
+system_ss.add(when: 'CONFIG_SGI_HPC3_VIRTUIX', if_true: files('sgi_hpc3_virtuix.c'))
 system_ss.add(when: 'CONFIG_SGI_ARCS', if_true: files('sgi_arcs.c'))
 system_ss.add(when: 'CONFIG_SGI_CRIME', if_true: files('sgi_crime.c'))
 system_ss.add(when: 'CONFIG_SGI_CRIME_RE', if_true: files('sgi_crime_re.c'))

@@ -1,5 +1,5 @@
 /*
- * SGI HPC3 (High Performance Peripheral Controller) emulation
+ * SGI HPC3 -- VIRTUIX/IP55 variant: SGI HPC3 (High Performance Peripheral Controller) emulation
  *
  * The HPC3 is the central I/O controller for SGI Indy (IP24) workstations.
  * It provides:
@@ -24,7 +24,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
-#include "hw/misc/sgi_hpc3.h"
+#include "hw/misc/sgi_hpc3_virtuix.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -98,9 +98,9 @@ static inline uint8_t bcd_to_bin(uint8_t bcd)
 #define HPC3_BC_COUNT_MASK  0x3fff      /* 14-bit byte count */
 
 /* Forward declarations */
-static void sgi_hpc3_update_irq(SGIHPC3State *s);
-static void sgi_hpc3_scsi_dma_run(SGIHPC3State *s, int ch);
-static void sgi_hpc3_enet_reset(SGIHPC3State *s);
+static void sgi_hpc3_virtuix_update_irq(SGIHPC3VirtuixState *s);
+static void sgi_hpc3_virtuix_scsi_dma_run(SGIHPC3VirtuixState *s, int ch);
+static void sgi_hpc3_virtuix_enet_reset(SGIHPC3VirtuixState *s);
 
 /*
  * Fetch next DMA descriptor from guest memory
@@ -108,7 +108,7 @@ static void sgi_hpc3_enet_reset(SGIHPC3State *s);
  * Reads 12-byte descriptor (CBP, BC, NBDP) from the address in scsi_nbdp[ch].
  * Sets scsi_dma_count from the lower 14 bits of BC.
  */
-static void sgi_hpc3_scsi_dma_fetch_chain(SGIHPC3State *s, int ch)
+static void sgi_hpc3_virtuix_scsi_dma_fetch_chain(SGIHPC3VirtuixState *s, int ch)
 {
     uint32_t desc_addr = s->scsi_nbdp[ch];
     uint32_t cbp, bc, nbdp;
@@ -130,7 +130,7 @@ static void sgi_hpc3_scsi_dma_fetch_chain(SGIHPC3State *s, int ch)
  * Advance the DMA descriptor chain after a descriptor's count reaches zero.
  * Handles interrupt-on-end and end-of-chain.
  */
-static void sgi_hpc3_scsi_dma_advance_chain(SGIHPC3State *s, int ch)
+static void sgi_hpc3_virtuix_scsi_dma_advance_chain(SGIHPC3VirtuixState *s, int ch)
 {
     /* Check for interrupt-on-end (XIE) */
     if (s->scsi_bc[ch] & HPC3_BC_XIE) {
@@ -139,7 +139,7 @@ static void sgi_hpc3_scsi_dma_advance_chain(SGIHPC3State *s, int ch)
         s->scsi_ctrl[ch] |= HPC3_DMACTRL_IRQ;
         /* Route HPC DMA completion to INT3 LOCAL1 (MAME: hpc_dma_done_w) */
         s->int3_local1_stat |= INT3_LOCAL1_HPC_DMA;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
     }
 
     /* Check for end-of-chain (EOX) */
@@ -150,7 +150,7 @@ static void sgi_hpc3_scsi_dma_advance_chain(SGIHPC3State *s, int ch)
     }
 
     /* Fetch next descriptor */
-    sgi_hpc3_scsi_dma_fetch_chain(s, ch);
+    sgi_hpc3_virtuix_scsi_dma_fetch_chain(s, ch);
 }
 
 /*
@@ -160,7 +160,7 @@ static void sgi_hpc3_scsi_dma_advance_chain(SGIHPC3State *s, int ch)
  * via the DMA descriptor chain. Loops while the WD33C93 has data
  * available (async_len > 0) and DMA is active.
  */
-static void sgi_hpc3_scsi_dma_run(SGIHPC3State *s, int ch)
+static void sgi_hpc3_virtuix_scsi_dma_run(SGIHPC3VirtuixState *s, int ch)
 {
     WD33C93State *wdc = s->scsi[ch];
     uint32_t total_transferred = 0;
@@ -174,7 +174,7 @@ static void sgi_hpc3_scsi_dma_run(SGIHPC3State *s, int ch)
 
         if (s->scsi_dma_count[ch] == 0) {
             /* Current descriptor exhausted, advance chain */
-            sgi_hpc3_scsi_dma_advance_chain(s, ch);
+            sgi_hpc3_virtuix_scsi_dma_advance_chain(s, ch);
             if (!s->scsi_dma_active[ch]) {
                 break;
             }
@@ -218,7 +218,7 @@ static void sgi_hpc3_scsi_dma_run(SGIHPC3State *s, int ch)
 
         /* If current descriptor is exhausted, advance chain */
         if (s->scsi_dma_count[ch] == 0) {
-            sgi_hpc3_scsi_dma_advance_chain(s, ch);
+            sgi_hpc3_virtuix_scsi_dma_advance_chain(s, ch);
         }
     }
 
@@ -229,7 +229,7 @@ static void sgi_hpc3_scsi_dma_run(SGIHPC3State *s, int ch)
      * still needs to be processed to clear dma_active and ENABLE.
      */
     while (s->scsi_dma_active[ch] && s->scsi_dma_count[ch] == 0) {
-        sgi_hpc3_scsi_dma_advance_chain(s, ch);
+        sgi_hpc3_virtuix_scsi_dma_advance_chain(s, ch);
     }
 
     /*
@@ -292,21 +292,21 @@ static void sgi_hpc3_scsi_dma_run(SGIHPC3State *s, int ch)
 /*
  * DRQ GPIO input handler - called when WD33C93 asserts/deasserts DRQ
  */
-static void sgi_hpc3_scsi_drq(void *opaque, int n, int level)
+static void sgi_hpc3_virtuix_scsi_drq(void *opaque, int n, int level)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
 
     s->scsi_drq[n] = !!level;
 
     if (level && s->scsi_dma_active[n]) {
-        sgi_hpc3_scsi_dma_run(s, n);
+        sgi_hpc3_virtuix_scsi_dma_run(s, n);
     }
 }
 
 /*
  * Handle CTRL register write for SCSI DMA channel
  */
-static void sgi_hpc3_scsi_ctrl_write(SGIHPC3State *s, int ch, uint32_t val)
+static void sgi_hpc3_virtuix_scsi_ctrl_write(SGIHPC3VirtuixState *s, int ch, uint32_t val)
 {
     bool was_active = s->scsi_dma_active[ch];
 
@@ -335,11 +335,11 @@ static void sgi_hpc3_scsi_ctrl_write(SGIHPC3State *s, int ch, uint32_t val)
      * data to go to the wrong address.
      */
     if (s->scsi_dma_active[ch]) {
-        sgi_hpc3_scsi_dma_fetch_chain(s, ch);
+        sgi_hpc3_virtuix_scsi_dma_fetch_chain(s, ch);
 
         /* If DRQ already asserted, start DMA immediately */
         if (s->scsi_drq[ch]) {
-            sgi_hpc3_scsi_dma_run(s, ch);
+            sgi_hpc3_virtuix_scsi_dma_run(s, ch);
         }
     }
 
@@ -354,7 +354,7 @@ static void sgi_hpc3_scsi_ctrl_write(SGIHPC3State *s, int ch, uint32_t val)
 /*
  * Get current counter value for a PIT channel
  */
-static uint16_t sgi_hpc3_pit_get_count(SGIHPC3State *s, int channel)
+static uint16_t sgi_hpc3_virtuix_pit_get_count(SGIHPC3VirtuixState *s, int channel)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t elapsed_ns = now - s->pit_load_time[channel];
@@ -381,9 +381,9 @@ static uint16_t sgi_hpc3_pit_get_count(SGIHPC3State *s, int channel)
  * Timer interrupts go directly to CPU IRQ lines, bypassing INT3 masking.
  * This allows the PROM to use timer delays before configuring INT3 masks.
  */
-static void sgi_hpc3_pit_timer0_cb(void *opaque)
+static void sgi_hpc3_virtuix_pit_timer0_cb(void *opaque)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
 
     trace_sgi_hpc3_pit(0, s->pit_count[0]);
     qemu_log_mask(LOG_UNIMP, "sgi_hpc3: Timer0 fired, map_status=0x%02x, "
@@ -403,7 +403,7 @@ static void sgi_hpc3_pit_timer0_cb(void *opaque)
      */
     s->timer_pending[0] = true;
 
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 
     /* Reschedule timer if count is non-zero */
     if (s->pit_count[0] > 0) {
@@ -419,9 +419,9 @@ static void sgi_hpc3_pit_timer0_cb(void *opaque)
  * MAME Reference (ioc2.cpp:210-226):
  * Timer interrupts go directly to CPU IRQ lines, bypassing INT3 masking.
  */
-static void sgi_hpc3_pit_timer1_cb(void *opaque)
+static void sgi_hpc3_virtuix_pit_timer1_cb(void *opaque)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
 
     trace_sgi_hpc3_pit(1, s->pit_count[1]);
     qemu_log_mask(LOG_UNIMP, "sgi_hpc3: Timer1 fired, map_status=0x%02x, "
@@ -432,7 +432,7 @@ static void sgi_hpc3_pit_timer1_cb(void *opaque)
     /* Direct to CPU IP5, bypass INT3 cascade (see timer0 comment above) */
     s->timer_pending[1] = true;
 
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 
     /* Reschedule timer if count is non-zero */
     if (s->pit_count[1] > 0) {
@@ -445,7 +445,7 @@ static void sgi_hpc3_pit_timer1_cb(void *opaque)
 /*
  * Start/restart a PIT timer
  */
-static void sgi_hpc3_pit_arm_timer(SGIHPC3State *s, int channel)
+static void sgi_hpc3_virtuix_pit_arm_timer(SGIHPC3VirtuixState *s, int channel)
 {
     if (channel > 1) {
         return;  /* Channel 2 is master clock, doesn't generate interrupts */
@@ -470,14 +470,14 @@ static void sgi_hpc3_pit_arm_timer(SGIHPC3State *s, int channel)
 /*
  * Read from PIT counter register
  */
-static uint8_t sgi_hpc3_pit_read(SGIHPC3State *s, int channel)
+static uint8_t sgi_hpc3_virtuix_pit_read(SGIHPC3VirtuixState *s, int channel)
 {
     uint16_t val;
 
     if (s->pit_latched[channel]) {
         val = s->pit_latch[channel];
     } else {
-        val = sgi_hpc3_pit_get_count(s, channel);
+        val = sgi_hpc3_virtuix_pit_get_count(s, channel);
     }
 
     /* Handle 16-bit read in two 8-bit parts based on control word */
@@ -514,18 +514,18 @@ static uint8_t sgi_hpc3_pit_read(SGIHPC3State *s, int channel)
 /*
  * Write to PIT counter register
  */
-static void sgi_hpc3_pit_write(SGIHPC3State *s, int channel, uint8_t val)
+static void sgi_hpc3_virtuix_pit_write(SGIHPC3VirtuixState *s, int channel, uint8_t val)
 {
     uint8_t rw_mode = (s->pit_control[channel] >> 4) & 0x03;
 
     switch (rw_mode) {
     case 1:  /* LSB only */
         s->pit_count[channel] = val;
-        sgi_hpc3_pit_arm_timer(s, channel);
+        sgi_hpc3_virtuix_pit_arm_timer(s, channel);
         break;
     case 2:  /* MSB only */
         s->pit_count[channel] = val << 8;
-        sgi_hpc3_pit_arm_timer(s, channel);
+        sgi_hpc3_virtuix_pit_arm_timer(s, channel);
         break;
     case 3:  /* LSB then MSB */
         if (s->pit_rw_state[channel] == 0) {
@@ -534,7 +534,7 @@ static void sgi_hpc3_pit_write(SGIHPC3State *s, int channel, uint8_t val)
         } else {
             s->pit_count[channel] = (s->pit_count[channel] & 0x00ff) | (val << 8);
             s->pit_rw_state[channel] = 0;
-            sgi_hpc3_pit_arm_timer(s, channel);
+            sgi_hpc3_virtuix_pit_arm_timer(s, channel);
         }
         break;
     }
@@ -543,7 +543,7 @@ static void sgi_hpc3_pit_write(SGIHPC3State *s, int channel, uint8_t val)
 /*
  * Write to PIT control register
  */
-static void sgi_hpc3_pit_control_write(SGIHPC3State *s, uint8_t val)
+static void sgi_hpc3_virtuix_pit_control_write(SGIHPC3VirtuixState *s, uint8_t val)
 {
     int channel = (val >> 6) & 0x03;
 
@@ -560,7 +560,7 @@ static void sgi_hpc3_pit_control_write(SGIHPC3State *s, uint8_t val)
 
     if (rw_mode == 0) {
         /* Counter latch command */
-        s->pit_latch[channel] = sgi_hpc3_pit_get_count(s, channel);
+        s->pit_latch[channel] = sgi_hpc3_virtuix_pit_get_count(s, channel);
         s->pit_latched[channel] = true;
         s->pit_rw_state[channel] = 0;
     } else {
@@ -637,7 +637,7 @@ static void sgi_hpc3_pit_control_write(SGIHPC3State *s, uint8_t val)
  * This is for 8042-level responses (self-test, interface test, etc.)
  * that don't come from the PS/2 devices themselves.
  */
-static void sgi_hpc3_kbd_queue_ctrl(SGIHPC3State *s, uint8_t data)
+static void sgi_hpc3_virtuix_kbd_queue_ctrl(SGIHPC3VirtuixState *s, uint8_t data)
 {
     ps2_queue(PS2_DEVICE(&s->ps2kbd), data);
 }
@@ -649,7 +649,7 @@ static void sgi_hpc3_kbd_queue_ctrl(SGIHPC3State *s, uint8_t data)
  *   0x21 → mouse data pending → read from ps2mouse
  *   0x01 → keyboard data pending → read from ps2kbd
  */
-static uint8_t sgi_hpc3_kbd_status(SGIHPC3State *s)
+static uint8_t sgi_hpc3_virtuix_kbd_status(SGIHPC3VirtuixState *s)
 {
     uint8_t status = KBD_STAT_SYS | KBD_STAT_UNLOCKED;
 
@@ -684,7 +684,7 @@ static uint8_t sgi_hpc3_kbd_status(SGIHPC3State *s)
  * pckm_mutex held. Without gating, we'd fire an interrupt that causes
  * pckm_intr to deadlock on the mutex.
  */
-static void sgi_hpc3_kbd_update_map_irq(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_kbd_update_map_irq(SGIHPC3VirtuixState *s)
 {
     bool kbd_active = s->kbd_irq_level &&
                       (s->kbd_cmd_byte & KBD_MODE_KBD_INT);
@@ -698,28 +698,28 @@ static void sgi_hpc3_kbd_update_map_irq(SGIHPC3State *s)
     }
     trace_sgi_hpc3_kbd_irq(s->kbd_irq_level, s->mouse_irq_level,
                            s->int3_map_status);
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 }
 
 /*
  * PS/2 keyboard IRQ callback — called when the PS/2 keyboard device
  * has data available in its queue (or when the queue drains).
  */
-static void sgi_hpc3_ps2_kbd_irq(void *opaque, int n, int level)
+static void sgi_hpc3_virtuix_ps2_kbd_irq(void *opaque, int n, int level)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     s->kbd_irq_level = level;
-    sgi_hpc3_kbd_update_map_irq(s);
+    sgi_hpc3_virtuix_kbd_update_map_irq(s);
 }
 
 /*
  * PS/2 mouse IRQ callback — same as keyboard but for mouse data.
  */
-static void sgi_hpc3_ps2_mouse_irq(void *opaque, int n, int level)
+static void sgi_hpc3_virtuix_ps2_mouse_irq(void *opaque, int n, int level)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     s->mouse_irq_level = level;
-    sgi_hpc3_kbd_update_map_irq(s);
+    sgi_hpc3_virtuix_kbd_update_map_irq(s);
 }
 
 /*
@@ -727,7 +727,7 @@ static void sgi_hpc3_ps2_mouse_irq(void *opaque, int n, int level)
  * Returns data from the appropriate PS/2 device queue based on
  * which device has pending data (keyboard takes priority).
  */
-static uint8_t sgi_hpc3_kbd_read_data(SGIHPC3State *s)
+static uint8_t sgi_hpc3_virtuix_kbd_read_data(SGIHPC3VirtuixState *s)
 {
     uint8_t val;
 
@@ -746,7 +746,7 @@ static uint8_t sgi_hpc3_kbd_read_data(SGIHPC3State *s)
 /*
  * Process 8042 keyboard controller command (written to command port 0x64)
  */
-static void sgi_hpc3_kbd_command(SGIHPC3State *s, uint8_t cmd)
+static void sgi_hpc3_virtuix_kbd_command(SGIHPC3VirtuixState *s, uint8_t cmd)
 {
     trace_sgi_hpc3_kbd_cmd(cmd);
     s->kbd_cmd = cmd;
@@ -756,15 +756,15 @@ static void sgi_hpc3_kbd_command(SGIHPC3State *s, uint8_t cmd)
         break;
 
     case KBD_CMD_SELF_TEST:  /* 0xAA - Controller self-test */
-        sgi_hpc3_kbd_queue_ctrl(s, KBD_RESP_SELF_TEST_OK);
+        sgi_hpc3_virtuix_kbd_queue_ctrl(s, KBD_RESP_SELF_TEST_OK);
         break;
 
     case KBD_CMD_IFACE_TEST:  /* 0xAB - Keyboard interface test */
-        sgi_hpc3_kbd_queue_ctrl(s, KBD_RESP_IFACE_OK);
+        sgi_hpc3_virtuix_kbd_queue_ctrl(s, KBD_RESP_IFACE_OK);
         break;
 
     case KBD_CMD_TEST_MOUSE:  /* 0xA9 - Mouse interface test */
-        sgi_hpc3_kbd_queue_ctrl(s, KBD_RESP_IFACE_OK);
+        sgi_hpc3_virtuix_kbd_queue_ctrl(s, KBD_RESP_IFACE_OK);
         break;
 
     case KBD_CMD_DISABLE_KBD:  /* 0xAD - Disable keyboard */
@@ -784,7 +784,7 @@ static void sgi_hpc3_kbd_command(SGIHPC3State *s, uint8_t cmd)
         break;
 
     case KBD_CMD_READ_CTRL:  /* 0x20 - Read controller command byte */
-        sgi_hpc3_kbd_queue_ctrl(s, s->kbd_cmd_byte);
+        sgi_hpc3_virtuix_kbd_queue_ctrl(s, s->kbd_cmd_byte);
         break;
 
     case KBD_CMD_WRITE_CTRL:  /* 0x60 - Next data byte is command byte */
@@ -792,11 +792,11 @@ static void sgi_hpc3_kbd_command(SGIHPC3State *s, uint8_t cmd)
         break;
 
     case KBD_CMD_READ_INPUT:  /* 0xC0 - Read input port */
-        sgi_hpc3_kbd_queue_ctrl(s, 0x80);
+        sgi_hpc3_virtuix_kbd_queue_ctrl(s, 0x80);
         break;
 
     case KBD_CMD_READ_OUTPUT:  /* 0xD0 - Read output port */
-        sgi_hpc3_kbd_queue_ctrl(s, 0x02);
+        sgi_hpc3_virtuix_kbd_queue_ctrl(s, 0x02);
         break;
 
     case KBD_CMD_WRITE_OUTPUT:  /* 0xD1 - Write output port */
@@ -822,7 +822,7 @@ static void sgi_hpc3_kbd_command(SGIHPC3State *s, uint8_t cmd)
  *   - After 0xD2: queue into keyboard output buffer
  *   - No pending command: forward to PS/2 keyboard device
  */
-static void sgi_hpc3_kbd_data_write(SGIHPC3State *s, uint8_t data)
+static void sgi_hpc3_virtuix_kbd_data_write(SGIHPC3VirtuixState *s, uint8_t data)
 {
     switch (s->kbd_cmd) {
     case KBD_CMD_WRITE_CTRL:  /* 0x60 - Writing command byte */
@@ -830,7 +830,7 @@ static void sgi_hpc3_kbd_data_write(SGIHPC3State *s, uint8_t data)
         ps2_keyboard_set_translation(&s->ps2kbd.parent_obj,
                                      (s->kbd_cmd_byte & KBD_MODE_KCC) != 0);
         s->kbd_cmd = 0;
-        sgi_hpc3_kbd_update_map_irq(s);  /* fire pending IRQ if now enabled */
+        sgi_hpc3_virtuix_kbd_update_map_irq(s);  /* fire pending IRQ if now enabled */
         break;
 
     case KBD_CMD_WRITE_OUTPUT:  /* 0xD1 - Writing to output port */
@@ -860,7 +860,7 @@ static void sgi_hpc3_kbd_data_write(SGIHPC3State *s, uint8_t data)
 }
 
 /* Update RTC time registers from current time + offset */
-static void sgi_hpc3_rtc_update_time(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_rtc_update_time(SGIHPC3VirtuixState *s)
 {
     struct tm tm;
 
@@ -876,11 +876,11 @@ static void sgi_hpc3_rtc_update_time(SGIHPC3State *s)
 }
 
 /* Read RTC register - returns stored value, updating time if TE set */
-static uint8_t sgi_hpc3_rtc_read(SGIHPC3State *s, int reg)
+static uint8_t sgi_hpc3_virtuix_rtc_read(SGIHPC3VirtuixState *s, int reg)
 {
     /* Update time registers if TE (Transfer Enable) is set */
     if (s->rtc_command & 0x80) {
-        sgi_hpc3_rtc_update_time(s);
+        sgi_hpc3_virtuix_rtc_update_time(s);
     }
 
     switch (reg) {
@@ -939,7 +939,7 @@ static uint8_t sgi_hpc3_rtc_read(SGIHPC3State *s, int reg)
  * Algorithm: XOR each byte with running checksum, rotating left after
  * each odd-indexed byte. Seed is 0xa5, byte 0 (checksum itself) is skipped.
  */
-static uint8_t sgi_hpc3_nvram_checksum(uint8_t *table, int len)
+static uint8_t sgi_hpc3_virtuix_nvram_checksum(uint8_t *table, int len)
 {
     int8_t checksum = (int8_t)0xa5;
 
@@ -959,7 +959,7 @@ static uint8_t sgi_hpc3_nvram_checksum(uint8_t *table, int len)
  * This avoids the PROM's "NVRAM checksum is incorrect: reinitializing"
  * message and the Full House "Could not set NVRAM variable" errors.
  */
-static void sgi_hpc3_nvram_init_defaults(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_nvram_init_defaults(SGIHPC3VirtuixState *s)
 {
     uint8_t *table = &s->bbram[NVRAM_TABLE_BASE];
     uint8_t mac_random[3];
@@ -1012,7 +1012,7 @@ static void sgi_hpc3_nvram_init_defaults(SGIHPC3State *s)
     table[NVOFF_ENET + 5] = mac_random[2];
 
     /* Compute and set checksum */
-    table[NVOFF_CHECKSUM] = sgi_hpc3_nvram_checksum(table, NVRAM_TABLE_SIZE);
+    table[NVOFF_CHECKSUM] = sgi_hpc3_virtuix_nvram_checksum(table, NVRAM_TABLE_SIZE);
 
     qemu_log_mask(LOG_UNIMP, "sgi_hpc3: initialized NVRAM defaults "
                   "(rev=%d, autoload=%c, eaddr=%02x:%02x:%02x:%02x:%02x:%02x)\n",
@@ -1031,7 +1031,7 @@ static void sgi_hpc3_nvram_init_defaults(SGIHPC3State *s)
  * The EEPROM stores 128 × 16-bit words. NVRAM layout is 256 bytes with
  * big-endian byte order within each word: byte 0 = high byte of word 0.
  */
-static void sgi_hpc3_eeprom_init_defaults(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_eeprom_init_defaults(SGIHPC3VirtuixState *s)
 {
     uint8_t table[NVRAM_TABLE_SIZE];
     uint16_t *data;
@@ -1085,7 +1085,7 @@ static void sgi_hpc3_eeprom_init_defaults(SGIHPC3State *s)
     table[NVOFF_ENET + 5] = mac_random[2];
 
     /* Compute and set checksum */
-    table[NVOFF_CHECKSUM] = sgi_hpc3_nvram_checksum(table, NVRAM_TABLE_SIZE);
+    table[NVOFF_CHECKSUM] = sgi_hpc3_virtuix_nvram_checksum(table, NVRAM_TABLE_SIZE);
 
     /* Pack byte table into 16-bit words (big-endian byte order) */
     data = eeprom93xx_data(s->serial_eeprom);
@@ -1105,7 +1105,7 @@ static void sgi_hpc3_eeprom_init_defaults(SGIHPC3State *s)
 /*
  * Sync a single byte of BBRAM to the backing file.
  */
-static void sgi_hpc3_nvram_sync(SGIHPC3State *s, int reg)
+static void sgi_hpc3_virtuix_nvram_sync(SGIHPC3VirtuixState *s, int reg)
 {
     if (!s->nvram_filename) {
         return;
@@ -1145,7 +1145,7 @@ static void sgi_hpc3_nvram_sync(SGIHPC3State *s, int reg)
  * (MAME ioc2.cpp:210-226: timer0_int → input line 2 = IP4,
  *  timer1_int → input line 3 = IP5).
  */
-static void sgi_hpc3_update_irq(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_update_irq(SGIHPC3VirtuixState *s)
 {
     /*
      * Mapped interrupt cascade (per MAME ioc2.cpp:268-284):
@@ -1202,9 +1202,9 @@ static void sgi_hpc3_update_irq(SGIHPC3State *s)
  * Handle SCSI interrupt from WD33C93 controllers
  * n=0 for SCSI0, n=1 for SCSI1
  */
-static void sgi_hpc3_scsi_irq(void *opaque, int n, int level)
+static void sgi_hpc3_virtuix_scsi_irq(void *opaque, int n, int level)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     uint8_t mask = (n == 0) ? INT3_LOCAL0_SCSI0 : INT3_LOCAL0_SCSI1;
 
     if (level) {
@@ -1213,16 +1213,16 @@ static void sgi_hpc3_scsi_irq(void *opaque, int n, int level)
         s->int3_local0_stat &= ~mask;
     }
 
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 }
 
 /*
  * Handle MC GIO DMA-complete interrupt from the memory controller.
  * Routes to INT3_LOCAL0 bit 4 (LIO_GDMA / "mc dma complete", VECTOR_GDMA) -> IP2.
  */
-static void sgi_hpc3_mc_dma_irq(void *opaque, int n, int level)
+static void sgi_hpc3_virtuix_mc_dma_irq(void *opaque, int n, int level)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
 
     if (level) {
         s->int3_local0_stat |= INT3_LOCAL0_MC_DMA;
@@ -1230,16 +1230,16 @@ static void sgi_hpc3_mc_dma_irq(void *opaque, int n, int level)
         s->int3_local0_stat &= ~INT3_LOCAL0_MC_DMA;
     }
 
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 }
 
 /*
  * Handle GIO retrace (VBLANK) interrupt from Newport graphics.
  * Routes to INT3_LOCAL1 bit 7 (GIO2/Retrace).
  */
-static void sgi_hpc3_gio_retrace_irq(void *opaque, int n, int level)
+static void sgi_hpc3_virtuix_gio_retrace_irq(void *opaque, int n, int level)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
 
     if (level) {
         s->int3_local1_stat |= INT3_LOCAL1_GIO2;
@@ -1247,10 +1247,10 @@ static void sgi_hpc3_gio_retrace_irq(void *opaque, int n, int level)
         s->int3_local1_stat &= ~INT3_LOCAL1_GIO2;
     }
 
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 }
 
-static void sgi_hpc3_scc_update_irq(SGIHPC3State *s);
+static void sgi_hpc3_virtuix_scc_update_irq(SGIHPC3VirtuixState *s);
 
 
 /*
@@ -1280,7 +1280,7 @@ static void sgi_hpc3_scc_update_irq(SGIHPC3State *s);
  * in RR3 and persists until explicitly cleared by a WR0 "Reset TX Int
  * Pending" command (command 5).  It is NOT gated by WR1 TX_INT_ENBL.
  *
- * The SCC INT pin IS gated by WR1, but our sgi_hpc3_scc_update_irq()
+ * The SCC INT pin IS gated by WR1, but our sgi_hpc3_virtuix_scc_update_irq()
  * simplifies this: it asserts INT if MIE is set AND any RR3 bit is
  * active, regardless of WR1 enables.  This means setting TX_IP in RR3
  * will cause du_handle_intr to be called, which reads RR3 and dispatches
@@ -1288,9 +1288,9 @@ static void sgi_hpc3_scc_update_irq(SGIHPC3State *s);
  * path work: du_tx called from interrupt context (strlock=0) may succeed
  * even when the initial call from mips_du_start_tx (strlock=1) failed.
  */
-static void sgi_hpc3_scc_tx_timer_cb(void *opaque)
+static void sgi_hpc3_virtuix_scc_tx_timer_cb(void *opaque)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
 
     /*
      * Determine which channel this timer belongs to, then set TX_IP.
@@ -1314,7 +1314,7 @@ static void sgi_hpc3_scc_tx_timer_cb(void *opaque)
          * Set TX_IP if TX_INT_ENBL is still set.  TX_IP may already
          * be set (from the synchronous assertion in the WR1 handler),
          * in which case this is a no-op.  The timer's main role is to
-         * trigger sgi_hpc3_scc_update_irq() to deliver the interrupt
+         * trigger sgi_hpc3_virtuix_scc_update_irq() to deliver the interrupt
          * after the MMIO write that scheduled us has completed.
          */
         if (s->scc_wr1[ch] & 0x02) {
@@ -1322,10 +1322,10 @@ static void sgi_hpc3_scc_tx_timer_cb(void *opaque)
         }
     }
 
-    sgi_hpc3_scc_update_irq(s);
+    sgi_hpc3_virtuix_scc_update_irq(s);
 }
 
-static void sgi_hpc3_serial_write(SGIHPC3State *s, int port, uint8_t data)
+static void sgi_hpc3_virtuix_serial_write(SGIHPC3VirtuixState *s, int port, uint8_t data)
 {
     /*
      * The SGI Indy uses serial1 (offset 0x0c/0x0d) as the console port
@@ -1367,7 +1367,7 @@ static void sgi_hpc3_serial_write(SGIHPC3State *s, int port, uint8_t data)
     if (s->scc_wr1[port] & 0x02) {
         uint8_t tx_ip_bit = port ? 0x02 : 0x10;
         s->scc_rr3 |= tx_ip_bit;
-        sgi_hpc3_scc_update_irq(s);
+        sgi_hpc3_virtuix_scc_update_irq(s);
         timer_mod(s->scc_tx_timer[port],
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCC_TX_DELAY_NS);
     }
@@ -1384,7 +1384,7 @@ static void sgi_hpc3_serial_write(SGIHPC3State *s, int port, uint8_t data)
  */
 #define LIO_DUART_BIT  0x20
 
-static void sgi_hpc3_scc_update_irq(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_scc_update_irq(SGIHPC3VirtuixState *s)
 {
     /*
      * SCC asserts INT if MIE (Master Interrupt Enable, WR9 bit 3) is set
@@ -1393,7 +1393,7 @@ static void sgi_hpc3_scc_update_irq(SGIHPC3State *s)
      * The SCC INT output connects to INT3's DUART mapped interrupt
      * (bit 5 = 0x20 in map_status).  The cascade from map_status
      * through map_mask0/map_mask1 to MAPPABLE0/MAPPABLE1 is handled
-     * centrally in sgi_hpc3_update_irq().
+     * centrally in sgi_hpc3_virtuix_update_irq().
      */
     if ((s->scc_wr9 & 0x08) && s->scc_rr3) {
         s->int3_map_status |= LIO_DUART_BIT;
@@ -1412,7 +1412,7 @@ static void sgi_hpc3_scc_update_irq(SGIHPC3State *s)
             s->int3_local0_stat, s->int3_local0_mask);
     }
 
-    sgi_hpc3_update_irq(s);
+    sgi_hpc3_virtuix_update_irq(s);
 }
 
 /*
@@ -1422,16 +1422,16 @@ static void sgi_hpc3_scc_update_irq(SGIHPC3State *s)
  * to check for received characters, then reads them from the DATA
  * register (or RR8 via the CMD register).
  */
-static int sgi_hpc3_serial_can_receive(void *opaque)
+static int sgi_hpc3_virtuix_serial_can_receive(void *opaque)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     /* Accept data for port 1 (console) */
     return SCC_RX_FIFO_SIZE - s->serial_rx_fifo_count[1];
 }
 
-static void sgi_hpc3_serial_receive(void *opaque, const uint8_t *buf, int size)
+static void sgi_hpc3_virtuix_serial_receive(void *opaque, const uint8_t *buf, int size)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     int port = 1;  /* Console port */
 
     for (int i = 0; i < size; i++) {
@@ -1457,11 +1457,11 @@ static void sgi_hpc3_serial_receive(void *opaque, const uint8_t *buf, int size)
         } else {
             s->scc_rr3 |= 0x20;  /* Ch A RX Char Available IP */
         }
-        sgi_hpc3_scc_update_irq(s);
+        sgi_hpc3_virtuix_scc_update_irq(s);
     }
 }
 
-static void sgi_hpc3_serial_event(void *opaque, QEMUChrEvent event)
+static void sgi_hpc3_virtuix_serial_event(void *opaque, QEMUChrEvent event)
 {
     /* No special handling needed */
 }
@@ -1476,12 +1476,12 @@ static void sgi_hpc3_serial_event(void *opaque, QEMUChrEvent event)
  * Raise ethernet interrupt: set MISC_INT, local0 ethernet bit, update IRQ.
  * Per MAME: only raise if MISC_INT is not already set.
  */
-static void sgi_hpc3_enet_raise_irq(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_enet_raise_irq(SGIHPC3VirtuixState *s)
 {
     if (!(s->enet_misc & HPC3_ENET_MISC_INT)) {
         s->enet_misc |= HPC3_ENET_MISC_INT;
         s->int3_local0_stat |= INT3_LOCAL0_ETHERNET;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         trace_sgi_hpc3_enet_irq(s->enet_misc, s->enet_rx_ctrl, s->enet_tx_ctrl);
     }
 }
@@ -1490,7 +1490,7 @@ static void sgi_hpc3_enet_raise_irq(SGIHPC3State *s)
  * Reset Seeq and ethernet DMA state.
  * Called on ENET_MISC reset bit or device reset.
  */
-static void sgi_hpc3_enet_reset(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_enet_reset(SGIHPC3VirtuixState *s)
 {
     memset(s->seeq_station_addr, 0, sizeof(s->seeq_station_addr));
     s->seeq_rx_cmd = 0;
@@ -1518,7 +1518,7 @@ static void sgi_hpc3_enet_reset(SGIHPC3State *s)
  * TX DMA: Walk the TX descriptor chain, assemble packet, and send.
  * Called when IRIX writes TXC_CA to HPC3_ENET_TX_CTRL.
  */
-static void sgi_hpc3_enet_tx(SGIHPC3State *s)
+static void sgi_hpc3_virtuix_enet_tx(SGIHPC3VirtuixState *s)
 {
     uint8_t packet_buf[ENET_MAX_PACKET];
     int packet_len = 0;
@@ -1614,16 +1614,16 @@ static void sgi_hpc3_enet_tx(SGIHPC3State *s)
 
     /* Raise interrupt if XIE was set or on completion */
     if (xie) {
-        sgi_hpc3_enet_raise_irq(s);
+        sgi_hpc3_virtuix_enet_raise_irq(s);
     }
 }
 
 /*
  * NIC can_receive callback: check if RX DMA is active and receiver enabled.
  */
-static bool sgi_hpc3_enet_can_receive(NetClientState *nc)
+static bool sgi_hpc3_virtuix_enet_can_receive(NetClientState *nc)
 {
-    SGIHPC3State *s = qemu_get_nic_opaque(nc);
+    SGIHPC3VirtuixState *s = qemu_get_nic_opaque(nc);
 
     /* Must have RX DMA active and Seeq receiver not disabled */
     if (!(s->enet_rx_ctrl & HPC3_ENET_RXC_CA)) {
@@ -1639,10 +1639,10 @@ static bool sgi_hpc3_enet_can_receive(NetClientState *nc)
  * NIC receive callback: called when a packet arrives from QEMU network backend.
  * Writes packet data into guest memory via the RX descriptor chain.
  */
-static ssize_t sgi_hpc3_enet_receive(NetClientState *nc,
+static ssize_t sgi_hpc3_virtuix_enet_receive(NetClientState *nc,
                                       const uint8_t *buf, size_t size)
 {
-    SGIHPC3State *s = qemu_get_nic_opaque(nc);
+    SGIHPC3VirtuixState *s = qemu_get_nic_opaque(nc);
     uint32_t desc_addr, cbp, bc, nbdp;
     uint8_t rx_mode;
 
@@ -1760,22 +1760,22 @@ static ssize_t sgi_hpc3_enet_receive(NetClientState *nc,
 
     /* Raise interrupt */
     if (xie || (bc & HPC3_ENET_BC_EOX) || (s->enet_rx_ctrl & HPC3_ENET_RXC_RBO)) {
-        sgi_hpc3_enet_raise_irq(s);
+        sgi_hpc3_virtuix_enet_raise_irq(s);
     }
 
     return size;
 }
 
-static NetClientInfo sgi_hpc3_enet_net_info = {
+static NetClientInfo sgi_hpc3_virtuix_enet_net_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
-    .can_receive = sgi_hpc3_enet_can_receive,
-    .receive = sgi_hpc3_enet_receive,
+    .can_receive = sgi_hpc3_virtuix_enet_can_receive,
+    .receive = sgi_hpc3_virtuix_enet_receive,
 };
 
-static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t sgi_hpc3_virtuix_read(void *opaque, hwaddr addr, unsigned size)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     uint32_t val = 0;
     hwaddr base_addr = addr & ~3;  /* Align to 32-bit boundary */
 
@@ -1817,7 +1817,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             s->intstat &= ~(0x100 << 0);
             if (s->intstat == 0) {
                 s->int3_local1_stat &= ~INT3_LOCAL1_HPC_DMA;
-                sgi_hpc3_update_irq(s);
+                sgi_hpc3_virtuix_update_irq(s);
             }
         }
         break;
@@ -1853,7 +1853,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             s->intstat &= ~(0x100 << 1);
             if (s->intstat == 0) {
                 s->int3_local1_stat &= ~INT3_LOCAL1_HPC_DMA;
-                sgi_hpc3_update_irq(s);
+                sgi_hpc3_virtuix_update_irq(s);
             }
         }
         break;
@@ -1992,7 +1992,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
                 qemu_chr_fe_accept_input(&s->serial);
                 if (s->serial_rx_fifo_count[1] == 0) {
                     s->scc_rr3 &= ~0x04;  /* Clear Ch B RX IP */
-                    sgi_hpc3_scc_update_irq(s);
+                    sgi_hpc3_virtuix_scc_update_irq(s);
                 }
             } else {
                 val = 0;
@@ -2016,7 +2016,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             qemu_chr_fe_accept_input(&s->serial);
             if (s->serial_rx_fifo_count[1] == 0) {
                 s->scc_rr3 &= ~0x04;  /* Clear Ch B RX IP */
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
             }
         } else {
             val = 0;
@@ -2046,7 +2046,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
                 qemu_chr_fe_accept_input(&s->serial);
                 if (s->serial_rx_fifo_count[0] == 0) {
                     s->scc_rr3 &= ~0x20;  /* Clear Ch A RX IP */
-                    sgi_hpc3_scc_update_irq(s);
+                    sgi_hpc3_virtuix_scc_update_irq(s);
                 }
             } else {
                 val = 0;
@@ -2070,7 +2070,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             qemu_chr_fe_accept_input(&s->serial);
             if (s->serial_rx_fifo_count[0] == 0) {
                 s->scc_rr3 &= ~0x20;  /* Clear Ch A RX IP */
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
             }
         } else {
             val = 0;
@@ -2079,10 +2079,10 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
 
     /* 8042 Keyboard/Mouse controller (embedded in IOC2) */
     case HPC3_KBD_MOUSE0:  /* 0x59840 - Data port */
-        val = sgi_hpc3_kbd_read_data(s);
+        val = sgi_hpc3_virtuix_kbd_read_data(s);
         break;
     case HPC3_KBD_MOUSE1:  /* 0x59844 - Status/Command port */
-        val = sgi_hpc3_kbd_status(s);
+        val = sgi_hpc3_virtuix_kbd_status(s);
         break;
 
     /* INT3 interrupt controller (byte access at +3) */
@@ -2119,13 +2119,13 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
 
     /* 8254 PIT timer registers */
     case HPC3_INT3_PIT_COUNTER0:
-        val = sgi_hpc3_pit_read(s, 0);
+        val = sgi_hpc3_virtuix_pit_read(s, 0);
         break;
     case HPC3_INT3_PIT_COUNTER1:
-        val = sgi_hpc3_pit_read(s, 1);
+        val = sgi_hpc3_virtuix_pit_read(s, 1);
         break;
     case HPC3_INT3_PIT_COUNTER2:
-        val = sgi_hpc3_pit_read(s, 2);
+        val = sgi_hpc3_virtuix_pit_read(s, 2);
         break;
     case HPC3_INT3_PIT_CONTROL:
         /* Control register is write-only, return 0 */
@@ -2158,13 +2158,13 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
         val = 0;
         break;
     case HPC3_FH_INT3_PIT_COUNTER0:
-        val = sgi_hpc3_pit_read(s, 0);
+        val = sgi_hpc3_virtuix_pit_read(s, 0);
         break;
     case HPC3_FH_INT3_PIT_COUNTER1:
-        val = sgi_hpc3_pit_read(s, 1);
+        val = sgi_hpc3_virtuix_pit_read(s, 1);
         break;
     case HPC3_FH_INT3_PIT_COUNTER2:
-        val = sgi_hpc3_pit_read(s, 2);
+        val = sgi_hpc3_virtuix_pit_read(s, 2);
         break;
     case HPC3_FH_INT3_PIT_CONTROL:
         val = 0;
@@ -2237,13 +2237,13 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             hwaddr pio_offset = base_addr - 0x58000;
             if (pio_offset == 0x484) {
                 /* Status register */
-                val = sgi_hpc3_kbd_status(s);
+                val = sgi_hpc3_virtuix_kbd_status(s);
             } else if (pio_offset == 0x488) {
                 /* Data register */
-                val = sgi_hpc3_kbd_read_data(s);
+                val = sgi_hpc3_virtuix_kbd_read_data(s);
             } else if (pio_offset == 0x48c) {
                 /* Alternate status access */
-                val = sgi_hpc3_kbd_status(s);
+                val = sgi_hpc3_virtuix_kbd_status(s);
             } else if (pio_offset == HAL2_REG_ISR) {
                 /* HAL2 ISR: TSTATUS always clear (never busy) */
                 val = s->hal2_isr & ~HAL2_ISR_TSTATUS;
@@ -2281,7 +2281,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             int reg = byte_offset >> 2;  /* 4-byte spacing */
             if (reg < 16) {
                 /* First 16 registers are DS1386 RTC */
-                val = sgi_hpc3_rtc_read(s, reg);
+                val = sgi_hpc3_virtuix_rtc_read(s, reg);
             } else {
                 val = s->bbram[reg];
             }
@@ -2324,10 +2324,10 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
-static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
+static void sgi_hpc3_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
-    SGIHPC3State *s = SGI_HPC3(opaque);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
     hwaddr base_addr = addr & ~3;  /* Align to 32-bit boundary */
 
     trace_sgi_hpc3_write((uint64_t)addr, val);
@@ -2338,7 +2338,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         s->intstat &= ~val;  /* Write to clear */
         if (s->intstat == 0) {
             s->int3_local1_stat &= ~INT3_LOCAL1_HPC_DMA;
-            sgi_hpc3_update_irq(s);
+            sgi_hpc3_virtuix_update_irq(s);
         }
         break;
     case HPC3_MISC:
@@ -2366,7 +2366,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         s->scsi_bc[0] = val;
         break;
     case HPC3_SCSI0_CTRL:
-        sgi_hpc3_scsi_ctrl_write(s, 0, val);
+        sgi_hpc3_virtuix_scsi_ctrl_write(s, 0, val);
         break;
     case HPC3_SCSI0_DMACFG:
         s->scsi_dmacfg[0] = val;
@@ -2390,7 +2390,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         s->scsi_bc[1] = val;
         break;
     case HPC3_SCSI1_CTRL:
-        sgi_hpc3_scsi_ctrl_write(s, 1, val);
+        sgi_hpc3_virtuix_scsi_ctrl_write(s, 1, val);
         break;
     case HPC3_SCSI1_GIO_FIFO:
         break;
@@ -2456,7 +2456,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                               (val & ~(HPC3_ENET_TXC_LC | HPC3_ENET_TXC_ST));
         }
         if (s->enet_tx_ctrl & HPC3_ENET_TXC_CA) {
-            sgi_hpc3_enet_tx(s);
+            sgi_hpc3_virtuix_enet_tx(s);
         }
         break;
     case HPC3_ENET_TX_GIO:
@@ -2473,12 +2473,12 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
          * ERST (bit 0) is toggled by the IRIX driver during every interrupt
          * acknowledge (write 0x03, then 0x00). This is NOT a full device
          * reset — it's part of the HPC3 interrupt handshake. Full reset
-         * only happens at device power-on via sgi_hpc3_enet_reset().
+         * only happens at device power-on via sgi_hpc3_virtuix_enet_reset().
          */
         if (val & HPC3_ENET_MISC_INT) {
             /* Clear interrupt */
             s->int3_local0_stat &= ~INT3_LOCAL0_ETHERNET;
-            sgi_hpc3_update_irq(s);
+            sgi_hpc3_virtuix_update_irq(s);
         }
         /* Store value, but INT bit is write-1-to-clear */
         s->enet_misc = val & ~HPC3_ENET_MISC_INT;
@@ -2557,14 +2557,14 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 break;
             case 2: /* Reset External/Status Interrupts */
                 s->scc_rr3 &= ~0x01;  /* Clear Ch B Ext/Status IP */
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
                 break;
             case 5: /* Reset TX Interrupt Pending */
                 qemu_log_mask(LOG_UNIMP,
                     "sgi_hpc3: ChB WR0 cmd5 Reset TX IP (rr3 0x%02x→0x%02x)\n",
                     s->scc_rr3, s->scc_rr3 & ~0x02);
                 s->scc_rr3 &= ~0x02;  /* Clear Ch B TX IP */
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
                 break;
             case 6: /* Error Reset */
                 break;
@@ -2618,7 +2618,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                         /* Set TX_IP immediately — latched in RR3 */
                         s->scc_rr3 |= 0x02;  /* Ch B TX IP */
                         /* Cascade interrupt through INT3 immediately */
-                        sgi_hpc3_scc_update_irq(s);
+                        sgi_hpc3_virtuix_scc_update_irq(s);
                     }
                 }
                 break;
@@ -2626,7 +2626,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 s->scc_wr5[1] = val;
                 break;
             case 8: /* WR8: TX data buffer */
-                sgi_hpc3_serial_write(s, 1, val);
+                sgi_hpc3_virtuix_serial_write(s, 1, val);
                 break;
             case 9: /* WR9: Master interrupt control (shared) */
                 s->scc_wr9 = val;
@@ -2643,14 +2643,14 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                         s->scc_wr1[1] = 0;
                     }
                 }
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
                 break;
             }
             s->serial_reg_ptr[1] = 0;
         }
         break;
     case HPC3_SERIAL1_DATA:
-        sgi_hpc3_serial_write(s, 1, val);
+        sgi_hpc3_virtuix_serial_write(s, 1, val);
         break;
     case HPC3_SERIAL0_CMD:
         if (s->serial_reg_ptr[0] == 0) {
@@ -2663,11 +2663,11 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 break;
             case 2: /* Reset External/Status Interrupts */
                 s->scc_rr3 &= ~0x08;  /* Clear Ch A Ext/Status IP */
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
                 break;
             case 5: /* Reset TX Interrupt Pending */
                 s->scc_rr3 &= ~0x10;  /* Clear Ch A TX IP */
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
                 break;
             case 6: /* Error Reset */
                 break;
@@ -2689,7 +2689,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                     /* TX_IP fires synchronously on TX_INT_ENBL 0→1 */
                     if ((val & 0x02) && !(old_wr1 & 0x02)) {
                         s->scc_rr3 |= 0x10;  /* Ch A TX IP */
-                        sgi_hpc3_scc_update_irq(s);
+                        sgi_hpc3_virtuix_scc_update_irq(s);
                     }
                 }
                 break;
@@ -2697,7 +2697,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 s->scc_wr5[0] = val;
                 break;
             case 8:
-                sgi_hpc3_serial_write(s, 0, val);
+                sgi_hpc3_virtuix_serial_write(s, 0, val);
                 break;
             case 9:
                 s->scc_wr9 = val;
@@ -2711,42 +2711,42 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                         s->scc_wr1[1] = 0;
                     }
                 }
-                sgi_hpc3_scc_update_irq(s);
+                sgi_hpc3_virtuix_scc_update_irq(s);
                 break;
             }
             s->serial_reg_ptr[0] = 0;
         }
         break;
     case HPC3_SERIAL0_DATA:
-        sgi_hpc3_serial_write(s, 0, val);
+        sgi_hpc3_virtuix_serial_write(s, 0, val);
         break;
 
     /* 8042 Keyboard/Mouse controller (embedded in IOC2) */
     case HPC3_KBD_MOUSE0:  /* 0x59840 - Data port */
-        sgi_hpc3_kbd_data_write(s, val);
+        sgi_hpc3_virtuix_kbd_data_write(s, val);
         break;
     case HPC3_KBD_MOUSE1:  /* 0x59844 - Command port */
-        sgi_hpc3_kbd_command(s, val);
+        sgi_hpc3_virtuix_kbd_command(s, val);
         break;
 
     /* INT3 interrupt controller (byte access at +3) */
     case HPC3_INT3_LOCAL0_MASK:
         s->int3_local0_mask = val;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_INT3_LOCAL1_MASK:
         s->int3_local1_mask = val;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_INT3_MAP_MASK0:
         s->int3_map_mask0 = val;
         /* Re-evaluate mapped interrupt cascade (per MAME set_map_int_mask) */
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_INT3_MAP_MASK1:
         s->int3_map_mask1 = val;
         /* Re-evaluate mapped interrupt cascade (per MAME set_map_int_mask) */
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_INT3_MAP_POLARITY:
         s->int3_map_polarity = val;
@@ -2757,7 +2757,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
          * Bit 0 clears timer 0, bit 1 clears timer 1.
          * Timer interrupts go directly to CPU via timer_irq[] lines,
          * not through INT3 cascade.  MAPPABLE0/MAPPABLE1 are handled
-         * centrally by sgi_hpc3_update_irq().
+         * centrally by sgi_hpc3_virtuix_update_irq().
          */
         if (val & 0x01) {
             s->timer_pending[0] = false;
@@ -2765,39 +2765,39 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         if (val & 0x02) {
             s->timer_pending[1] = false;
         }
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
 
     /* 8254 PIT timer registers */
     case HPC3_INT3_PIT_COUNTER0:
-        sgi_hpc3_pit_write(s, 0, val);
+        sgi_hpc3_virtuix_pit_write(s, 0, val);
         break;
     case HPC3_INT3_PIT_COUNTER1:
-        sgi_hpc3_pit_write(s, 1, val);
+        sgi_hpc3_virtuix_pit_write(s, 1, val);
         break;
     case HPC3_INT3_PIT_COUNTER2:
-        sgi_hpc3_pit_write(s, 2, val);
+        sgi_hpc3_virtuix_pit_write(s, 2, val);
         break;
     case HPC3_INT3_PIT_CONTROL:
-        sgi_hpc3_pit_control_write(s, val);
+        sgi_hpc3_virtuix_pit_control_write(s, val);
         break;
 
     /* Full House (IP22) INT3 at PIO4 base - same state, different offsets */
     case HPC3_FH_INT3_LOCAL0_MASK:
         s->int3_local0_mask = val;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_FH_INT3_LOCAL1_MASK:
         s->int3_local1_mask = val;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_FH_INT3_MAP_MASK0:
         s->int3_map_mask0 = val;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_FH_INT3_MAP_MASK1:
         s->int3_map_mask1 = val;
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_FH_INT3_TIMER_CLEAR:
         if (val & 0x01) {
@@ -2806,19 +2806,19 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         if (val & 0x02) {
             s->timer_pending[1] = false;
         }
-        sgi_hpc3_update_irq(s);
+        sgi_hpc3_virtuix_update_irq(s);
         break;
     case HPC3_FH_INT3_PIT_COUNTER0:
-        sgi_hpc3_pit_write(s, 0, val);
+        sgi_hpc3_virtuix_pit_write(s, 0, val);
         break;
     case HPC3_FH_INT3_PIT_COUNTER1:
-        sgi_hpc3_pit_write(s, 1, val);
+        sgi_hpc3_virtuix_pit_write(s, 1, val);
         break;
     case HPC3_FH_INT3_PIT_COUNTER2:
-        sgi_hpc3_pit_write(s, 2, val);
+        sgi_hpc3_virtuix_pit_write(s, 2, val);
         break;
     case HPC3_FH_INT3_PIT_CONTROL:
-        sgi_hpc3_pit_control_write(s, val);
+        sgi_hpc3_virtuix_pit_control_write(s, val);
         break;
 
     default:
@@ -2898,10 +2898,10 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
             hwaddr pio_offset = base_addr - 0x58000;
             if (pio_offset == 0x484) {
                 /* Command register */
-                sgi_hpc3_kbd_command(s, val);
+                sgi_hpc3_virtuix_kbd_command(s, val);
             } else if (pio_offset == 0x488) {
                 /* Data register */
-                sgi_hpc3_kbd_data_write(s, val);
+                sgi_hpc3_virtuix_kbd_data_write(s, val);
             } else if (pio_offset == HAL2_REG_ISR) {
                 /* HAL2 ISR: PROM writes reset bits here */
                 s->hal2_isr = val;
@@ -2938,7 +2938,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 s->rtc_command = val;
             } else {
                 s->bbram[reg] = val;
-                sgi_hpc3_nvram_sync(s, reg);
+                sgi_hpc3_virtuix_nvram_sync(s, reg);
                 /* Recalculate time offset when time registers are written */
                 if (reg >= RTC_SECONDS && reg <= RTC_YEAR) {
                     struct tm tm;
@@ -2989,9 +2989,9 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
-static const MemoryRegionOps sgi_hpc3_ops = {
-    .read = sgi_hpc3_read,
-    .write = sgi_hpc3_write,
+static const MemoryRegionOps sgi_hpc3_virtuix_ops = {
+    .read = sgi_hpc3_virtuix_read,
+    .write = sgi_hpc3_virtuix_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .impl = {
         .min_access_size = 1,
@@ -2999,9 +2999,9 @@ static const MemoryRegionOps sgi_hpc3_ops = {
     },
 };
 
-static void sgi_hpc3_reset(DeviceState *dev)
+static void sgi_hpc3_virtuix_reset(DeviceState *dev)
 {
-    SGIHPC3State *s = SGI_HPC3(dev);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(dev);
 
     s->intstat = 0;
     s->misc = 0;
@@ -3022,7 +3022,7 @@ static void sgi_hpc3_reset(DeviceState *dev)
         s->scsi_drq[i] = false;
     }
 
-    sgi_hpc3_enet_reset(s);
+    sgi_hpc3_virtuix_enet_reset(s);
 
     /* SCSI controllers are reset by their own device reset */
 
@@ -3134,7 +3134,7 @@ static void sgi_hpc3_reset(DeviceState *dev)
 
     /* If NVRAM wasn't loaded from file, initialize with defaults */
     if (!s->nvram_loaded) {
-        sgi_hpc3_nvram_init_defaults(s);
+        sgi_hpc3_virtuix_nvram_init_defaults(s);
     } else if (!s->autoload) {
         /*
          * Even with NVRAM loaded from file, override AutoLoad when
@@ -3143,17 +3143,17 @@ static void sgi_hpc3_reset(DeviceState *dev)
          */
         uint8_t *table = &s->bbram[NVRAM_TABLE_BASE];
         table[NVOFF_AUTOLOAD] = 'N';
-        table[NVOFF_CHECKSUM] = sgi_hpc3_nvram_checksum(table,
+        table[NVOFF_CHECKSUM] = sgi_hpc3_virtuix_nvram_checksum(table,
                                                          NVRAM_TABLE_SIZE);
     }
 
     /* Initialize serial EEPROM with NVRAM defaults (Full House path) */
-    sgi_hpc3_eeprom_init_defaults(s);
+    sgi_hpc3_virtuix_eeprom_init_defaults(s);
 }
 
-static void sgi_hpc3_realize(DeviceState *dev, Error **errp)
+static void sgi_hpc3_virtuix_realize(DeviceState *dev, Error **errp)
 {
-    SGIHPC3State *s = SGI_HPC3(dev);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(dev);
 
     /* Realize PS/2 keyboard and mouse devices */
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->ps2kbd), errp)) {
@@ -3215,19 +3215,19 @@ static void sgi_hpc3_realize(DeviceState *dev, Error **errp)
      * Channel 2 is the master clock and doesn't generate interrupts
      */
     s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                    sgi_hpc3_pit_timer0_cb, s);
+                                    sgi_hpc3_virtuix_pit_timer0_cb, s);
     s->pit_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                    sgi_hpc3_pit_timer1_cb, s);
+                                    sgi_hpc3_virtuix_pit_timer1_cb, s);
 
     /* SCC TX completion timers (one per channel) */
     s->scc_tx_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                       sgi_hpc3_scc_tx_timer_cb, s);
+                                       sgi_hpc3_virtuix_scc_tx_timer_cb, s);
     s->scc_tx_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                       sgi_hpc3_scc_tx_timer_cb, s);
+                                       sgi_hpc3_virtuix_scc_tx_timer_cb, s);
 
     /* Create ethernet NIC (Seeq 80C03 via HPC3 DMA) */
     qemu_macaddr_default_if_unset(&s->enet_conf.macaddr);
-    s->nic = qemu_new_nic(&sgi_hpc3_enet_net_info, &s->enet_conf,
+    s->nic = qemu_new_nic(&sgi_hpc3_virtuix_enet_net_info, &s->enet_conf,
                            object_get_typename(OBJECT(dev)), dev->id,
                            &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic),
@@ -3236,9 +3236,9 @@ static void sgi_hpc3_realize(DeviceState *dev, Error **errp)
     /* Register serial chardev receive handlers (for serial console input) */
     if (qemu_chr_fe_backend_connected(&s->serial)) {
         qemu_chr_fe_set_handlers(&s->serial,
-                                  sgi_hpc3_serial_can_receive,
-                                  sgi_hpc3_serial_receive,
-                                  sgi_hpc3_serial_event,
+                                  sgi_hpc3_virtuix_serial_can_receive,
+                                  sgi_hpc3_virtuix_serial_receive,
+                                  sgi_hpc3_virtuix_serial_event,
                                   NULL, s, NULL, true);
     }
 
@@ -3257,36 +3257,36 @@ static void sgi_hpc3_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static void sgi_hpc3_init(Object *obj)
+static void sgi_hpc3_virtuix_init(Object *obj)
 {
-    SGIHPC3State *s = SGI_HPC3(obj);
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, obj, &sgi_hpc3_ops, s,
-                          "sgi-hpc3", HPC3_REG_SIZE);
+    memory_region_init_io(&s->iomem, obj, &sgi_hpc3_virtuix_ops, s,
+                          "sgi-hpc3-virtuix", HPC3_REG_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
 
     /* Create GPIO inputs for SCSI interrupts (from WD33C93 controllers) */
-    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_scsi_irq, "scsi-irq", 2);
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_scsi_irq, "scsi-irq", 2);
 
     /* Create GPIO inputs for SCSI DRQ (from WD33C93 controllers) */
-    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_scsi_drq, "scsi-drq", 2);
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_scsi_drq, "scsi-drq", 2);
 
     /* Create GPIO input for GIO retrace/VBLANK interrupt (from Newport) */
-    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_gio_retrace_irq,
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_gio_retrace_irq,
                             "gio-retrace", 1);
-    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_mc_dma_irq,
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_mc_dma_irq,
                             "mc-dma-irq", 1);
 
     /* Initialize PS/2 keyboard and mouse child devices */
-    object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_SGI_PS2_KBD);
+    object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_SGI_PS2_KBD_VIRTUIX);
     object_initialize_child(obj, "ps2mouse", &s->ps2mouse,
                             TYPE_PS2_MOUSE_DEVICE);
 
     /* GPIO inputs for PS/2 device IRQ callbacks */
-    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_ps2_kbd_irq,
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_ps2_kbd_irq,
                             "ps2-kbd-irq", 1);
-    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_ps2_mouse_irq,
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_ps2_mouse_irq,
                             "ps2-mouse-irq", 1);
 
     /* Create GPIO outputs for CPU interrupts (to MIPS CPU) */
@@ -3296,119 +3296,119 @@ static void sgi_hpc3_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(s), s->timer_irq, "timer-irq", 2);
 }
 
-static const Property sgi_hpc3_properties[] = {
-    DEFINE_PROP_CHR("chardev", SGIHPC3State, serial),
-    DEFINE_PROP_UINT8("board-type", SGIHPC3State, board_type, BOARD_IP24),
-    DEFINE_PROP_UINT8("nvram-rev", SGIHPC3State, nvram_rev, 8),
-    DEFINE_NIC_PROPERTIES(SGIHPC3State, enet_conf),
-    DEFINE_PROP_STRING("nvram-file", SGIHPC3State, nvram_filename),
-    DEFINE_PROP_BOOL("autoload", SGIHPC3State, autoload, true),
+static const Property sgi_hpc3_virtuix_properties[] = {
+    DEFINE_PROP_CHR("chardev", SGIHPC3VirtuixState, serial),
+    DEFINE_PROP_UINT8("board-type", SGIHPC3VirtuixState, board_type, BOARD_IP24),
+    DEFINE_PROP_UINT8("nvram-rev", SGIHPC3VirtuixState, nvram_rev, 8),
+    DEFINE_NIC_PROPERTIES(SGIHPC3VirtuixState, enet_conf),
+    DEFINE_PROP_STRING("nvram-file", SGIHPC3VirtuixState, nvram_filename),
+    DEFINE_PROP_BOOL("autoload", SGIHPC3VirtuixState, autoload, true),
 };
 
 static const VMStateDescription vmstate_sgi_hpc3 = {
-    .name = "sgi-hpc3",
+    .name = "sgi-hpc3-virtuix",
     .version_id = 6,
     .minimum_version_id = 6,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT8_ARRAY(bbram, SGIHPC3State, 8192),
-        VMSTATE_UINT32(intstat, SGIHPC3State),
-        VMSTATE_UINT32(misc, SGIHPC3State),
-        VMSTATE_UINT32(eeprom, SGIHPC3State),
-        VMSTATE_UINT32(buserr_stat, SGIHPC3State),
-        VMSTATE_UINT32_ARRAY(scsi_cbp, SGIHPC3State, 2),
-        VMSTATE_UINT32_ARRAY(scsi_nbdp, SGIHPC3State, 2),
-        VMSTATE_UINT32_ARRAY(scsi_bc, SGIHPC3State, 2),
-        VMSTATE_UINT32_ARRAY(scsi_ctrl, SGIHPC3State, 2),
-        VMSTATE_UINT32_ARRAY(scsi_dmacfg, SGIHPC3State, 2),
-        VMSTATE_UINT32_ARRAY(scsi_piocfg, SGIHPC3State, 2),
-        VMSTATE_UINT16_ARRAY(scsi_dma_count, SGIHPC3State, 2),
-        VMSTATE_BOOL_ARRAY(scsi_dma_active, SGIHPC3State, 2),
-        VMSTATE_BOOL_ARRAY(scsi_dma_to_device, SGIHPC3State, 2),
-        VMSTATE_BOOL_ARRAY(scsi_dma_big_endian, SGIHPC3State, 2),
-        VMSTATE_BOOL_ARRAY(scsi_drq, SGIHPC3State, 2),
-        VMSTATE_UINT32(enet_rx_cbp, SGIHPC3State),
-        VMSTATE_UINT32(enet_rx_nbdp, SGIHPC3State),
-        VMSTATE_UINT32(enet_rx_bc, SGIHPC3State),
-        VMSTATE_UINT32(enet_rx_ctrl, SGIHPC3State),
-        VMSTATE_UINT32(enet_tx_cbp, SGIHPC3State),
-        VMSTATE_UINT32(enet_tx_nbdp, SGIHPC3State),
-        VMSTATE_UINT32(enet_tx_bc, SGIHPC3State),
-        VMSTATE_UINT32(enet_tx_ctrl, SGIHPC3State),
-        VMSTATE_UINT32(enet_misc, SGIHPC3State),
-        VMSTATE_UINT32(enet_dmacfg, SGIHPC3State),
-        VMSTATE_UINT32(enet_piocfg, SGIHPC3State),
-        VMSTATE_UINT32(enet_rx_cbdp, SGIHPC3State),
-        VMSTATE_UINT32(enet_tx_cpfbdp, SGIHPC3State),
-        VMSTATE_UINT32(enet_tx_ppfbdp, SGIHPC3State),
-        VMSTATE_UINT8_ARRAY(seeq_station_addr, SGIHPC3State, 6),
-        VMSTATE_UINT8(seeq_rx_cmd, SGIHPC3State),
-        VMSTATE_UINT8(seeq_tx_cmd, SGIHPC3State),
-        VMSTATE_UINT8(seeq_rx_status, SGIHPC3State),
-        VMSTATE_UINT8(seeq_tx_status, SGIHPC3State),
-        VMSTATE_UINT32_ARRAY(pbus_dmacfg, SGIHPC3State, 8),
-        VMSTATE_UINT32_ARRAY(pbus_piocfg, SGIHPC3State, 10),
-        VMSTATE_UINT32_ARRAY(pbus_bp, SGIHPC3State, 8),
-        VMSTATE_UINT32_ARRAY(pbus_dp, SGIHPC3State, 8),
-        VMSTATE_UINT32_ARRAY(pbus_ctrl, SGIHPC3State, 8),
-        VMSTATE_UINT32(par_data, SGIHPC3State),
-        VMSTATE_UINT32(par_control, SGIHPC3State),
-        VMSTATE_UINT32(gen_control, SGIHPC3State),
-        VMSTATE_UINT32(panel, SGIHPC3State),
-        VMSTATE_UINT32(sysid, SGIHPC3State),
-        VMSTATE_UINT8(board_type, SGIHPC3State),
-        VMSTATE_UINT32(read_reg, SGIHPC3State),
-        VMSTATE_UINT32(dma_select, SGIHPC3State),
-        VMSTATE_UINT32(write1, SGIHPC3State),
-        VMSTATE_UINT32(write2, SGIHPC3State),
-        VMSTATE_UINT32(int3_local0_stat, SGIHPC3State),
-        VMSTATE_UINT32(int3_local0_mask, SGIHPC3State),
-        VMSTATE_UINT32(int3_local1_stat, SGIHPC3State),
-        VMSTATE_UINT32(int3_local1_mask, SGIHPC3State),
-        VMSTATE_UINT32(int3_map_status, SGIHPC3State),
-        VMSTATE_UINT32(int3_map_mask0, SGIHPC3State),
-        VMSTATE_UINT32(int3_map_mask1, SGIHPC3State),
-        VMSTATE_UINT32(int3_map_polarity, SGIHPC3State),
-        VMSTATE_UINT32(int3_error_status, SGIHPC3State),
-        VMSTATE_UINT8_ARRAY(serial_cmd, SGIHPC3State, 2),
-        VMSTATE_UINT8_ARRAY(serial_data, SGIHPC3State, 2),
-        VMSTATE_INT64(rtc_time_offset, SGIHPC3State),
-        VMSTATE_UINT16_ARRAY(pit_count, SGIHPC3State, 3),
-        VMSTATE_UINT16_ARRAY(pit_latch, SGIHPC3State, 3),
-        VMSTATE_UINT8_ARRAY(pit_control, SGIHPC3State, 3),
-        VMSTATE_UINT8_ARRAY(pit_rw_state, SGIHPC3State, 3),
-        VMSTATE_INT64_ARRAY(pit_load_time, SGIHPC3State, 3),
-        VMSTATE_UINT8(kbd_cmd, SGIHPC3State),
-        VMSTATE_UINT8(kbd_cmd_byte, SGIHPC3State),
-        VMSTATE_BOOL(kbd_write_to_mouse, SGIHPC3State),
-        VMSTATE_BOOL(kbd_irq_level, SGIHPC3State),
-        VMSTATE_BOOL(mouse_irq_level, SGIHPC3State),
-        VMSTATE_UINT8(kbd_pending_source, SGIHPC3State),
-        VMSTATE_BOOL_ARRAY(timer_pending, SGIHPC3State, 2),
-        VMSTATE_UINT32(hal2_isr, SGIHPC3State),
-        VMSTATE_UINT32(hal2_iar, SGIHPC3State),
-        VMSTATE_UINT32_ARRAY(hal2_idr, SGIHPC3State, 4),
-        VMSTATE_UINT8(hal2_volume_left, SGIHPC3State),
-        VMSTATE_UINT8(hal2_volume_right, SGIHPC3State),
+        VMSTATE_UINT8_ARRAY(bbram, SGIHPC3VirtuixState, 8192),
+        VMSTATE_UINT32(intstat, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(misc, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(eeprom, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(buserr_stat, SGIHPC3VirtuixState),
+        VMSTATE_UINT32_ARRAY(scsi_cbp, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32_ARRAY(scsi_nbdp, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32_ARRAY(scsi_bc, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32_ARRAY(scsi_ctrl, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32_ARRAY(scsi_dmacfg, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32_ARRAY(scsi_piocfg, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT16_ARRAY(scsi_dma_count, SGIHPC3VirtuixState, 2),
+        VMSTATE_BOOL_ARRAY(scsi_dma_active, SGIHPC3VirtuixState, 2),
+        VMSTATE_BOOL_ARRAY(scsi_dma_to_device, SGIHPC3VirtuixState, 2),
+        VMSTATE_BOOL_ARRAY(scsi_dma_big_endian, SGIHPC3VirtuixState, 2),
+        VMSTATE_BOOL_ARRAY(scsi_drq, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32(enet_rx_cbp, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_rx_nbdp, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_rx_bc, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_rx_ctrl, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_tx_cbp, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_tx_nbdp, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_tx_bc, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_tx_ctrl, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_misc, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_dmacfg, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_piocfg, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_rx_cbdp, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_tx_cpfbdp, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(enet_tx_ppfbdp, SGIHPC3VirtuixState),
+        VMSTATE_UINT8_ARRAY(seeq_station_addr, SGIHPC3VirtuixState, 6),
+        VMSTATE_UINT8(seeq_rx_cmd, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(seeq_tx_cmd, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(seeq_rx_status, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(seeq_tx_status, SGIHPC3VirtuixState),
+        VMSTATE_UINT32_ARRAY(pbus_dmacfg, SGIHPC3VirtuixState, 8),
+        VMSTATE_UINT32_ARRAY(pbus_piocfg, SGIHPC3VirtuixState, 10),
+        VMSTATE_UINT32_ARRAY(pbus_bp, SGIHPC3VirtuixState, 8),
+        VMSTATE_UINT32_ARRAY(pbus_dp, SGIHPC3VirtuixState, 8),
+        VMSTATE_UINT32_ARRAY(pbus_ctrl, SGIHPC3VirtuixState, 8),
+        VMSTATE_UINT32(par_data, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(par_control, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(gen_control, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(panel, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(sysid, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(board_type, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(read_reg, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(dma_select, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(write1, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(write2, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_local0_stat, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_local0_mask, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_local1_stat, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_local1_mask, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_map_status, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_map_mask0, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_map_mask1, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_map_polarity, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(int3_error_status, SGIHPC3VirtuixState),
+        VMSTATE_UINT8_ARRAY(serial_cmd, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8_ARRAY(serial_data, SGIHPC3VirtuixState, 2),
+        VMSTATE_INT64(rtc_time_offset, SGIHPC3VirtuixState),
+        VMSTATE_UINT16_ARRAY(pit_count, SGIHPC3VirtuixState, 3),
+        VMSTATE_UINT16_ARRAY(pit_latch, SGIHPC3VirtuixState, 3),
+        VMSTATE_UINT8_ARRAY(pit_control, SGIHPC3VirtuixState, 3),
+        VMSTATE_UINT8_ARRAY(pit_rw_state, SGIHPC3VirtuixState, 3),
+        VMSTATE_INT64_ARRAY(pit_load_time, SGIHPC3VirtuixState, 3),
+        VMSTATE_UINT8(kbd_cmd, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(kbd_cmd_byte, SGIHPC3VirtuixState),
+        VMSTATE_BOOL(kbd_write_to_mouse, SGIHPC3VirtuixState),
+        VMSTATE_BOOL(kbd_irq_level, SGIHPC3VirtuixState),
+        VMSTATE_BOOL(mouse_irq_level, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(kbd_pending_source, SGIHPC3VirtuixState),
+        VMSTATE_BOOL_ARRAY(timer_pending, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT32(hal2_isr, SGIHPC3VirtuixState),
+        VMSTATE_UINT32(hal2_iar, SGIHPC3VirtuixState),
+        VMSTATE_UINT32_ARRAY(hal2_idr, SGIHPC3VirtuixState, 4),
+        VMSTATE_UINT8(hal2_volume_left, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(hal2_volume_right, SGIHPC3VirtuixState),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static void sgi_hpc3_class_init(ObjectClass *klass, const void *data)
+static void sgi_hpc3_virtuix_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->realize = sgi_hpc3_realize;
-    device_class_set_legacy_reset(dc, sgi_hpc3_reset);
+    dc->realize = sgi_hpc3_virtuix_realize;
+    device_class_set_legacy_reset(dc, sgi_hpc3_virtuix_reset);
     dc->vmsd = &vmstate_sgi_hpc3;
-    device_class_set_props(dc, sgi_hpc3_properties);
+    device_class_set_props(dc, sgi_hpc3_virtuix_properties);
 }
 
-static const TypeInfo sgi_hpc3_info = {
-    .name          = TYPE_SGI_HPC3,
+static const TypeInfo sgi_hpc3_virtuix_info = {
+    .name          = TYPE_SGI_HPC3_VIRTUIX,
     .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(SGIHPC3State),
-    .instance_init = sgi_hpc3_init,
-    .class_init    = sgi_hpc3_class_init,
+    .instance_size = sizeof(SGIHPC3VirtuixState),
+    .instance_init = sgi_hpc3_virtuix_init,
+    .class_init    = sgi_hpc3_virtuix_class_init,
 };
 
 /* -----------------------------------------------------------------------
@@ -3520,7 +3520,7 @@ static void sgi_ps2_put_keycode(PS2KbdState *ps2, int keycode)
  * Emit a PS/2 make code for qcode (used by the typematic timer callback).
  * PAUSE and PRINT are skipped — they do not repeat on real hardware.
  */
-static void sgi_ps2_emit_make(SGIPs2KbdState *s, int qcode)
+static void sgi_ps2_emit_make(SGIPs2KbdVirtuixState *s, int qcode)
 {
     PS2KbdState *ps2 = &s->parent_obj;
     uint16_t keycode = 0;
@@ -3562,7 +3562,7 @@ static void sgi_ps2_emit_make(SGIPs2KbdState *s, int qcode)
 /* Typematic repeat timer callback — fires on QEMU_CLOCK_REALTIME. */
 static void sgi_ps2_kbd_typematic(void *opaque)
 {
-    SGIPs2KbdState *s = opaque;
+    SGIPs2KbdVirtuixState *s = opaque;
 
     if (s->typematic_qcode < 0) {
         return;
@@ -3584,7 +3584,7 @@ static void sgi_ps2_kbd_typematic(void *opaque)
 static void sgi_ps2_keyboard_event(DeviceState *dev, QemuConsole *src,
                                    InputEvent *evt)
 {
-    SGIPs2KbdState *s = (SGIPs2KbdState *)dev;
+    SGIPs2KbdVirtuixState *s = (SGIPs2KbdVirtuixState *)dev;
     PS2KbdState *ps2 = &s->parent_obj;
     InputKeyEvent *key = evt->u.key.data;
     int qcode;
@@ -3893,7 +3893,7 @@ static ResettableHoldPhase sgi_ps2_parent_hold_fn;
 /* Reset hold: call upstream ps2_kbd_reset_hold, then reset typematic state. */
 static void sgi_ps2_kbd_reset_hold(Object *obj, ResetType type)
 {
-    SGIPs2KbdState *s = (SGIPs2KbdState *)obj;
+    SGIPs2KbdVirtuixState *s = (SGIPs2KbdVirtuixState *)obj;
 
     if (sgi_ps2_parent_hold_fn) {
         sgi_ps2_parent_hold_fn(obj, type);
@@ -3906,7 +3906,7 @@ static void sgi_ps2_kbd_reset_hold(Object *obj, ResetType type)
 
 static void sgi_ps2_kbd_realize(DeviceState *dev, Error **errp)
 {
-    SGIPs2KbdState *s = (SGIPs2KbdState *)dev;
+    SGIPs2KbdVirtuixState *s = (SGIPs2KbdVirtuixState *)dev;
 
     s->typematic_qcode    = -1;
     s->typematic_delay_ms  = 500;
@@ -3941,16 +3941,16 @@ static void sgi_ps2_kbd_class_init(ObjectClass *klass, const void *data)
 }
 
 static const TypeInfo sgi_ps2_kbd_info = {
-    .name          = TYPE_SGI_PS2_KBD,
+    .name          = TYPE_SGI_PS2_KBD_VIRTUIX,
     .parent        = TYPE_PS2_KBD_DEVICE,
-    .instance_size = sizeof(SGIPs2KbdState),
+    .instance_size = sizeof(SGIPs2KbdVirtuixState),
     .class_init    = sgi_ps2_kbd_class_init,
 };
 
-static void sgi_hpc3_register_types(void)
+static void sgi_hpc3_virtuix_register_types(void)
 {
     type_register_static(&sgi_ps2_kbd_info);
-    type_register_static(&sgi_hpc3_info);
+    type_register_static(&sgi_hpc3_virtuix_info);
 }
 
-type_init(sgi_hpc3_register_types)
+type_init(sgi_hpc3_virtuix_register_types)

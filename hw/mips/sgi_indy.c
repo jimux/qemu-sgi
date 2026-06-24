@@ -75,7 +75,8 @@
 #define SGI_EISA_IO_SIZE (512 * KiB)
 
 #define SGI_PROM_SIZE (512 * KiB)
-#define SGI_RAM_MAX (2048 * MiB)
+/* Authentic Indy/Indigo2 RAM cap = 256 MiB. (Virtuix's larger cap is private.) */
+#define SGI_RAM_MAX (256 * MiB)
 
 /* Forward declaration for kernel boot trampoline */
 static void write_kernel_trampoline(uint32_t kernel_entry_32);
@@ -336,7 +337,7 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
 
   /* Validate RAM size */
   if (machine->ram_size > SGI_RAM_MAX) {
-    error_report("RAM size more than 2GB is not supported");
+    error_report("RAM size more than 256MB is not supported");
     exit(EXIT_FAILURE);
   }
 
@@ -346,11 +347,19 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
                 "Using R4000 instead. PROM will fail CPU PRId check.");
   }
 
-  /* Create CPU clock */
+  /*
+   * Create CPU clock. The modeled CPU frequency sets the CP0 Count rate
+   * (Count = cpu_clock / CCRes). Authentic Indy is modeled at 100 MHz -- this
+   * is the faithful Indy machine; the virtualization-native clock match/decouple
+   * lives in the separate Virtuix machine (hw/mips/sgi_virtuix.c), NOT here.
+   */
   cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
-  clock_set_hz(cpuclk, 100000000); /* 100 MHz default */
+  clock_set_hz(cpuclk, 100000000);
 
-  /* Create CPU */
+  /*
+   * Authentic Indy/Indigo2 are uniprocessor (max_cpus = 1). Create the single
+   * CPU; SMP (the sgi-smp paravirtual controller) is a Virtuix-only feature.
+   */
   cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk, true);
   cpu_mips_irq_init_cpu(cpu);
   cpu_mips_clock_init(cpu);
@@ -523,6 +532,10 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     qdev_connect_gpio_out_named(hpc3_dev, "cpu-irq", 1, cpu->env.irq[3]);
     qdev_connect_gpio_out_named(hpc3_dev, "timer-irq", 0, cpu->env.irq[4]);
     qdev_connect_gpio_out_named(hpc3_dev, "timer-irq", 1, cpu->env.irq[5]);
+
+    /* MC GIO DMA-complete → HPC3 LIO_GDMA (Local0 bit 4) → IP2 */
+    sysbus_connect_irq(SYS_BUS_DEVICE(mc_dev), 0,
+                       qdev_get_gpio_in_named(hpc3_dev, "mc-dma-irq", 0));
   }
 
   /*
@@ -706,6 +719,13 @@ static void sgi_indigo2_r10k_init(MachineState *machine) {
 static void sgi_indigo_init(MachineState *machine) {
   sgi_ip2x_init(machine, SGI_IP20);
 }
+
+/*
+ * NOTE: Virtuix (IP55) is NOT defined here. It is a separate, virtualization-
+ * native machine with its OWN device copies, in hw/mips/sgi_virtuix.c. Keep
+ * this file authentic-Indy only -- changes here must not bleed into Virtuix and
+ * vice-versa.
+ */
 
 /* Per-machine class_init functions */
 

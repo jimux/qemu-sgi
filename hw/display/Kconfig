@@ -153,6 +153,9 @@ config MAC_PVG_PCI
 config SGI_NEWPORT
     bool
 
+config SGI_NEWPORT_VIRTUIX
+    bool
+
 config SGI_GBE
     bool
 

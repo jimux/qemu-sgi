@@ -75,7 +75,15 @@ static void sgi_smp_write(void *opaque, hwaddr addr, uint64_t val,
           CPUState *cs = s->cpus[i];
           cpu_reset(cs);
           MIPSCPU *mips_cpu = MIPS_CPU(cs);
-          mips_cpu->env.active_tc.PC = s->boot_addr;
+          /*
+           * boot_addr is a 32-bit register write but the secondary CPU runs in
+           * 64-bit mode, where compatibility-segment addresses (KSEG0/1, the
+           * reset/boot region 0xbfc.....) must be sign-extended. Assigning the
+           * bare uint32 would yield 0x00000000bfc..... (an unmapped xuseg
+           * address) and the CPU would fault immediately. Sign-extend so e.g.
+           * 0xbfc00078 -> 0xffffffffbfc00078.
+           */
+          mips_cpu->env.active_tc.PC = (target_ulong)(int32_t)s->boot_addr;
           cs->halted = 0;
           qemu_cpu_kick(cs);
           s->started[i] = true;

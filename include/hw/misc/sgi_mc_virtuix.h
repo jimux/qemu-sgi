@@ -1,19 +1,19 @@
 /*
- * SGI Memory Controller (MC) emulation
+ * SGI Memory Controller (MC) emulation -- VIRTUIX/IP55 variant
  *
  * Copyright (c) 2024 the QEMU project
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#ifndef HW_MISC_SGI_MC_H
-#define HW_MISC_SGI_MC_H
+#ifndef HW_MISC_SGI_MC_VIRTUIX_H
+#define HW_MISC_SGI_MC_VIRTUIX_H
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 
-#define TYPE_SGI_MC "sgi-mc"
-OBJECT_DECLARE_SIMPLE_TYPE(SGIMCState, SGI_MC)
+#define TYPE_SGI_MC_VIRTUIX "sgi-mc-virtuix"
+OBJECT_DECLARE_SIMPLE_TYPE(SGIMCVirtuixState, SGI_MC_VIRTUIX)
 
 #define MC_NUM_BANKS 4
 
@@ -29,7 +29,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMCState, SGI_MC)
  * Each bank can be independently configured with a base address and size.
  * The MC dynamically maps/unmaps RAM aliases based on MEMCFG writes.
  */
-typedef struct SGIMCBankState {
+typedef struct SGIMCVirtuixBankState {
     MemoryRegion *region;       /* Dynamic alias (NULL = not mapped) */
     MemoryRegion *low_alias;    /* 512KB alias at 0x0 when bank at SEG0 */
     MemoryRegion **wrap_aliases; /* Mirror aliases when cfg_size > installed */
@@ -38,7 +38,7 @@ typedef struct SGIMCBankState {
     uint32_t ram_offset;        /* Offset within machine->ram */
     bool mapped;
     uint32_t mapped_base;
-} SGIMCBankState;
+} SGIMCVirtuixBankState;
 
 /*
  * MC Register offsets (from 0x1fa00000)
@@ -97,10 +97,17 @@ typedef struct SGIMCBankState {
 #define MC_REALTIME_CTR        0x0050
 
 /*
- * NOTE: the wrap-free 64-bit host real-time counter (MC_REALTIME_CTR64_LO/HI)
- * is a virtualization-native extension that lives ONLY on the Virtuix MC
- * (include/hw/misc/sgi_mc_virtuix.h). Authentic Indy's MC does not expose it.
+ * QEMU extension: wrap-free 64-bit host real-time microsecond counter, for
+ * virtualization-native guest timekeeping (gettimeofday sourced from the host
+ * clock, making the modeled CPU frequency cosmetic). Both LO and HI return the
+ * live low/high 32 bits of qemu_clock_get_us(QEMU_CLOCK_REALTIME). A 32-bit
+ * N32 kernel reads an atomic 64-bit value SMP-safely with the standard
+ * HI/LO/HI re-read: read HI, read LO, read HI again; if HI changed, retry (the
+ * low half wrapped — only ~every 71 min). Both offsets are in the unused MC
+ * gap (0x0050..0x007c, before MC_GIO64_ARB).
  */
+#define MC_REALTIME_CTR64_LO   0x0054
+#define MC_REALTIME_CTR64_HI   0x0058
 
 /* RPSS counter is in a separate page */
 #define MC_RPSS_CTR            0x1000
@@ -125,7 +132,7 @@ typedef struct SGIMCBankState {
 /* Total MC region size to cover semaphores */
 #define MC_REG_SIZE            0x20000
 
-struct SGIMCState {
+struct SGIMCVirtuixState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -138,7 +145,7 @@ struct SGIMCState {
     uint32_t ram_size;          /* RAM size in bytes (set by machine) */
     bool has_eisa;              /* EISA bus present (Full House/IP22) */
     uint8_t revision;           /* MC revision (< 5: shift 22, >= 5: shift 24) */
-    SGIMCBankState banks[MC_NUM_BANKS]; /* Per-bank memory state */
+    SGIMCVirtuixBankState banks[MC_NUM_BANKS]; /* Per-bank memory state */
 
     /* Registers */
     uint32_t cpu_ctrl[2];
@@ -178,4 +185,4 @@ struct SGIMCState {
     uint32_t semaphore[16];
 };
 
-#endif /* HW_MISC_SGI_MC_H */
+#endif /* HW_MISC_SGI_MC_VIRTUIX_H */

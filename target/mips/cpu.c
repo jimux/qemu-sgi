@@ -599,7 +599,20 @@ static vaddr mips_pointer_wrap(CPUState *cs, int mmu_idx,
 #endif
 
 static const TCGCPUOps mips_tcg_ops = {
-    .mttcg_supported = TARGET_LONG_BITS == 32,
+    /*
+     * IP55/Virtuix SMP: enable MTTCG for mips64 too (upstream gated it to 32-bit,
+     * which forced all vCPUs onto one host thread -> no real parallelism; 2
+     * CPU-bound guest procs took 2x wall time even with runon placement). MIPS is
+     * weakly ordered (guest_default_memory_order = 0) so the guest's explicit
+     * `sync` barriers are honored and ll/sc use real host atomics under MTTCG.
+     * Launch with -accel tcg,thread=multi for true parallel cores.
+     * NOTE: TCG_MO_ALL (sequential consistency) was tried as a stability fix and
+     * did NOT help (deadlock persisted 4/12 boots) — the IP55 SMP boot deadlock
+     * was a true lock-order/head-of-line-blocking bug (cross-cpu icache rendezvous
+     * vs TLB shootdown), fixed in the guest kernel (dopatch §5o virtuix_xicache_local),
+     * NOT a memory-ordering issue. So MO stays 0 (faster).
+     */
+    .mttcg_supported = true,
     .guest_default_memory_order = 0,
 
     .initialize = mips_tcg_init,

@@ -1,5 +1,5 @@
 /*
- * SGI Memory Controller (MC) emulation
+ * SGI Memory Controller (MC) emulation -- VIRTUIX/IP55 variant
  *
  * The MC is the central memory controller for SGI Indy (IP24) and
  * Indigo2 (IP22) workstations. It handles:
@@ -23,7 +23,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "hw/misc/sgi_mc.h"
+#include "hw/misc/sgi_mc_virtuix.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -83,7 +83,7 @@ static QEMUClockType mc_timebase_clock(void)
  * MC rev < 5 uses 4MB memory units (shift 22).
  * Source: IRIX stand/arcs/IP22prom/lmem_conf.s setup_regs
  */
-static int sgi_mc_addr_shift(SGIMCState *s)
+static int sgi_mc_virtuix_addr_shift(SGIMCVirtuixState *s)
 {
     return (s->revision >= 5) ? 24 : 22;
 }
@@ -91,9 +91,9 @@ static int sgi_mc_addr_shift(SGIMCState *s)
 /*
  * Unmap a single bank's memory regions (alias + low alias).
  */
-static void sgi_mc_unmap_bank(SGIMCState *s, int bank_idx)
+static void sgi_mc_virtuix_unmap_bank(SGIMCVirtuixState *s, int bank_idx)
 {
-    SGIMCBankState *bank = &s->banks[bank_idx];
+    SGIMCVirtuixBankState *bank = &s->banks[bank_idx];
 
     if (bank->mapped && bank->region) {
         qemu_log_mask(LOG_UNIMP,
@@ -134,7 +134,7 @@ static void sgi_mc_unmap_bank(SGIMCState *s, int bank_idx)
 /*
  * Extract bank configuration from a 16-bit MEMCFG field.
  */
-static void sgi_mc_extract_bank_config(uint16_t field, bool *valid,
+static void sgi_mc_virtuix_extract_bank_config(uint16_t field, bool *valid,
                                         uint32_t *base, uint32_t *size,
                                         int addr_shift)
 {
@@ -156,11 +156,11 @@ static void sgi_mc_extract_bank_config(uint16_t field, bool *valid,
  * When a bank maps to SEG0 (0x08000000), a 512KB alias is also
  * created at 0x00000000 (matching MAME behavior).
  */
-static void sgi_mc_update_ram_mapping(SGIMCState *s)
+static void sgi_mc_virtuix_update_ram_mapping(SGIMCVirtuixState *s)
 {
     int i;
     uint16_t fields[MC_NUM_BANKS];
-    int addr_shift = sgi_mc_addr_shift(s);
+    int addr_shift = sgi_mc_virtuix_addr_shift(s);
     uint32_t seg0_base = (addr_shift >= 24) ? 0x20000000 : 0x08000000;
 
     /* Extract all 4 bank fields from MEMCFG0 and MEMCFG1 */
@@ -171,17 +171,17 @@ static void sgi_mc_update_ram_mapping(SGIMCState *s)
 
     /* Unmap all banks first */
     for (i = 0; i < MC_NUM_BANKS; i++) {
-        sgi_mc_unmap_bank(s, i);
+        sgi_mc_virtuix_unmap_bank(s, i);
     }
 
     /* Remap each bank based on current MEMCFG */
     for (i = 0; i < MC_NUM_BANKS; i++) {
-        SGIMCBankState *bank = &s->banks[i];
+        SGIMCVirtuixBankState *bank = &s->banks[i];
         bool valid;
         uint32_t base, cfg_size, map_size;
         char name[32];
 
-        sgi_mc_extract_bank_config(fields[i], &valid, &base, &cfg_size,
+        sgi_mc_virtuix_extract_bank_config(fields[i], &valid, &base, &cfg_size,
                                     addr_shift);
 
         /* Only map if valid, bank has physical RAM, and we have RAM backend */
@@ -270,9 +270,9 @@ static void sgi_mc_update_ram_mapping(SGIMCState *s)
     }
 }
 
-static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t sgi_mc_virtuix_read(void *opaque, hwaddr addr, unsigned size)
 {
-    SGIMCState *s = SGI_MC(opaque);
+    SGIMCVirtuixState *s = SGI_MC_VIRTUIX(opaque);
     uint32_t val = 0;
 
     /* Registers are 32-bit but spaced at 64-bit intervals */
@@ -312,6 +312,15 @@ static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
          * time rather than racing virtual time.
          */
         val = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) & 0xFFFFFFFF);
+        break;
+    case MC_REALTIME_CTR64_LO:
+        /* Low 32 bits of the live 64-bit host real-time µs (see sgi_mc.h). */
+        val = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) & 0xFFFFFFFF);
+        break;
+    case MC_REALTIME_CTR64_HI:
+        /* High 32 bits, live. SMP-safe 64-bit read = HI, LO, HI; retry if HI
+         * changed (the low half wrapped mid-read — happens only ~every 71 min). */
+        val = (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) >> 32);
         break;
     case MC_GIO64_ARB:
         val = s->gio64_arb;
@@ -479,12 +488,12 @@ static uint64_t sgi_mc_read(void *opaque, hwaddr addr, unsigned size)
  * data and times out ("ng1 pixel dma write timeout"), leaving banded output.
  */
 /* Level-follow the GIO DMA-complete interrupt (HPC3 LIO_GDMA -> IP2). */
-static void sgi_mc_update_dma_irq(SGIMCState *s)
+static void sgi_mc_virtuix_update_dma_irq(SGIMCVirtuixState *s)
 {
     qemu_set_irq(s->dma_irq, (s->dma_int_cause & (1 << 3)) ? 1 : 0);
 }
 
-static uint32_t sgi_mc_dma_translate(SGIMCState *s, uint32_t address)
+static uint32_t sgi_mc_virtuix_dma_translate(SGIMCVirtuixState *s, uint32_t address)
 {
     for (int entry = 0; entry < 4; entry++) {
         if ((address & 0xffc00000) == (s->dma_tlb_hi[entry] & 0xffc00000)) {
@@ -499,7 +508,7 @@ static uint32_t sgi_mc_dma_translate(SGIMCState *s, uint32_t address)
     return 0;
 }
 
-static void sgi_mc_perform_dma(SGIMCState *s)
+static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
 {
     uint32_t memory_addr = s->dma_mem_addr;
     uint32_t linecount = s->dma_size >> 16;
@@ -521,7 +530,7 @@ static void sgi_mc_perform_dma(SGIMCState *s)
                 if (s->dma_mode & MC_DMA_MODE_TO_HOST) {
                     if (s->dma_mode & MC_DMA_MODE_FILL) {
                         address_space_stl_be(&address_space_memory,
-                            sgi_mc_dma_translate(s, memory_addr), s->dma_gio_addr,
+                            sgi_mc_virtuix_dma_translate(s, memory_addr), s->dma_gio_addr,
                             MEMTXATTRS_UNSPECIFIED, NULL);
                         memory_addr += (s->dma_mode & MC_DMA_MODE_DIR) ? 4 : -4;
                         bytecount -= 4;
@@ -532,7 +541,7 @@ static void sgi_mc_perform_dma(SGIMCState *s)
                             gio_addr, MEMTXATTRS_UNSPECIFIED, NULL);
                         for (uint32_t i = 0; i < length; i++) {
                             address_space_stb(&address_space_memory,
-                                sgi_mc_dma_translate(s, memory_addr),
+                                sgi_mc_virtuix_dma_translate(s, memory_addr),
                                 (uint8_t)(data >> shift),
                                 MEMTXATTRS_UNSPECIFIED, NULL);
                             memory_addr += (s->dma_mode & MC_DMA_MODE_DIR) ? 1 : -1;
@@ -546,7 +555,7 @@ static void sgi_mc_perform_dma(SGIMCState *s)
                     uint64_t data = 0;
                     for (uint32_t i = 0; i < length; i++) {
                         data |= (uint64_t)address_space_ldub(&address_space_memory,
-                            sgi_mc_dma_translate(s, memory_addr),
+                            sgi_mc_virtuix_dma_translate(s, memory_addr),
                             MEMTXATTRS_UNSPECIFIED, NULL) << shift;
                         memory_addr += (s->dma_mode & MC_DMA_MODE_DIR) ? 1 : -1;
                         shift -= 8;
@@ -586,7 +595,7 @@ static void sgi_mc_perform_dma(SGIMCState *s)
      * expect to observe RUNNING at least once after a start before it clears:
      * the indy PROM's "VDMA Clear" polls DMA_RUN and aborts ("VDMA Clear failed
      * to start") if it never sees RUNNING — which crashed machine=indy boot.
-     * RUNNING is instead cleared on the first DMA_RUN *read* (see sgi_mc_read);
+     * RUNNING is instead cleared on the first DMA_RUN *read* (see sgi_mc_virtuix_read);
      * COMPLETE persists so IRIX vdma_wait() still sees it.
      */
     if (s->dma_control & (1 << 4)) {   /* IntMask (GIO_CTL[4]) enabled */
@@ -595,14 +604,14 @@ static void sgi_mc_perform_dma(SGIMCState *s)
          * of sleeping for its full ~2s timeout (which starves interactive gfx:
          * Toolchest menus, window-drag rubber-banding). The guest's GDMA ISR
          * acks by clearing MC_DMA_INT_CAUSE, which lowers the line. */
-        sgi_mc_update_dma_irq(s);
+        sgi_mc_virtuix_update_dma_irq(s);
     }
 }
 
-static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
+static void sgi_mc_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
                          unsigned size)
 {
-    SGIMCState *s = SGI_MC(opaque);
+    SGIMCVirtuixState *s = SGI_MC_VIRTUIX(opaque);
 
     /* Registers are 32-bit but spaced at 64-bit intervals */
     addr &= ~7ULL;
@@ -648,11 +657,11 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case MC_MEMCFG0:
         s->memcfg[0] = val;
-        sgi_mc_update_ram_mapping(s);
+        sgi_mc_virtuix_update_ram_mapping(s);
         break;
     case MC_MEMCFG1:
         s->memcfg[1] = val;
-        sgi_mc_update_ram_mapping(s);
+        sgi_mc_virtuix_update_ram_mapping(s);
         break;
     case MC_CPU_MEM_ACCESS:
         s->cpu_mem_access = val;
@@ -691,16 +700,16 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case MC_DMA_INT_CAUSE:
         /*
-         * Acknowledge/clear the DMA interrupt cause. The IRIX gfx GDMA ISR acks
-         * by writing the register back as 0 (observed: MCwr 0160 = 00000000), so
-         * the register is write-value, NOT write-1-to-clear: `&= ~val` with
-         * val==0 was a no-op, leaving the Complete bit set and the level-followed
-         * LIO_GDMA (IP2) line permanently asserted -> the ISR re-entered forever
-         * (a hard hang loading the desktop weave). Assigning val clears the cause
-         * on the guest's write-0 ack and deasserts the line.
+         * Acknowledge/clear the DMA interrupt cause. Write-value semantics (NOT
+         * write-1-to-clear): the IRIX gfx GDMA ISR acks by writing the register
+         * back as 0, so `&= ~val` (val==0) was a no-op that left the level-
+         * followed LIO_GDMA line asserted forever -> ISR re-entry hang loading
+         * the desktop weave. Assigning val clears it on the write-0 ack. (Same
+         * fix as indy's sgi_mc.c; virtuix's current kernel doesn't enable the DMA
+         * IntMask so it never hit it, but keep both MCs correct.)
          */
         s->dma_int_cause = val;
-        sgi_mc_update_dma_irq(s);
+        sgi_mc_virtuix_update_dma_irq(s);
         break;
     case MC_DMA_CONTROL:
         s->dma_control = val;
@@ -759,14 +768,14 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         /* "Start" variant of GIO_ADDR — kick the transfer. */
         s->dma_run = 0x40;          /* running */
         trace_sgi_mc_dma(val, s->dma_size);
-        sgi_mc_perform_dma(s);      /* moves data; sets done, clears running */
+        sgi_mc_virtuix_perform_dma(s);      /* moves data; sets done, clears running */
         break;
     case MC_DMA_START:
         /* Only bit 0 starts the transfer — MAME mc.cpp 0x2040. */
         if (val & 1) {
             s->dma_run |= 0x40;     /* running */
             trace_sgi_mc_dma(val, s->dma_size);
-            sgi_mc_perform_dma(s);  /* moves data; sets done, clears running */
+            sgi_mc_virtuix_perform_dma(s);  /* moves data; sets done, clears running */
         }
         break;
     case MC_DMA_GIO_ADDR_DEF_START:
@@ -778,7 +787,7 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         s->dma_mode = 0x00000028;
         s->dma_run |= 0x40;
         trace_sgi_mc_dma(val, s->dma_size);
-        sgi_mc_perform_dma(s);
+        sgi_mc_virtuix_perform_dma(s);
         break;
     default:
         if (addr >= MC_SEMAPHORE_BASE &&
@@ -797,9 +806,9 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
-static const MemoryRegionOps sgi_mc_ops = {
-    .read = sgi_mc_read,
-    .write = sgi_mc_write,
+static const MemoryRegionOps sgi_mc_virtuix_ops = {
+    .read = sgi_mc_virtuix_read,
+    .write = sgi_mc_virtuix_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .impl = {
         .min_access_size = 4,
@@ -817,7 +826,7 @@ static const MemoryRegionOps sgi_mc_ops = {
  *   Bit 13:     Valid
  *   Bit 14:     2 subbanks
  */
-static uint16_t sgi_mc_memcfg_bank(uint32_t base_addr, uint32_t size_bytes,
+static uint16_t sgi_mc_virtuix_memcfg_bank(uint32_t base_addr, uint32_t size_bytes,
                                     int addr_shift)
 {
     uint16_t val = 0;
@@ -847,9 +856,9 @@ static uint16_t sgi_mc_memcfg_bank(uint32_t base_addr, uint32_t size_bytes,
     return val;
 }
 
-static void sgi_mc_reset(DeviceState *dev)
+static void sgi_mc_virtuix_reset(DeviceState *dev)
 {
-    SGIMCState *s = SGI_MC(dev);
+    SGIMCVirtuixState *s = SGI_MC_VIRTUIX(dev);
 
     /* System ID: revision from property, optionally with EISA */
     s->sysid = s->revision;
@@ -874,7 +883,7 @@ static void sgi_mc_reset(DeviceState *dev)
      * The PROM will probe banks by writing MEMCFG and testing addresses.
      */
     for (int i = 0; i < MC_NUM_BANKS; i++) {
-        sgi_mc_unmap_bank(s, i);
+        sgi_mc_virtuix_unmap_bank(s, i);
         s->banks[i].installed_size = 0;
         s->banks[i].ram_offset = 0;
     }
@@ -888,16 +897,16 @@ static void sgi_mc_reset(DeviceState *dev)
      * MEMCFG1 starts at 0 (no banks configured).
      */
     {
-        int shift = sgi_mc_addr_shift(s);
+        int shift = sgi_mc_virtuix_addr_shift(s);
         uint32_t seg0_base = (shift >= 24) ? 0x20000000 : 0x08000000;
-        uint16_t bank0_cfg = sgi_mc_memcfg_bank(seg0_base, s->ram_size,
+        uint16_t bank0_cfg = sgi_mc_virtuix_memcfg_bank(seg0_base, s->ram_size,
                                                   shift);
         s->memcfg[0] = (uint32_t)bank0_cfg << 16;
     }
     s->memcfg[1] = 0;
 
     /* Apply the initial mapping */
-    sgi_mc_update_ram_mapping(s);
+    sgi_mc_virtuix_update_ram_mapping(s);
 
     qemu_log_mask(LOG_UNIMP,
                   "sgi_mc: reset with ram_size=%u\n", s->ram_size);
@@ -932,91 +941,91 @@ static void sgi_mc_reset(DeviceState *dev)
     }
 }
 
-static void sgi_mc_init(Object *obj)
+static void sgi_mc_virtuix_init(Object *obj)
 {
-    SGIMCState *s = SGI_MC(obj);
+    SGIMCVirtuixState *s = SGI_MC_VIRTUIX(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, obj, &sgi_mc_ops, s,
-                          "sgi-mc", MC_REG_SIZE);
+    memory_region_init_io(&s->iomem, obj, &sgi_mc_virtuix_ops, s,
+                          "sgi-mc-virtuix", MC_REG_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->dma_irq);
 }
 
 static const VMStateDescription vmstate_sgi_mc = {
-    .name = "sgi-mc",
+    .name = "sgi-mc-virtuix",
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_ARRAY(cpu_ctrl, SGIMCState, 2),
-        VMSTATE_UINT32(watchdog, SGIMCState),
-        VMSTATE_UINT32(sysid, SGIMCState),
-        VMSTATE_UINT32(rpss_div, SGIMCState),
-        VMSTATE_UINT32(eeprom_ctrl, SGIMCState),
-        VMSTATE_UINT32(refcnt_preload, SGIMCState),
-        VMSTATE_UINT32(refcnt, SGIMCState),
-        VMSTATE_UINT32(gio64_arb, SGIMCState),
-        VMSTATE_UINT32(arb_cpu_time, SGIMCState),
-        VMSTATE_UINT32(arb_burst_time, SGIMCState),
-        VMSTATE_UINT32_ARRAY(memcfg, SGIMCState, 2),
-        VMSTATE_UINT32(cpu_mem_access, SGIMCState),
-        VMSTATE_UINT32(gio_mem_access, SGIMCState),
-        VMSTATE_UINT32(cpu_err_addr, SGIMCState),
-        VMSTATE_UINT32(cpu_err_status, SGIMCState),
-        VMSTATE_UINT32(gio_err_addr, SGIMCState),
-        VMSTATE_UINT32(gio_err_status, SGIMCState),
-        VMSTATE_UINT32(sys_semaphore, SGIMCState),
-        VMSTATE_UINT32(gio_lock, SGIMCState),
-        VMSTATE_UINT32(eisa_lock, SGIMCState),
-        VMSTATE_UINT32(gio64_xlate_mask, SGIMCState),
-        VMSTATE_UINT32(gio64_subst_bits, SGIMCState),
-        VMSTATE_UINT32(dma_int_cause, SGIMCState),
-        VMSTATE_UINT32(dma_control, SGIMCState),
-        VMSTATE_UINT32_ARRAY(dma_tlb_hi, SGIMCState, 4),
-        VMSTATE_UINT32_ARRAY(dma_tlb_lo, SGIMCState, 4),
-        VMSTATE_UINT32(rpss_ctr, SGIMCState),
-        VMSTATE_UINT32(dma_mem_addr, SGIMCState),
-        VMSTATE_UINT32(dma_size, SGIMCState),
-        VMSTATE_UINT32(dma_stride, SGIMCState),
-        VMSTATE_UINT32(dma_gio_addr, SGIMCState),
-        VMSTATE_UINT32(dma_mode, SGIMCState),
-        VMSTATE_UINT32(dma_count, SGIMCState),
-        VMSTATE_UINT32(dma_run, SGIMCState),
-        VMSTATE_UINT32_ARRAY(semaphore, SGIMCState, 16),
+        VMSTATE_UINT32_ARRAY(cpu_ctrl, SGIMCVirtuixState, 2),
+        VMSTATE_UINT32(watchdog, SGIMCVirtuixState),
+        VMSTATE_UINT32(sysid, SGIMCVirtuixState),
+        VMSTATE_UINT32(rpss_div, SGIMCVirtuixState),
+        VMSTATE_UINT32(eeprom_ctrl, SGIMCVirtuixState),
+        VMSTATE_UINT32(refcnt_preload, SGIMCVirtuixState),
+        VMSTATE_UINT32(refcnt, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio64_arb, SGIMCVirtuixState),
+        VMSTATE_UINT32(arb_cpu_time, SGIMCVirtuixState),
+        VMSTATE_UINT32(arb_burst_time, SGIMCVirtuixState),
+        VMSTATE_UINT32_ARRAY(memcfg, SGIMCVirtuixState, 2),
+        VMSTATE_UINT32(cpu_mem_access, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio_mem_access, SGIMCVirtuixState),
+        VMSTATE_UINT32(cpu_err_addr, SGIMCVirtuixState),
+        VMSTATE_UINT32(cpu_err_status, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio_err_addr, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio_err_status, SGIMCVirtuixState),
+        VMSTATE_UINT32(sys_semaphore, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio_lock, SGIMCVirtuixState),
+        VMSTATE_UINT32(eisa_lock, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio64_xlate_mask, SGIMCVirtuixState),
+        VMSTATE_UINT32(gio64_subst_bits, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_int_cause, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_control, SGIMCVirtuixState),
+        VMSTATE_UINT32_ARRAY(dma_tlb_hi, SGIMCVirtuixState, 4),
+        VMSTATE_UINT32_ARRAY(dma_tlb_lo, SGIMCVirtuixState, 4),
+        VMSTATE_UINT32(rpss_ctr, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_mem_addr, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_size, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_stride, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_gio_addr, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_mode, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_count, SGIMCVirtuixState),
+        VMSTATE_UINT32(dma_run, SGIMCVirtuixState),
+        VMSTATE_UINT32_ARRAY(semaphore, SGIMCVirtuixState, 16),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static const Property sgi_mc_properties[] = {
-    DEFINE_PROP_UINT32("ram-size", SGIMCState, ram_size, 64 * 1024 * 1024),
-    DEFINE_PROP_BOOL("has-eisa", SGIMCState, has_eisa, false),
-    DEFINE_PROP_UINT8("revision", SGIMCState, revision, MC_SYSID_REV_C),
-    DEFINE_PROP_LINK("ram", SGIMCState, ram, TYPE_MEMORY_REGION,
+static const Property sgi_mc_virtuix_properties[] = {
+    DEFINE_PROP_UINT32("ram-size", SGIMCVirtuixState, ram_size, 64 * 1024 * 1024),
+    DEFINE_PROP_BOOL("has-eisa", SGIMCVirtuixState, has_eisa, false),
+    DEFINE_PROP_UINT8("revision", SGIMCVirtuixState, revision, MC_SYSID_REV_C),
+    DEFINE_PROP_LINK("ram", SGIMCVirtuixState, ram, TYPE_MEMORY_REGION,
                      MemoryRegion *),
-    DEFINE_PROP_LINK("system-memory", SGIMCState, system_memory,
+    DEFINE_PROP_LINK("system-memory", SGIMCVirtuixState, system_memory,
                      TYPE_MEMORY_REGION, MemoryRegion *),
 };
 
-static void sgi_mc_class_init(ObjectClass *klass, const void *data)
+static void sgi_mc_virtuix_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    device_class_set_legacy_reset(dc, sgi_mc_reset);
+    device_class_set_legacy_reset(dc, sgi_mc_virtuix_reset);
     dc->vmsd = &vmstate_sgi_mc;
-    device_class_set_props(dc, sgi_mc_properties);
+    device_class_set_props(dc, sgi_mc_virtuix_properties);
 }
 
-static const TypeInfo sgi_mc_info = {
-    .name          = TYPE_SGI_MC,
+static const TypeInfo sgi_mc_virtuix_info = {
+    .name          = TYPE_SGI_MC_VIRTUIX,
     .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(SGIMCState),
-    .instance_init = sgi_mc_init,
-    .class_init    = sgi_mc_class_init,
+    .instance_size = sizeof(SGIMCVirtuixState),
+    .instance_init = sgi_mc_virtuix_init,
+    .class_init    = sgi_mc_virtuix_class_init,
 };
 
-static void sgi_mc_register_types(void)
+static void sgi_mc_virtuix_register_types(void)
 {
-    type_register_static(&sgi_mc_info);
+    type_register_static(&sgi_mc_virtuix_info);
 }
 
-type_init(sgi_mc_register_types)
+type_init(sgi_mc_virtuix_register_types)

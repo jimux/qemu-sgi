@@ -31,7 +31,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "hw/display/sgi_newport.h"
+#include "hw/display/sgi_newport_virtuix.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
@@ -40,7 +40,7 @@
 #include "trace.h"
 
 /* NewView binary log record (20 bytes, MAME-compatible layout) */
-static void newport_newview_log(SGINewportState *s, uint32_t offset,
+static void newport_newview_log(SGINewportVirtuixState *s, uint32_t offset,
                                 uint32_t data)
 {
     if (s->newview_log_file) {
@@ -305,7 +305,7 @@ static uint32_t newport_convert_draw_to_host(uint32_t color,
  * Expands color_i or color_vram to fill all lanes.
  * MAME ref: get_default_color() at newport.cpp:3276-3305
  */
-static uint32_t newport_get_default_color(SGINewportState *s)
+static uint32_t newport_get_default_color(SGINewportVirtuixState *s)
 {
     uint32_t color;
 
@@ -344,7 +344,7 @@ static uint32_t newport_get_default_color(SGINewportState *s)
  * Used when dm0_colorhost is set (text rendering, bitmap blits).
  * MAME ref: get_host_color() at newport.cpp:2191-2248
  */
-static uint32_t newport_get_host_color(SGINewportState *s)
+static uint32_t newport_get_host_color(SGINewportVirtuixState *s)
 {
     uint32_t depth = host_depth_bpp[s->dm1_hostdepth];
     uint32_t color;
@@ -388,7 +388,7 @@ static uint32_t newport_get_host_color(SGINewportState *s)
  * clamps negative (>= 0x180 or sign bit set) to 0, overflow (> 0xff) to 0xff.
  * MAME ref: get_rgb_color() at newport.cpp:2548-2654
  */
-static uint32_t newport_get_rgb_color(SGINewportState *s)
+static uint32_t newport_get_rgb_color(SGINewportVirtuixState *s)
 {
     uint32_t red   = (s->curr_color_red >> 11) & 0x1ff;
     uint32_t green = (s->curr_color_green >> 11) & 0x1ff;
@@ -436,7 +436,7 @@ static int32_t newport_sm_to_signed(int32_t val, int nbits)
     return val & mask;
 }
 
-static void newport_iterate_shade(SGINewportState *s)
+static void newport_iterate_shade(SGINewportVirtuixState *s)
 {
     if (s->slope_red & 0x7fffff) {
         s->curr_color_red += newport_sm_to_signed(s->slope_red, 24);
@@ -492,7 +492,7 @@ static void newport_iterate_shade(SGINewportState *s)
  * Called when DM0 DOSETUP bit (5) is set before each command.
  * MAME ref: do_setup() at newport.cpp:2724-2740, get_octant() at line 2693
  */
-static void newport_do_setup(SGINewportState *s)
+static void newport_do_setup(SGINewportVirtuixState *s)
 {
     int32_t x1 = (int32_t)(s->x_start << 5) >> 12;  /* sign-extend 20-bit from bits [26:7] */
     int32_t y1 = (int32_t)(s->y_start << 5) >> 12;
@@ -521,7 +521,7 @@ static void newport_do_setup(SGINewportState *s)
  * Called at end of scanline or when X reaches end in span/block.
  * MAME ref: newport.cpp lines 3408-3411, 3480-3483
  */
-static void newport_reset_curr_colors(SGINewportState *s)
+static void newport_reset_curr_colors(SGINewportVirtuixState *s)
 {
     s->curr_color_red   = s->color_red;
     s->curr_color_alpha = s->color_alpha;
@@ -534,7 +534,7 @@ static void newport_reset_curr_colors(SGINewportState *s)
  * MAME ref: logic_pixel() at newport.cpp:1039-1062,
  *           store_pixel() at newport.cpp:1064-1069
  */
-static void newport_logic_pixel(SGINewportState *s, uint32_t addr,
+static void newport_logic_pixel(SGINewportVirtuixState *s, uint32_t addr,
                                 uint32_t src)
 {
     uint32_t *buf;
@@ -612,7 +612,7 @@ static void newport_logic_pixel(SGINewportState *s, uint32_t addr,
  *
  * MAME ref: pixel_clip_pass() at newport.cpp:2262-2343
  */
-static bool newport_pixel_clip_pass(SGINewportState *s, int16_t x, int16_t y)
+static bool newport_pixel_clip_pass(SGINewportVirtuixState *s, int16_t x, int16_t y)
 {
     /* Mask 0: check raw coords before window offset */
     if (s->clip_mode & 1) {
@@ -659,7 +659,7 @@ static bool newport_pixel_clip_pass(SGINewportState *s, int16_t x, int16_t y)
  * Output a pixel at coordinates (x, y), applying clipping and window offset.
  * MAME ref: output_pixel() at newport.cpp:2345-2363
  */
-static void newport_output_pixel(SGINewportState *s, int16_t x, int16_t y,
+static void newport_output_pixel(SGINewportVirtuixState *s, int16_t x, int16_t y,
                                  uint32_t color)
 {
     int wx, wy;
@@ -694,7 +694,7 @@ static void newport_output_pixel(SGINewportState *s, int16_t x, int16_t y,
  * Takes raw XSTART-format value: bits 26:11=integer, 10:7=fraction.
  * MAME ref: write_x_start() at newport.cpp:3552-3558
  */
-static void newport_write_x_start(SGINewportState *s, int32_t val)
+static void newport_write_x_start(SGINewportVirtuixState *s, int32_t val)
 {
     s->x_start = val & 0x07ffff80;
     s->x_start_i = s->x_start;
@@ -709,7 +709,7 @@ static void newport_write_x_start(SGINewportState *s, int32_t val)
  * Takes raw YSTART-format value: bits 26:11=integer, 10:7=fraction.
  * MAME ref: write_y_start() at newport.cpp:3561-3567
  */
-static void newport_write_y_start(SGINewportState *s, int32_t val)
+static void newport_write_y_start(SGINewportVirtuixState *s, int32_t val)
 {
     s->y_start = val & 0x07ffff80;
     s->y_start_f = (uint32_t)val & 0x007fff80;
@@ -723,7 +723,7 @@ static void newport_write_y_start(SGINewportState *s, int32_t val)
  * Takes raw XEND-format value: bits 26:11=integer, 10:7=fraction.
  * MAME ref: write_x_end() at newport.cpp:3570-3576
  */
-static void newport_write_x_end(SGINewportState *s, int32_t val)
+static void newport_write_x_end(SGINewportVirtuixState *s, int32_t val)
 {
     s->x_end = val & 0x07ffff80;
     s->x_end_f = (uint32_t)val & 0x007fff80;
@@ -737,7 +737,7 @@ static void newport_write_x_end(SGINewportState *s, int32_t val)
  * Takes raw YEND-format value: bits 26:11=integer, 10:7=fraction.
  * MAME ref: write_y_end() at newport.cpp:3579-3585
  */
-static void newport_write_y_end(SGINewportState *s, int32_t val)
+static void newport_write_y_end(SGINewportVirtuixState *s, int32_t val)
 {
     s->y_end = val & 0x07ffff80;
     s->y_end_f = (uint32_t)val & 0x007fff80;
@@ -757,7 +757,7 @@ static const int16_t rwpacked_max_len[2][4] = {
  * The PROM's most-used operation (screen clear, rectangle fill).
  * MAME ref: newport.cpp:3418-3492
  */
-static void newport_draw_block(SGINewportState *s)
+static void newport_draw_block(SGINewportVirtuixState *s)
 {
     int16_t start_x = s->x_start_int;
     int16_t start_y = s->y_start_int;
@@ -888,7 +888,7 @@ static void newport_draw_block(SGINewportState *s)
  * Used for text rendering with host data.
  * MAME ref: newport.cpp:3348-3415
  */
-static void newport_draw_span(SGINewportState *s)
+static void newport_draw_span(SGINewportVirtuixState *s)
 {
     int16_t start_x = s->x_start_int;
     int16_t end_x = s->x_end_int;
@@ -973,7 +973,7 @@ static void newport_draw_span(SGINewportState *s)
  * Integer line drawing (Bresenham).
  * MAME ref: do_iline() at newport.cpp:2944-3069
  */
-static void newport_draw_iline(SGINewportState *s)
+static void newport_draw_iline(SGINewportVirtuixState *s)
 {
     int16_t x0 = s->x_start_int;
     int16_t y0 = s->y_start_int;
@@ -1036,7 +1036,7 @@ static void newport_draw_iline(SGINewportState *s)
  * For this implementation, convert to integer and use Bresenham.
  * MAME ref: do_fline() at newport.cpp:2741-2942
  */
-static void newport_draw_fline(SGINewportState *s)
+static void newport_draw_fline(SGINewportVirtuixState *s)
 {
     int16_t x0 = (int16_t)(s->x_start >> 16);
     int16_t y0 = (int16_t)(s->y_start >> 16);
@@ -1098,7 +1098,7 @@ static void newport_draw_fline(SGINewportState *s)
  * window offset).
  * MAME ref: newport.cpp:3510-3548
  */
-static void newport_draw_scr2scr(SGINewportState *s)
+static void newport_draw_scr2scr(SGINewportVirtuixState *s)
 {
     int16_t start_x = s->x_start_int;
     int16_t start_y = s->y_start_int;
@@ -1166,7 +1166,7 @@ static void newport_draw_scr2scr(SGINewportState *s)
  * advance position, and return the pixel value.
  * MAME ref: do_pixel_read() at newport.cpp:3071-3136
  */
-static uint32_t newport_read_one_pixel(SGINewportState *s)
+static uint32_t newport_read_one_pixel(SGINewportVirtuixState *s)
 {
     int wx, wy;
     uint32_t ret = 0;
@@ -1215,7 +1215,7 @@ static uint32_t newport_read_one_pixel(SGINewportState *s)
  * based on hostdepth/rwdouble settings.
  * MAME ref: do_pixel_word_read() at newport.cpp:3138-3210
  */
-static void newport_do_pixel_read(SGINewportState *s)
+static void newport_do_pixel_read(SGINewportVirtuixState *s)
 {
     uint16_t x_start = s->x_start_int;
     uint16_t x_end = s->x_end_int;
@@ -1282,7 +1282,7 @@ static void newport_do_pixel_read(SGINewportState *s)
  * Command dispatch — called when a "Go" register is accessed.
  * MAME ref: do_rex3_command() at newport.cpp:3307-3549
  */
-static void newport_do_rex3_command(SGINewportState *s)
+static void newport_do_rex3_command(SGINewportVirtuixState *s)
 {
     uint8_t opcode = DM0_OPCODE(s->drawmode0);
     uint8_t adrmode = DM0_ADRMODE(s->drawmode0);
@@ -1341,7 +1341,7 @@ static void newport_do_rex3_command(SGINewportState *s)
  */
 static void newport_dcb_timeout(void *opaque)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(opaque);
     s->status &= ~REX3_STATUS_BACKBUSY;
 }
 
@@ -1351,7 +1351,7 @@ static void newport_dcb_timeout(void *opaque)
  */
 static void newport_vrint_deassert(void *opaque)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(opaque);
     s->vrint_active = false;
     qemu_irq_lower(s->irq);
 }
@@ -1377,7 +1377,7 @@ static void newport_vrint_deassert(void *opaque)
  */
 static void newport_vblank_timer(void *opaque)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if ((s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_VINTR) &&
@@ -1404,7 +1404,7 @@ static void newport_vblank_timer(void *opaque)
  * Handle DCB read from sub-devices.
  * The DCB connects REX3 to VC2, XMAP, CMAP, and RAMDAC.
  */
-static uint32_t newport_dcb_read(SGINewportState *s)
+static uint32_t newport_dcb_read(SGINewportVirtuixState *s)
 {
     uint32_t slave = (s->dcb_mode >> DCB_MODE_CSADDR_SHIFT) & 0xf;
     uint32_t reg = (s->dcb_mode >> DCB_MODE_REGSEL_SHIFT) & 0x7;
@@ -1602,7 +1602,7 @@ static inline bool vc2_reg_affects_cursor(uint8_t idx)
 /*
  * Handle DCB write to sub-devices.
  */
-static void newport_dcb_write(SGINewportState *s, uint32_t val)
+static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
 {
     uint32_t slave = (s->dcb_mode >> DCB_MODE_CSADDR_SHIFT) & 0xf;
     uint32_t reg = (s->dcb_mode >> DCB_MODE_REGSEL_SHIFT) & 0x7;
@@ -1830,7 +1830,7 @@ static void newport_dcb_write(SGINewportState *s, uint32_t val)
  * Decode DRAWMODE1 bit fields into cached state for fast access.
  * MAME ref: newport.cpp:3786-3807
  */
-static void newport_decode_drawmode1(SGINewportState *s)
+static void newport_decode_drawmode1(SGINewportVirtuixState *s)
 {
     uint32_t val = s->drawmode1;
     s->dm1_planes    = val & 7;
@@ -1848,7 +1848,7 @@ static void newport_decode_drawmode1(SGINewportState *s)
 /*
  * Decode DRAWMODE0 fields.
  */
-static void newport_decode_drawmode0(SGINewportState *s)
+static void newport_decode_drawmode0(SGINewportVirtuixState *s)
 {
     uint32_t val = s->drawmode0;
     s->dm0_colorhost = (val >> 6) & 1;
@@ -1866,9 +1866,9 @@ static void newport_decode_drawmode0(SGINewportState *s)
  * ============================================================
  */
 
-static uint64_t sgi_newport_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t sgi_newport_virtuix_read(void *opaque, hwaddr addr, unsigned size)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(opaque);
     uint32_t val = 0;
     bool is_go;
     hwaddr reg;
@@ -2132,10 +2132,10 @@ static uint64_t sgi_newport_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
-static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
+static void sgi_newport_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
                                unsigned size)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(opaque);
     bool is_go;
     hwaddr reg;
     unsigned byte_offset = addr & 3;
@@ -2457,9 +2457,9 @@ static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
     }
 }
 
-static const MemoryRegionOps sgi_newport_ops = {
-    .read = sgi_newport_read,
-    .write = sgi_newport_write,
+static const MemoryRegionOps sgi_newport_virtuix_ops = {
+    .read = sgi_newport_virtuix_read,
+    .write = sgi_newport_virtuix_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .impl = {
         .min_access_size = 1,
@@ -2483,7 +2483,7 @@ static const MemoryRegionOps sgi_newport_ops = {
  * running the same DID/XMAP/CMAP/RAMDAC logic as newport_update_display().
  * Useful for inspecting what's actually in VRAM when the display shows black.
  */
-static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
+static void newport_dump_vram_ppm(SGINewportVirtuixState *s, const char *path)
 {
     FILE *f;
     int x, y;
@@ -2771,7 +2771,7 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
 
 static void newport_invalidate(void *opaque)
 {
-    SGINewportState *s = opaque;
+    SGINewportVirtuixState *s = opaque;
     s->display_dirty = true;
 }
 
@@ -2780,7 +2780,7 @@ static void newport_invalidate(void *opaque)
  * Supports 32x32 (2-plane, 4-color) and 64x64 (1-plane, monochrome) cursors.
  * MAME ref: get_cursor_pixel() at newport.cpp:782-814
  */
-static void newport_draw_cursor(SGINewportState *s, uint32_t *dest)
+static void newport_draw_cursor(SGINewportVirtuixState *s, uint32_t *dest)
 {
     uint16_t dc = s->vc2_reg[VC2_DC_CONTROL];
     int16_t cx, cy;
@@ -2797,6 +2797,28 @@ static void newport_draw_cursor(SGINewportState *s, uint32_t *dest)
     cursor_entry = s->vc2_reg[VC2_CURSOR_ENTRY];
     is_64 = dc & VC2_DC_CURSOR_SIZE64;
     size = is_64 ? 64 : 32;
+
+    /*
+     * Virtuix-only diagnostic: emit the VC2 hardware-cursor (x,y) to stderr when
+     * env NP_CURSOR is set, so host-side tooling can closed-loop servo the guest
+     * cursor to an exact position (immune to X11 pointer acceleration). Off by
+     * default -> zero overhead/behavior change. Indy's sgi_newport.c has no such
+     * trace (kept pristine).
+     */
+    {
+        static int np_cursor_trace = -1;
+        if (np_cursor_trace < 0) {
+            np_cursor_trace = getenv("NP_CURSOR") ? 1 : 0;
+        }
+        if (np_cursor_trace) {
+            static int16_t last_cx = -32768, last_cy = -32768;
+            if (cx != last_cx || cy != last_cy) {
+                last_cx = cx;
+                last_cy = cy;
+                fprintf(stderr, "cursor=(%d,%d)\n", cx, cy);
+            }
+        }
+    }
 
     for (gy = 0; gy < size; gy++) {
         sy = cy - (size - 1) + gy;
@@ -2850,7 +2872,7 @@ static void newport_draw_cursor(SGINewportState *s, uint32_t *dest)
  */
 static void newport_update_display(void *opaque)
 {
-    SGINewportState *s = opaque;
+    SGINewportVirtuixState *s = opaque;
     DisplaySurface *surface;
     uint32_t *dest;
     int x, y;
@@ -3054,9 +3076,9 @@ static const GraphicHwOps newport_gfx_ops = {
  * ============================================================
  */
 
-static void sgi_newport_reset(DeviceState *dev)
+static void sgi_newport_virtuix_reset(DeviceState *dev)
 {
-    SGINewportState *s = SGI_NEWPORT(dev);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(dev);
 
     /* Clear all registers */
     s->drawmode0 = 0;
@@ -3185,9 +3207,9 @@ static void sgi_newport_reset(DeviceState *dev)
     s->display_dirty = true;
 }
 
-static void sgi_newport_realize(DeviceState *dev, Error **errp)
+static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(dev);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(dev);
 
     /* Allocate VRAM */
     s->vram_rgbci = g_malloc0(NEWPORT_VRAM_W * NEWPORT_VRAM_H *
@@ -3226,22 +3248,22 @@ static void sgi_newport_realize(DeviceState *dev, Error **errp)
     s->display_dirty = true;
 }
 
-static void sgi_newport_init(Object *obj)
+static void sgi_newport_virtuix_init(Object *obj)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, obj, &sgi_newport_ops, s,
-                          "sgi-newport", REX3_REG_SIZE);
+    memory_region_init_io(&s->iomem, obj, &sgi_newport_virtuix_ops, s,
+                          "sgi-newport-virtuix", REX3_REG_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
 
     /* IRQ output for vertical retrace → INT3_LOCAL1 bit 7 */
     sysbus_init_irq(sbd, &s->irq);
 }
 
-static void sgi_newport_finalize(Object *obj)
+static void sgi_newport_virtuix_finalize(Object *obj)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
 
     if (s->newview_log_file) {
         fclose(s->newview_log_file);
@@ -3259,7 +3281,7 @@ static void sgi_newport_finalize(Object *obj)
 
 static char *newport_get_diag_cmap(Object *obj, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     GString *buf = g_string_sized_new(4096);
     int first_nz = -1, last_nz = -1;
     uint32_t nz_count = 0;
@@ -3315,7 +3337,7 @@ static char *newport_get_diag_cmap(Object *obj, Error **errp)
 
 static char *newport_get_diag_xmap(Object *obj, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     GString *buf = g_string_sized_new(1024);
 
     g_string_append_printf(buf,
@@ -3348,7 +3370,7 @@ static char *newport_get_diag_xmap(Object *obj, Error **errp)
 
 static char *newport_get_diag_vc2(Object *obj, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     GString *buf = g_string_sized_new(2048);
 
     static const char *reg_names[] = {
@@ -3435,7 +3457,7 @@ static char *newport_get_diag_vc2(Object *obj, Error **errp)
 
 static char *newport_get_diag_rex3(Object *obj, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     GString *buf = g_string_sized_new(2048);
     const char *op_names[] = {"NOOP", "READ", "DRAW", "SCR2SCR"};
     const char *adr_names[] = {"SPAN", "BLOCK", "ILINE", "FLINE",
@@ -3493,7 +3515,7 @@ static char *newport_get_diag_rex3(Object *obj, Error **errp)
 
 static char *newport_get_diag_dcb(Object *obj, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     GString *buf = g_string_sized_new(512);
     uint32_t m = s->dcb_mode;
     const char *dw_names[] = {"4bit", "1byte", "2byte", "4byte"};
@@ -3523,7 +3545,7 @@ static char *newport_get_diag_dcb(Object *obj, Error **errp)
 
 static char *newport_get_diag_all(Object *obj, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
     GString *buf = g_string_sized_new(1024);
 
     /* CMAP summary */
@@ -3681,7 +3703,7 @@ static char *newport_get_fb_dump(Object *obj, Error **errp)
 
 static void newport_set_fb_dump(Object *obj, const char *value, Error **errp)
 {
-    SGINewportState *s = SGI_NEWPORT(obj);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(obj);
 
     if (value && value[0] != '\0') {
         /* Force display dirty so the surface gets updated too */
@@ -3690,13 +3712,13 @@ static void newport_set_fb_dump(Object *obj, const char *value, Error **errp)
     }
 }
 
-static const Property sgi_newport_properties[] = {
-    DEFINE_PROP_STRING("newview-log", SGINewportState, newview_log_path),
+static const Property sgi_newport_virtuix_properties[] = {
+    DEFINE_PROP_STRING("newview-log", SGINewportVirtuixState, newview_log_path),
 };
 
-static int sgi_newport_post_load(void *opaque, int version_id)
+static int sgi_newport_virtuix_post_load(void *opaque, int version_id)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
+    SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(opaque);
 
     /* Rebuild decoded drawmode fields from saved register values */
     newport_decode_drawmode1(s);
@@ -3712,140 +3734,140 @@ static int sgi_newport_post_load(void *opaque, int version_id)
     (NEWPORT_VRAM_W * NEWPORT_VRAM_H * sizeof(uint32_t))
 
 static const VMStateDescription vmstate_sgi_newport = {
-    .name = "sgi-newport",
+    .name = "sgi-newport-virtuix",
     .version_id = 5,
     .minimum_version_id = 5,
-    .post_load = sgi_newport_post_load,
+    .post_load = sgi_newport_virtuix_post_load,
     .fields = (const VMStateField[]) {
         /* REX3 drawing registers */
-        VMSTATE_UINT32(drawmode0, SGINewportState),
-        VMSTATE_UINT32(drawmode1, SGINewportState),
-        VMSTATE_UINT32(ls_mode, SGINewportState),
-        VMSTATE_UINT32(ls_pattern, SGINewportState),
-        VMSTATE_UINT32(ls_pattern_saved, SGINewportState),
-        VMSTATE_UINT32(z_pattern, SGINewportState),
-        VMSTATE_UINT32(color_back, SGINewportState),
-        VMSTATE_UINT32(color_vram, SGINewportState),
-        VMSTATE_UINT32(alpha_ref, SGINewportState),
-        VMSTATE_UINT32_ARRAY(smask_x, SGINewportState, 5),
-        VMSTATE_UINT32_ARRAY(smask_y, SGINewportState, 5),
-        VMSTATE_UINT32(setup, SGINewportState),
-        VMSTATE_UINT32(step_z, SGINewportState),
+        VMSTATE_UINT32(drawmode0, SGINewportVirtuixState),
+        VMSTATE_UINT32(drawmode1, SGINewportVirtuixState),
+        VMSTATE_UINT32(ls_mode, SGINewportVirtuixState),
+        VMSTATE_UINT32(ls_pattern, SGINewportVirtuixState),
+        VMSTATE_UINT32(ls_pattern_saved, SGINewportVirtuixState),
+        VMSTATE_UINT32(z_pattern, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_back, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_vram, SGINewportVirtuixState),
+        VMSTATE_UINT32(alpha_ref, SGINewportVirtuixState),
+        VMSTATE_UINT32_ARRAY(smask_x, SGINewportVirtuixState, 5),
+        VMSTATE_UINT32_ARRAY(smask_y, SGINewportVirtuixState, 5),
+        VMSTATE_UINT32(setup, SGINewportVirtuixState),
+        VMSTATE_UINT32(step_z, SGINewportVirtuixState),
 
         /* Coordinate registers */
-        VMSTATE_INT32(x_start, SGINewportState),
-        VMSTATE_INT32(y_start, SGINewportState),
-        VMSTATE_INT32(x_end, SGINewportState),
-        VMSTATE_INT32(y_end, SGINewportState),
-        VMSTATE_INT32(x_save, SGINewportState),
-        VMSTATE_UINT32(xy_move, SGINewportState),
-        VMSTATE_UINT32(bres_d, SGINewportState),
-        VMSTATE_UINT32(bres_s1, SGINewportState),
-        VMSTATE_UINT32(bres_octant_inc1, SGINewportState),
-        VMSTATE_UINT32(bres_round_inc2, SGINewportState),
-        VMSTATE_UINT32(bres_e1, SGINewportState),
-        VMSTATE_UINT32(bres_s2, SGINewportState),
-        VMSTATE_UINT32(a_weight0, SGINewportState),
-        VMSTATE_UINT32(a_weight1, SGINewportState),
-        VMSTATE_UINT32(x_start_f, SGINewportState),
-        VMSTATE_UINT32(y_start_f, SGINewportState),
-        VMSTATE_UINT32(x_end_f, SGINewportState),
-        VMSTATE_UINT32(y_end_f, SGINewportState),
-        VMSTATE_INT32(x_start_i, SGINewportState),
-        VMSTATE_UINT32(xy_start_i, SGINewportState),
-        VMSTATE_UINT32(xy_end_i, SGINewportState),
-        VMSTATE_UINT32(x_start_end_i, SGINewportState),
+        VMSTATE_INT32(x_start, SGINewportVirtuixState),
+        VMSTATE_INT32(y_start, SGINewportVirtuixState),
+        VMSTATE_INT32(x_end, SGINewportVirtuixState),
+        VMSTATE_INT32(y_end, SGINewportVirtuixState),
+        VMSTATE_INT32(x_save, SGINewportVirtuixState),
+        VMSTATE_UINT32(xy_move, SGINewportVirtuixState),
+        VMSTATE_UINT32(bres_d, SGINewportVirtuixState),
+        VMSTATE_UINT32(bres_s1, SGINewportVirtuixState),
+        VMSTATE_UINT32(bres_octant_inc1, SGINewportVirtuixState),
+        VMSTATE_UINT32(bres_round_inc2, SGINewportVirtuixState),
+        VMSTATE_UINT32(bres_e1, SGINewportVirtuixState),
+        VMSTATE_UINT32(bres_s2, SGINewportVirtuixState),
+        VMSTATE_UINT32(a_weight0, SGINewportVirtuixState),
+        VMSTATE_UINT32(a_weight1, SGINewportVirtuixState),
+        VMSTATE_UINT32(x_start_f, SGINewportVirtuixState),
+        VMSTATE_UINT32(y_start_f, SGINewportVirtuixState),
+        VMSTATE_UINT32(x_end_f, SGINewportVirtuixState),
+        VMSTATE_UINT32(y_end_f, SGINewportVirtuixState),
+        VMSTATE_INT32(x_start_i, SGINewportVirtuixState),
+        VMSTATE_UINT32(xy_start_i, SGINewportVirtuixState),
+        VMSTATE_UINT32(xy_end_i, SGINewportVirtuixState),
+        VMSTATE_UINT32(x_start_end_i, SGINewportVirtuixState),
 
         /* Integer coordinate state */
-        VMSTATE_INT16(iter_x, SGINewportState),
-        VMSTATE_INT16(iter_y, SGINewportState),
-        VMSTATE_INT16(x_start_int, SGINewportState),
-        VMSTATE_INT16(y_start_int, SGINewportState),
-        VMSTATE_INT16(x_end_int, SGINewportState),
-        VMSTATE_INT16(y_end_int, SGINewportState),
-        VMSTATE_INT16(x_save_int, SGINewportState),
+        VMSTATE_INT16(iter_x, SGINewportVirtuixState),
+        VMSTATE_INT16(iter_y, SGINewportVirtuixState),
+        VMSTATE_INT16(x_start_int, SGINewportVirtuixState),
+        VMSTATE_INT16(y_start_int, SGINewportVirtuixState),
+        VMSTATE_INT16(x_end_int, SGINewportVirtuixState),
+        VMSTATE_INT16(y_end_int, SGINewportVirtuixState),
+        VMSTATE_INT16(x_save_int, SGINewportVirtuixState),
 
         /* Color registers */
-        VMSTATE_UINT32(write_mask, SGINewportState),
-        VMSTATE_UINT32(color_i, SGINewportState),
-        VMSTATE_UINT32(zero_overflow, SGINewportState),
-        VMSTATE_UINT32(color_red, SGINewportState),
-        VMSTATE_UINT32(color_alpha, SGINewportState),
-        VMSTATE_UINT32(color_green, SGINewportState),
-        VMSTATE_UINT32(color_blue, SGINewportState),
-        VMSTATE_UINT32(curr_color_red, SGINewportState),
-        VMSTATE_UINT32(curr_color_alpha, SGINewportState),
-        VMSTATE_UINT32(curr_color_green, SGINewportState),
-        VMSTATE_UINT32(curr_color_blue, SGINewportState),
-        VMSTATE_INT32(slope_red, SGINewportState),
-        VMSTATE_INT32(slope_alpha, SGINewportState),
-        VMSTATE_INT32(slope_green, SGINewportState),
-        VMSTATE_INT32(slope_blue, SGINewportState),
-        VMSTATE_UINT64(host_dataport, SGINewportState),
-        VMSTATE_UINT32(host_shift, SGINewportState),
-        VMSTATE_UINT32(global_mask, SGINewportState),
+        VMSTATE_UINT32(write_mask, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_i, SGINewportVirtuixState),
+        VMSTATE_UINT32(zero_overflow, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_red, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_alpha, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_green, SGINewportVirtuixState),
+        VMSTATE_UINT32(color_blue, SGINewportVirtuixState),
+        VMSTATE_UINT32(curr_color_red, SGINewportVirtuixState),
+        VMSTATE_UINT32(curr_color_alpha, SGINewportVirtuixState),
+        VMSTATE_UINT32(curr_color_green, SGINewportVirtuixState),
+        VMSTATE_UINT32(curr_color_blue, SGINewportVirtuixState),
+        VMSTATE_INT32(slope_red, SGINewportVirtuixState),
+        VMSTATE_INT32(slope_alpha, SGINewportVirtuixState),
+        VMSTATE_INT32(slope_green, SGINewportVirtuixState),
+        VMSTATE_INT32(slope_blue, SGINewportVirtuixState),
+        VMSTATE_UINT64(host_dataport, SGINewportVirtuixState),
+        VMSTATE_UINT32(host_shift, SGINewportVirtuixState),
+        VMSTATE_UINT32(global_mask, SGINewportVirtuixState),
 
         /* DCB */
-        VMSTATE_UINT32(dcb_mode, SGINewportState),
-        VMSTATE_UINT32(dcb_data_msw, SGINewportState),
-        VMSTATE_UINT32(dcb_data_lsw, SGINewportState),
+        VMSTATE_UINT32(dcb_mode, SGINewportVirtuixState),
+        VMSTATE_UINT32(dcb_data_msw, SGINewportVirtuixState),
+        VMSTATE_UINT32(dcb_data_lsw, SGINewportVirtuixState),
 
         /* Screenmask and clipping */
-        VMSTATE_UINT32(top_scanline, SGINewportState),
-        VMSTATE_UINT32(xy_window, SGINewportState),
-        VMSTATE_UINT32(clip_mode, SGINewportState),
+        VMSTATE_UINT32(top_scanline, SGINewportVirtuixState),
+        VMSTATE_UINT32(xy_window, SGINewportVirtuixState),
+        VMSTATE_UINT32(clip_mode, SGINewportVirtuixState),
 
         /* Config and status */
-        VMSTATE_UINT32(config, SGINewportState),
-        VMSTATE_UINT32(status, SGINewportState),
+        VMSTATE_UINT32(config, SGINewportVirtuixState),
+        VMSTATE_UINT32(status, SGINewportVirtuixState),
 
         /* VC2 */
-        VMSTATE_UINT32(vc2_ram_addr, SGINewportState),
-        VMSTATE_UINT32(vc2_reg_idx, SGINewportState),
-        VMSTATE_UINT32(vc2_reg_data, SGINewportState),
-        VMSTATE_UINT16_ARRAY(vc2_ram, SGINewportState, 32768),
-        VMSTATE_UINT16_ARRAY(vc2_reg, SGINewportState, 32),
+        VMSTATE_UINT32(vc2_ram_addr, SGINewportVirtuixState),
+        VMSTATE_UINT32(vc2_reg_idx, SGINewportVirtuixState),
+        VMSTATE_UINT32(vc2_reg_data, SGINewportVirtuixState),
+        VMSTATE_UINT16_ARRAY(vc2_ram, SGINewportVirtuixState, 32768),
+        VMSTATE_UINT16_ARRAY(vc2_reg, SGINewportVirtuixState, 32),
 
         /* XMAP9 */
-        VMSTATE_UINT32(xmap_config, SGINewportState),
-        VMSTATE_UINT32(xmap_revision, SGINewportState),
-        VMSTATE_UINT8(xmap_cursor_cmap, SGINewportState),
-        VMSTATE_UINT8(xmap_popup_cmap, SGINewportState),
-        VMSTATE_UINT8(xmap_mode_table_idx, SGINewportState),
-        VMSTATE_UINT32_ARRAY(xmap_mode_table, SGINewportState, 32),
+        VMSTATE_UINT32(xmap_config, SGINewportVirtuixState),
+        VMSTATE_UINT32(xmap_revision, SGINewportVirtuixState),
+        VMSTATE_UINT8(xmap_cursor_cmap, SGINewportVirtuixState),
+        VMSTATE_UINT8(xmap_popup_cmap, SGINewportVirtuixState),
+        VMSTATE_UINT8(xmap_mode_table_idx, SGINewportVirtuixState),
+        VMSTATE_UINT32_ARRAY(xmap_mode_table, SGINewportVirtuixState, 32),
 
         /* CMAP */
-        VMSTATE_UINT32(cmap_revision, SGINewportState),
-        VMSTATE_UINT16(cmap_palette_idx, SGINewportState),
-        VMSTATE_UINT32_ARRAY(cmap0_palette, SGINewportState, 8192),
+        VMSTATE_UINT32(cmap_revision, SGINewportVirtuixState),
+        VMSTATE_UINT16(cmap_palette_idx, SGINewportVirtuixState),
+        VMSTATE_UINT32_ARRAY(cmap0_palette, SGINewportVirtuixState, 8192),
 
         /* RAMDAC */
-        VMSTATE_UINT8(ramdac_lut_index, SGINewportState),
-        VMSTATE_UINT32_ARRAY(ramdac_lut_r, SGINewportState, 256),
-        VMSTATE_UINT32_ARRAY(ramdac_lut_g, SGINewportState, 256),
-        VMSTATE_UINT32_ARRAY(ramdac_lut_b, SGINewportState, 256),
+        VMSTATE_UINT8(ramdac_lut_index, SGINewportVirtuixState),
+        VMSTATE_UINT32_ARRAY(ramdac_lut_r, SGINewportVirtuixState, 256),
+        VMSTATE_UINT32_ARRAY(ramdac_lut_g, SGINewportVirtuixState, 256),
+        VMSTATE_UINT32_ARRAY(ramdac_lut_b, SGINewportVirtuixState, 256),
 
         /* VRAM (heap-allocated, fixed size) */
-        VMSTATE_BUFFER_POINTER_UNSAFE(vram_rgbci, SGINewportState, 0,
+        VMSTATE_BUFFER_POINTER_UNSAFE(vram_rgbci, SGINewportVirtuixState, 0,
                                       NEWPORT_VRAM_BYTES),
-        VMSTATE_BUFFER_POINTER_UNSAFE(vram_cidaux, SGINewportState, 0,
+        VMSTATE_BUFFER_POINTER_UNSAFE(vram_cidaux, SGINewportVirtuixState, 0,
                                       NEWPORT_VRAM_BYTES),
 
         /* Display dirty flag */
-        VMSTATE_BOOL(display_dirty, SGINewportState),
+        VMSTATE_BOOL(display_dirty, SGINewportVirtuixState),
 
         VMSTATE_END_OF_LIST()
     }
 };
 
-static void sgi_newport_class_init(ObjectClass *klass, const void *data)
+static void sgi_newport_virtuix_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->realize = sgi_newport_realize;
-    device_class_set_legacy_reset(dc, sgi_newport_reset);
+    dc->realize = sgi_newport_virtuix_realize;
+    device_class_set_legacy_reset(dc, sgi_newport_virtuix_reset);
     dc->vmsd = &vmstate_sgi_newport;
-    device_class_set_props(dc, sgi_newport_properties);
+    device_class_set_props(dc, sgi_newport_virtuix_properties);
 
     /* fb-dump: set to a file path to dump raw VRAM as PPM (via qom-set) */
     object_class_property_add_str(klass, "fb-dump",
@@ -3867,18 +3889,18 @@ static void sgi_newport_class_init(ObjectClass *klass, const void *data)
                                   newport_get_diag_all, NULL);
 }
 
-static const TypeInfo sgi_newport_info = {
-    .name              = TYPE_SGI_NEWPORT,
+static const TypeInfo sgi_newport_virtuix_info = {
+    .name              = TYPE_SGI_NEWPORT_VIRTUIX,
     .parent            = TYPE_SYS_BUS_DEVICE,
-    .instance_size     = sizeof(SGINewportState),
-    .instance_init     = sgi_newport_init,
-    .instance_finalize = sgi_newport_finalize,
-    .class_init        = sgi_newport_class_init,
+    .instance_size     = sizeof(SGINewportVirtuixState),
+    .instance_init     = sgi_newport_virtuix_init,
+    .instance_finalize = sgi_newport_virtuix_finalize,
+    .class_init        = sgi_newport_virtuix_class_init,
 };
 
-static void sgi_newport_register_types(void)
+static void sgi_newport_virtuix_register_types(void)
 {
-    type_register_static(&sgi_newport_info);
+    type_register_static(&sgi_newport_virtuix_info);
 }
 
-type_init(sgi_newport_register_types)
+type_init(sgi_newport_virtuix_register_types)

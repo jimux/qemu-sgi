@@ -100,6 +100,22 @@ config SGI_INDY
     select SERIAL_MM
     select UNIMP
 
+# Virtuix (IP55) -- SGI-Indy-derived virtualization-native SMP machine. Built
+# from its OWN device copies (sgi_*_virtuix.c / TYPE_*_VIRTUIX) so changes to
+# Virtuix hardware never touch the authentic Indy devices above.
+config SGI_VIRTUIX
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select SGI_MC_VIRTUIX
+    select SGI_HPC3_VIRTUIX
+    select SGI_NEWPORT_VIRTUIX
+    select SGI_SMP
+    select SGI_ARCS
+    select WD33C93
+    select SERIAL_MM
+    select UNIMP
+
 config SGI_O2
     bool
     default y
