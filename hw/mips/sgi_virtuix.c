@@ -230,6 +230,19 @@ static void sgi_virtuix_init(MachineState *machine) {
   }
 
   /*
+   * Virtualization-native time: drive CP0 Count/Compare (the source of the HZ
+   * scheduling tick, IRQ7) off the host monotonic clock instead of
+   * QEMU_CLOCK_VIRTUAL. Under MTTCG at high -smp counts, virtual time advances
+   * in bursts (each vCPU thread progresses its clock in chunks), so the tick
+   * fires erratically -> the UI stalls for seconds (measured: window-drag lag,
+   * with the guest 100% idle, was bursty/stalled HZ-tick delivery). Routing
+   * Count to the realtime clock makes the tick smooth. Respects an explicit
+   * user override (overwrite=0). See target/mips/system/cp0_timer.c. Authentic
+   * Indy keeps the default VIRTUAL clock (sgi_indy.c sets nothing).
+   */
+  setenv("QEMU_MIPS_COUNT_REALTIME", "1", 0);
+
+  /*
    * Virtualization-native CPU clock. The modeled frequency sets the CP0 Count
    * rate (Count = cpu_clock / CCRes); 66.67 MHz matches the frequency IRIX
    * believes (hinv "66 MHZ IP22"), so cycle->time conversion tracks real time
