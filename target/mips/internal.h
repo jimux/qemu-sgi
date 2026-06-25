@@ -216,6 +216,7 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t value);
 void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value);
 void cpu_mips_start_count(CPUMIPSState *env);
 void cpu_mips_stop_count(CPUMIPSState *env);
+void cpu_mips_timer_catchup(CPUMIPSState *env);
 
 static inline void mips_env_set_pc(CPUMIPSState *env, target_ulong value)
 {

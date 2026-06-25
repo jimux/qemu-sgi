@@ -140,6 +140,15 @@ static bool mips_cpu_has_work(CPUState *cs)
     bool has_work = false;
 
     /*
+     * Deliver an already-expired host-clock CP0 timer tick from this vCPU
+     * context rather than waiting for the (possibly BQL-starved) main-loop
+     * timer callback. No-op unless the realtime-clock (virtuix) config is in
+     * use, so authentic indy / other MIPS machines are unaffected. See
+     * cpu_mips_timer_catchup() in cp0_timer.c.
+     */
+    cpu_mips_timer_catchup(env);
+
+    /*
      * Prior to MIPS Release 6 it is implementation dependent if non-enabled
      * interrupts wake-up the CPU, however most of the implementations only
      * check for interrupts that can be taken. For pre-release 6 CPUs,

@@ -155,6 +155,35 @@ static void mips_timer_cb(void *opaque)
     cpu_mips_timer_expire(env);
 }
 
+/*
+ * vCPU-thread self-service for the host-clock (realtime) CP0 timer.
+ *
+ * mips_timer_cb runs in the main loop, which can be BQL-starved for seconds
+ * during MMIO/TLB-shootdown-heavy guest activity (e.g. a window drag on an
+ * -smp virtuix desktop): the HZ tick interrupt then arrives seconds late and
+ * the UI freezes even though every vCPU is busy. When the timer is driven off
+ * QEMU_CLOCK_REALTIME we can safely deliver an already-expired tick from the
+ * calling vCPU context (called from mips_cpu_has_work, which is re-evaluated
+ * whenever a CPU is kicked -- and the drag's cross-CPU shootdowns kick them
+ * constantly), so the tick no longer depends solely on main-loop latency.
+ *
+ * Idempotent and gated to the realtime clock, so the VIRTUAL-clock default
+ * (authentic indy and every other MIPS machine) is completely unaffected.
+ */
+void cpu_mips_timer_catchup(CPUMIPSState *env)
+{
+    if (mips_count_clock_type() != QEMU_CLOCK_REALTIME) {
+        return;
+    }
+    if (!env->timer || (env->CP0_Cause & (1 << CP0Ca_DC))) {
+        return;
+    }
+    if (timer_pending(env->timer) &&
+        timer_expired(env->timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME))) {
+        cpu_mips_timer_expire(env);
+    }
+}
+
 void cpu_mips_clock_init(MIPSCPU *cpu)
 {
     CPUMIPSState *env = &cpu->env;
