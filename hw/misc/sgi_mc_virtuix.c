@@ -756,12 +756,22 @@ static void sgi_mc_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
         s->dma_count = val;
         break;
     case MC_DMA_RUN:
-        s->dma_run = val;
-        /* TODO: Actually perform DMA when enabled */
+        /*
+         * Read-only DMA status register (RUNNING bit 6 / COMPLETE bit 3): MAME
+         * mc.cpp has NO write case for 0x2048. The transfer is kicked by the
+         * *_START registers (GIO_ADDR_START / DMA_START / GIO_ADDR_DEF_START),
+         * never by writing here. Ignore the write so the guest cannot clobber
+         * the running/complete status the read side reports.
+         */
         break;
     case MC_DMA_MEM_ADDR_DEF:
+        /*
+         * "+ default params" is a misnomer: MAME mc.cpp 0x2008 also only stores
+         * the DMA memory address -- there is no implicit descriptor default to
+         * set. The actual default-descriptor seeding happens in the
+         * GIO_ADDR_DEF_START (0x2070) handler.
+         */
         s->dma_mem_addr = val;
-        /* TODO: Also set default parameters */
         break;
     case MC_DMA_GIO_ADDR_START:
         s->dma_gio_addr = val;
