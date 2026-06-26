@@ -475,7 +475,12 @@ static void sgi_virtuix_class_init(ObjectClass *oc, const void *data) {
   mc->block_default_type = IF_SCSI;
   mc->default_ram_size = 256 * MiB;
   mc->default_ram_id = "sgi.ram";
-  mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4600");
+  /* R5000 = MIPS IV so IP55 runs the full (mips4) nekoware catalog. Same
+   * R4x00/UP-era lineage + software-managed caches as the R4600 we ran SMP on,
+   * and the IP22/IP55 kernel already compiles the R5000 errata WARs; the R5000
+   * code paths are FP/cache, not SMP coherency. (R10000/R12000 would trip
+   * IS_R10000() into L2/speculation paths we don't model.) */
+  mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R5000");
   mc->default_cpus = 1;
   mc->max_cpus = 32; /* IP55 SMP: paravirtual IPI via sgi-smp on env.irq[6] */
   mc->no_floppy = 1;

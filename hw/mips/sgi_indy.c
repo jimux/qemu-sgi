@@ -737,7 +737,10 @@ static void sgi_indy_class_init(ObjectClass *oc, const void *data) {
   mc->block_default_type = IF_SCSI;
   mc->default_ram_size = 64 * MiB;
   mc->default_ram_id = "sgi.ram";
-  mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4600");
+  /* R5000 = MIPS IV: the highest authentic Indy CPU the IP24 PROM recognizes,
+   * and the ISA nekoware is built for. R4600 (mips3) could not run mips4
+   * binaries ("Program not supported by architecture"). */
+  mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R5000");
   mc->default_cpus = 1;
   mc->no_floppy = 1;
   mc->no_cdrom = 1;

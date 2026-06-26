@@ -753,6 +753,93 @@ static const int16_t rwpacked_max_len[2][4] = {
 };
 
 /*
+ * Host-offloaded fast path for the common solid rectangle fill (root weave,
+ * window clears, opaque panel fills) — the bulk of 4Dwm's REX3 traffic and the
+ * single most host-CPU-expensive thing the per-pixel emulator does. When the
+ * fill is solid-color, opaque, unclipped, no-stipple, full-rect with a logic op
+ * whose result is independent of the destination, every pixel of a row is the
+ * same constant store to a CONTIGUOUS run of VRAM, so we fill each row with a
+ * tight word loop instead of ~4 function calls + clip/offset/bounds recompute
+ * per pixel. Output is bit-identical to the newport_output_pixel path; the
+ * caller gates entry on exactly the conditions assumed here, and we leave the
+ * coordinate registers exactly where the slow loop would (iter = x_save, end_y).
+ */
+static void newport_fast_block_fill(SGINewportVirtuixState *s,
+                                    int16_t start_x, int16_t start_y,
+                                    int16_t end_x, int16_t end_y,
+                                    int16_t dx, int16_t dy, uint32_t color)
+{
+    uint32_t *buf = (s->dm1_planes == 4 || s->dm1_planes == 5 ||
+                     s->dm1_planes == 6) ? s->vram_cidaux : s->vram_rgbci;
+    uint32_t src = color;
+    uint32_t cval, mask, cm, nm;
+    int winx, winy, xa, xb, ya, yb, y;
+
+    /* plane-lane shift — matches newport_logic_pixel */
+    if (s->dm1_planes == 5) {
+        src <<= 2;
+    } else if (s->dm1_planes == 4) {
+        src <<= 8;
+    }
+    /* logic op — only dst-independent ops reach here (gated by caller) */
+    switch (s->dm1_logicop) {
+    case 0x0: cval = 0; break;
+    case 0xc: cval = ~src; break;
+    case 0xf: cval = 0xffffffff; break;
+    default:  cval = src; break;   /* 0x3 SRC — the overwhelmingly common case */
+    }
+    mask = s->write_mask & s->global_mask;
+    cm = cval & mask; nm = ~mask;
+
+    winx = (int16_t)((s->xy_window >> 16) & 0xffff);
+    winy = (int16_t)(s->xy_window & 0xffff);
+
+    /* inclusive pixel ranges the slow loop draws: x in [start_x,end_x) step dx */
+    xa = (dx > 0) ? start_x : (end_x + 1);
+    xb = (dx > 0) ? (end_x - 1) : start_x;
+    ya = (dy > 0) ? start_y : (end_y + 1);
+    yb = (dy > 0) ? (end_y - 1) : start_y;
+
+    for (y = ya; y <= yb; y++) {
+        int wy = y + winy - 0x1000;
+        int wxa = xa + winx - 0x1000;
+        int wxb = xb + winx - 0x1000;
+        uint32_t base;
+        int n, i;
+
+        if (wy < 0 || wy >= NEWPORT_VRAM_H) {
+            continue;                      /* out-of-bounds row: slow path skips too */
+        }
+        if (wxa < 0) {
+            wxa = 0;
+        }
+        if (wxb >= NEWPORT_VRAM_W) {
+            wxb = NEWPORT_VRAM_W - 1;
+        }
+        if (wxa > wxb) {
+            continue;
+        }
+        base = (uint32_t)wy * NEWPORT_VRAM_W + (uint32_t)wxa;
+        n = wxb - wxa + 1;
+        if (mask == 0xffffffff) {
+            for (i = 0; i < n; i++) {
+                buf[base + i] = cval;
+            }
+        } else {
+            for (i = 0; i < n; i++) {
+                buf[base + i] = (buf[base + i] & nm) | cm;
+            }
+        }
+    }
+
+    /* leave the coordinate registers where the per-pixel loop would */
+    s->iter_x = s->x_save_int;
+    s->iter_y = end_y;
+    newport_write_x_start(s, (int32_t)s->x_save_int << 11);
+    newport_write_y_start(s, (int32_t)end_y << 11);
+}
+
+/*
  * Block fill — nested loop over Y then X.
  * The PROM's most-used operation (screen clear, rectangle fill).
  * MAME ref: newport.cpp:3418-3492
@@ -821,6 +908,24 @@ static void newport_draw_block(SGINewportVirtuixState *s)
      *
      * MAME ref: newport.cpp lines 3449-3487
      */
+    /*
+     * Host-offloaded fast path: solid, opaque, unclipped, no-stipple,
+     * full-rectangle fill with a destination-independent logic op. Every
+     * condition here guarantees the per-pixel loop below would write the same
+     * constant value to every covered pixel, so newport_fast_block_fill()
+     * reproduces it with a per-row word fill. Anything else falls through to
+     * the faithful per-pixel path unchanged.
+     */
+    if (stop_on_x && stop_on_y && !shade && !lr_abort &&
+        !s->dm0_colorhost && (!s->dm1_rgbmode || s->dm1_fastclear) &&
+        pattern == 0xffffffff && prim_end_x == end_x && s->clip_mode == 0 &&
+        s->dm1_planes != 0 && s->x_save_int == start_x &&
+        (s->dm1_logicop == 0x3 || s->dm1_logicop == 0x0 ||
+         s->dm1_logicop == 0xc || s->dm1_logicop == 0xf)) {
+        newport_fast_block_fill(s, start_x, start_y, end_x, end_y, dx, dy, color);
+        return;
+    }
+
     sx = start_x;
     sy = start_y;
     do {
