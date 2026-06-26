@@ -38,6 +38,7 @@
 #include "hw/core/loader.h"
 #include "hw/misc/sgi_arcs.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
 #include "qom/object.h"
 
 /*
@@ -289,12 +290,26 @@ static void arcs_hypercall(SGIARCSState *s)
 
     case ARCS_FN_HALT:
     case ARCS_FN_POWERDOWN:
+        /* Clean guest-initiated shutdown (`init 0`/halt): exit QEMU. The
+         * kernel ELF + trampoline are registered ROMs, so under -kernel boot
+         * there is no firmware to return to — shutting down is correct and
+         * supports the disk-safety "graceful init 0" stop workflow. */
+        qemu_log("ARCS: %s called -> QEMU shutdown\n",
+                 s->func == ARCS_FN_HALT ? "Halt" : "PowerDown");
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        s->result = 0;
+        break;
+
     case ARCS_FN_RESTART:
     case ARCS_FN_REBOOT:
-        qemu_log("ARCS: %s called, stopping QEMU\n",
-                 s->func == ARCS_FN_HALT ? "Halt" :
-                 s->func == ARCS_FN_POWERDOWN ? "PowerDown" :
+        /* Guest reboot (`init 6`/reboot): request a system reset. On reset the
+         * CPU restarts at the PROM trampoline and QEMU re-applies the kernel
+         * ELF + trampoline ROM blobs, so the guest boots fresh (no PROM
+         * needed). Without this the guest's ARCS reboot was a no-op and it
+         * spun retrying. */
+        qemu_log("ARCS: %s called -> system reset (reboot)\n",
                  s->func == ARCS_FN_RESTART ? "Restart" : "Reboot");
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         s->result = 0;
         break;
 
