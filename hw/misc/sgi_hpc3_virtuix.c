@@ -1179,9 +1179,9 @@ static void sgi_hpc3_virtuix_update_irq(SGIHPC3VirtuixState *s)
      * Local1 sources: HPC_DMA (0x10), GIO2/Retrace (0x80),
      *                  MAPPABLE1/LCL0 (0x08)
      */
-    s->int3_local0_stat &= (INT3_LOCAL0_SCSI0 | INT3_LOCAL0_SCSI1 |
-                             INT3_LOCAL0_ETHERNET | INT3_LOCAL0_MC_DMA |
-                             INT3_LOCAL0_MAPPABLE0);
+    s->int3_local0_stat &= (INT3_LOCAL0_FIFO | INT3_LOCAL0_SCSI0 |
+                             INT3_LOCAL0_SCSI1 | INT3_LOCAL0_ETHERNET |
+                             INT3_LOCAL0_MC_DMA | INT3_LOCAL0_MAPPABLE0);
     s->int3_local1_stat &= (INT3_LOCAL1_LCL0 | INT3_LOCAL1_HPC_DMA |
                              INT3_LOCAL1_GIO2);
     int local0_pending = (s->int3_local0_stat & s->int3_local0_mask) ? 1 : 0;
@@ -2235,7 +2235,16 @@ static uint64_t sgi_hpc3_virtuix_read(void *opaque, hwaddr addr, unsigned size)
          */
         else if (base_addr >= 0x58000 && base_addr < 0x5c000) {
             hwaddr pio_offset = base_addr - 0x58000;
-            if (pio_offset == 0x484) {
+            if (s->voice && pio_offset >= 0x400 && pio_offset <= 0x4ff) {
+                /* HAL2 AES register block (read back what was written so
+                 * a2_dd's write-readback codec probe passes). On real HAL2
+                 * silicon these ARE the AES-TX registers; we give them priority
+                 * over the PROM-only keyboard PIO at 0x484/0x488/0x48c (the OS
+                 * keyboard uses HPC3_KBD_MOUSE0/1 at 0x59840/0x59844). Gated on
+                 * s->voice so non-audio boots keep the PROM keyboard unchanged. */
+                val = s->hal2_aes[pio_offset - 0x400];
+                trace_sgi_hpc3_hal2_read(pio_offset, val);
+            } else if (pio_offset == 0x484) {
                 /* Status register */
                 val = sgi_hpc3_virtuix_kbd_status(s);
             } else if (pio_offset == 0x488) {
@@ -2296,7 +2305,26 @@ static uint64_t sgi_hpc3_virtuix_read(void *opaque, hwaddr addr, unsigned size)
             } else if (ch_offset == HPC3_PBUS_DP_BASE) {
                 val = s->pbus_dp[ch];
             } else if (ch_offset == HPC3_PBUS_CTRL_BASE) {
-                val = s->pbus_ctrl[ch];
+                /*
+                 * Audio channels (0..3) report DMA status here and ack the
+                 * completion interrupt on read (MAME hpc3.cpp:777-789):
+                 *   bit0 = IRQ pending, bit1 = DMA active. Other channels
+                 *   read back the raw control word.
+                 */
+                if (ch < 4 && s->voice) {
+                    val = (s->hal2_pbus[ch].active ? 2 : 0)
+                        | ((s->intstat & (1u << ch)) ? 1 : 0);
+                    if (s->intstat & (1u << ch)) {
+                        s->intstat &= ~(1u << ch);
+                        if (s->intstat == 0) {
+                            s->int3_local0_stat &= ~INT3_LOCAL0_FIFO;
+                        }
+                        sgi_hpc3_virtuix_update_irq(s);
+                    }
+                } else {
+                    val = s->pbus_ctrl[ch];
+                }
+                trace_sgi_hpc3_pbus_ctrl_rd(ch, val);
             }
             /* Other offsets in channel return 0 */
         }
@@ -2322,6 +2350,284 @@ static uint64_t sgi_hpc3_virtuix_read(void *opaque, hwaddr addr, unsigned size)
 
     trace_sgi_hpc3_read((uint64_t)addr, (uint64_t)val);
     return val;
+}
+
+/* ------------------------------------------------------------------------- *
+ *  HAL2 audio: rate generator + PBUS audio-DMA walker (ported from MAME
+ *  sgi/hal2.cpp + sgi/hpc3.cpp). All gated on s->voice (NULL unless an
+ *  audiodev is configured), so default boots are unaffected.
+ * ------------------------------------------------------------------------- */
+
+static void sgi_hpc3_virtuix_audio_out_cb(void *opaque, int avail);
+
+/*
+ * Bresenham clock-gen frequency (MAME hal2.cpp update_clock_freq/get_rate):
+ *   base = 48000 (sel==0) | 44100 (sel==1) | 0 (off)
+ *   mod  = 0x10000 - ((modctrl + 1) - inc)   [mod==0 treated as 1]
+ *   tick = base * inc / mod                   (per-frame rate)
+ */
+static uint32_t hal2_bres_freq(uint32_t base, uint16_t inc, uint16_t modctrl)
+{
+    if (base == 0 || inc == 0) {
+        return 0;
+    }
+    uint32_t mod = 0x10000u - (((uint32_t)modctrl + 1u) - (uint32_t)inc);
+    if (mod == 0) {
+        mod = 1;
+    }
+    return (uint32_t)(((uint64_t)base * inc) / mod);
+}
+
+/* Recompute the codec-A host frame rate from the decoded codec/bres state. */
+static void hal2_recompute_rate(SGIHPC3VirtuixState *s)
+{
+    uint32_t cg = s->hal2_codeca_clock;        /* 1..3, 0=off */
+    uint32_t hz = 0;
+    if (cg >= 1 && cg <= 3) {
+        uint16_t sel = s->hal2_bres_sel[cg - 1];
+        uint32_t base = (sel == 0) ? 48000 : (sel == 1) ? 44100 : 0;
+        hz = hal2_bres_freq(base, s->hal2_bres_inc[cg - 1],
+                            s->hal2_bres_modctrl[cg - 1]);
+    }
+    s->hal2_frame_hz = hz;
+}
+
+/*
+ * Re-open the host voice if the computed frame rate changed meaningfully.
+ * The voice is always S16/stereo/big-endian; mono codec streams are
+ * duplicated L->R in the walker, so only the frequency varies. Defensive:
+ * out-of-range rates are ignored (keep the last good / 44100 default).
+ */
+static void hal2_maybe_reopen_voice(SGIHPC3VirtuixState *s)
+{
+    uint32_t hz = s->hal2_frame_hz;
+    if (!s->audio_be || hz < 4000 || hz > 50000) {
+        return;
+    }
+    if (hz == s->hal2_open_hz) {
+        return;
+    }
+    struct audsettings as = {
+        .freq = hz,
+        .nchannels = 2,
+        .fmt = AUDIO_FORMAT_S16,
+        .endianness = 1, /* big-endian (MIPS) */
+    };
+    /* AUD_open_out reconfigures the existing voice in place (reuse arg). */
+    s->voice = AUD_open_out(s->audio_be, s->voice, "sgi-hal2",
+                            s, sgi_hpc3_virtuix_audio_out_cb, &as);
+    s->hal2_open_hz = hz;
+    s->hal2_open_nch = 2;
+    trace_sgi_hpc3_hal2_rate(hz, s->hal2_codeca_chancount);
+    /* Keep streaming if a buffer is in flight across the rate change. */
+    if (s->voice && s->hal2_pbus[0].active) {
+        AUD_set_active_out(s->voice, 1);
+    }
+}
+
+/*
+ * HAL2 IAR write: decode the indirect-register protocol (MAME hal2.cpp:115-305).
+ * The decode happens on the IAR write; IDR words are pre-loaded by the guest.
+ */
+static void hal2_iar_write(SGIHPC3VirtuixState *s, uint16_t iar)
+{
+    uint32_t type  = iar & 0xf000;
+    uint32_t num   = iar & 0x0f00;
+    bool     read  = (iar & 0x0080) != 0;   /* ACCESS_SEL: 1=read */
+    uint32_t param = (iar & 0x000c) >> 2;
+
+    s->hal2_iar = iar;
+
+    if (read) {
+        return;   /* readback path: HAL2 -> IDR; outputs don't need it */
+    }
+
+    switch (type) {
+    case 0x1000:  /* DMA port group */
+        if (num == 0x0400) {            /* Codec A (DAC) out */
+            if (param == 1) {           /* control 1: channel/clock/count */
+                uint16_t v = s->hal2_idr[0];
+                s->hal2_codeca_ctrl[0]   = v;
+                s->hal2_codeca_channel   =  v        & 3;
+                s->hal2_codeca_clock     = (v >> 3)  & 3;
+                s->hal2_codeca_chancount = (v >> 8)  & 3;
+                hal2_recompute_rate(s);
+                hal2_maybe_reopen_voice(s);
+            } else if (param == 2) {    /* control 2: format flags (unused) */
+                s->hal2_codeca_ctrl[1] = s->hal2_idr[0];
+            }
+        }
+        /* num 0x0500 (Codec B / ADC in) and others: output path ignores. */
+        break;
+    case 0x2000: {  /* Bresenham clock-gen group */
+        uint32_t cg = num >> 8;         /* 1..3 */
+        if (cg >= 1 && cg <= 3) {
+            int i = cg - 1;
+            if (param == 1) {           /* clock select */
+                s->hal2_bres_sel[i] = s->hal2_idr[0];
+            } else if (param == 2) {    /* inc / modctrl (two IDR words) */
+                s->hal2_bres_inc[i]     = s->hal2_idr[0];
+                s->hal2_bres_modctrl[i] = s->hal2_idr[1];
+            }
+            hal2_recompute_rate(s);
+            hal2_maybe_reopen_voice(s);
+        }
+        break;
+    }
+    default:
+        break;   /* unix timer / global DMA control: not modeled */
+    }
+}
+
+/* Read one int16 PCM sample from the channel's DMA cursor (MAME hpc3.cpp:212). */
+static int16_t hal2_fetch_sample(SGIHPC3VirtuixState *s, int ch, bool be_native)
+{
+    uint32_t w = address_space_ldl_be(&address_space_memory,
+                                      s->hal2_pbus[ch].cur_ptr,
+                                      MEMTXATTRS_UNSPECIFIED, NULL);
+    uint16_t s16 = w >> 16;             /* sample in the high half-word */
+    int16_t out = be_native ? (int16_t)s16 : (int16_t)bswap16(s16);
+    s->hal2_pbus[ch].cur_ptr   += 4;
+    s->hal2_pbus[ch].bytes_left -= 4;
+    return out;
+}
+
+/*
+ * Current buffer drained: raise the completion IRQ (if XIE) and advance to the
+ * next descriptor in the ring (MAME hpc3.cpp:220-246). Returns true if there is
+ * more PCM to play, false at end-of-chain.
+ */
+static bool hal2_pbus_next(SGIHPC3VirtuixState *s, int ch)
+{
+    uint32_t flags = s->hal2_pbus[ch].desc_flags;
+
+    if (flags & HPC3_PBUS_DESC_XIE) {
+        s->intstat |= (1u << ch);
+        s->int3_local0_stat |= INT3_LOCAL0_FIFO;
+        sgi_hpc3_virtuix_update_irq(s);
+    }
+    trace_sgi_hpc3_hal2_dma_done(ch, (flags & HPC3_PBUS_DESC_EOX) ? 1 : 0);
+
+    if (flags & HPC3_PBUS_DESC_EOX) {
+        s->hal2_pbus[ch].active = false;
+        return false;
+    }
+
+    uint32_t dp = HPC3_DMA_ADDR(s->hal2_pbus[ch].next_ptr);
+    s->hal2_pbus[ch].desc_ptr   = dp;
+    s->hal2_pbus[ch].cur_ptr    = HPC3_DMA_ADDR(address_space_ldl_be(
+        &address_space_memory, dp, MEMTXATTRS_UNSPECIFIED, NULL));
+    s->hal2_pbus[ch].desc_flags = address_space_ldl_be(
+        &address_space_memory, dp + 4, MEMTXATTRS_UNSPECIFIED, NULL);
+    s->hal2_pbus[ch].next_ptr   = address_space_ldl_be(
+        &address_space_memory, dp + 8, MEMTXATTRS_UNSPECIFIED, NULL);
+    s->hal2_pbus[ch].bytes_left = s->hal2_pbus[ch].desc_flags
+                                  & HPC3_PBUS_DESC_COUNT;
+    if (s->hal2_pbus[ch].bytes_left == 0) {
+        s->hal2_pbus[ch].active = false;
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Drain the current buffer's PCM to the host voice (one host stereo frame per
+ * codec frame; mono duplicated L->R). Consumes bytes_left down to the leftover
+ * partial frame. Called from the DMA timer when a buffer finishes "playing".
+ */
+static void hal2_drain_buffer_to_voice(SGIHPC3VirtuixState *s, int ch)
+{
+    bool be_native = (s->pbus_dmacfg[ch] & (1u << 19)) != 0;
+    int cc = s->hal2_codeca_chancount ? s->hal2_codeca_chancount : 1;
+    if (cc < 1) {
+        cc = 1;
+    } else if (cc > 2) {
+        cc = 2;
+    }
+    uint8_t buf[2048];
+    int n = 0;
+    uint32_t pushed = 0;
+    while (s->hal2_pbus[ch].bytes_left >= (uint32_t)(4 * cc)) {
+        int16_t l = hal2_fetch_sample(s, ch, be_native);
+        int16_t r = (cc >= 2) ? hal2_fetch_sample(s, ch, be_native) : l;
+        buf[n++] = (uint8_t)(l >> 8); buf[n++] = (uint8_t)(l & 0xff);
+        buf[n++] = (uint8_t)(r >> 8); buf[n++] = (uint8_t)(r & 0xff);
+        if (n >= (int)sizeof(buf)) { pushed += AUD_write(s->voice, buf, n); n = 0; }
+    }
+    if (n) {
+        pushed += AUD_write(s->voice, buf, n);
+    }
+    if (pushed) {
+        trace_sgi_hpc3_hal2_dma_write(ch, pushed);
+    }
+}
+
+/* Schedule a channel's buffer completion after its real playback duration. */
+static void hal2_schedule_dma(SGIHPC3VirtuixState *s, int ch)
+{
+    uint32_t rate = s->hal2_frame_hz ? s->hal2_frame_hz : 44100;
+    int cc = s->hal2_codeca_chancount ? s->hal2_codeca_chancount : 1;
+    uint32_t frames = (s->hal2_pbus[ch].bytes_left / 4) / (cc ? cc : 1);
+    if (frames == 0) {
+        frames = 1;
+    }
+    int64_t dur_ns = (int64_t)frames * 1000000000LL / rate;
+    timer_mod(s->hal2_dma_timer[ch],
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + dur_ns);
+}
+
+/*
+ * DMA completion timer: the current buffer has "played" for its duration. Route
+ * its PCM to the host voice (primary codec output channel only, to avoid double
+ * audio across a channel pair), complete the descriptor (IRQ if XIE), and either
+ * advance to the next chained buffer or clear "active" so the driver's poll ends.
+ */
+static void hal2_dma_tick(void *opaque)
+{
+    SGIHPC3VirtuixHal2Tctx *ctx = opaque;
+    SGIHPC3VirtuixState *s = ctx->s;
+    int ch = ctx->ch;
+
+    if (!s->hal2_pbus[ch].active) {
+        return;
+    }
+    if (s->voice && ch == (int)s->hal2_codeca_channel) {
+        hal2_drain_buffer_to_voice(s, ch);
+    } else {
+        /* Non-output channel (or no voice): consume the buffer silently. */
+        s->hal2_pbus[ch].cur_ptr   += s->hal2_pbus[ch].bytes_left;
+        s->hal2_pbus[ch].bytes_left = 0;
+    }
+    if (hal2_pbus_next(s, ch)) {
+        hal2_schedule_dma(s, ch);   /* more chained data -> keep streaming */
+    }
+}
+
+/* Arm a PBUS audio-DMA channel: load the first descriptor + activate. */
+static void hal2_pbus_arm(SGIHPC3VirtuixState *s, int ch)
+{
+    uint32_t dp = HPC3_DMA_ADDR(s->pbus_dp[ch]);
+    s->hal2_pbus[ch].desc_ptr   = dp;
+    s->hal2_pbus[ch].cur_ptr    = HPC3_DMA_ADDR(address_space_ldl_be(
+        &address_space_memory, dp, MEMTXATTRS_UNSPECIFIED, NULL));
+    s->hal2_pbus[ch].desc_flags = address_space_ldl_be(
+        &address_space_memory, dp + 4, MEMTXATTRS_UNSPECIFIED, NULL);
+    s->hal2_pbus[ch].next_ptr   = address_space_ldl_be(
+        &address_space_memory, dp + 8, MEMTXATTRS_UNSPECIFIED, NULL);
+    s->hal2_pbus[ch].bytes_left = s->hal2_pbus[ch].desc_flags
+                                  & HPC3_PBUS_DESC_COUNT;
+    s->hal2_pbus[ch].active = (s->hal2_pbus[ch].bytes_left > 0);
+    trace_sgi_hpc3_hal2_dma_arm(ch, s->hal2_pbus[ch].cur_ptr,
+                                s->hal2_pbus[ch].bytes_left,
+                                s->hal2_pbus[ch].desc_flags);
+    if (s->hal2_pbus[ch].active) {
+        if (s->voice) {
+            AUD_set_active_out(s->voice, 1);
+        }
+        /* Pace completion off a timer at the codec rate (not the host-audio
+         * backend), so the driver's poll on "active" terminates. */
+        hal2_schedule_dma(s, ch);
+    }
 }
 
 static void sgi_hpc3_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
@@ -2896,7 +3202,14 @@ static void sgi_hpc3_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
          */
         else if (base_addr >= 0x58000 && base_addr < 0x5c000) {
             hwaddr pio_offset = base_addr - 0x58000;
-            if (pio_offset == 0x484) {
+            if (s->voice && pio_offset >= 0x400 && pio_offset <= 0x4ff) {
+                /* HAL2 AES register block: store for readback (codec probe).
+                 * Priority over the PROM-only keyboard PIO at 0x484/0x488/0x48c
+                 * (OS keyboard is at HPC3_KBD_MOUSE0/1 0x59840/0x59844). Gated
+                 * on s->voice so non-audio boots keep the PROM keyboard. */
+                s->hal2_aes[pio_offset - 0x400] = val & 0xff;
+                trace_sgi_hpc3_hal2_write(pio_offset, val & 0xff);
+            } else if (pio_offset == 0x484) {
                 /* Command register */
                 sgi_hpc3_virtuix_kbd_command(s, val);
             } else if (pio_offset == 0x488) {
@@ -2907,7 +3220,7 @@ static void sgi_hpc3_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
                 s->hal2_isr = val;
                 trace_sgi_hpc3_hal2_write(pio_offset, val);
             } else if (pio_offset == HAL2_REG_IAR) {
-                s->hal2_iar = val;
+                hal2_iar_write(s, val);   /* decodes codec/bres + rate */
                 trace_sgi_hpc3_hal2_iar(val);
                 trace_sgi_hpc3_hal2_write(pio_offset, val);
             } else if (pio_offset >= HAL2_REG_IDR0
@@ -2961,10 +3274,30 @@ static void sgi_hpc3_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
             hwaddr ch_offset = base_addr % HPC3_PBUS_STRIDE;
             if (ch_offset == HPC3_PBUS_BP_BASE) {
                 s->pbus_bp[ch] = val;
+                trace_sgi_hpc3_pbus_bp_wr(ch, val);
             } else if (ch_offset == HPC3_PBUS_DP_BASE) {
                 s->pbus_dp[ch] = val;
+                trace_sgi_hpc3_pbus_dp_wr(ch, val);
             } else if (ch_offset == HPC3_PBUS_CTRL_BASE) {
                 s->pbus_ctrl[ch] = val;
+                trace_sgi_hpc3_pbus_ctrl_wr(ch, val);
+                /*
+                 * Audio playback: PBUS channels 0..3 feed the HAL2 codecs;
+                 * channel 0 is Codec A (DAC out). Arm when DMASTART+LOAD_EN are
+                 * set for a TX (playback) transfer and a codec voice exists.
+                 * Gated on s->voice so non-audio boots are unaffected.
+                 */
+                if (ch < 4 && s->voice
+                    && (val & HPC3_PBUS_CTRL_DMASTART)
+                    && (val & HPC3_PBUS_CTRL_LOAD_EN)
+                    && !(val & HPC3_PBUS_CTRL_RECV)) {
+                    hal2_pbus_arm(s, ch);
+                } else if (ch < 4 && !(val & HPC3_PBUS_CTRL_DMASTART)) {
+                    s->hal2_pbus[ch].active = false;
+                    if (s->hal2_dma_timer[ch]) {
+                        timer_del(s->hal2_dma_timer[ch]);
+                    }
+                }
             }
             /* Other offsets in channel are silently ignored */
         }
@@ -2973,6 +3306,7 @@ static void sgi_hpc3_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
             base_addr < HPC3_PBUS_CFGDMA_BASE + 8 * HPC3_PBUS_CFG_STRIDE) {
             int idx = (base_addr - HPC3_PBUS_CFGDMA_BASE) / HPC3_PBUS_CFG_STRIDE;
             s->pbus_dmacfg[idx] = val;
+            trace_sgi_hpc3_pbus_cfg_wr(idx, val);
         }
         /* PBUS PIO config */
         else if (base_addr >= HPC3_PBUS_CFGPIO_BASE &&
@@ -3151,6 +3485,18 @@ static void sgi_hpc3_virtuix_reset(DeviceState *dev)
     sgi_hpc3_virtuix_eeprom_init_defaults(s);
 }
 
+/*
+ * HAL2 codec output callback. Output is push-driven from the per-channel DMA
+ * completion timers (hal2_dma_tick -> AUD_write) at the codec rate, so this
+ * backend "want more data" hint needs do nothing. (Kept as the required
+ * AUD_open_out callback.)
+ */
+static void sgi_hpc3_virtuix_audio_out_cb(void *opaque, int avail)
+{
+    (void)opaque;
+    (void)avail;
+}
+
 static void sgi_hpc3_virtuix_realize(DeviceState *dev, Error **errp)
 {
     SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(dev);
@@ -3255,6 +3601,38 @@ static void sgi_hpc3_virtuix_realize(DeviceState *dev, Error **errp)
             fclose(f);
         }
     }
+
+    /*
+     * Optional host audio: HAL2 codec -> host -audiodev. Wired ONLY when an
+     * audiodev is explicitly configured (e.g. `-audiodev pa,id=aud0 -global
+     * sgi-hpc3-virtuix.audiodev=aud0`). Default boots pass no audiodev, so
+     * s->audio_be is NULL, audio is skipped entirely, and existing boots are
+     * unaffected. This step opens the codec voice (backend plumbing); the PBUS
+     * audio-DMA walker that activates + feeds it is a later step.
+     */
+    if (s->audio_be) {
+        struct audsettings as = {
+            .freq = 44100,
+            .nchannels = 2,
+            .fmt = AUDIO_FORMAT_S16,
+            .endianness = 1, /* big-endian (MIPS) */
+        };
+        if (!AUD_backend_check(&s->audio_be, errp)) {
+            return;
+        }
+        s->voice = AUD_open_out(s->audio_be, NULL, "sgi-hal2",
+                                s, sgi_hpc3_virtuix_audio_out_cb, &as);
+        s->hal2_open_hz = as.freq;
+        s->hal2_open_nch = as.nchannels;
+        /* Per-channel DMA completion timers (codec-rate paced). */
+        for (int i = 0; i < 4; i++) {
+            s->hal2_tctx[i].s = s;
+            s->hal2_tctx[i].ch = i;
+            s->hal2_dma_timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                                hal2_dma_tick,
+                                                &s->hal2_tctx[i]);
+        }
+    }
 }
 
 static void sgi_hpc3_virtuix_init(Object *obj)
@@ -3298,6 +3676,7 @@ static void sgi_hpc3_virtuix_init(Object *obj)
 
 static const Property sgi_hpc3_virtuix_properties[] = {
     DEFINE_PROP_CHR("chardev", SGIHPC3VirtuixState, serial),
+    DEFINE_AUDIO_PROPERTIES(SGIHPC3VirtuixState, audio_be),
     DEFINE_PROP_UINT8("board-type", SGIHPC3VirtuixState, board_type, BOARD_IP24),
     DEFINE_PROP_UINT8("nvram-rev", SGIHPC3VirtuixState, nvram_rev, 8),
     DEFINE_NIC_PROPERTIES(SGIHPC3VirtuixState, enet_conf),

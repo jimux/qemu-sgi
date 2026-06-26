@@ -15,7 +15,15 @@
 #include "hw/nvram/eeprom93xx.h"
 #include "hw/input/ps2.h"
 #include "net/net.h"
+#include "qemu/audio.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
+
+/* Per-channel context for the HAL2 audio-DMA completion timers (below). */
+typedef struct SGIHPC3VirtuixHal2Tctx {
+    void *s;     /* SGIHPC3VirtuixState * (void to avoid a forward-ref cycle) */
+    int   ch;    /* PBUS audio channel index 0..3 */
+} SGIHPC3VirtuixHal2Tctx;
 
 /*
  * HPC3 DMA uses physical addresses, but IRIX passes KSEG0/KSEG1
@@ -488,6 +496,74 @@ struct SGIHPC3VirtuixState {
     uint32_t hal2_idr[4];       /* Indirect data registers */
     uint8_t  hal2_volume_left;  /* Volume DAC left */
     uint8_t  hal2_volume_right; /* Volume DAC right */
+
+    /*
+     * HAL2 extended register block (PIO offsets 0x400-0x4ff) — the AES
+     * receiver/transmitter registers. a2_dd's hal2_init_aesrx/aestx probe the
+     * codec by writing a byte then reading it back; if the readback doesn't
+     * match it declares "AES receiver/transmitter not responding" and audio
+     * attach fails. We don't emulate the AES silicon — we just make these
+     * registers read back what was written (8-bit), which satisfies the probe.
+     * (Keyboard PIO at 0x484/0x488/0x48c is handled before this block.)
+     */
+    uint8_t  hal2_aes[0x100];
+
+    /* Host audio backend (HAL2 -> host -audiodev). Optional: only wired when an
+     * audiodev is configured; default boots have none and stay silent. The
+     * codec voice is opened here (plumbing); the PBUS audio-DMA walker that
+     * feeds it is a later step. */
+    AudioBackend *audio_be;
+    SWVoiceOut   *voice;
+
+    /*
+     * HAL2 codec/rate decode (ported from MAME sgi/hal2.cpp). Programmed via the
+     * IAR/IDR indirect-register protocol. Codec A is the DAC output path.
+     */
+    uint16_t hal2_codeca_ctrl[2];     /* control words 1,2 */
+    uint16_t hal2_codeca_channel;     /* [1:0] PBUS DMA channel select */
+    uint16_t hal2_codeca_clock;       /* [4:3] which bresenham clock-gen (1..3) */
+    uint16_t hal2_codeca_chancount;   /* [9:8] interleave: 1=mono, 2=stereo */
+    uint16_t hal2_bres_sel[3];        /* clock-gen base select (0=48k,1=44.1k) */
+    uint16_t hal2_bres_inc[3];        /* Bresenham increment */
+    uint16_t hal2_bres_modctrl[3];    /* Bresenham modulus control */
+    uint32_t hal2_frame_hz;           /* computed host frame rate (Hz) */
+    uint32_t hal2_open_hz;            /* last freq the voice was opened at */
+    uint8_t  hal2_open_nch;           /* last nchannels the voice was opened at */
+
+    /*
+     * PBUS audio-DMA walker state (channels 0..3 are audio codecs; channel 0 is
+     * Codec A DAC out). The walker reads a descriptor ring + PCM from guest
+     * memory and feeds the host voice in the out-callback.
+     */
+    struct {
+        bool     active;
+        uint32_t cur_ptr;     /* phys addr of next PCM word */
+        uint32_t desc_ptr;    /* current descriptor address */
+        uint32_t desc_flags;  /* current descriptor +4 word (count|XIE|EOX) */
+        uint32_t next_ptr;    /* current descriptor +8 word */
+        uint32_t bytes_left;  /* bytes remaining in current buffer */
+    } hal2_pbus[4];
+
+    /*
+     * Timer-paced DMA completion (one per audio channel). The IRIX a2_dd driver
+     * arms a PBUS audio-DMA buffer and POLLS the channel ctrl register until the
+     * "active" bit clears (= buffer drained at the codec rate). We complete each
+     * buffer after its real playback duration via these timers (the MAME model),
+     * independent of the host-audio backend's pull timing, and route the PCM to
+     * the host voice as it drains. Created only when an audiodev is configured.
+     */
+    QEMUTimer *hal2_dma_timer[4];
+    SGIHPC3VirtuixHal2Tctx hal2_tctx[4];
 };
+
+/* PBUS DMA control bits (hpc3.cpp pbusdma) */
+#define HPC3_PBUS_CTRL_RECV      0x00000004  /* 1=record (RX), 0=playback (TX) */
+#define HPC3_PBUS_CTRL_DMASTART  0x00000010  /* arm */
+#define HPC3_PBUS_CTRL_LOAD_EN   0x00000020  /* arm */
+
+/* PBUS DMA descriptor +4 flag word */
+#define HPC3_PBUS_DESC_COUNT     0x00003fff  /* byte count (max 16KB) */
+#define HPC3_PBUS_DESC_XIE       0x20000000  /* raise IRQ on buffer completion */
+#define HPC3_PBUS_DESC_EOX       0x80000000  /* end of chain (stop) */
 
 #endif /* HW_MISC_SGI_HPC3_VIRTUIX_H */
