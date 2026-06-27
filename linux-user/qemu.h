@@ -2,6 +2,9 @@
 #define QEMU_H
 
 #include "cpu.h"
+#ifdef TARGET_ABI_IRIX
+#include <pthread.h>  /* IRIX TaskState uses host pthread mutex/cond */
+#endif
 #include "accel/tcg/cpu-ldst.h"
 
 #include "user/abitypes.h"
@@ -127,6 +130,24 @@ struct TaskState {
     abi_ulong gcs_size;
     abi_ulong gcs_el0_locked;
 #endif
+#if defined(TARGET_ABI_IRIX)
+    /*
+     * Ported from qemu-irix (Kai-Uwe Bloem <derkub@gmail.com>;
+     * n64decomp/qemu-irix), GPLv2. IRIX share-group / PRDA / signal-trampoline
+     * thread state.
+     */
+    struct TaskState *parent_task;
+    abi_ulong ctx_link;
+    abi_ulong sigtramp;
+    unsigned char prda[TARGET_PAGE_SIZE];
+    int procblk_count;
+    pthread_mutex_t procblk_mutex;
+    pthread_cond_t procblk_cond;
+    int is_pthread;
+    int is_blocked;
+    int termchild_sig;
+    int exit_sig;
+#endif
     int used; /* non zero if used */
     struct image_info *info;
     struct linux_binprm *bprm;
@@ -173,6 +194,17 @@ abi_long do_brk(abi_ulong new_brk);
 int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *pathname,
                     int flags, mode_t mode, bool safe);
 ssize_t do_guest_readlink(const char *pathname, char *buf, size_t bufsiz);
+
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX share-group helpers (ported from qemu-irix; Kai-Uwe Bloem;
+ * n64decomp/qemu-irix, GPLv2). find_task_state/find_cpu_state look up a
+ * task/CPU by IRIX thread id; sgi_map_elf_image implements syssgi(SGI_ELFMAP).
+ */
+TaskState *find_task_state(pid_t tid);
+CPUState *find_cpu_state(pid_t tid);
+abi_ulong sgi_map_elf_image(int image_fd, void *phdr, int phnum);
+#endif
 
 /* user access */
 

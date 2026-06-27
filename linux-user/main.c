@@ -70,6 +70,15 @@
 char *exec_path;
 char real_exec_path[PATH_MAX];
 
+/*
+ * QEMU's own argv (binary + options up to the guest program), saved so that a
+ * guest execve() of another target binary can re-exec QEMU on it instead of the
+ * host (we don't rely on binfmt_misc). Ported from qemu-irix
+ * (Kai-Uwe Bloem <derkub@gmail.com>; n64decomp/qemu-irix), GPLv2.
+ */
+int qemu_argc;
+char **qemu_argv;
+
 static bool opt_one_insn_per_tb;
 static unsigned long opt_tb_size;
 static const char *argv0;
@@ -230,7 +239,47 @@ void init_task_state(TaskState *ts)
     }
 
     ts->sys_dispatch_len = -1;
+
+#ifdef TARGET_ABI_IRIX
+    /* IRIX procblk uses a host condition variable per task */
+    pthread_mutex_init(&ts->procblk_mutex, NULL);
+    pthread_cond_init(&ts->procblk_cond, NULL);
+#endif
 }
+
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX share-group helpers. Ported from qemu-irix (Kai-Uwe Bloem;
+ * n64decomp/qemu-irix), GPLv2. Look up a task/CPU by its IRIX thread id.
+ */
+TaskState *find_task_state(pid_t tid)
+{
+    CPUState *cpu;
+    TaskState *ts = NULL;
+
+    CPU_FOREACH(cpu) {
+        ts = get_task_state(cpu);
+        if (ts->ts_tid == tid) {
+            break;
+        }
+    }
+
+    return ts;
+}
+
+CPUState *find_cpu_state(pid_t tid)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (get_task_state(cpu)->ts_tid == tid) {
+            return cpu;
+        }
+    }
+
+    return NULL;
+}
+#endif /* TARGET_ABI_IRIX */
 
 CPUArchState *cpu_copy(CPUArchState *env)
 {
@@ -675,6 +724,10 @@ static int parse_args(int argc, char **argv)
     }
 
     exec_path = argv[optind];
+
+    /* argv[0..optind) is QEMU + its options; replay it for guest re-exec. */
+    qemu_argc = optind;
+    qemu_argv = argv;
 
     return optind;
 }

@@ -2785,4 +2785,159 @@ struct target_open_how_ver0 {
 #define TARGET_ARCH_WANT_SYS_OLD_MMAP
 #endif
 
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX-specific structs/macros referenced by the IRIX syscall handlers.
+ * Ported from qemu-irix (Kai-Uwe Bloem <derkub@gmail.com>;
+ * n64decomp/qemu-irix), GPLv2.
+ */
+
+#define TARGET_MAP_AUTOGROW     0x40
+#define TARGET_STAT64_VER       3
+
+/* IRIX waitid() idtype + option flags (differ from Linux). */
+#define TARGET_P_PID        0
+#define TARGET_P_PGID       2
+#define TARGET_P_ALL        7
+
+#define TARGET_WEXITED      0001
+#define TARGET_WSTOPPED     0004
+#define TARGET_WCONTINUED   0010
+#define TARGET_WNOHANG      0100
+#define TARGET_WNOWAIT      0200
+
+struct target_irix_stat {
+	uint32_t		st_dev;
+	abi_long		st_pad0[3];
+	abi_ulong		st_ino;
+	uint32_t		st_mode;
+	uint32_t		st_nlink;
+	int32_t			st_uid;
+	int32_t			st_gid;
+	uint32_t		st_rdev;
+	abi_long		st_pad1[2];
+	abi_long		st_size;
+	abi_long		st_pad2;
+	int32_t			target_st_atime;
+	abi_long		target_st_atime_nsec;
+	int32_t			target_st_mtime;
+	abi_long		target_st_mtime_nsec;
+	int32_t			target_st_ctime;
+	abi_long		target_st_ctime_nsec;
+	abi_long		st_blksize;
+	abi_long		st_blocks;
+	char			st_fstype[16];
+	abi_long		st_projid;
+	abi_long		st_pad[7];
+};
+
+struct target_irix_stat64 {
+	uint32_t		st_dev;
+	abi_long		st_pad0[3];
+	abi_ullong		st_ino;
+	uint32_t		st_mode;
+	uint32_t		st_nlink;
+	int32_t			st_uid;
+	int32_t			st_gid;
+	uint32_t		st_rdev;
+	abi_long		st_pad1[2];
+	abi_llong		st_size;
+	abi_long		st_pad2;
+	int32_t			target_st_atime;
+	abi_long		target_st_atime_nsec;
+	int32_t			target_st_mtime;
+	abi_long		target_st_mtime_nsec;
+	int32_t			target_st_ctime;
+	abi_long		target_st_ctime_nsec;
+	abi_long		st_blksize;
+	abi_llong		st_blocks;
+	char			st_fstype[16];
+	abi_long		st_projid;
+	abi_long		st_pad[7];
+};
+
+/* IRIX statvfs / statvfs64 (used by statvfs64/fstatvfs64). */
+struct target_statvfs {
+        abi_ulong f_bsize;        /* fundamental file system block size */
+        abi_ulong f_frsize;       /* fragment size */
+        abi_ulong f_blocks;       /* total # of blocks of f_frsize on fs */
+        abi_ulong f_bfree;        /* total # of free blocks of f_frsize */
+        abi_ulong f_bavail;       /* # of free blocks avail to non-superuser */
+        abi_ulong f_files;        /* total # of file nodes (inodes) */
+        abi_ulong f_ffree;        /* total # of free file nodes */
+        abi_ulong f_favail;       /* # of free nodes avail to non-superuser */
+        abi_ulong f_fsid;         /* file system id (dev for now) */
+        uint32_t  f_pad0[4];
+        abi_ulong f_flag;         /* bit-mask of flags */
+        abi_ulong f_namemax;      /* maximum file name length */
+        uint32_t  f_pad1[24];     /* reserved for future expansion */
+};
+
+struct target_statvfs64 {
+        abi_ulong f_bsize;        /* fundamental file system block size */
+        abi_ulong f_frsize;       /* fragment size */
+        uint64_t  f_blocks;       /* total # of blocks of f_frsize on fs */
+        uint64_t  f_bfree;        /* total # of free blocks of f_frsize */
+        uint64_t  f_bavail;       /* # of free blocks avail to non-superuser */
+        uint64_t  f_files;        /* total # of file nodes (inodes) */
+        uint64_t  f_ffree;        /* total # of free file nodes */
+        uint64_t  f_favail;       /* # of free nodes avail to non-superuser */
+        abi_ulong f_fsid;         /* file system id (dev for now) */
+        uint32_t  f_pad0[4];
+        abi_ulong f_flag;         /* bit-mask of flags */
+        abi_ulong f_namemax;      /* maximum file name length */
+        uint32_t  f_pad1[24];     /* reserved for future expansion */
+};
+
+/* IRIX utsname: standard 5 x 257-byte fields plus an IRIX-only reserved area */
+struct target_utsname {
+        char    sysname[257];
+        char    nodename[257];
+        char    release[257];
+        char    version[257];
+        char    machine[257];
+        char    reserved[257][8];
+};
+
+/* usync interface (synchronising address); layout reverse-engineered by SGI */
+struct target_usync {
+        abi_int         u_magic;        /* 1002 in all cases? */
+        uint64_t        u_sync;         /* pointer to sync object */
+        uint16_t        u_type;         /* type of sync object? 1 or 2 */
+        uint16_t        u_flags;        /* e.g. timeout flag for timed wait */
+        abi_int         u_unknown1[4];  /* some signal stuff? */
+        uint64_t        u_lock;         /* pointer to mutex for cond_wait */
+        uint64_t        u_sec;          /* timeout for cond_wait, tv_sec */
+        uint64_t        u_nsec;         /* timeout for cond_wait, tv_nsec */
+        abi_int         u_unknown2[6];
+};
+
+#define TARGET_US_TIMEOUT   0x00000004
+
+/* nsproc interface - structure from sys/prctl.h */
+struct target_prthread {
+#ifdef TARGET_ABI_MIPSN32
+        abi_uint        prt_entry;
+        abi_uint        prt_arg;
+        abi_uint        prt_flags;
+        abi_uint        prt_stkptr;
+#else
+        abi_ulong       prt_entry;
+        abi_ulong       prt_arg;
+        abi_uint        prt_flags;
+        abi_ulong       prt_stkptr;
+#endif
+        abi_int         prt_stklen;
+};
+
+/* sproc flags */
+#define TARGET_PR_SPROC     0x00000001
+#define TARGET_PR_SFDS      0x00000002
+#define TARGET_PR_SDIR      0x00000004
+#define TARGET_PR_SADDR     0x00000040
+#define TARGET_PR_SALL      0x0000007f
+#define TARGET_PR_BLOCK     0x01000000
+
+#endif /* TARGET_ABI_IRIX */
+
 #endif

@@ -18,6 +18,10 @@
  */
 #define _ATFILE_SOURCE
 #include "qemu/osdep.h"
+#ifdef TARGET_ABI_IRIX
+#include <semaphore.h>  /* IRIX psema_cntl POSIX semaphores */
+#include <dirent.h>     /* IRIX syssgi fdhi */
+#endif
 #include "qemu/cutils.h"
 #include "qemu/path.h"
 #include "qemu/memfd.h"
@@ -52,6 +56,7 @@
 #include <sys/shm.h>
 #include <sys/sem.h>
 #include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <utime.h>
 #include <sys/sysinfo.h>
 #include <sys/signalfd.h>
@@ -6837,6 +6842,11 @@ static void *clone_func(void *arg)
     ts = get_task_state(cpu);
     info->tid = sys_gettid();
     task_settid(ts);
+#ifdef TARGET_ABI_IRIX
+    /* IRIX: fill PRDA per-thread id slots (t_pid / t_rpid) */
+    __put_user(info->tid, (abi_int *)&ts->prda[0xe00]);
+    __put_user(info->tid, (abi_int *)&ts->prda[0xe40]);
+#endif
     if (info->child_tidptr)
         put_user_u32(info->tid, info->child_tidptr);
     if (info->parent_tidptr)
@@ -6856,11 +6866,29 @@ static void *clone_func(void *arg)
     return NULL;
 }
 
+#ifdef TARGET_ABI_IRIX
+/* IRIX do_fork() takes two extra args (entry, arg) for sproc(); plain
+ * fork/clone callers pass 0, 0. */
+#define IRIX_FORK_EXTRA , 0, 0
+#else
+#define IRIX_FORK_EXTRA
+#endif
+
 /* do_fork() Must return host values and target errnos (unlike most
    do_*() functions). */
 static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
                    abi_ulong parent_tidptr, target_ulong newtls,
-                   abi_ulong child_tidptr)
+                   abi_ulong child_tidptr
+#ifdef TARGET_ABI_IRIX
+                   /*
+                    * IRIX sproc()/nsproc() extension: when entry != 0 the new
+                    * thread/process starts at entry(arg) on a fresh stack
+                    * (newsp), rather than returning to the fork call site.
+                    * Ported from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix).
+                    */
+                   , abi_ulong entry, abi_ulong arg
+#endif
+                   )
 {
     CPUState *cpu = env_cpu(env);
     int ret;
@@ -6936,6 +6964,17 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         if (flags & CLONE_SETTLS) {
             cpu_set_tls (new_env, newtls);
         }
+
+#ifdef TARGET_ABI_IRIX
+        if (entry) {    /* sproc: child starts at entry(arg) on its own stack */
+            new_env->active_tc.PC = entry;
+            new_env->active_tc.gpr[4] = arg;
+            new_env->active_tc.gpr[29] = newsp;
+        }
+        ts->parent_task = parent_ts;
+        ts->exit_sig = parent_ts->exit_sig;
+        ts->is_pthread = parent_ts->is_pthread;
+#endif
 
         memset(&info, 0, sizeof(info));
         pthread_mutex_init(&info.mutex, NULL);
@@ -7021,8 +7060,31 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
                 cpu_set_tls (env, newtls);
             if (flags & CLONE_CHILD_CLEARTID)
                 ts->child_tidptr = child_tidptr;
+#ifdef TARGET_ABI_IRIX
+            if (entry) {    /* sproc child: start at entry(arg) on its stack */
+                env->active_tc.PC = entry;
+                env->active_tc.gpr[4] = arg;
+                env->active_tc.gpr[29] = newsp;
+            } else {
+                /* IRIX fork returns child flag in gpr[3] */
+                env->active_tc.gpr[3] = 1;
+            }
+#endif
         } else {
             cpu_clone_regs_parent(env, flags);
+#ifdef TARGET_ABI_IRIX
+            /*
+             * IRIX fork() distinguishes parent from child via gpr[3]
+             * (parent=0, child=1), not just the gpr[2] return value. The
+             * child sets gpr[3]=1 above; the parent MUST clear gpr[3]=0 here.
+             * Omitting this leaves a stale gpr[3] in the parent, so IRIX libc
+             * mistakes the parent for a second child and the parent wrongly
+             * re-runs the child code path (e.g. both halves exec the
+             * compiler pass). Ported from qemu-irix (Kai-Uwe Bloem;
+             * n64decomp/qemu-irix), GPLv2.
+             */
+            env->active_tc.gpr[3] = 0;
+#endif
             if (flags & CLONE_PIDFD) {
                 int pid_fd = 0;
 #if defined(__NR_pidfd_open) && defined(TARGET_NR_pidfd_open)
@@ -8946,6 +9008,37 @@ static int do_execv(CPUArchState *cpu_env, int dirfd,
         goto execve_efault;
     }
 
+#ifdef TARGET_ABI_IRIX
+    /*
+     * IRIX target binaries can't be exec'd natively on the host (ENOEXEC), and
+     * we don't rely on binfmt_misc. Re-exec QEMU on the target binary instead,
+     * prepending QEMU's own argv (binary + -L/-E options) — the compiler driver
+     * forks fec/be/asm/ld this way. Mirrors qemu-irix's qemu_execve().
+     * Ported from qemu-irix (Kai-Uwe Bloem <derkub@gmail.com>;
+     * n64decomp/qemu-irix), GPLv2.
+     */
+    if (!is_execveat) {
+        const char *fname = path(p);
+        int tc = 0, i;
+        while (argp[tc]) {
+            tc++;
+        }
+        char **exec_argv = g_new0(char *, qemu_argc + tc + 1);
+        for (i = 0; i < qemu_argc; i++) {
+            exec_argv[i] = qemu_argv[i];
+        }
+        exec_argv[qemu_argc] = (char *)fname;        /* translated program path */
+        for (i = 1; i < tc; i++) {                   /* target argv[1..] */
+            exec_argv[qemu_argc + i] = argp[i];
+        }
+        exec_argv[qemu_argc + tc] = NULL;
+        ret = get_errno(safe_execve(exec_argv[0], exec_argv, envp));
+        g_free(exec_argv);
+        unlock_user(p, pathname, 0);
+        goto execve_end;
+    }
+#endif
+
     const char *exe = p;
     if (is_proc_myself(p, "exe")) {
         exe = exec_path;
@@ -9579,6 +9672,176 @@ _syscall5(int, sys_move_mount, int, __from_dfd, const char *, __from_pathname,
            int, __to_dfd, const char *, __to_pathname, unsigned int, flag)
 #endif
 
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX usync (synchronising-address) and psema (POSIX semaphore) helper state.
+ * Ported from qemu-irix (Kai-Uwe Bloem <derkub@gmail.com>;
+ * n64decomp/qemu-irix), GPLv2.
+ */
+struct usync_ref {
+    abi_ulong addr;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int waiters;
+    int count;
+    int handoffs;
+    struct usync_ref *next;
+};
+
+/* the usync list and the mutex protecting it */
+static pthread_mutex_t usync_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct usync_ref *usync_list;
+
+/* get the usync reference for addr, or create one if it doesn't exist */
+static struct usync_ref *usync_get_sync(abi_ulong addr)
+{
+    struct usync_ref *p;
+
+    pthread_mutex_lock(&usync_mutex);
+    for (p = usync_list; p; p = p->next) {
+        if (p->addr == addr) {
+            break;
+        }
+    }
+    if (!p) {
+        p = malloc(sizeof(struct usync_ref));
+        if (p) {
+            pthread_mutex_init(&p->lock, NULL);
+            pthread_cond_init(&p->cond, NULL);
+            p->waiters = p->count = p->handoffs = 0;
+            p->addr = addr;
+            p->next = usync_list;
+            usync_list = p;
+        }
+    }
+    pthread_mutex_unlock(&usync_mutex);
+    return p;
+}
+
+/* IRIX psema stuff. POSIX semaphores */
+struct psema_ref {
+    char *name;
+    sem_t *sem;
+};
+
+/* the psema list and the mutex protecting it */
+#define PSEMA_MAX 30
+static pthread_mutex_t psema_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct psema_ref psema_list[PSEMA_MAX];
+
+/* get the pindex for sem or name, or -1 if it doesn't exist */
+static int psema_get_index(char *name, sem_t *sem, int create)
+{
+    struct psema_ref *p;
+    int i, empty = -1;
+
+    pthread_mutex_lock(&psema_mutex);
+    for (i = 0, p = psema_list; i < PSEMA_MAX; i++, p++) {
+        if (p->sem) {
+            if (p->sem == sem || (name && p->name && !strcmp(p->name, name))) {
+                pthread_mutex_unlock(&psema_mutex);
+                return i;
+            }
+        } else if (empty < 0) {
+            empty = i;
+        }
+    }
+    if (create && empty >= 0) {
+        psema_list[empty].name = name ? strdup(name) : NULL;
+        psema_list[empty].sem = sem;
+        i = empty;
+    } else {
+        i = -1;
+    }
+    pthread_mutex_unlock(&psema_mutex);
+    return i;
+}
+
+/* get sem_t for index */
+static sem_t *psema_get_sem(int index)
+{
+    if (index >= 0 && index < PSEMA_MAX) {
+        return psema_list[index].sem;
+    }
+    return NULL;
+}
+
+/* drop semaphore from list */
+static void psema_remove_index(int index)
+{
+    if (index >= 0 && index < PSEMA_MAX) {
+        if (psema_list[index].name) {
+            free(psema_list[index].name);
+        }
+        psema_list[index].name = NULL;
+        psema_list[index].sem = NULL;
+    }
+}
+
+/* remove name from semaphore */
+static void psema_unlink_index(char *name)
+{
+    int index = psema_get_index(name, NULL, 0);
+
+    if (index >= 0 && index < PSEMA_MAX) {
+        free(psema_list[index].name);
+        psema_list[index].name = NULL;
+    }
+}
+
+static abi_long host_to_target_irix_stat(abi_ulong target_addr,
+                                         struct stat *host_st)
+{
+    struct target_irix_stat *target_st;
+
+    if (!lock_user_struct(VERIFY_WRITE, target_st, target_addr, 0)) {
+        return -TARGET_EFAULT;
+    }
+    memset(target_st, 0, sizeof(*target_st));
+    __put_user(host_st->st_dev, &target_st->st_dev);
+    __put_user(host_st->st_ino, &target_st->st_ino);
+    __put_user(host_st->st_mode, &target_st->st_mode);
+    __put_user(host_st->st_nlink, &target_st->st_nlink);
+    __put_user(host_st->st_uid, &target_st->st_uid);
+    __put_user(host_st->st_gid, &target_st->st_gid);
+    __put_user(host_st->st_rdev, &target_st->st_rdev);
+    __put_user(host_st->st_size, &target_st->st_size);
+    __put_user(host_st->st_blksize, &target_st->st_blksize);
+    __put_user(host_st->st_blocks, &target_st->st_blocks);
+    __put_user(host_st->st_atime, &target_st->target_st_atime);
+    __put_user(host_st->st_mtime, &target_st->target_st_mtime);
+    __put_user(host_st->st_ctime, &target_st->target_st_ctime);
+    unlock_user_struct(target_st, target_addr, 1);
+    return 0;
+}
+
+static abi_long host_to_target_irix_stat64(abi_ulong target_addr,
+                                           struct stat *host_st)
+{
+    struct target_irix_stat64 *target_st;
+
+    if (!lock_user_struct(VERIFY_WRITE, target_st, target_addr, 0)) {
+        return -TARGET_EFAULT;
+    }
+    memset(target_st, 0, sizeof(*target_st));
+    __put_user(host_st->st_dev, &target_st->st_dev);
+    __put_user(host_st->st_ino, &target_st->st_ino);
+    __put_user(host_st->st_mode, &target_st->st_mode);
+    __put_user(host_st->st_nlink, &target_st->st_nlink);
+    __put_user(host_st->st_uid, &target_st->st_uid);
+    __put_user(host_st->st_gid, &target_st->st_gid);
+    __put_user(host_st->st_rdev, &target_st->st_rdev);
+    __put_user(host_st->st_size, &target_st->st_size);
+    __put_user(host_st->st_blksize, &target_st->st_blksize);
+    __put_user(host_st->st_blocks, &target_st->st_blocks);
+    __put_user(host_st->st_atime, &target_st->target_st_atime);
+    __put_user(host_st->st_mtime, &target_st->target_st_mtime);
+    __put_user(host_st->st_ctime, &target_st->target_st_ctime);
+    unlock_user_struct(target_st, target_addr, 1);
+    return 0;
+}
+#endif /* TARGET_ABI_IRIX */
+
 /* This is an internal helper for do_syscall so that it is easier
  * to have a single return point, so that actions, such as logging
  * of syscall results, can be performed.
@@ -9600,6 +9863,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #if defined(TARGET_NR_statfs) || defined(TARGET_NR_statfs64) \
     || defined(TARGET_NR_fstatfs)
     struct statfs stfs;
+#endif
+#if defined(TARGET_ABI_IRIX) && (defined(TARGET_NR_statvfs) \
+    || defined(TARGET_NR_fstatvfs) || defined(TARGET_NR_statvfs64) \
+    || defined(TARGET_NR_fstatvfs64))
+    /* IRIX statvfs-family marshalling buffer. Ported from qemu-irix, GPLv2. */
+    struct statvfs stvfs;
 #endif
     void *p;
 
@@ -9768,7 +10037,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return do_brk(arg1);
 #ifdef TARGET_NR_fork
     case TARGET_NR_fork:
-        return get_errno(do_fork(cpu_env, TARGET_SIGCHLD, 0, 0, 0, 0));
+        return get_errno(do_fork(cpu_env, TARGET_SIGCHLD, 0, 0, 0, 0 IRIX_FORK_EXTRA));
 #endif
 #ifdef TARGET_NR_waitpid
     case TARGET_NR_waitpid:
@@ -9787,6 +10056,31 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             struct rusage ru;
             siginfo_t info;
 
+#ifdef TARGET_ABI_IRIX
+            /*
+             * IRIX idtype/options constants differ from Linux: translate
+             * them before calling the host waitid (raw IRIX P_ALL=7 and the
+             * IRIX W* option bits are invalid Linux values -> EINVAL).
+             * Ported from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix),
+             * GPLv2.
+             */
+            {
+                int opt = arg4;
+                switch (arg1) {
+                case TARGET_P_PID:  arg1 = P_PID;  break;
+                case TARGET_P_PGID: arg1 = P_PGID; break;
+                case TARGET_P_ALL:  arg1 = P_ALL;  break;
+                default:            arg1 = P_ALL;  break;
+                }
+                arg4 = 0;
+                if (opt & TARGET_WNOHANG)    arg4 |= WNOHANG;
+                if (opt & TARGET_WSTOPPED)   arg4 |= WSTOPPED;
+                if (opt & TARGET_WEXITED)    arg4 |= WEXITED;
+                if (opt & TARGET_WCONTINUED) arg4 |= WCONTINUED;
+                if (opt & TARGET_WNOWAIT)    arg4 |= WNOWAIT;
+            }
+#endif
+            info.si_pid = 0;
             ret = get_errno(safe_waitid(arg1, arg2, (arg3 ? &info : NULL),
                                         arg4, (arg5 ? &ru : NULL)));
             if (!is_error(ret)) {
@@ -9796,7 +10090,23 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
                     if (!p) {
                         return -TARGET_EFAULT;
                     }
+#ifdef TARGET_ABI_IRIX
+                    /*
+                     * WNOHANG with no ready child returns success but leaves
+                     * si_pid == 0; IRIX libc/pmake polls in this mode and
+                     * loops forever (then crashes) if it reads a stale
+                     * siginfo. Zero the target siginfo in that case so the
+                     * caller sees "no child". Ported from qemu-irix
+                     * (Kai-Uwe Bloem; n64decomp/qemu-irix), GPLv2.
+                     */
+                    if (info.si_pid != 0) {
+                        host_to_target_siginfo(p, &info);
+                    } else {
+                        memset(p, 0, sizeof(target_siginfo_t));
+                    }
+#else
                     host_to_target_siginfo(p, &info);
+#endif
                     unlock_user(p, arg3, sizeof(target_siginfo_t));
                 }
                 if (arg5 && host_to_target_rusage(arg5, &ru)) {
@@ -10362,6 +10672,21 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 
         ret = get_errno(do_sigaction(arg1, pact, &oact, 0));
 
+#ifdef TARGET_ABI_IRIX
+            /*
+             * IRIX libc hands the kernel its own signal-return trampoline as
+             * the 4th sigaction argument, so the kernel needn't install one
+             * per-ABI. The IRIX signal-frame setup jumps to this trampoline
+             * (ts->sigtramp) with the real handler in a3. Without capturing
+             * it, ts->sigtramp stays 0 and the first delivered signal jumps
+             * to PC=0 (SIGSEGV at NULL) -- which breaks every guest signal
+             * handler (e.g. pmake's SIGCHLD reaper). Ported from qemu-irix
+             * (Kai-Uwe Bloem; n64decomp/qemu-irix), GPLv2.
+             */
+            if (!is_error(ret)) {
+                get_task_state(cpu)->sigtramp = arg4;
+            }
+#endif
 	    if (!is_error(ret) && arg3) {
                 if (!lock_user_struct(VERIFY_WRITE, old_act, arg3, 0))
                     return -TARGET_EFAULT;
@@ -11361,7 +11686,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             }
         }
         return ret;
-#ifdef TARGET_NR_stat
+#if defined(TARGET_NR_stat) && !defined(TARGET_ABI_IRIX)
     case TARGET_NR_stat:
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
@@ -11555,13 +11880,13 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
          * implicit argument to clone for the TLS pointer.
          */
 #if defined(TARGET_MICROBLAZE)
-        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg4, arg6, arg5));
+        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg4, arg6, arg5 IRIX_FORK_EXTRA));
 #elif defined(TARGET_CLONE_BACKWARDS)
-        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg3, arg4, arg5));
+        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg3, arg4, arg5 IRIX_FORK_EXTRA));
 #elif defined(TARGET_CLONE_BACKWARDS2)
-        ret = get_errno(do_fork(cpu_env, arg2, arg1, arg3, arg5, arg4));
+        ret = get_errno(do_fork(cpu_env, arg2, arg1, arg3, arg5, arg4 IRIX_FORK_EXTRA));
 #else
-        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg3, arg5, arg4));
+        ret = get_errno(do_fork(cpu_env, arg1, arg2, arg3, arg5, arg4 IRIX_FORK_EXTRA));
 #endif
         return ret;
 #ifdef __NR_exit_group
@@ -12197,7 +12522,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_vfork:
         return get_errno(do_fork(cpu_env,
                          CLONE_VFORK | CLONE_VM | TARGET_SIGCHLD,
-                         0, 0, 0, 0));
+                         0, 0, 0, 0 IRIX_FORK_EXTRA));
 #endif
 #ifdef TARGET_NR_ugetrlimit
     case TARGET_NR_ugetrlimit:
@@ -14293,6 +14618,837 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_map_shadow_stack:
         return do_map_shadow_stack(cpu_env, arg1, arg2, arg3);
 #endif
+
+
+#ifdef TARGET_ABI_IRIX
+    /*
+     * IRIX-specific syscalls. Ported from qemu-irix (Kai-Uwe Bloem
+     * <derkub@gmail.com>; n64decomp/qemu-irix), GPLv2. Adapted to the QEMU
+     * 10.x linux-user API (gemu_log -> qemu_log_mask, cpu->opaque ->
+     * get_task_state, do_fork entry/arg extension, return -TARGET_EFAULT).
+     */
+    case TARGET_NR_mmap64:  /* IRIX mmap/mmap64 (134 maps to 185) */
+        {
+            off_t off;
+            int hflags;
+            if (regpairs_aligned(cpu_env, num)) {
+                off = target_offset64(arg7, arg8);
+            } else {
+                off = target_offset64(arg6, arg7);
+            }
+            /* IRIX MAP_AUTOGROW has no Linux equivalent: grow the file. */
+            if ((arg4 & TARGET_MAP_AUTOGROW) && (abi_long)arg5 >= 0 &&
+                fstat(arg5, &st) >= 0 && st.st_size < off + arg2) {
+                ret = get_errno(ftruncate(arg5, off + arg2));
+                if (is_error(ret)) {
+                    break;
+                }
+            }
+            hflags = arg4 & ~TARGET_MAP_AUTOGROW;
+            ret = do_mmap(arg1, arg2, arg3, hflags, arg5, off);
+        }
+        break;
+
+    case TARGET_NR_lseek64:  /* IRIX lseek64(fd, offset64, whence) */
+        {
+            /*
+             * The cpu_loop arg-expander splits the 64-bit offset into an
+             * O32-style (high, low) pair, and flags lseek64 as returning a
+             * 64-bit value (split across gpr2/gpr3 by the cpu_loop). Compute
+             * the offset, do the seek, and hand the cpu_loop the 64-bit
+             * result: low word in gpr[3], high word as the return value.
+             * Ported from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix),
+             * GPLv2.
+             */
+            int64_t off, res;
+            int whence;
+            if (regpairs_aligned(cpu_env, num)) {
+                off = target_offset64(arg3, arg4);
+                whence = arg5;
+            } else {
+                off = target_offset64(arg2, arg3);
+                whence = arg4;
+            }
+            res = lseek(arg1, off, whence);
+            if (res == -1) {
+                ret = get_errno(res);
+            } else {
+                /* split the 64 bit return value for the N32 cpu_loop */
+                cpu_env->active_tc.gpr[3] = (abi_int)res;
+                ret = (abi_int)(res >> 32);
+            }
+        }
+        break;
+
+    /*
+     * IRIX statvfs/fstatvfs (+ 64-bit variants). ld32 calls fstatvfs64 on its
+     * inputs; without this it gets ENOSYS ("Function not implemented").
+     * The host struct statvfs fields are wider than needed; truncate into the
+     * IRIX layout. Ported from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix),
+     * GPLv2.
+     */
+    case TARGET_NR_fstatvfs:    /* fstatvfs(fd, buf) */
+        ret = get_errno(fstatvfs(arg1, &stvfs));
+        goto convert_irix_statvfs;
+    case TARGET_NR_statvfs:     /* statvfs(path, buf) */
+        if (!(p = lock_user_string(arg1))) {
+            return -TARGET_EFAULT;
+        }
+        ret = get_errno(statvfs(path(p), &stvfs));
+        unlock_user(p, arg1, 0);
+    convert_irix_statvfs:
+        if (!is_error(ret)) {
+            struct target_statvfs *target_stvfs;
+            if (!lock_user_struct(VERIFY_WRITE, target_stvfs, arg2, 0)) {
+                return -TARGET_EFAULT;
+            }
+            __put_user(stvfs.f_bsize, &target_stvfs->f_bsize);
+            __put_user(stvfs.f_frsize, &target_stvfs->f_frsize);
+            __put_user(stvfs.f_blocks, &target_stvfs->f_blocks);
+            __put_user(stvfs.f_bfree, &target_stvfs->f_bfree);
+            __put_user(stvfs.f_bavail, &target_stvfs->f_bavail);
+            __put_user(stvfs.f_files, &target_stvfs->f_files);
+            __put_user(stvfs.f_ffree, &target_stvfs->f_ffree);
+            __put_user(stvfs.f_favail, &target_stvfs->f_favail);
+            __put_user(stvfs.f_fsid, &target_stvfs->f_fsid);
+            __put_user(stvfs.f_flag, &target_stvfs->f_flag);
+            __put_user(stvfs.f_namemax, &target_stvfs->f_namemax);
+            unlock_user_struct(target_stvfs, arg2, 1);
+        }
+        break;
+    case TARGET_NR_fstatvfs64:  /* fstatvfs64(fd, buf) */
+        ret = get_errno(fstatvfs(arg1, &stvfs));
+        goto convert_irix_statvfs64;
+    case TARGET_NR_statvfs64:   /* statvfs64(path, buf) */
+        if (!(p = lock_user_string(arg1))) {
+            return -TARGET_EFAULT;
+        }
+        ret = get_errno(statvfs(path(p), &stvfs));
+        unlock_user(p, arg1, 0);
+    convert_irix_statvfs64:
+        if (!is_error(ret)) {
+            struct target_statvfs64 *target_stvfs;
+            if (!lock_user_struct(VERIFY_WRITE, target_stvfs, arg2, 0)) {
+                return -TARGET_EFAULT;
+            }
+            __put_user(stvfs.f_bsize, &target_stvfs->f_bsize);
+            __put_user(stvfs.f_frsize, &target_stvfs->f_frsize);
+            __put_user(stvfs.f_blocks, &target_stvfs->f_blocks);
+            __put_user(stvfs.f_bfree, &target_stvfs->f_bfree);
+            __put_user(stvfs.f_bavail, &target_stvfs->f_bavail);
+            __put_user(stvfs.f_files, &target_stvfs->f_files);
+            __put_user(stvfs.f_ffree, &target_stvfs->f_ffree);
+            __put_user(stvfs.f_favail, &target_stvfs->f_favail);
+            __put_user(stvfs.f_fsid, &target_stvfs->f_fsid);
+            __put_user(stvfs.f_flag, &target_stvfs->f_flag);
+            __put_user(stvfs.f_namemax, &target_stvfs->f_namemax);
+            unlock_user_struct(target_stvfs, arg2, 1);
+        }
+        break;
+
+    case TARGET_NR_xstat:   /* xstat(ver, path, statbuf) */
+        if (!(p = lock_user_string(arg2))) {
+            return -TARGET_EFAULT;
+        }
+        /*
+         * IRIX libc probes named POSIX semaphores via xstat against a virtual
+         * file. Return fake stat info for a known semaphore name.
+         */
+        ret = psema_get_index(p, NULL, 0);
+        if (ret >= 0) {
+            memset(&st, 0, sizeof(st));
+            st.st_ino = ret;
+        } else {
+            ret = get_errno(stat(path(p), &st));
+        }
+        unlock_user(p, arg2, 0);
+        goto do_irix_xstat;
+    case TARGET_NR_lxstat:  /* lxstat(ver, path, statbuf) */
+        if (!(p = lock_user_string(arg2))) {
+            return -TARGET_EFAULT;
+        }
+        ret = get_errno(lstat(path(p), &st));
+        unlock_user(p, arg2, 0);
+        goto do_irix_xstat;
+    case TARGET_NR_fxstat:  /* fxstat(ver, fd, statbuf) */
+        ret = get_errno(fstat(arg2, &st));
+        goto do_irix_xstat;
+    do_irix_xstat:
+        /*
+         * On IRIX N32, the stat-family (xstat/lxstat/fxstat) buffer always uses
+         * the 64-bit "stat64" layout (8-byte st_ino/st_size/st_blocks),
+         * regardless of the version the guest passes in arg1 (libc commonly
+         * passes ver=2). Matching qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix):
+         * for N32 force the stat64 marshaller, else select on the version.
+         * Ported from qemu-irix, GPLv2.
+         */
+        if (!is_error(ret)) {
+#ifdef TARGET_ABI_MIPSN32
+            ret = host_to_target_irix_stat64(arg3, &st);
+#else
+            if (arg1 == TARGET_STAT64_VER) {
+                ret = host_to_target_irix_stat64(arg3, &st);
+            } else {
+                ret = host_to_target_irix_stat(arg3, &st);
+            }
+#endif
+        }
+        break;
+    case TARGET_NR_stat:    /* IRIX stat(path, statbuf) */
+        if (!(p = lock_user_string(arg1))) {
+            return -TARGET_EFAULT;
+        }
+        ret = get_errno(stat(path(p), &st));
+        unlock_user(p, arg1, 0);
+        if (!is_error(ret)) {
+            ret = host_to_target_irix_stat(arg2, &st);
+        }
+        break;
+
+    case TARGET_NR_nsproc:  /* pid = nsproc(entry, flags, prthread, prsched) */
+    {
+       struct target_prthread *target_prthread;
+       abi_ulong prthread = arg3;
+       if (!lock_user_struct(VERIFY_READ, target_prthread, prthread, 0)) {
+           return -TARGET_EFAULT;
+       }
+       __get_user(arg3, &target_prthread->prt_arg);
+       __get_user(arg4, &target_prthread->prt_stkptr);
+       __get_user(arg5, &target_prthread->prt_stklen);
+       unlock_user_struct(target_prthread, prthread, 1);
+       goto do_sprocsp;
+    }
+    case TARGET_NR_sproc:   /* pid = sproc(entry, flags, arg) */
+        arg5 = 16384;   /* default stack size? */
+        arg4 = target_mmap(0, arg5, PROT_READ | PROT_WRITE,
+                                    MAP_ANON | MAP_PRIVATE, -1, 0);
+        if ((abi_int)arg4 == -1) {
+            ret = -TARGET_ENOMEM;
+            break;
+        }
+        goto do_sprocsp;
+
+    case TARGET_NR_sprocsp: /* pid = sprocsp(entry, flags, arg, stack, len) */
+    do_sprocsp:
+    {
+        int opt;
+
+        /* qemu only knows about (v)fork and pthread_create */
+        if ((arg2 & (TARGET_PR_BLOCK | TARGET_PR_SALL)) ==
+                    (TARGET_PR_BLOCK | TARGET_PR_SADDR)) {
+            /* treat this like vfork */
+            opt = CLONE_VFORK | CLONE_VM | TARGET_SIGCHLD;
+        } else {
+            /* treat everything else like pthread_create */
+            opt = CLONE_THREAD_FLAGS;
+        }
+        arg4 = arg4 + arg5 - 16;    /* set stack top */
+        ret = get_errno(do_fork(cpu_env, opt, arg4, 0, 0, 0, arg1, arg3));
+        /* man page says PR_BLOCK blocks the parent like procblk does */
+        if (ret > 0 && !(opt & CLONE_VFORK) && (arg2 & TARGET_PR_BLOCK)) {
+            TaskState *ts = get_task_state(cpu);
+            arg1 = TARGET_NR_procblk_block;
+            arg2 = ts->ts_tid;
+            goto do_procblk;
+        }
+        /* child, or error */
+        break;
+    }
+
+    case TARGET_NR_procblk:
+    do_procblk:
+    {
+        TaskState *ts = find_task_state(arg2);
+        int old_count;
+        ret = 0;
+        if (!ts) {
+            ret = -TARGET_ESRCH;
+            break;
+        }
+        /* NOTE: implementation inspired by netbsd-5 code */
+        pthread_mutex_lock(&ts->procblk_mutex);
+        old_count = ts->procblk_count;
+        switch (arg1) {
+        case TARGET_NR_procblk_block:   /* blockproc(pid) */
+            if (ts != get_task_state(cpu) && old_count == 0) {
+                ret = -TARGET_EPERM;
+            } else {
+                ts->procblk_count--;
+            }
+            break;
+        case TARGET_NR_procblk_unblock: /* unblockproc(pid) */
+            ts->procblk_count++;
+            break;
+        case TARGET_NR_procblk_count:   /* setblockproccnt(pid, val) */
+            if (ts != get_task_state(cpu) && (old_count < 0) != (arg3 < 0)) {
+                ret = -TARGET_EPERM;
+            } else {
+                ts->procblk_count = arg3;
+            }
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: procblk(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        if (ret == 0 && ts) {
+            if (ts->procblk_count < 0 && old_count >= 0) {
+                ts->is_blocked = 1;
+                do {
+                    pthread_cond_wait(&ts->procblk_cond, &ts->procblk_mutex);
+                } while (ts->is_blocked);
+            } else if (ts->procblk_count >= 0 && old_count < 0) {
+                ts->is_blocked = 0;
+                pthread_cond_broadcast(&ts->procblk_cond);
+            }
+        }
+        pthread_mutex_unlock(&ts->procblk_mutex);
+    }
+    break;
+
+    case TARGET_NR_usync_cntl:
+    {
+        struct target_usync *target_buf;
+        struct usync_ref *sync, *lock;
+        struct timespec uts;
+        if (!lock_user_struct(VERIFY_WRITE, target_buf, arg2, 0)) {
+            return -TARGET_EFAULT;
+        }
+        if (!(sync = usync_get_sync(tswap64(target_buf->u_sync)))) {
+            ret = -TARGET_ENOMEM;
+            unlock_user_struct(target_buf, arg2, 1);
+            break;
+        }
+        switch (arg1) {
+        case TARGET_NR_usync_handoff: /* implements pthread_cond_wait? */
+            if (!(lock = usync_get_sync(tswap64(target_buf->u_lock)))) {
+                ret = -TARGET_ENOMEM;
+                break;
+            }
+            pthread_mutex_lock(&lock->lock);
+            lock->count++;
+            lock->handoffs++; /* Mark this as being used as handoff lock */
+            ret = pthread_cond_signal(&lock->cond);
+            pthread_mutex_unlock(&lock->lock);
+            /* FALLTHROUGH */
+        case TARGET_NR_usync_block: /* block on address */
+        case TARGET_NR_usync_intr_block: /* interruptible block? */
+            __get_user(uts.tv_sec, &target_buf->u_sec);
+            __get_user(uts.tv_nsec, &target_buf->u_nsec);
+            pthread_mutex_lock(&sync->lock);
+            sync->waiters++;
+            for (ret = 0; sync->count <= 0 && ret == 0; ) {
+                if (target_buf->u_flags & tswap16(TARGET_US_TIMEOUT)) {
+                    ret = pthread_cond_timedwait(&sync->cond, &sync->lock, &uts);
+                } else {
+                    ret = pthread_cond_wait(&sync->cond, &sync->lock);
+                }
+            }
+            if (!ret) {
+                sync->count--;
+                /* Notify the caller if this was used as handoff lock */
+                ret = sync->handoffs;
+                if (sync->handoffs) {
+                    sync->handoffs--;
+                }
+            }
+            sync->waiters--;
+            pthread_mutex_unlock(&sync->lock);
+            break;
+        case TARGET_NR_usync_unblock_all: /* unblock everyone waiting on addr */
+            pthread_mutex_lock(&sync->lock);
+            sync->count = sync->waiters;
+            ret = pthread_cond_broadcast(&sync->cond);
+            pthread_mutex_unlock(&sync->lock);
+            break;
+        case TARGET_NR_usync_unblock: /* unblock one process waiting on addr */
+            pthread_mutex_lock(&sync->lock);
+            sync->count++;
+            ret = pthread_cond_signal(&sync->cond);
+            pthread_mutex_unlock(&sync->lock);
+            break;
+        case TARGET_NR_usync_get_state: /* get current wait state */
+            pthread_mutex_lock(&sync->lock);
+            ret = sync->count - sync->waiters;
+            pthread_mutex_unlock(&sync->lock);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: usynccntl(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        unlock_user_struct(target_buf, arg2, 1);
+    }
+    break;
+
+    case TARGET_NR_sgiprctl:
+    {
+        CPUState *p;
+        TaskState *ts = get_task_state(cpu);
+        switch (arg1) {
+        case TARGET_NR_prctl_maxpprocs: /* #available processors */
+            ret = 1;
+            break;
+        case TARGET_NR_prctl_getnshare: /* #processes in share group? */
+            for (ret = 0, p = first_cpu; p; ret++, p = CPU_NEXT(p)) {
+                ;
+            }
+            break;
+        case TARGET_NR_prctl_lastshexit: /* checks if share group is empty? */
+            ret = (CPU_NEXT(first_cpu) == NULL);
+            break;
+        case TARGET_NR_prctl_termchild: /* send SIGHUP to child if parent dies */
+            ts->termchild_sig = TARGET_SIGHUP;
+            ret = 0;
+            break;
+        case TARGET_NR_prctl_unblkonexec: /* on exec unblock parent thread */
+            ret = 0;
+            break;
+        case TARGET_NR_prctl_setexitsig: /* on exit send signal to threads */
+            for (p = first_cpu; p; p = CPU_NEXT(p)) {
+                ts = get_task_state(p);
+                ts->exit_sig = arg2;
+            }
+            ret = 0;
+            break;
+        case TARGET_NR_prctl_isblocked: /* is process blocked? */
+            ts = find_task_state(arg2);
+            if (ts) {
+                ret = ts->is_blocked;
+            } else {
+                ret = -TARGET_ESRCH;
+            }
+            break;
+        case TARGET_NR_prctl_initthreads: /* initialize process for pthreads? */
+            ts->is_pthread = 1;
+            ret = 0;
+            break;
+        case TARGET_NR_prctl_threadctl: /* pthread thread control */
+            switch (arg2) {
+            case TARGET_NR_prctl_thread_exit:       /* exit() */
+                preexit_cleanup(cpu_env, 0);
+                pthread_exit(NULL);
+                /* not reached */
+                ret = 0;
+                break;
+            case TARGET_NR_prctl_thread_block:      /* block(), this thread */
+                pthread_mutex_lock(&ts->procblk_mutex);
+                ts->procblk_count--;
+                ts->is_blocked = 1;
+                for (ret = 0; ts->procblk_count < 0 && ret == 0; ) {
+                    ret = pthread_cond_wait(&ts->procblk_cond,
+                                            &ts->procblk_mutex);
+                }
+                ts->is_blocked = 0;
+                pthread_mutex_unlock(&ts->procblk_mutex);
+                if (ret) {
+                    ret = -host_to_target_errno(errno);
+                }
+                break;
+            case TARGET_NR_prctl_thread_unblock:    /* unblock(tid) */
+                ts = find_task_state(arg3);
+                if (ts) {
+                    pthread_mutex_lock(&ts->procblk_mutex);
+                    ts->procblk_count++;
+                    pthread_cond_broadcast(&ts->procblk_cond);
+                    pthread_mutex_unlock(&ts->procblk_mutex);
+                    ret = 0;
+                } else {
+                    ret = -TARGET_ESRCH;
+                }
+                break;
+            case TARGET_NR_prctl_thread_kill:       /* kill(tid, sig) */
+            {
+                CPUState *pk = find_cpu_state(arg3);
+                target_siginfo_t info = { 0 };
+                info.si_signo = arg4;
+                if (pk) {
+                    /* cpu_env is shadowed by the do_syscall1 parameter here */
+                    CPUArchState *penv = &MIPS_CPU(pk)->env;
+                    queue_signal(penv, info.si_signo, QEMU_SI_KILL, &info);
+                    process_pending_signals(penv);
+                }
+                ret = 0;
+                break;
+            }
+            case TARGET_NR_prctl_thread_sched:
+            default:
+                ret = -TARGET_ENOSYS;
+                break;
+            }
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: sgiprctl(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        break;
+    }
+
+    case TARGET_NR_psema_cntl:
+    {
+        sem_t *s;
+        int v;
+        switch (arg1) {
+        case TARGET_NR_psema_open: /* idx = sem_open(name, flags, mode, val) */
+            if (!(p = lock_user_string(arg2))) {
+                return -TARGET_EFAULT;
+            }
+            s = sem_open(p, target_to_host_bitmask(arg3, fcntl_flags_tbl),
+                            arg4, arg5);
+            if (s == SEM_FAILED) {
+                ret = -host_to_target_errno(errno);
+            } else {
+                ret = psema_get_index(p, s, 1);
+            }
+            unlock_user(p, arg2, 0);
+            break;
+        case TARGET_NR_psema_close:     /* sem_close(idx) */
+            ret = get_errno(sem_close(psema_get_sem(arg2)));
+            if (ret == 0) {
+                psema_remove_index(arg2);
+            }
+            break;
+        case TARGET_NR_psema_unlink:    /* sem_unlink(name) */
+            if (!(p = lock_user_string(arg2))) {
+                return -TARGET_EFAULT;
+            }
+            ret = get_errno(sem_unlink(p));
+            if (!is_error(ret)) {
+                psema_unlink_index(p);
+            }
+            unlock_user(p, arg2, 0);
+            break;
+        case TARGET_NR_psema_wait:      /* sem_wait(idx) */
+        case TARGET_NR_psema_wait2:
+            ret = get_errno(sem_wait(psema_get_sem(arg2)));
+            break;
+        case TARGET_NR_psema_trywait:   /* sem_trywait(idx) */
+            ret = get_errno(sem_trywait(psema_get_sem(arg2)));
+            break;
+        case TARGET_NR_psema_post:      /* sem_post(idx) */
+            ret = get_errno(sem_post(psema_get_sem(arg2)));
+            break;
+        case TARGET_NR_psema_getvalue:  /* sem_getvalue(idx, &val) */
+            ret = get_errno(sem_getvalue(psema_get_sem(arg2), &v));
+            put_user(v, arg3, abi_int);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: psema_cntl(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        break;
+    }
+
+    case TARGET_NR_syssgi:
+    {
+        switch (arg1) {
+        case TARGET_NR_syssgi_elfmap: /* map ELF shared object */
+        {
+            Elf32_Phdr *target_phdr, *phdr;
+            int i;
+            target_phdr = lock_user(VERIFY_READ, arg3,
+                                    sizeof(*phdr) * arg4, 1);
+            if (!target_phdr) {
+                return -TARGET_EFAULT;
+            }
+            phdr = alloca(sizeof(*phdr) * arg4);
+            for (i = 0; i < arg4; i++) {
+                __get_user(phdr[i].p_type, &target_phdr[i].p_type);
+                __get_user(phdr[i].p_offset, &target_phdr[i].p_offset);
+                __get_user(phdr[i].p_vaddr, &target_phdr[i].p_vaddr);
+                __get_user(phdr[i].p_paddr, &target_phdr[i].p_paddr);
+                __get_user(phdr[i].p_filesz, &target_phdr[i].p_filesz);
+                __get_user(phdr[i].p_memsz, &target_phdr[i].p_memsz);
+                __get_user(phdr[i].p_flags, &target_phdr[i].p_flags);
+                __get_user(phdr[i].p_align, &target_phdr[i].p_align);
+            }
+            ret = sgi_map_elf_image(arg2, phdr, arg4);
+            unlock_user(target_phdr, arg3, 0);
+            break;
+        }
+        case TARGET_NR_syssgi_sigaltstack:
+            ret = do_sigaltstack(arg2, arg3, cpu_env);
+            break;
+        case TARGET_NR_syssgi_settimeofday:
+            {
+                struct timeval tv;
+                if (copy_from_user_timeval(&tv, arg2)) {
+                    return -TARGET_EFAULT;
+                }
+                ret = get_errno(settimeofday(&tv, NULL));
+            }
+            break;
+        case TARGET_NR_syssgi_getpgid:
+            ret = get_errno(getpgid(arg2));
+            break;
+        case TARGET_NR_syssgi_getsid:
+            ret = get_errno(getsid(arg2));
+            break;
+        case TARGET_NR_syssgi_sysconf:
+            switch (arg2) {
+            case TARGET_NR_sysconf_childmax:
+                ret = get_errno(sysconf(_SC_CHILD_MAX));
+                break;
+            case TARGET_NR_sysconf_openmax:
+                ret = get_errno(sysconf(_SC_OPEN_MAX));
+                break;
+            case TARGET_NR_sysconf_clktick:
+                ret = get_errno(sysconf(_SC_CLK_TCK));
+                break;
+            case TARGET_NR_sysconf_pagesize:
+                ret = TARGET_PAGE_SIZE;
+                break;
+            case TARGET_NR_sysconf_nprocs:
+                ret = 1;
+                break;
+            case TARGET_NR_sysconf_acl:
+            case TARGET_NR_sysconf_cap:
+            case TARGET_NR_sysconf_mac:
+                ret = 0;
+                break;
+            default:
+                qemu_log_mask(LOG_UNIMP,
+                              "Unsupported syscall: sysconf(%d)\n", (int)arg2);
+                ret = -TARGET_ENOSYS;
+                break;
+            }
+            break;
+        case TARGET_NR_syssgi_rusage:
+            {
+                struct rusage rusage;
+                ret = get_errno(getrusage(arg2, &rusage));
+                if (!is_error(ret)) {
+                    ret = host_to_target_rusage(arg3, &rusage);
+                }
+            }
+            break;
+        case TARGET_NR_syssgi_fdhi: /* highest valid fd */
+            {
+                DIR *dir;
+                struct dirent *de;
+                int fdhi = 0;
+                if ((dir = opendir("/proc/self/fd"))) {
+                    while ((de = readdir(dir))) {
+                        if (de->d_name[0] != '.') {
+                            char *err = NULL;
+                            long l = strtol(de->d_name, &err, 10);
+                            if (err && !*err && l > fdhi) {
+                                fdhi = l;
+                            }
+                        }
+                    }
+                    closedir(dir);
+                }
+                ret = (fdhi > 0 ? fdhi + 1 : -TARGET_EBADF);
+            }
+            break;
+        case TARGET_NR_syssgi_getust: /* get unadjusted system time */
+            {
+                struct timespec uts;
+                struct timeval tv;
+                abi_ullong ust, *target_ust;
+
+                target_ust = lock_user(VERIFY_WRITE, arg1, sizeof(ust), 0);
+                if (!target_ust) {
+                    return -TARGET_EFAULT;
+                }
+                ret = get_errno(clock_gettime(CLOCK_MONOTONIC_RAW, &uts));
+                if (!is_error(ret)) {
+                    ust = uts.tv_sec * 1000000000LL + uts.tv_nsec;
+                    __put_user(ust, target_ust);
+                }
+                unlock_user(target_ust, arg1, sizeof(ust));
+
+                if (arg2 && !is_error(ret)) {
+                    ret = get_errno(gettimeofday(&tv, NULL));
+                    if (!is_error(ret) && arg2) {
+                        if (copy_to_user_timeval(arg2, &tv)) {
+                            return -TARGET_EFAULT;
+                        }
+                    }
+                }
+            }
+            break;
+        case TARGET_NR_syssgi_sysid:
+        {
+            char *buf = lock_user(VERIFY_WRITE, arg2, 64, 0);
+            if (!buf) {
+                return -TARGET_EFAULT;
+            }
+            snprintf(buf, 64, "%12llx", 0x08006900000DULL);
+            ret = 0;
+            unlock_user(buf, arg2, 64);
+            break;
+        }
+        case TARGET_NR_syssgi_rldenv:
+        case TARGET_NR_syssgi_tosstsave:
+        case TARGET_NR_syssgi_fpbcopy:
+        case TARGET_NR_syssgi_getprocattr:
+            ret = 0;
+            break;
+        case TARGET_NR_syssgi_setgroups:
+        case TARGET_NR_syssgi_getgroups:
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: sgisys(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        break;
+    }
+
+    case TARGET_NR_sginap: /* yield if arg1=0, else nap arg1 clk ticks */
+        if (arg1) {
+            ret = get_errno(usleep(arg1 * 10000)); /* tick freq = 100 Hz */
+        } else {
+            ret = sched_yield();
+        }
+        break;
+
+    case TARGET_NR_getmountid:
+    {
+        uint32_t *mid = lock_user(VERIFY_WRITE, arg2, sizeof(uint32_t) * 4, 0);
+        if (!(p = lock_user_string(arg1))) {
+            unlock_user(mid, arg2, sizeof(uint32_t) * 4);
+            return -TARGET_EFAULT;
+        }
+        ret = get_errno(statfs(p, &stfs));
+        memcpy(mid, &stfs.f_fsid, sizeof(uint32_t) * 4);
+        __put_user(stfs.f_type, &mid[3]);
+        unlock_user(p, arg1, 0);
+        unlock_user(mid, arg2, sizeof(uint32_t) * 4);
+        break;
+    }
+
+    case TARGET_NR_sysmp:
+    {
+        switch (arg1) {
+        case TARGET_NR_sysmp_nprocs:  /* #physical processors */
+        case TARGET_NR_sysmp_naprocs: /* #processors without process limit */
+            ret = 1;
+            break;
+        case TARGET_NR_sysmp_pgsize:
+            ret = TARGET_PAGE_SIZE;
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: sgisysmp(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        break;
+    }
+
+    case TARGET_NR_swapctl:
+    {
+        switch (arg1) {
+        case TARGET_NR_swapctl_getfree:
+            put_user(512 * 512, arg2, abi_ulong);
+            ret = 0;
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: swapctl(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        break;
+    }
+
+    case TARGET_NR_sysinfosgi:
+    {
+        char *target_buf;
+
+        if (!(target_buf = lock_user(VERIFY_WRITE, arg2, arg3, 0))) {
+            return -TARGET_EFAULT;
+        }
+
+        ret = 0;
+        target_buf[arg3 - 1] = 0;
+        switch (arg1) {
+        case TARGET_NR_sysinfo_gethostname:
+            ret = get_errno(gethostname(target_buf, arg3 - 1));
+            break;
+        case TARGET_NR_sysinfo_sethostname:
+            ret = get_errno(sethostname(target_buf, arg3 - 1));
+            break;
+        case TARGET_NR_sysinfo_getsrpcdomain:
+            strncpy(target_buf, "", arg3 - 1);
+            break;
+        case TARGET_NR_sysinfo_sysname:
+            strncpy(target_buf, "IRIX", arg3 - 1);
+            break;
+        case TARGET_NR_sysinfo_release:
+            strncpy(target_buf, "6.5", arg3 - 1);
+            break;
+        case TARGET_NR_sysinfo_version:
+            strncpy(target_buf, "01010101", arg3 - 1);
+            break;
+        case TARGET_NR_sysinfo_machine:
+            strncpy(target_buf, "IP22", arg3 - 1);
+            break;
+        case TARGET_NR_sysinfo_hwserial:
+            snprintf(target_buf, arg3 - 1, "%12llx", 0x08006900000DULL);
+            break;
+        case TARGET_NR_sysinfo_hwproducer:
+            strncpy(target_buf, "Qemu", arg3 - 1);
+            break;
+        case TARGET_NR_sysinfo_processors:
+            strncpy(target_buf, "R4000 3.0", arg3 - 1);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: sgisysinfo(%d)\n", (int)arg1);
+            ret = -TARGET_EINVAL;
+        }
+        ret = (ret ? ret : strlen(target_buf) + 1);
+        unlock_user(target_buf, arg2, (ret > 0 ? ret : 0));
+        break;
+    }
+
+    case TARGET_NR_utssyssgi:
+    {
+        switch (arg3) {
+        case TARGET_NR_utssys_uname:
+        {
+            struct target_utsname *target_buf;
+            struct utsname buf;
+
+            if (!lock_user_struct(VERIFY_WRITE, target_buf, arg1, 0)) {
+                return -TARGET_EFAULT;
+            }
+            ret = get_errno(uname(&buf));
+            if (!is_error(ret)) {
+                strncpy(target_buf->sysname, "IRIX",
+                        sizeof(target_buf->sysname));
+                strncpy(target_buf->nodename, buf.nodename,
+                        sizeof(target_buf->nodename));
+                strncpy(target_buf->release, "6.5",
+                        sizeof(target_buf->release));
+                strncpy(target_buf->version, "01010101",
+                        sizeof(target_buf->version));
+                strncpy(target_buf->machine, "IP22",
+                        sizeof(target_buf->machine));
+            }
+            unlock_user_struct(target_buf, arg1, 1);
+            break;
+        }
+        default:
+            qemu_log_mask(LOG_UNIMP,
+                          "Unsupported syscall: utssys(%d)\n", (int)arg1);
+            ret = -TARGET_ENOSYS;
+            break;
+        }
+        break;
+    }
+#endif /* TARGET_ABI_IRIX */
+
 
     default:
         qemu_log_mask(LOG_UNIMP, "Unsupported syscall: %d\n", num);

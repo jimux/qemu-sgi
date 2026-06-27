@@ -24,6 +24,8 @@
 #include "exec/translation-block.h"
 
 extern char *exec_path;
+extern int qemu_argc;
+extern char **qemu_argv;
 void init_task_state(TaskState *ts);
 void task_settid(TaskState *);
 void stop_all_tasks(void);
@@ -112,7 +114,17 @@ static inline int is_error(abi_long ret)
     return (abi_ulong)ret >= (abi_ulong)(-4096);
 }
 
-#if (TARGET_ABI_BITS == 32) && !defined(TARGET_ABI_MIPSN32)
+/*
+ * IRIX N32: although TARGET_ABI_MIPSN32 normally passes a 64-bit syscall
+ * argument in a single register, the IRIX cpu_loop arg-expander
+ * (get_args_n32) splits it into an O32-style (high, low) word pair, so the
+ * 64-bit syscall handlers must recombine the two words here. Restore the
+ * word-combining form for IRIX N32 (matching qemu-irix, which selected it via
+ * TARGET_ABI_BITS == 32). Ported from qemu-irix (Kai-Uwe Bloem;
+ * n64decomp/qemu-irix), GPLv2.
+ */
+#if (TARGET_ABI_BITS == 32) && \
+    (!defined(TARGET_ABI_MIPSN32) || defined(TARGET_ABI_IRIX))
 static inline uint64_t target_offset64(uint32_t word0, uint32_t word1)
 {
 #if TARGET_BIG_ENDIAN
@@ -140,6 +152,16 @@ static inline int regpairs_aligned(CPUArchState *cpu_env, int num)
     return cpu_env->eabi;
 }
 #elif defined(TARGET_MIPS) && defined(TARGET_ABI_MIPSO32)
+static inline int regpairs_aligned(CPUArchState *cpu_env, int num) { return 1; }
+#elif defined(TARGET_ABI_IRIX) && (TARGET_ABI_BITS == 32)
+/*
+ * IRIX N32: the cpu_loop arg-expander (get_args_n32) splits a 64-bit syscall
+ * argument into an O32-style even-aligned (high, low) register pair, so the
+ * 64-bit syscall handlers must treat the pair as aligned. Upstream's modern
+ * MIPS guard checks TARGET_ABI_MIPSO32, which excludes N32; qemu-irix used
+ * (TARGET_ABI_BITS == 32), which correctly covers N32. Restore that for IRIX.
+ * Ported from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix), GPLv2.
+ */
 static inline int regpairs_aligned(CPUArchState *cpu_env, int num) { return 1; }
 #elif defined(TARGET_PPC) && !defined(TARGET_PPC64)
 /*

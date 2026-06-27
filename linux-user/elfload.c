@@ -420,8 +420,17 @@ static abi_ulong setup_arg_pages(struct linux_binprm *bprm,
     if (info->exec_stack) {
         prot |= PROT_EXEC;
     }
+#ifdef TARGET_ABI_IRIX
+    /*
+     * IRIX maps the user stack at a fixed high address (top = 0x7fff8000)
+     * growing down. Ported from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix).
+     */
+    error = target_mmap(0x7fff8000 - size - guard, size + guard, prot,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#else
     error = target_mmap(0, size + guard, prot,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
     if (error == -1) {
         perror("mmap stack");
         exit(-1);
@@ -497,6 +506,102 @@ static bool zero_bss(abi_ulong start_bss, abi_ulong end_bss,
     }
     return true;
 }
+
+#ifdef TARGET_ABI_IRIX
+/*
+ * SGI_ELFMAP (syssgi 68): map an already-open ELF image's PT_LOAD segments
+ * into the address space at a single computed load bias and return the
+ * bias-adjusted vaddr of the first program header. Ported from qemu-irix
+ * (Kai-Uwe Bloem <derkub@gmail.com>; n64decomp/qemu-irix), GPLv2. Adapted to
+ * the QEMU 10.x elfload helpers (zero_bss(prot, errp), TARGET_PAGE_*).
+ *
+ * phdr points at an array of (host-endian, native-decoded) Elf32 program
+ * headers; the field layout matches struct elf_phdr.
+ */
+abi_ulong sgi_map_elf_image(int image_fd, void *phdr_in, int phnum)
+{
+    struct elf_phdr *phdr = phdr_in;
+    abi_ulong load_addr, load_bias, loaddr, hiaddr, error;
+    int i;
+
+    /* Find the address span of the image. */
+    loaddr = -1, hiaddr = 0;
+    for (i = 0; i < phnum; ++i) {
+        if (phdr[i].p_type == PT_LOAD) {
+            abi_ulong a = phdr[i].p_vaddr;
+            if (a < loaddr) {
+                loaddr = a;
+            }
+            a += phdr[i].p_memsz;
+            if (a > hiaddr) {
+                hiaddr = a;
+            }
+        }
+    }
+
+    mmap_lock();
+
+    /* Reserve a contiguous region; honour the image vaddr if available. */
+    load_addr = target_mmap(loaddr, hiaddr - loaddr, PROT_NONE,
+                            MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (load_addr == -1) {
+        goto exit_perror;
+    }
+    /* unmap to avoid failure if objects would be loaded into a hole */
+    target_munmap(load_addr, hiaddr - loaddr);
+    load_bias = load_addr - loaddr;
+
+    for (i = 0; i < phnum; i++) {
+        struct elf_phdr *eppnt = phdr + i;
+        if (eppnt->p_type == PT_LOAD) {
+            abi_ulong vaddr, vaddr_po, vaddr_ps, vaddr_ef, vaddr_em;
+            int elf_prot = 0;
+
+            if (eppnt->p_flags & PF_R) {
+                elf_prot |= PROT_READ;
+            }
+            if (eppnt->p_flags & PF_W) {
+                elf_prot |= PROT_WRITE;
+            }
+            if (eppnt->p_flags & PF_X) {
+                elf_prot |= PROT_EXEC;
+            }
+
+            vaddr = load_bias + eppnt->p_vaddr;
+            vaddr_po = vaddr & (TARGET_PAGE_SIZE - 1);
+            vaddr_ps = vaddr & ~(abi_ulong)(TARGET_PAGE_SIZE - 1);
+
+            error = target_mmap(vaddr_ps, eppnt->p_filesz + vaddr_po,
+                                elf_prot, MAP_PRIVATE | MAP_FIXED,
+                                image_fd, eppnt->p_offset - vaddr_po);
+            if (error == -1) {
+                goto exit_perror;
+            }
+
+            vaddr_ef = vaddr + eppnt->p_filesz;
+            vaddr_em = vaddr + eppnt->p_memsz;
+
+            /* If the load segment requests extra zeros (e.g. bss), map it. */
+            if (vaddr_ef < vaddr_em) {
+                Error *err = NULL;
+                if (!zero_bss(vaddr_ef, vaddr_em, elf_prot, &err)) {
+                    error_free(err);
+                    goto exit_perror;
+                }
+            }
+        }
+    }
+
+    mmap_unlock();
+
+    return load_bias + phdr[0].p_vaddr;
+
+ exit_perror:
+    mmap_unlock();
+    fprintf(stderr, "error in syssgi elfmap: %s\n", strerror(errno));
+    return -TARGET_ENOEXEC;
+}
+#endif /* TARGET_ABI_IRIX */
 
 #if defined(TARGET_ARM)
 static int elf_is_fdpic(struct elfhdr *exec)
@@ -672,6 +777,17 @@ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
     info->argv = u_argv;
     info->envp = u_envp;
 
+#ifdef TARGET_ABI_IRIX
+    /*
+     * IRIX writes the auxv a_type id as a 32-bit word followed by an
+     * abi-word value (the "4+4" layout on N64). Ported from qemu-irix
+     * (Kai-Uwe Bloem; n64decomp/qemu-irix).
+     */
+#define NEW_AUX_ENT(id, val) do {               \
+        put_user_u32(id, u_auxv);  u_auxv += n; \
+        put_user_ual(val, u_auxv); u_auxv += n; \
+    } while (0)
+#else
     /* This is correct because Linux defines
      * elf_addr_t as Elf32_Off / Elf64_Off
      */
@@ -679,6 +795,7 @@ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
         put_user_ual(id, u_auxv);  u_auxv += n; \
         put_user_ual(val, u_auxv); u_auxv += n; \
     } while(0)
+#endif
 
 #ifdef ARCH_DLINFO
     /*
@@ -1995,6 +2112,25 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
 
 #ifdef HAVE_ELF_CORE_DUMP
     bprm->core_dump = &elf_core_dump;
+#endif
+
+#ifdef TARGET_ABI_IRIX
+    {
+        /*
+         * IRIX PRDA: map one anonymous page at the fixed guest address
+         * 0x200000 and seed the pid fields. Ported from qemu-irix
+         * (Kai-Uwe Bloem; n64decomp/qemu-irix).
+         */
+        abi_ulong perror_addr =
+            target_mmap(0x200000, TARGET_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+        if (perror_addr == (abi_ulong)-1) {
+            fprintf(stderr, "Error mapping IRIX PRDA: %s\n", strerror(errno));
+            exit(-1);
+        }
+        put_user(getpid(), 0x200e00, target_pid_t);
+        put_user(getpid(), 0x200e40, target_pid_t);
+    }
 #endif
 
     return 0;
