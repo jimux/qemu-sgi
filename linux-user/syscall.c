@@ -8854,6 +8854,46 @@ int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *pathname,
     }
 }
 
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX root-write emulation. The IRIX build runs as root in the guest and
+ * routinely opens read-only (mode 444) shipped files for writing (e.g. the
+ * `install` tool re-installing 444 headers). root bypasses DAC, so on the real
+ * build host these opens succeed; on our unprivileged host they fail EACCES.
+ * Emulate root's bypass: on a write-open that fails EACCES against an existing
+ * file, temporarily make it writable, retry, and restore the original mode.
+ * This keeps the host filesystem changes byte-identical to a privileged build.
+ */
+static int irix_root_open_retry(int hostfd, abi_long dirfd, const char *pathname,
+                                int flags)
+{
+    struct stat st;
+    int acc = flags & O_ACCMODE;
+
+    if (hostfd != -1 || errno != EACCES) {
+        return hostfd;
+    }
+    if (acc != O_WRONLY && acc != O_RDWR) {
+        return hostfd;
+    }
+    if (fstatat(dirfd, path(pathname), &st, 0) != 0) {
+        errno = EACCES;
+        return -1;
+    }
+    if (fchmodat(dirfd, path(pathname), st.st_mode | 0600, 0) != 0) {
+        errno = EACCES;
+        return -1;
+    }
+    hostfd = openat(dirfd, path(pathname), flags & ~O_CREAT, 0);
+    /* restore the file's intended mode (install will re-chmod it anyway). */
+    fchmodat(dirfd, path(pathname), st.st_mode, 0);
+    if (hostfd == -1) {
+        errno = EACCES;
+    }
+    return hostfd;
+}
+#endif /* TARGET_ABI_IRIX */
+
 
 static int do_openat2(CPUArchState *cpu_env, abi_long dirfd,
                       abi_ptr guest_pathname, abi_ptr guest_open_how,
@@ -9020,20 +9060,83 @@ static int do_execv(CPUArchState *cpu_env, int dirfd,
     if (!is_execveat) {
         const char *fname = path(p);
         int tc = 0, i;
+        /*
+         * Shebang scripts: the kernel-build toolchain uses `#!/bin/sh` wrappers
+         * (e.g. the `as` -> `cc -c` shim). The host can't exec a guest script,
+         * and re-execing QEMU on the script text loads it as a (bad) ELF. So
+         * read the interpreter line ourselves and run QEMU on the INTERPRETER,
+         * inserting [interp_arg] and the script path before the script's argv.
+         * Mirrors the kernel binfmt_script behaviour for the IRIX target.
+         */
+        char *shebang_interp = NULL, *shebang_arg = NULL;
+        {
+            int sf = open(fname, O_RDONLY);
+            if (sf >= 0) {
+                char hdr[256];
+                int n = read(sf, hdr, sizeof(hdr) - 1);
+                close(sf);
+                if (n > 2 && hdr[0] == '#' && hdr[1] == '!') {
+                    char *nl = memchr(hdr, '\n', n);
+                    if (nl) {
+                        *nl = '\0';
+                    } else {
+                        hdr[n] = '\0';
+                    }
+                    char *s = hdr + 2;
+                    while (*s == ' ' || *s == '\t') {
+                        s++;
+                    }
+                    shebang_interp = s;
+                    /* split off a single optional argument */
+                    char *sp = s;
+                    while (*sp && *sp != ' ' && *sp != '\t') {
+                        sp++;
+                    }
+                    if (*sp) {
+                        *sp++ = '\0';
+                        while (*sp == ' ' || *sp == '\t') {
+                            sp++;
+                        }
+                        if (*sp) {
+                            shebang_arg = sp;
+                        }
+                    }
+                    /* Resolve the interpreter through the -L prefix so a guest
+                     * path like /bin/sh maps to <rootfs>/bin/sh, not the host's
+                     * /bin/sh. path() returns a static buffer -> dup it. */
+                    shebang_interp = g_strdup(path(shebang_interp));
+                    if (shebang_arg) {
+                        shebang_arg = g_strdup(shebang_arg);
+                    }
+                }
+            }
+        }
         while (argp[tc]) {
             tc++;
         }
-        char **exec_argv = g_new0(char *, qemu_argc + tc + 1);
+        int extra = 1 + (shebang_interp ? (shebang_arg ? 2 : 1) : 0);
+        char **exec_argv = g_new0(char *, qemu_argc + extra + tc + 1);
+        int k = 0;
         for (i = 0; i < qemu_argc; i++) {
-            exec_argv[i] = qemu_argv[i];
+            exec_argv[k++] = qemu_argv[i];
         }
-        exec_argv[qemu_argc] = (char *)fname;        /* translated program path */
+        if (shebang_interp) {
+            exec_argv[k++] = shebang_interp;         /* interpreter program */
+            if (shebang_arg) {
+                exec_argv[k++] = shebang_arg;
+            }
+            exec_argv[k++] = (char *)fname;          /* the script itself */
+        } else {
+            exec_argv[k++] = (char *)fname;          /* translated program path */
+        }
         for (i = 1; i < tc; i++) {                   /* target argv[1..] */
-            exec_argv[qemu_argc + i] = argp[i];
+            exec_argv[k++] = argp[i];
         }
-        exec_argv[qemu_argc + tc] = NULL;
+        exec_argv[k] = NULL;
         ret = get_errno(safe_execve(exec_argv[0], exec_argv, envp));
         g_free(exec_argv);
+        g_free(shebang_interp);
+        g_free(shebang_arg);
         unlock_user(p, pathname, 0);
         goto execve_end;
     }
@@ -9248,6 +9351,95 @@ static int do_getdents(abi_long dirfd, abi_long arg2, abi_long count)
     return toff;
 }
 #endif /* TARGET_NR_getdents */
+
+#ifdef TARGET_ABI_IRIX
+/*
+ * IRIX getdents/getdents64/ngetdents/ngetdents64.
+ *
+ * Under the n32 large-file ABI used by the IRIX userland, ino_t and off_t are
+ * BOTH 64-bit, so the on-disk record the C library expects is:
+ *     struct dirent { uint64 d_ino; int64 d_off; u_short d_reclen; char d_name[]; }
+ * (identical for the 32- and 64-bit "dirent"/"dirent64" variants on n32). There
+ * is NO d_type byte (unlike Linux's getdents64); d_name begins immediately at
+ * offset 18. d_reclen is the IRIX DIRENT64SIZE: (18 + namelen + 1) rounded up to
+ * 8 bytes (sizeof(off64_t)).
+ *
+ * We always read the host with getdents64 (to recover full 64-bit ino/off) and
+ * re-pack into the IRIX record. The `n` variants additionally write an EOF flag
+ * through a 4th int* argument (*eofp = 1 once the directory is exhausted).
+ * Ported in spirit from qemu-irix (Kai-Uwe Bloem; n64decomp/qemu-irix), GPLv2.
+ */
+struct target_irix_dirent {
+    uint64_t        d_ino;
+    int64_t         d_off;
+    uint16_t        d_reclen;
+    char            d_name[];
+};
+static abi_long do_irix_getdents(abi_long dirfd, abi_long arg2, abi_long count,
+                                 abi_long eofp)
+{
+    g_autofree void *hdirp = NULL;
+    void *tdirp;
+    int hlen, hoff, toff;
+    int hreclen, treclen;
+    off_t prev_diroff = 0;
+    const int base = offsetof(struct target_irix_dirent, d_name); /* 18 */
+
+    hdirp = g_try_malloc(count);
+    if (!hdirp) {
+        return -TARGET_ENOMEM;
+    }
+
+    hlen = get_errno(sys_getdents64(dirfd, hdirp, count));
+    if (is_error(hlen)) {
+        return hlen;
+    }
+
+    tdirp = lock_user(VERIFY_WRITE, arg2, count, 0);
+    if (!tdirp) {
+        return -TARGET_EFAULT;
+    }
+
+    for (hoff = toff = 0; hoff < hlen; hoff += hreclen, toff += treclen) {
+        struct linux_dirent64 *hde = hdirp + hoff;
+        struct target_irix_dirent *tde = tdirp + toff;
+        int namelen;
+
+        namelen = strlen(hde->d_name);
+        hreclen = hde->d_reclen;
+        /* IRIX DIRENT64SIZE(namelen) = (base + namelen + 1) rounded up to 8. */
+        treclen = QEMU_ALIGN_UP(base + namelen + 1, 8);
+
+        if (toff + treclen > count) {
+            if (toff == 0) {
+                toff = -TARGET_EINVAL; /* result buffer is too small */
+                break;
+            }
+            /* return what we have; rewind to the first record not returned. */
+            lseek(dirfd, prev_diroff, SEEK_SET);
+            break;
+        }
+
+        prev_diroff = hde->d_off;
+        tde->d_ino = tswap64(hde->d_ino);
+        tde->d_off = tswap64(hde->d_off);
+        tde->d_reclen = tswap16(treclen);
+        memcpy(tde->d_name, hde->d_name, namelen + 1);
+    }
+
+    unlock_user(tdirp, arg2, toff > 0 ? toff : 0);
+
+    /* ngetdents/ngetdents64: *eofp = (no more entries). hlen==0 -> EOF. */
+    if (eofp && toff >= 0) {
+        abi_long *p = lock_user(VERIFY_WRITE, eofp, sizeof(abi_long), 0);
+        if (p) {
+            *p = tswapal(hlen == 0 ? 1 : 0);
+            unlock_user(p, eofp, sizeof(abi_long));
+        }
+    }
+    return toff;
+}
+#endif /* TARGET_ABI_IRIX */
 
 #if defined(TARGET_NR_getdents64) && defined(__NR_getdents64)
 static int do_getdents64(abi_long dirfd, abi_long arg2, abi_long count)
@@ -9958,9 +10150,16 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_open:
         if (!(p = lock_user_string(arg1)))
             return -TARGET_EFAULT;
-        ret = get_errno(do_guest_openat(cpu_env, AT_FDCWD, p,
-                                  target_to_host_bitmask(arg2, fcntl_flags_tbl),
-                                  arg3, true));
+        {
+            int oflags = target_to_host_bitmask(arg2, fcntl_flags_tbl);
+            int hfd = do_guest_openat(cpu_env, AT_FDCWD, p, oflags, arg3, true);
+#ifdef TARGET_ABI_IRIX
+            if (hfd == -1 && errno == EACCES) {
+                hfd = irix_root_open_retry(hfd, AT_FDCWD, p, oflags);
+            }
+#endif
+            ret = get_errno(hfd);
+        }
         fd_trans_unregister(ret);
         unlock_user(p, arg1, 0);
         return ret;
@@ -9968,9 +10167,16 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_openat:
         if (!(p = lock_user_string(arg2)))
             return -TARGET_EFAULT;
-        ret = get_errno(do_guest_openat(cpu_env, arg1, p,
-                                  target_to_host_bitmask(arg3, fcntl_flags_tbl),
-                                  arg4, true));
+        {
+            int oflags = target_to_host_bitmask(arg3, fcntl_flags_tbl);
+            int hfd = do_guest_openat(cpu_env, arg1, p, oflags, arg4, true);
+#ifdef TARGET_ABI_IRIX
+            if (hfd == -1 && errno == EACCES) {
+                hfd = irix_root_open_retry(hfd, arg1, p, oflags);
+            }
+#endif
+            ret = get_errno(hfd);
+        }
         fd_trans_unregister(ret);
         unlock_user(p, arg2, 0);
         return ret;
@@ -10120,7 +10326,16 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_creat:
         if (!(p = lock_user_string(arg1)))
             return -TARGET_EFAULT;
-        ret = get_errno(creat(p, arg2));
+        {
+            int hfd = creat(p, arg2);
+#ifdef TARGET_ABI_IRIX
+            if (hfd == -1 && errno == EACCES) {
+                hfd = irix_root_open_retry(hfd, AT_FDCWD, p,
+                                           O_WRONLY | O_CREAT | O_TRUNC);
+            }
+#endif
+            ret = get_errno(hfd);
+        }
         fd_trans_unregister(ret);
         unlock_user(p, arg1, 0);
         return ret;
@@ -10445,6 +10660,19 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
+#ifdef TARGET_ABI_IRIX
+        /*
+         * IRIX access() defines extra mode bits Linux rejects with EINVAL:
+         * EFF_ONLY_OK (010, test using effective ids) and EX_OK (020, test for
+         * a regular executable file). Map EX_OK -> X_OK and drop EFF_ONLY_OK
+         * (Linux already checks with the calling ids). Without this, mv/ln/cp
+         * (which probe `access(".", W_OK|EFF_ONLY_OK)`) fail spuriously.
+         */
+        if (arg2 & 020) {            /* EX_OK -> X_OK */
+            arg2 = (arg2 & ~020) | X_OK;
+        }
+        arg2 &= ~010;               /* drop EFF_ONLY_OK */
+#endif
         ret = get_errno(access(path(p), arg2));
         unlock_user(p, arg1, 0);
         return ret;
@@ -10454,6 +10682,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg2))) {
             return -TARGET_EFAULT;
         }
+#ifdef TARGET_ABI_IRIX
+        if (arg3 & 020) {           /* EX_OK -> X_OK (see TARGET_NR_access) */
+            arg3 = (arg3 & ~020) | X_OK;
+        }
+        arg3 &= ~010;               /* drop EFF_ONLY_OK */
+#endif
         ret = get_errno(faccessat(arg1, p, arg3, 0));
         unlock_user(p, arg2, 0);
         return ret;
@@ -12004,11 +12238,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         }
         return ret;
 #endif
-#ifdef TARGET_NR_getdents
+#if defined(TARGET_NR_getdents) && !defined(TARGET_ABI_IRIX)
     case TARGET_NR_getdents:
         return do_getdents(arg1, arg2, arg3);
 #endif /* TARGET_NR_getdents */
-#if defined(TARGET_NR_getdents64) && defined(__NR_getdents64)
+#if defined(TARGET_NR_getdents64) && defined(__NR_getdents64) && \
+    !defined(TARGET_ABI_IRIX)
     case TARGET_NR_getdents64:
         return do_getdents64(arg1, arg2, arg3);
 #endif /* TARGET_NR_getdents64 */
@@ -12669,6 +12904,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             return -TARGET_EFAULT;
         ret = get_errno(lchown(p, low2highuid(arg2), low2highgid(arg3)));
         unlock_user(p, arg1, 0);
+#ifdef TARGET_ABI_IRIX
+        if (ret == -TARGET_EPERM) {
+            ret = 0;        /* unprivileged host: swallow EPERM (see fchown) */
+        }
+#endif
         return ret;
 #endif
 #ifdef TARGET_NR_getuid
@@ -12751,7 +12991,17 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             return get_errno(sys_setgroups(gidsetsize, grouplist));
         }
     case TARGET_NR_fchown:
-        return get_errno(fchown(arg1, low2highuid(arg2), low2highgid(arg3)));
+        ret = get_errno(fchown(arg1, low2highuid(arg2), low2highgid(arg3)));
+#ifdef TARGET_ABI_IRIX
+        /* The IRIX build runs as root in the guest and chowns installed files
+         * to root.staff. We run unprivileged on the host, so chown returns
+         * EPERM; ownership is meaningless under emulation, so report success
+         * (a lightweight fakeroot, avoiding an install-tool wrapper). */
+        if (ret == -TARGET_EPERM) {
+            ret = 0;
+        }
+#endif
+        return ret;
 #if defined(TARGET_NR_fchownat)
     case TARGET_NR_fchownat:
         if (!(p = lock_user_string(arg2))) 
@@ -12807,6 +13057,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             return -TARGET_EFAULT;
         ret = get_errno(chown(p, low2highuid(arg2), low2highgid(arg3)));
         unlock_user(p, arg1, 0);
+#ifdef TARGET_ABI_IRIX
+        if (ret == -TARGET_EPERM) {
+            ret = 0;        /* unprivileged host: swallow EPERM (see fchown) */
+        }
+#endif
         return ret;
 #endif
     case TARGET_NR_setuid:
@@ -14627,6 +14882,22 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
      * 10.x linux-user API (gemu_log -> qemu_log_mask, cpu->opaque ->
      * get_task_state, do_fork entry/arg extension, return -TARGET_EFAULT).
      */
+#ifdef TARGET_NR_getdents
+    case TARGET_NR_getdents:        /* getdents(fd, buf, nbyte) */
+        return do_irix_getdents(arg1, arg2, arg3, 0);
+#endif
+#ifdef TARGET_NR_getdents64
+    case TARGET_NR_getdents64:      /* getdents64(fd, buf, nbyte) */
+        return do_irix_getdents(arg1, arg2, arg3, 0);
+#endif
+#ifdef TARGET_NR_ngetdents
+    case TARGET_NR_ngetdents:       /* ngetdents(fd, buf, nbyte, &eof) */
+        return do_irix_getdents(arg1, arg2, arg3, arg4);
+#endif
+#ifdef TARGET_NR_ngetdents64
+    case TARGET_NR_ngetdents64:     /* ngetdents64(fd, buf, nbyte, &eof) */
+        return do_irix_getdents(arg1, arg2, arg3, arg4);
+#endif
     case TARGET_NR_mmap64:  /* IRIX mmap/mmap64 (134 maps to 185) */
         {
             off_t off;
