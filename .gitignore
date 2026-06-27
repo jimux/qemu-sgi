@@ -25,6 +25,7 @@ GTAGS
 /build-linux/
 /build-mac/
 /build-new/
+/build-*/
 
 # Local logs / scratch
 qemu.log
