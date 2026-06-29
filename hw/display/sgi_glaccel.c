@@ -1036,7 +1036,7 @@ static const Property sgi_glaccel_props[] = {
     DEFINE_PROP_STRING("gl-forward", SGIGLAccelState, gl_forward),
     /* IN-PROCESS GL end-goal gate (default OFF): only the launch that sets this uses the
      * in-process glr_submit path; every stock app keeps the proven socket/Newport path. */
-    DEFINE_PROP_BOOL("inproc", SGIGLAccelState, inproc, false),
+    DEFINE_PROP_BOOL("inproc", SGIGLAccelState, inproc, true),
 };
 
 static void sgi_glaccel_class_init(ObjectClass *klass, const void *data)

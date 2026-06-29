@@ -121,11 +121,11 @@ struct SGIGLAccelState {
     char       *gl_forward;       /* qom prop: "<port>" of host glserver to forward GL ops to */
     char       *cmd_file;         /* qom prop (test): a file of commands to execute now */
 
-    /* IN-PROCESS host-GPU GL (CLAUDE.md "Host-GPU GL push" END-GOAL, NOT scaffolding): when
-     * set (qom prop "inproc=on"), PVGPU_OP_GL calls glr_submit() directly via a dlopen'd
-     * renderer .so (no glserver socket), the virtio-gpu/virgl-shaped destination. Opt-in +
-     * default off so only the gated launch (our custom powerflip) uses it and every stock app
-     * keeps the proven socket/Newport path unchanged — a minimal error surface. */
+    /* IN-PROCESS host-GPU GL (CLAUDE.md "Host-GPU GL push" END-GOAL, NOT scaffolding).
+     * PVGPU_OP_GL calls glr_submit() directly via a dlopen'd renderer .so (no glserver
+     * socket) — the virtio-gpu/virgl-shaped destination. Default ON (all GL apps use the
+     * in-process path); set sgi-glaccel.inproc=off to fall back to the socket/glserver
+     * path for debugging or if the renderer .so is unavailable. */
     bool        inproc;           /* qom prop: in-process glr_submit instead of the socket */
 };
 
