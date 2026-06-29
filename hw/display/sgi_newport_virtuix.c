@@ -32,6 +32,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/display/sgi_newport_virtuix.h"
+#include "hw/display/sgi_glaccel.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
@@ -2984,10 +2985,25 @@ static void newport_update_display(void *opaque)
     uint16_t did_entry_ptr;
     bool use_did;
     uint16_t popup_msb = (uint16_t)s->xmap_popup_cmap << 5;
+    bool ov, do_full;
 
-    if (!s->display_dirty) {
-        return;
+    {
+        /* Live paravirtual-GL windows (atlantis etc.) animate independently of the desktop;
+         * keep recompositing while any is present even if the desktop is clean. */
+        PVGPUWindow probe[PVGPU_MAXCTX];
+        ov = sgi_glaccel_get_windows(probe, PVGPU_MAXCTX) > 0;
+        /* redraw while a GL window is live, AND for exactly one frame after it clears, so
+         * the desktop underneath is restored instead of keeping the last GL frame. */
+        if (!s->display_dirty && !ov && !s->gl_overlay_was_active) {
+            return;
+        }
+        s->gl_overlay_was_active = ov;
     }
+    /* Fast path for a smooth GL window: when ONLY the GL window animates (desktop clean),
+     * skip the expensive full-screen DID/CMAP/RAMDAC regeneration — the surface still holds
+     * the last desktop — and just re-composite the GL rect below. Full regen only when the
+     * desktop actually changed, or for the one frame that restores it after the GL clears. */
+    do_full = s->display_dirty || !ov;
 
     surface = qemu_console_surface(s->con);
     if (!surface) {
@@ -2996,6 +3012,7 @@ static void newport_update_display(void *opaque)
 
     dest = (uint32_t *)surface_data(surface);
 
+    if (do_full) {
     did_entry_ptr = s->vc2_reg[VC2_DID_ENTRY];
     use_did = (s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS)
               && did_entry_ptr != 0;
@@ -3157,6 +3174,45 @@ static void newport_update_display(void *opaque)
             b = s->ramdac_lut_b[rgb & 0xff];
 
             dest[y * NEWPORT_SCREEN_W + x] = rgb_to_pixel32(r, g, b);
+        }
+    }
+    }   /* if (do_full) — else the surface keeps the last desktop, just recomposite the GL rect */
+
+    /* Paravirtual-GL desktop overlay: composite EVERY active host-rendered GL window into the
+     * live desktop at its tracked screen position — windows on the 4Dwm desktop, not separate
+     * consoles — each clipped so windows stacked above it correctly occlude it. Pixels are
+     * host xRGB (RAMDAC-final); re-pack through rgb_to_pixel32. */
+    {
+        PVGPUWindow wins[PVGPU_MAXCTX];
+        int nw = sgi_glaccel_get_windows(wins, PVGPU_MAXCTX);
+        int wi, yy, xx, k;
+        for (wi = 0; wi < nw; wi++) {
+            PVGPUWindow *gw = &wins[wi];
+            for (yy = 0; yy < gw->h; yy++) {
+                int dy = gw->y + yy;
+                if (dy < 0 || dy >= NEWPORT_SCREEN_H) {
+                    continue;
+                }
+                for (xx = 0; xx < gw->w; xx++) {
+                    int dx = gw->x + xx;
+                    uint32_t px;
+                    if (dx < 0 || dx >= NEWPORT_SCREEN_W) {
+                        continue;
+                    }
+                    for (k = 0; k < gw->n_occ; k++) {  /* skip pixels under a higher window */
+                        if (dx >= gw->occ[k][0] && dx < gw->occ[k][0] + gw->occ[k][2] &&
+                            dy >= gw->occ[k][1] && dy < gw->occ[k][1] + gw->occ[k][3]) {
+                            break;
+                        }
+                    }
+                    if (k < gw->n_occ) {
+                        continue;
+                    }
+                    px = gw->frame[yy * gw->w + xx];
+                    dest[dy * NEWPORT_SCREEN_W + dx] =
+                        rgb_to_pixel32((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+                }
+            }
         }
     }
 

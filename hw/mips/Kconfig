@@ -110,6 +110,7 @@ config SGI_VIRTUIX
     select SGI_MC_VIRTUIX
     select SGI_HPC3_VIRTUIX
     select SGI_NEWPORT_VIRTUIX
+    select SGI_GLACCEL
     select SGI_SMP
     select SGI_ARCS
     select WD33C93

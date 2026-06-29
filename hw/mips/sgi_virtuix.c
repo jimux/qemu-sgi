@@ -39,6 +39,7 @@
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
+#include "hw/display/sgi_glaccel.h"
 #include "hw/display/sgi_newport_virtuix.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/sgi_arcs.h"
@@ -47,6 +48,7 @@
 #include "hw/misc/sgi_smp.h"
 #include "hw/misc/unimp.h"
 #include "hw/scsi/scsi.h"
+#include "monitor/qdev.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
@@ -405,6 +407,16 @@ static void sgi_virtuix_init(MachineState *machine) {
 
   create_gio_empty_slot(system_memory, "gio-exp0", SGI_GIO_EXP0_BASE, 2 * MiB);
   create_gio_empty_slot(system_memory, "gio-exp1", SGI_GIO_EXP1_BASE, 4 * MiB);
+
+  /* Paravirtual GL accelerator: the host renderer (glserver) streams PVGL frames to its
+   * gl-listen socket (enable with -global sgi-glaccel.gl-listen=PORT); the device
+   * composites the latest frame into its own QEMU console (visible with -display gtk). */
+  {
+      DeviceState *glaccel_dev = qdev_new(TYPE_SGI_GLACCEL);
+      qdev_set_id(glaccel_dev, g_strdup("glaccel"), &error_fatal);  /* parents it + lets `screendump glaccel` work */
+      sysbus_realize_and_unref(SYS_BUS_DEVICE(glaccel_dev), &error_fatal);
+      sysbus_mmio_map(SYS_BUS_DEVICE(glaccel_dev), 0, 0x1fa20000ULL);
+  }
 
   /*
    * Memory probe areas. The MC dynamically maps RAM aliases (priority 1) over

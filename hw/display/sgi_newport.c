@@ -32,6 +32,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/display/sgi_newport.h"
+#include "hw/display/sgi_glaccel.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
@@ -2858,8 +2859,14 @@ static void newport_update_display(void *opaque)
     bool use_did;
     uint16_t popup_msb = (uint16_t)s->xmap_popup_cmap << 5;
 
-    if (!s->display_dirty) {
-        return;
+    {
+        /* A live paravirtual-GL window animates independently of the desktop; keep
+         * recompositing while one is present even if the desktop itself is clean.
+         * (Indy has no glaccel, so this is a no-op there.) */
+        PVGPUWindow probe[PVGPU_MAXCTX];
+        if (!s->display_dirty && sgi_glaccel_get_windows(probe, PVGPU_MAXCTX) == 0) {
+            return;
+        }
     }
 
     surface = qemu_console_surface(s->con);
@@ -3030,6 +3037,35 @@ static void newport_update_display(void *opaque)
             b = s->ramdac_lut_b[rgb & 0xff];
 
             dest[y * NEWPORT_SCREEN_W + x] = rgb_to_pixel32(r, g, b);
+        }
+    }
+
+    /* Paravirtual-GL desktop overlay: composite the host-rendered GL window (atlantis,
+     * powerflip, ...) into the live desktop at its tracked screen position, so it appears
+     * as a window on the 4Dwm desktop instead of in the glaccel device's own console.
+     * Pixels are host xRGB (RAMDAC-final); re-pack through rgb_to_pixel32 for the surface. */
+    {
+        PVGPUWindow wins[PVGPU_MAXCTX];
+        int nw = sgi_glaccel_get_windows(wins, PVGPU_MAXCTX);
+        int wi, yy, xx;
+        for (wi = 0; wi < nw; wi++) {
+            PVGPUWindow *gw = &wins[wi];
+            for (yy = 0; yy < gw->h; yy++) {
+                int dy = gw->y + yy;
+                if (dy < 0 || dy >= NEWPORT_SCREEN_H) {
+                    continue;
+                }
+                for (xx = 0; xx < gw->w; xx++) {
+                    int dx = gw->x + xx;
+                    uint32_t px;
+                    if (dx < 0 || dx >= NEWPORT_SCREEN_W) {
+                        continue;
+                    }
+                    px = gw->frame[yy * gw->w + xx];
+                    dest[dy * NEWPORT_SCREEN_W + dx] =
+                        rgb_to_pixel32((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
+                }
+            }
         }
     }
 

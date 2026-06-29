@@ -224,6 +224,7 @@ struct SGINewportVirtuixState {
     uint32_t *vram_rgbci;           /* RGB/CI pixel data */
     uint32_t *vram_cidaux;          /* CID/overlay/popup data */
     bool display_dirty;
+    bool gl_overlay_was_active;     /* paravirtual-GL window present last frame (restore on clear) */
 
     /* REX3 drawing registers */
     uint32_t drawmode0;

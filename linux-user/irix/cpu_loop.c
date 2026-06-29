@@ -30,6 +30,7 @@
 #include "elf.h"
 #include "internal.h"
 #include "fpu_helper.h"
+#include "glbridge.h"
 
 /* PRDA emulation gate, consumed by target/mips/translate.c. */
 int irix_emulate_prda;
@@ -344,7 +345,13 @@ void cpu_loop(CPUMIPSState *env)
             if (offset) {
                 syscall_num = env->active_tc.gpr[4] - TARGET_NR_Linux;
             }
-            if (syscall_num >= ARRAY_SIZE(mips_syscall_args)) {
+            if (syscall_num == GLSYS_NR - TARGET_NR_Linux) {
+                /* IRIS GL passthrough. syscall_num is already de-indirected (handles
+                 * both direct v0=GLSYS_NR and libc's indirect SYS_syscall form), so
+                 * the args live at gpr[4+offset]=cmd-buffer ptr, gpr[5+offset]=length. */
+                ret = irix_gl_submit(env->active_tc.gpr[4 + offset],
+                                     env->active_tc.gpr[5 + offset]);
+            } else if (syscall_num >= ARRAY_SIZE(mips_syscall_args)) {
                 ret = -TARGET_ENOSYS;
             } else {
                 int nb_args;

@@ -4272,6 +4272,11 @@ foreach target : target_dirs
         dir / 'elfload.c',
         dir / 'signal.c',
       )
+      if abi == 'irix'
+        # IRIS GL → host OpenGL passthrough glue (dlopen's an external renderer .so;
+        # no GL/X11 link deps in qemu itself). See linux-user/irix/glbridge.c.
+        arch_srcs += files(dir / 'glbridge.c')
+      endif
       if config_target.has_key('TARGET_SYSTBL_ABI')
         arch_srcs += \
           syscall_nr_generators[abi].process(base_dir / abi / config_target['TARGET_SYSTBL'],

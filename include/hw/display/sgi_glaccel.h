@@ -23,10 +23,56 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 #define SGI_GLACCEL_EXEC     0x18
 #define SGI_GLACCEL_FORMAT   0x1C   /* Pixel format: 0=RGBA8888, 1=RGB565 */
 #define SGI_GLACCEL_STRIDE   0x20   /* Bytes per scanline (0 = width*bpp) */
+#define SGI_GLACCEL_CONTEXT  0x24   /* GL context (window) id; a CMD_BASE write latches per ctx */
+#define SGI_GLACCEL_DOORBELL 0x28   /* atomic submit: write (ctx<<24)|len -> process ctx's ring */
 
 /* Execution Commands */
 #define GLACCEL_CMD_RESET   (1 << 0)
 #define GLACCEL_CMD_PROCESS (1 << 1)
+
+/* ---- paravirtual GPU command-ring opcodes (2D + 3D acceleration) ----
+ * The guest writes a command buffer (sequence of these, big-endian = guest native) to a
+ * DMA region, programs CMD_BASE/CMD_LEN, then writes EXEC=GLACCEL_CMD_PROCESS. The device
+ * executes them into its internal framebuffer: 2D ops are host memcpy/memset (no per-pixel
+ * REX3 emulation); GL ops are forwarded to the host renderer and composited. */
+#define PVGPU_OP_CLEAR   1   /* [op][rgba] : fill whole fb */
+#define PVGPU_OP_FILL    2   /* [op][x][y][w][h][rgba] : fill rect */
+#define PVGPU_OP_COPY    3   /* [op][sx][sy][dx][dy][w][h] : copy rect within fb */
+#define PVGPU_OP_BLIT    4   /* [op][x][y][w][h] then w*h u32 rgba : blit image */
+#define PVGPU_OP_GL      5   /* [op][x][y][w][h][gllen] then gllen bytes glproto (pad 4) */
+#define PVGPU_OP_PRESENT 6   /* [op] : present the framebuffer to the console */
+#define PVGPU_OP_WINCLIP 7   /* [op][n] then n*[x][y][w][h] : screen rects of windows stacked
+                              * ABOVE the GL window that occlude it (desktop overlay clipping) */
+
+#define PVGPU_MAX_OCC 16     /* max occluder rects tracked for desktop overlay clipping */
+#define PVGPU_MAXCTX  8      /* max concurrent GL windows (contexts) */
+
+/* Per-GL-window (per-context) device state: its own glserver forward connection, its own
+ * gl-listen frame connection, its latest frame, screen placement, and occluder rects. */
+typedef struct PVGPUCtx {
+    SGIGLAccelState *dev;        /* back-pointer (fd-handler opaque); idx = this - dev->ctx */
+    uint32_t    cmd_base;        /* this context's command-ring phys base (latched once) */
+    int         fwd_fd;          /* forward connection to glserver (this context) */
+    int         pending;         /* fire-and-forget replies not yet drained (async) */
+    int         conn_fd;         /* gl-listen frame connection from this context's renderer */
+    GByteArray *rxbuf;           /* frame reassembly buffer for conn_fd */
+    uint32_t   *frame;           /* latest frame, host xRGB */
+    int         w, h;            /* frame dimensions */
+    int         x, y;            /* tracked screen placement (window origin) */
+    bool        active;          /* a frame is present */
+    int64_t     last_us;         /* monotonic time of last frame (overlay idle timeout) */
+    int         occ[PVGPU_MAX_OCC][4]; /* screen rects occluding this window */
+    int         n_occ;
+    int         frame_serial;    /* in-process path: last glr_get_last_frame serial composited */
+} PVGPUCtx;
+
+/* One active GL window for the Newport desktop multi-composite. */
+typedef struct PVGPUWindow {
+    uint32_t *frame;
+    int x, y, w, h;
+    int occ[PVGPU_MAX_OCC][4];
+    int n_occ;
+} PVGPUWindow;
 
 /* Pixel formats */
 #define GLACCEL_FMT_RGBA8888 0
@@ -54,6 +100,40 @@ struct SGIGLAccelState {
 
     /* Internal state */
     bool invalidate;
+
+    /* --- live GL frame channel (host renderer -> device -> console) ---
+     * The host renderer (glserver) connects and streams PVGL frames; the device
+     * composites the latest one. Protocol (little-endian):
+     *   "PVGL"(4) + int32 x,y,w,h ; then w*h*4 RGBA bytes.  w==0 clears.  */
+    char       *gl_listen;        /* qom prop: "<port>" to listen on 127.0.0.1:port */
+    int         gl_listen_fd;     /* one accept socket; the ctx-id handshake routes per window */
+
+    /* Per-context (per GL window) state — multiple GL apps run concurrently, each with its
+     * own command ring (driver), glserver connection, frame, placement and occluders. */
+    PVGPUCtx    ctx[PVGPU_MAXCTX];
+    int         cur_ctx;          /* selected by the CONTEXT register before EXEC */
+
+    /* --- paravirtual GPU: internal framebuffer + command ring --- *
+     * 2D ops draw here via host memcpy; GL frames composite here; gfx_update presents it. */
+    uint32_t   *fb;               /* internal framebuffer, host xRGB, fb_w*fb_h */
+    int         fb_w, fb_h;       /* framebuffer dimensions */
+    bool        fb_active;        /* fb has been drawn (present it instead of legacy paths) */
+    char       *gl_forward;       /* qom prop: "<port>" of host glserver to forward GL ops to */
+    char       *cmd_file;         /* qom prop (test): a file of commands to execute now */
+
+    /* IN-PROCESS host-GPU GL (CLAUDE.md "Host-GPU GL push" END-GOAL, NOT scaffolding): when
+     * set (qom prop "inproc=on"), PVGPU_OP_GL calls glr_submit() directly via a dlopen'd
+     * renderer .so (no glserver socket), the virtio-gpu/virgl-shaped destination. Opt-in +
+     * default off so only the gated launch (our custom powerflip) uses it and every stock app
+     * keeps the proven socket/Newport path unchanged — a minimal error surface. */
+    bool        inproc;           /* qom prop: in-process glr_submit instead of the socket */
 };
+
+/* Desktop overlay: fill out[] with every active host-rendered GL window (frame + tracked
+ * screen placement + occluder rects) so the Newport desktop device can composite them into
+ * the live framebuffer — making GL apps (atlantis etc.) appear as windows on the 4Dwm desktop
+ * rather than in the glaccel device's own console. Returns the count of active windows.
+ * frame pixels are host xRGB (0x00RRGGBB). */
+int sgi_glaccel_get_windows(PVGPUWindow *out, int max);
 
 #endif /* SGI_GLACCEL_H */
