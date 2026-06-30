@@ -26,6 +26,7 @@
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "ui/console.h"
+#include "ui/dmabuf.h"
 #include "ui/pixel_ops.h"
 #include "framebuffer.h"
 #include <poll.h>
@@ -59,10 +60,13 @@ struct glr_result_abi {
 typedef int  (*glr_submit_fn)(const unsigned char *, int, struct glr_result_abi *);
 typedef void (*glr_set_ctxid_fn)(int);
 typedef int  (*glr_get_last_frame_fn)(int, const unsigned char **, int *, int *);
+typedef int  (*glr_get_dmabuf_fn)(int ctxid, int *w, int *h, int *stride,
+                                  int *offset, int *fourcc, uint64_t *modifier);
 
 static glr_submit_fn          gi_submit;
 static glr_set_ctxid_fn        gi_set_ctxid;
 static glr_get_last_frame_fn   gi_get_last_frame;
+static glr_get_dmabuf_fn       gi_get_dmabuf;
 static int                     gi_tried;
 
 /* dlopen the renderer once (mirror glbridge.c::load_renderer). Returns true if usable. */
@@ -86,6 +90,7 @@ static bool glaccel_inproc_load(void)
     gi_submit         = (glr_submit_fn)dlsym(h, "glr_submit");
     gi_set_ctxid      = (glr_set_ctxid_fn)dlsym(h, "glr_set_ctxid");
     gi_get_last_frame = (glr_get_last_frame_fn)dlsym(h, "glr_get_last_frame");
+    gi_get_dmabuf     = (glr_get_dmabuf_fn)dlsym(h, "glr_get_dmabuf");
     if (!gi_submit || !gi_get_last_frame) {
         fprintf(stderr, "sgi-glaccel: in-process renderer missing glr_submit/glr_get_last_frame\n");
         gi_submit = NULL;
@@ -514,23 +519,60 @@ static void pvgpu_gl_submit_inproc(SGIGLAccelState *s, PVGPUCtx *c,
         gi_submit(gl, (int)gllen, &r);
     }
 
-    /* pull the just-rendered frame (top-down RGB) and present it via the shared compositor —
-     * but only when the renderer's frame serial advanced (one completed frame per SWAPBUFFERS),
-     * so we match the socket path's cadence and never composite a stale mid-frame readback. */
-    serial = gi_get_last_frame(cid, &rgb, &fw, &fh);
-    if (serial && serial != c->frame_serial && rgb && fw > 0 && fh > 0) {
-        c->frame_serial = serial;
-        uint8_t *rgba = g_malloc((size_t)fw * fh * 4);
-        size_t i, n = (size_t)fw * fh;
-        for (i = 0; i < n; i++) {
-            rgba[i * 4 + 0] = rgb[i * 3 + 0];
-            rgba[i * 4 + 1] = rgb[i * 3 + 1];
-            rgba[i * 4 + 2] = rgb[i * 3 + 2];
-            rgba[i * 4 + 3] = 0xff;
+    /* ---- GPU scanout (steps ③-④): try DMABUF zero-copy path first ----
+     * If the renderer exported a DMABUF, use QEMU's dpy_gl_scanout_dmabuf to
+     * display it directly from the GPU — no CPU readback, no RGB→RGBA conversion.
+     * Falls back to the CPU readback path when DMABUF is unavailable.            */
+    serial = gi_get_last_frame(cid, &rgb, &fw, &fh);  /* always get serial for gating */
+    if (serial && serial != c->frame_serial) {
+        int dmabuf_fd = -1;
+        if (gi_get_dmabuf) {
+            int dmabuf_w, dmabuf_h, dmabuf_stride, dmabuf_offset, dmabuf_fourcc;
+            uint64_t dmabuf_modifier;
+            dmabuf_fd = gi_get_dmabuf(cid, &dmabuf_w, &dmabuf_h,
+                        &dmabuf_stride, &dmabuf_offset,
+                        &dmabuf_fourcc, &dmabuf_modifier);
+            if (dmabuf_fd >= 0) {
+                /* Got a DMABUF fd — hand it to QEMU's display for GPU scanout.
+                 * The display listener owns the fd after this call (closes it). */
+                QemuDmaBuf *dmabuf = qemu_dmabuf_new(
+                    dmabuf_w, dmabuf_h,
+                    (const uint32_t[]){dmabuf_offset},
+                    (const uint32_t[]){dmabuf_stride},
+                    0, 0, dmabuf_w, dmabuf_h,
+                    dmabuf_fourcc, dmabuf_modifier,
+                    (const int32_t[]){dmabuf_fd}, 1,
+                    false, true);
+                if (dmabuf) {
+                    /* scan out to every registered display listener */
+                    QemuConsole *con = s->con;
+                    if (con) {
+                        dpy_gl_scanout_dmabuf(con, dmabuf);
+                    }
+                    qemu_dmabuf_free(dmabuf);
+                } else {
+                    close(dmabuf_fd);  /* qemu_dmabuf_new failed — close our ref */
+                }
+                c->frame_serial = serial;
+                goto dmabuf_done;
+            }
         }
-        glaccel_apply_frame(c, c->x, c->y, fw, fh, rgba);   /* same path as gl-listen frames */
-        g_free(rgba);
+        /* CPU fallback: readback + RGB→RGBA conversion + software composite */
+        if (rgb && fw > 0 && fh > 0) {
+            c->frame_serial = serial;
+            uint8_t *rgba = g_malloc((size_t)fw * fh * 4);
+            size_t i, n = (size_t)fw * fh;
+            for (i = 0; i < n; i++) {
+                rgba[i * 4 + 0] = rgb[i * 3 + 0];
+                rgba[i * 4 + 1] = rgb[i * 3 + 1];
+                rgba[i * 4 + 2] = rgb[i * 3 + 2];
+                rgba[i * 4 + 3] = 0xff;
+            }
+            glaccel_apply_frame(c, c->x, c->y, fw, fh, rgba);
+            g_free(rgba);
+        }
     }
+    dmabuf_done:
 
     /* mirror the socket path's query writeback so getmatrix/getsize/qread DMA back correctly */
     if (need_reply && resp) {
