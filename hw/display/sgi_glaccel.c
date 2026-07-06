@@ -722,12 +722,24 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
         case PVGPU_OP_PRESENT:
             s->invalidate = true; break;
         case PVGPU_OP_SCANOUT_SET: {
-            /* Stage 2 Variant B: register shadow framebuffer in guest RAM.
-             * [op:u32][base_lo:u32][base_hi:u32][w:u32][h:u32][stride:u32][fmt:u32] */
+            /* Stage 2 Phase 2a: register a shadow framebuffer in guest RAM.
+             * [op:u32][base_lo:u32][base_hi:u32][w:u32][h:u32][stride:u32][fmt:u32]
+             * The engine only echoes the params; the desktop renderer (Newport)
+             * validates the (hostile) guest values and owns the DID-walk sourcing. */
             uint32_t lo, hi;
             if (p + 24 > len) return;
             lo = pv_be32(buf + p); hi = pv_be32(buf + p + 4);
-            s->shadow_base   = ((uint64_t)hi << 32) | lo;
+            /* 2a shortcut (no driver MAP_FB ioctl yet): if base_hi bit 31 is set,
+             * base_lo is a byte OFFSET from THIS context's ring physical base, so
+             * a synthetic guest test can place the shadowfb inside its own mmap'd
+             * ring without knowing the ring's guest-physical address.  Phase 2b's
+             * real DDX registers an absolute phys base (bit 31 clear) via a proper
+             * PVGPU_MAP_FB ioctl that pins+translates a dedicated fb region. */
+            if (hi & 0x80000000u) {
+                s->shadow_base = (uint64_t)wc->cmd_base + lo;
+            } else {
+                s->shadow_base = ((uint64_t)hi << 32) | lo;
+            }
             s->shadow_w      = pv_be32(buf + p + 8);
             s->shadow_h      = pv_be32(buf + p + 12);
             s->shadow_stride = pv_be32(buf + p + 16);
@@ -735,15 +747,26 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
             p += 24;
             s->shadow_active = (s->shadow_base != 0 && s->shadow_w > 0
                                 && s->shadow_h > 0);
-            s->invalidate   = true;
+            if (s->desk_scanout) {
+                s->desk_scanout(s->desk_opaque, s->shadow_base, s->shadow_w,
+                                s->shadow_h, s->shadow_stride, s->shadow_format,
+                                s->shadow_active);
+            }
             break;
         }
         case PVGPU_OP_DAMAGE: {
-            /* Stage 2: shadowfb region changed — invalidate for next scanout.
+            /* Stage 2 Phase 2a: shadowfb region changed — feed the desktop
+             * renderer's dirty-rect machinery (bounds-checked + coalesced there).
              * [op:u32][x:u32][y:u32][w:u32][h:u32] */
+            uint32_t dx, dy, dw, dh;
             if (p + 16 > len) return;
+            dx = pv_be32(buf + p);      dy = pv_be32(buf + p + 4);
+            dw = pv_be32(buf + p + 8);  dh = pv_be32(buf + p + 12);
             p += 16;
-            s->invalidate = true;
+            if (s->desk_damage) {
+                s->desk_damage(s->desk_opaque, (int)dx, (int)dy,
+                               (int)dw, (int)dh);
+            }
             break;
         }
         default:
@@ -839,37 +862,12 @@ static void sgi_glaccel_update(void *opaque)
         }
         if (!surface) return;
 
-        /* Stage 2 shadowfb path: when a shadow framebuffer is registered,
-         * DMA it from guest RAM instead of calling the desktop render callback.
-         * (Scaffolding — always full-blits; Phase D bounding applies to the
-         * live REX3 decoder path below.) */
-        if (s->shadow_active && s->shadow_base) {
-            uint8_t *shadow = g_malloc(s->shadow_stride * s->shadow_h);
-            dma_memory_read(&address_space_memory,
-                            (hwaddr)(s->shadow_base & 0x1FFFFFFFULL),
-                            shadow, (size_t)s->shadow_stride * s->shadow_h,
-                            MEMTXATTRS_UNSPECIFIED);
-            if (s->shadow_format == 0 && s->shadow_cmap) {
-                /* CI8 → xRGB via LUT */
-                for (int sy = 0; sy < s->shadow_h && sy < s->desk_h; sy++) {
-                    for (int sx = 0; sx < s->shadow_w && sx < s->desk_w; sx++) {
-                        uint8_t ci = shadow[(size_t)sy * s->shadow_stride + sx];
-                        s->desk[(size_t)sy * s->desk_w + sx] = s->shadow_cmap[ci];
-                    }
-                }
-            } else {
-                /* xRGB direct copy */
-                for (int sy = 0; sy < s->shadow_h && sy < s->desk_h; sy++) {
-                    memcpy(&s->desk[(size_t)sy * s->desk_w],
-                           &shadow[(size_t)sy * s->shadow_stride],
-                           (size_t)s->shadow_w * 4);
-                }
-            }
-            g_free(shadow);
-            s->invalidate = false;
-            desk_full = true;
-            goto composite_and_blit;
-        }
+        /* Stage 2 Phase 2a note: the shadow framebuffer is NOT scanned out here.
+         * SCANOUT_SET/DAMAGE are forwarded to the desktop renderer (Newport),
+         * which sources the base layer's CI8 rows from guest RAM inside its
+         * existing DID/XMAP/CMAP walk.  The engine's unified path below is
+         * therefore identical whether or not a shadowfb is active — Phase D's
+         * dirty-rect + bounded-blit machinery covers both by construction. */
 
         /*
          * Phase D force decision.  A full desktop repaint (and full blit) is
@@ -937,7 +935,6 @@ static void sgi_glaccel_update(void *opaque)
         s->last_composite_sig = sig;
         s->have_composite_sig = true;
 
-composite_and_blit:
         /* composite GL overlays onto the desktop buffer; capture composited
          * (clamped) window rects for a bounded blit */
         n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w, s->desk_h,
@@ -1323,6 +1320,7 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
 /* ---- unified display engine (Phase A) ---- */
 
 void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn invalidate,
+                                  PVDeskScanoutFn scanout, PVDeskDamageFn damage,
                                   void *opaque, int w, int h)
 {
     SGIGLAccelState *s = g_glaccel_overlay;
@@ -1331,6 +1329,8 @@ void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn inva
     assert(w > 0 && h > 0);
     s->desk_render = render;
     s->desk_invalidate = invalidate;
+    s->desk_scanout = scanout;
+    s->desk_damage = damage;
     s->desk_opaque = opaque;
     s->desk_w = w;  s->desk_h = h;
     s->desk = g_new0(uint32_t, (size_t)w * h);

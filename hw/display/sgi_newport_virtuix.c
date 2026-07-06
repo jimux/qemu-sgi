@@ -33,6 +33,8 @@
 #include "qemu/module.h"
 #include "hw/display/sgi_newport_virtuix.h"
 #include "hw/display/sgi_glaccel.h"
+#include "system/address-spaces.h"
+#include "system/dma.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
@@ -3791,6 +3793,199 @@ static void newport_convert_row(SGINewportVirtuixState *s, uint32_t *dst, int w,
     }
 }
 
+/* ============================================================
+ * Stage 2 Phase 2a — paravirtual shadowfb scanout (Variant B)
+ * ============================================================
+ * SCANOUT_SET registers a linear shadow framebuffer in guest RAM; when active,
+ * the base CI plane's pixels for the DID walk come from it instead of VRAM.  The
+ * DID/XMAP/CMAP/RAMDAC pipeline and the popup/overlay cidaux compositing are
+ * UNCHANGED — only the src_rgbci row handed to newport_convert_row differs.  This
+ * keeps per-window DID palettes, private colormaps and colormap animation correct
+ * by construction (no global CI8->xRGB LUT, per the director's design review). */
+
+/* Sanity/hostile-value bounds for guest-supplied shadowfb geometry.  Anything
+ * out of range disables the shadowfb (falls back to VRAM) rather than trusting
+ * the guest — a lying base/stride can't over-read (dma_memory_read clamps) but a
+ * huge w/h/stride could blow up the scratch allocations, so cap them here. */
+#define NP_SCANOUT_MAX_W      4096
+#define NP_SCANOUT_MAX_H      4096
+#define NP_SCANOUT_MAX_STRIDE (NP_SCANOUT_MAX_W * 4)
+
+/* SCANOUT_SET handler (invoked from glaccel via the desk_scanout callback).
+ * Validates the guest values, (re)allocates the per-row DMA scratch, latches the
+ * geometry, and forces a full repaint so the first shadowfb frame is complete. */
+static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
+                                uint32_t h, uint32_t stride, uint32_t fmt,
+                                bool active)
+{
+    SGINewportVirtuixState *s = opaque;
+    uint32_t bpp;
+
+    if (!active) {
+        s->scanout_active = false;
+        newport_dirty_full(s);
+        return;
+    }
+
+    /* format: 0=CI8 (1 byte/pixel), 1=xRGB32 (4 bytes/pixel, experimental) */
+    bpp = (fmt == 1) ? 4 : 1;
+    if (stride == 0) {
+        stride = w * bpp;   /* tightly packed default */
+    }
+
+    /* hostile-value validation → disable on any failure */
+    if (base == 0 || w == 0 || h == 0 ||
+        w > NP_SCANOUT_MAX_W || h > NP_SCANOUT_MAX_H ||
+        stride < w * bpp || stride > NP_SCANOUT_MAX_STRIDE) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "newport: SCANOUT_SET rejected (base=0x%" PRIx64
+                      " w=%u h=%u stride=%u fmt=%u)\n",
+                      base, w, h, stride, fmt);
+        s->scanout_active = false;
+        newport_dirty_full(s);
+        return;
+    }
+
+    /* Note: base is a guest phys addr masked to KSEG0 (0x1FFFFFFF) at read time;
+     * an out-of-RAM base can't over-read (dma_memory_read clamps to the address
+     * space, returning zeros), so the geometry caps above are the real defense
+     * against hostile values (they bound the scratch allocations). */
+
+    s->scanout_base   = base;
+    s->scanout_w      = w;
+    s->scanout_h      = h;
+    s->scanout_stride = stride;
+    s->scanout_format = fmt;
+    s->scanout_rowbytes = g_realloc(s->scanout_rowbytes, stride);
+    if (!s->scanout_row) {
+        s->scanout_row = g_new0(uint32_t, NEWPORT_SCREEN_W);
+    }
+    s->scanout_active = true;
+    newport_dirty_full(s);   /* first shadowfb frame repaints everything */
+}
+
+/* DAMAGE handler (invoked from glaccel via the desk_damage callback): a region
+ * of the shadowfb changed → feed the existing dirty-rect machinery so only those
+ * rows are re-walked next frame.  No DAMAGE between frames = nothing redrawn. */
+static void newport_scanout_damage(void *opaque, int x, int y, int w, int h)
+{
+    SGINewportVirtuixState *s = opaque;
+    if (!s->scanout_active) {
+        return;
+    }
+    newport_dirty_rect(s, x, y, w, h);
+}
+
+/* Build one CI8 shadowfb scanline as rgbci words for the DID walk: DMA row y of
+ * the shadow fb from guest RAM and zero-extend each CI byte into the low 8 bits
+ * of an rgbci word (newport_convert_row's pix_size=1 path reads pixel & 0xff).
+ * Rows/columns outside the shadowfb are sourced as 0.  Returns a pointer to the
+ * SCREEN_W-wide scratch row (valid until the next call). */
+static const uint32_t *newport_scanout_ci_row(SGINewportVirtuixState *s, int y)
+{
+    uint32_t *row = s->scanout_row;
+    int x, cols;
+
+    if ((uint32_t)y >= s->scanout_h) {
+        memset(row, 0, NEWPORT_SCREEN_W * sizeof(uint32_t));
+        return row;
+    }
+    dma_memory_read(&address_space_memory,
+                    (hwaddr)((s->scanout_base & 0x1FFFFFFFULL) +
+                             (uint64_t)y * s->scanout_stride),
+                    s->scanout_rowbytes, s->scanout_stride,
+                    MEMTXATTRS_UNSPECIFIED);
+    cols = (int)MIN((uint32_t)NEWPORT_SCREEN_W, s->scanout_w);
+    for (x = 0; x < cols; x++) {
+        row[x] = s->scanout_rowbytes[x];
+    }
+    for (; x < NEWPORT_SCREEN_W; x++) {
+        row[x] = 0;
+    }
+    return row;
+}
+
+/* Gate 2a criterion (a) oracle, env-gated NP_SCANOUT_AB=1 (debug only): for a
+ * shadowfb row just rendered into dst, copy the SAME CI values into the real
+ * vram_rgbci row and render through the standard VRAM source; byte-compare.
+ * Same CI values + same DID/XMAP/CMAP walk must render byte-identically
+ * regardless of pixel source — the "same pattern drawn via REX3 into VRAM"
+ * equivalence with the REX3 store replaced by a direct CI copy (the store path
+ * itself is covered by Gates C/D).  VRAM row saved/restored. */
+static bool newport_scanout_ab(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("NP_SCANOUT_AB") ? 1 : 0;
+    }
+    return v;
+}
+
+static void newport_scanout_ab_check(SGINewportVirtuixState *s,
+                                     const uint32_t *dst, int w, int y,
+                                     int x_begin, int x_end,
+                                     const uint32_t *shadow_row,
+                                     uint16_t did_entry_ptr, bool use_did,
+                                     uint16_t popup_msb)
+{
+    static uint32_t *scratch;       /* full frame: convert_row indexes dst[y*w+x] */
+    static uint32_t n_rows, n_bad;
+    uint32_t saved[NEWPORT_SCREEN_W];
+    uint32_t *vrow = &s->vram_rgbci[y * NEWPORT_VRAM_W];
+    int x;
+    bool ok = true;
+
+    if (!scratch) {
+        scratch = g_new0(uint32_t, (size_t)NEWPORT_SCREEN_W * NEWPORT_SCREEN_H);
+    }
+    memcpy(saved, vrow, sizeof(saved));
+    memcpy(vrow, shadow_row, sizeof(saved));   /* same CI values, now in VRAM */
+    newport_convert_row(s, scratch, w, y, x_begin, x_end,
+                        vrow, &s->vram_cidaux[y * NEWPORT_VRAM_W],
+                        did_entry_ptr, use_did, popup_msb);
+    memcpy(vrow, saved, sizeof(saved));
+
+    for (x = x_begin; x < x_end; x++) {
+        if (scratch[(size_t)y * w + x] != dst[(size_t)y * w + x]) {
+            ok = false;
+            break;
+        }
+    }
+    n_rows++;
+    if (!ok) {
+        n_bad++;
+        fprintf(stderr, "NP_SCANOUT_AB MISMATCH y=%d x=%d ci=%02x "
+                "shadow_out=%08x vram_out=%08x\n", y, x,
+                shadow_row[x] & 0xff, dst[(size_t)y * w + x],
+                scratch[(size_t)y * w + x]);
+    }
+    if ((n_rows % 1024) == 0 || (!ok && n_bad < 8)) {
+        fprintf(stderr, "NP_SCANOUT_AB rows=%u mismatches=%u\n", n_rows, n_bad);
+    }
+}
+
+/* xRGB32 shadowfb (experimental >8bpp path): DMA row y and copy it straight to
+ * dst, bypassing the CI/DID/CMAP LUT entirely.  cidaux is NOT composited here —
+ * this path is a placeholder for the future TrueColor screen (Phase 2b+). */
+static void newport_scanout_xrgb_row(SGINewportVirtuixState *s, uint32_t *dst,
+                                     int w, int y, int x_begin, int x_end)
+{
+    int x, cols;
+    if ((uint32_t)y >= s->scanout_h) {
+        return;
+    }
+    dma_memory_read(&address_space_memory,
+                    (hwaddr)((s->scanout_base & 0x1FFFFFFFULL) +
+                             (uint64_t)y * s->scanout_stride),
+                    s->scanout_rowbytes, s->scanout_stride,
+                    MEMTXATTRS_UNSPECIFIED);
+    cols = (int)MIN((uint32_t)x_end, s->scanout_w);
+    for (x = x_begin; x < cols; x++) {
+        uint32_t px = ldl_be_p(s->scanout_rowbytes + (size_t)x * 4);
+        dst[(size_t)y * w + x] = px;
+    }
+}
+
 /* Render the desktop REX3/VC2/CMAP/RAMDAC pipeline into *dst (w*h xRGB32).
  * Called by the unified display engine on every frame tick.  force_full means
  * repaint every pixel (the caller discarded the previous buffer).
@@ -3833,12 +4028,31 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
     do_full = force_full || newport_scanout_full() ||
               s->dirty_n >= NEWPORT_DIRTY_MAX || soft_cursor;
 
+    /* Stage 2 Phase 2a: pixel-source selection.  When a CI8 shadowfb is active
+     * the base plane's rgbci row comes from guest RAM (via the DID walk); the
+     * xRGB32 shadowfb takes an experimental straight-copy path that bypasses the
+     * LUT.  With no shadowfb, everything is exactly as before (VRAM source). */
+    bool shadow_ci8   = s->scanout_active && s->scanout_format == 0;
+    bool shadow_xrgb  = s->scanout_active && s->scanout_format == 1;
+
     if (do_full) {
         for (y = 0; y < NEWPORT_SCREEN_H; y++) {
-            newport_convert_row(s, dst, w, y, 0, NEWPORT_SCREEN_W,
-                                &s->vram_rgbci[y * NEWPORT_VRAM_W],
-                                &s->vram_cidaux[y * NEWPORT_VRAM_W],
-                                did_entry_ptr, use_did, popup_msb);
+            if (shadow_xrgb) {
+                newport_scanout_xrgb_row(s, dst, w, y, 0, NEWPORT_SCREEN_W);
+            } else {
+                const uint32_t *src = shadow_ci8
+                    ? newport_scanout_ci_row(s, y)
+                    : &s->vram_rgbci[y * NEWPORT_VRAM_W];
+                newport_convert_row(s, dst, w, y, 0, NEWPORT_SCREEN_W,
+                                    src,
+                                    &s->vram_cidaux[y * NEWPORT_VRAM_W],
+                                    did_entry_ptr, use_did, popup_msb);
+                if (shadow_ci8 && newport_scanout_ab()) {
+                    newport_scanout_ab_check(s, dst, w, y, 0, NEWPORT_SCREEN_W,
+                                             src, did_entry_ptr, use_did,
+                                             popup_msb);
+                }
+            }
         }
     } else {
         for (i = 0; i < s->dirty_n; i++) {
@@ -3847,10 +4061,22 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
             int xe = MIN(rx + rw, NEWPORT_SCREEN_W);
             int ye = MIN(ry + rh, NEWPORT_SCREEN_H);
             for (y = ry; y < ye; y++) {
-                newport_convert_row(s, dst, w, y, rx, xe,
-                                    &s->vram_rgbci[y * NEWPORT_VRAM_W],
-                                    &s->vram_cidaux[y * NEWPORT_VRAM_W],
-                                    did_entry_ptr, use_did, popup_msb);
+                if (shadow_xrgb) {
+                    newport_scanout_xrgb_row(s, dst, w, y, rx, xe);
+                } else {
+                    const uint32_t *src = shadow_ci8
+                        ? newport_scanout_ci_row(s, y)
+                        : &s->vram_rgbci[y * NEWPORT_VRAM_W];
+                    newport_convert_row(s, dst, w, y, rx, xe,
+                                        src,
+                                        &s->vram_cidaux[y * NEWPORT_VRAM_W],
+                                        did_entry_ptr, use_did, popup_msb);
+                    if (shadow_ci8 && newport_scanout_ab()) {
+                        newport_scanout_ab_check(s, dst, w, y, rx, xe,
+                                                 src, did_entry_ptr, use_did,
+                                                 popup_msb);
+                    }
+                }
             }
             if (out_rects && nrects < max_rects) {
                 out_rects[nrects].x = rx;      out_rects[nrects].y = ry;
@@ -3884,6 +4110,9 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
 static void sgi_newport_virtuix_reset(DeviceState *dev)
 {
     SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(dev);
+
+    /* Stage 2 Phase 2a: drop any registered shadowfb (guest re-issues SCANOUT_SET) */
+    s->scanout_active = false;
 
     /* Clear all registers */
     s->drawmode0 = 0;
@@ -4039,6 +4268,7 @@ static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
     /* Register as the desktop renderer with the unified display engine.
      * The engine owns the QemuConsole; we only render pixels into its buffer. */
     sgi_glaccel_register_desktop(newport_render_desktop, newport_invalidate,
+                                  newport_set_scanout, newport_scanout_damage,
                                   s, NEWPORT_SCREEN_W, NEWPORT_SCREEN_H);
 
     /* Open NewView binary log file if property is set */

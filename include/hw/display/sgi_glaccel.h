@@ -74,6 +74,20 @@ typedef int (*PVDeskRenderFn)(void *opaque, uint32_t *dst, int w, int h,
  * (surface reallocation, display-backend switch, etc.). */
 typedef void (*PVDeskInvalidateFn)(void *opaque);
 
+/* Stage 2 Phase 2a — paravirtual shadowfb scanout callbacks.
+ * The pvgpu ring ops SCANOUT_SET/DAMAGE arrive on the glaccel device, but the
+ * base layer's DID/XMAP/CMAP walk lives in the desktop renderer (Newport).  So
+ * the engine forwards them straight to the desktop layer: it registers a shadow
+ * framebuffer in guest RAM (SCANOUT_SET) whose CI8 rows the renderer sources
+ * INSTEAD of VRAM's rgbci plane — keeping per-window DID palettes, popup/overlay
+ * cidaux compositing and colormap semantics intact by construction (per the
+ * director's Phase 2 design review: keep the DID walk, swap only the pixel
+ * source; there is deliberately NO global CI8->xRGB LUT). */
+typedef void (*PVDeskScanoutFn)(void *opaque, uint64_t base, uint32_t w,
+                                uint32_t h, uint32_t stride, uint32_t fmt,
+                                bool active);
+typedef void (*PVDeskDamageFn)(void *opaque, int x, int y, int w, int h);
+
 /* Per-GL-window (per-context) device state: its own glserver forward connection, its own
  * gl-listen frame connection, its latest frame, screen placement, and occluder rects. */
 typedef struct PVGPUCtx {
@@ -160,6 +174,8 @@ struct SGIGLAccelState {
     int         desk_w, desk_h;   /* desktop resolution (e.g. 1280x1024) */
     PVDeskRenderFn      desk_render;      /* desktop render callback */
     PVDeskInvalidateFn  desk_invalidate;  /* desktop invalidate callback */
+    PVDeskScanoutFn     desk_scanout;     /* Stage 2: register shadow fb (SCANOUT_SET) */
+    PVDeskDamageFn      desk_damage;      /* Stage 2: shadow fb damage (DAMAGE) */
     void               *desk_opaque;      /* opaque for the desktop callbacks */
     int         prev_n_windows;   /* one-frame GL-overlay restore: count of windows last frame */
     uint64_t    last_composite_sig; /* signature of last frame's GL overlay set (idle-skip) */
@@ -170,12 +186,15 @@ struct SGIGLAccelState {
     PVDeskRect  prev_win_rects[PVGPU_MAXCTX];
     int         prev_n_win_rects;
 
-    /* ---- Stage 2 shadow framebuffer (Variant B) ---- */
+    /* ---- Stage 2 Phase 2a shadow framebuffer (Variant B) ----
+     * The engine only latches the SCANOUT_SET parameters for debug/echo; the
+     * authoritative shadowfb state and the DID-walk pixel sourcing live in the
+     * desktop renderer (Newport), reached via desk_scanout/desk_damage.  There
+     * is deliberately NO shadow_cmap LUT here (see the callback typedefs). */
     uint64_t    shadow_base;       /* guest physical address of shadow fb */
     uint32_t    shadow_w, shadow_h, shadow_stride;
     uint32_t    shadow_format;     /* 0=CI8, 1=xRGB */
-    bool        shadow_active;     /* shadowfb registered → scan out from guest RAM */
-    uint32_t   *shadow_cmap;       /* CI8→xRGB LUT, 256 entries, when format==0 */
+    bool        shadow_active;     /* shadowfb registered */
 };
 
 /* Desktop overlay: fill out[] with every active host-rendered GL window (frame + tracked
@@ -189,6 +208,7 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max);
  * after registration; Newport (or any future desktop device) demotes itself to a renderer.
  * Only one desktop layer may be registered.  w/h must be the native desktop resolution. */
 void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn invalidate,
+                                  PVDeskScanoutFn scanout, PVDeskDamageFn damage,
                                   void *opaque, int w, int h);
 
 /* Phase E: return the unified engine's console for hardware-cursor setup.

@@ -367,6 +367,21 @@ struct SGINewportVirtuixState {
     /* NewView binary logger — records every REX3 register access */
     char *newview_log_path;
     FILE *newview_log_file;
+
+    /* ---- Stage 2 Phase 2a: paravirtual shadowfb scanout (Variant B) ----
+     * When active, the base CI plane's pixels for the DID/XMAP/CMAP walk are
+     * sourced from a linear shadow framebuffer in guest RAM instead of
+     * vram_rgbci.  The popup/overlay cidaux plane still composites from VRAM,
+     * so private colormaps, colormap animation and menus survive unchanged
+     * (the director's Phase 2 design: keep the DID walk, swap only the source).
+     * Registered/damaged via the glaccel SCANOUT_SET/DAMAGE ring ops. */
+    bool      scanout_active;       /* shadowfb registered → source base plane from RAM */
+    uint64_t  scanout_base;         /* guest physical base of the shadow fb */
+    uint32_t  scanout_w, scanout_h; /* shadowfb dimensions (pixels) */
+    uint32_t  scanout_stride;       /* bytes per shadowfb scanline */
+    uint32_t  scanout_format;       /* 0=CI8, 1=xRGB32 (experimental >8bpp path) */
+    uint32_t *scanout_row;          /* scratch: one row expanded to rgbci words (SCREEN_W) */
+    uint8_t  *scanout_rowbytes;     /* scratch: one raw DMA'd shadowfb scanline (stride bytes) */
 };
 
 #endif /* HW_DISPLAY_SGI_NEWPORT_VIRTUIX_H */
