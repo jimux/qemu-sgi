@@ -758,7 +758,10 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
  * DMA the guest framebuffer and blit to the console surface.
  */
 static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
-                                      int dw, int dh);
+                                      int dw, int dh,
+                                      PVDeskRect *out_rects, int max_out);
+static void glaccel_clamp_rect(PVDeskRect *out, int x, int y, int wpx, int hpx,
+                               int dw, int dh);
 
 /*
  * Cheap signature of the GL overlay set (which windows exist, their latest
@@ -794,6 +797,22 @@ static uint64_t glaccel_composite_signature(SGIGLAccelState *s)
     return sig;
 }
 
+/* Phase D: blit one rect of the engine desktop buffer to the display surface
+ * and issue a bounded dpy_gfx_update for it (replaces the full-screen memcpy +
+ * dpy_gfx_update_full on incremental frames).  r is in desk/surface space. */
+static void glaccel_blit_rect(SGIGLAccelState *s, uint8_t *dst, int dst_stride,
+                              const PVDeskRect *r)
+{
+    int y;
+    if (r->w <= 0 || r->h <= 0) return;
+    for (y = r->y; y < r->y + r->h && y < s->desk_h; y++) {
+        memcpy(dst + (size_t)y * dst_stride + (size_t)r->x * 4,
+               s->desk + (size_t)y * s->desk_w + r->x,
+               (size_t)r->w * 4);
+    }
+    dpy_gfx_update(s->con, r->x, r->y, r->w, r->h);
+}
+
 static void sgi_glaccel_update(void *opaque)
 {
     SGIGLAccelState *s = opaque;
@@ -802,10 +821,13 @@ static void sgi_glaccel_update(void *opaque)
 
     /* ---- unified display path (Phase A) — runs when a desktop layer is registered ---- */
     if (s->desk_render) {
-        int y, dst_stride, n_wins;
+        int y, dst_stride, n_wins, i;
         uint8_t *dst;
-        bool desk_changed;
         uint64_t sig;
+        PVDeskRect desk_rects[PVDESK_MAX_RECTS];
+        PVDeskRect win_rects[PVGPU_MAXCTX];
+        int n_desk_rects = 0, n_win_rects = 0;
+        bool desk_full, desk_changed, force, geom_changed = false;
 
         /* pin the console to desktop resolution */
         surface = qemu_console_surface(s->con);
@@ -818,7 +840,9 @@ static void sgi_glaccel_update(void *opaque)
         if (!surface) return;
 
         /* Stage 2 shadowfb path: when a shadow framebuffer is registered,
-         * DMA it from guest RAM instead of calling the desktop render callback. */
+         * DMA it from guest RAM instead of calling the desktop render callback.
+         * (Scaffolding — always full-blits; Phase D bounding applies to the
+         * live REX3 decoder path below.) */
         if (s->shadow_active && s->shadow_base) {
             uint8_t *shadow = g_malloc(s->shadow_stride * s->shadow_h);
             dma_memory_read(&address_space_memory,
@@ -843,32 +867,68 @@ static void sgi_glaccel_update(void *opaque)
             }
             g_free(shadow);
             s->invalidate = false;
-            goto composite_overlays;
+            desk_full = true;
+            goto composite_and_blit;
+        }
+
+        /*
+         * Phase D force decision.  A full desktop repaint (and full blit) is
+         * required when:
+         *  - a backend/console invalidate is pending (s->invalidate);
+         *  - all GL windows just vanished (one-frame restore of the desktop
+         *    underneath — the old logic);
+         *  - the GL window GEOMETRY changed vs. last frame (a window moved,
+         *    resized, appeared, or vanished): the desktop under the previous
+         *    positions must be restored, which the incremental path does not do,
+         *    so fall back to a full repaint.  Content-only changes (same
+         *    geometry, new frame_serial) stay on the cheap bounded path.
+         */
+        force = s->invalidate;
+        {
+            int n_now = 0;
+            for (i = 0; i < PVGPU_MAXCTX; i++) {
+                PVGPUCtx *c = &s->ctx[i];
+                if (c->active && c->frame && c->w > 0 && c->h > 0) {
+                    glaccel_clamp_rect(&win_rects[n_now], c->x, c->y, c->w, c->h,
+                                       s->desk_w, s->desk_h);
+                    n_now++;
+                }
+            }
+            if (!force && s->prev_n_windows > 0 && n_now == 0) {
+                force = true;
+            }
+            if (n_now != s->prev_n_win_rects) {
+                geom_changed = true;
+            } else {
+                for (i = 0; i < n_now; i++) {
+                    if (win_rects[i].x != s->prev_win_rects[i].x ||
+                        win_rects[i].y != s->prev_win_rects[i].y ||
+                        win_rects[i].w != s->prev_win_rects[i].w ||
+                        win_rects[i].h != s->prev_win_rects[i].h) {
+                        geom_changed = true;
+                        break;
+                    }
+                }
+            }
+            if (geom_changed) {
+                force = true;
+            }
         }
 
         /* render the desktop into the engine buffer */
         {
-            bool force = s->invalidate;
-            /* one-frame restore: if GL windows just vanished, force a full desktop repaint
-             * so the surface underneath is restored instead of showing the last GL frame */
-            if (!force && s->prev_n_windows > 0) {
-                int n_now = 0;
-                for (int i = 0; i < PVGPU_MAXCTX; i++)
-                    if (s->ctx[i].active && s->ctx[i].frame) n_now++;
-                if (n_now == 0) force = true;
-            }
-            desk_changed = s->desk_render(s->desk_opaque, s->desk,
-                                          s->desk_w, s->desk_h, force);
+            int rc = s->desk_render(s->desk_opaque, s->desk, s->desk_w,
+                                    s->desk_h, force, desk_rects,
+                                    PVDESK_MAX_RECTS);
             s->invalidate = false;
+            desk_full = (rc == PVDESK_FULL);
+            desk_changed = (rc != 0);
+            n_desk_rects = desk_full ? 0 : rc;
         }
 
-        /* Idle-frame skip: the desktop reported no change (force was false, so
-         * no pending invalidate / console-resize / restore-frame either). If the
-         * GL overlay set is also identical to the last blitted frame, the
-         * composited output is unchanged — the surface already holds it — so
-         * skip the composite, the desk->surface blit and dpy_gfx_update_full
-         * entirely. The invalidate chain still forces a repaint because a pending
-         * invalidate makes force (hence desk_changed) true above. */
+        /* Idle-frame skip: the desktop reported no change AND the GL overlay set
+         * is identical to the last blitted frame — the surface already holds the
+         * composited output, so skip everything. */
         sig = glaccel_composite_signature(s);
         if (!desk_changed && s->have_composite_sig &&
             sig == s->last_composite_sig) {
@@ -877,19 +937,51 @@ static void sgi_glaccel_update(void *opaque)
         s->last_composite_sig = sig;
         s->have_composite_sig = true;
 
-composite_overlays:
-        /* composite GL overlays onto the desktop buffer */
-        n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w, s->desk_h);
+composite_and_blit:
+        /* composite GL overlays onto the desktop buffer; capture composited
+         * (clamped) window rects for a bounded blit */
+        n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w, s->desk_h,
+                                            win_rects, PVGPU_MAXCTX);
         s->prev_n_windows = n_wins;
+        n_win_rects = n_wins < PVGPU_MAXCTX ? n_wins : PVGPU_MAXCTX;
 
-        /* blit engine buffer → display surface */
         dst_stride = surface_stride(surface);
         dst = surface_data(surface);
-        for (y = 0; y < s->desk_h; y++)
-            memcpy(dst + (size_t)y * dst_stride,
-                   s->desk + (size_t)y * s->desk_w,
-                   (size_t)s->desk_w * 4);
-        dpy_gfx_update_full(s->con);
+
+        /* PVDISPLAY_FULL_BLIT=1: measurement oracle — force the pre-Phase-D
+         * full-screen blit + dpy_gfx_update_full every frame, so the Phase D
+         * bounded-blit CPU win can be measured before/after with one binary. */
+        {
+            static int fb_oracle = -1;
+            if (fb_oracle < 0)
+                fb_oracle = getenv("PVDISPLAY_FULL_BLIT") ? 1 : 0;
+            if (fb_oracle) desk_full = true;
+        }
+
+        if (desk_full) {
+            /* full blit engine buffer → display surface */
+            for (y = 0; y < s->desk_h; y++)
+                memcpy(dst + (size_t)y * dst_stride,
+                       s->desk + (size_t)y * s->desk_w,
+                       (size_t)s->desk_w * 4);
+            dpy_gfx_update_full(s->con);
+        } else {
+            /* bounded blit: desktop dirty rects + composited GL window rects.
+             * Both copies are bounded here (VRAM→desk happened per-rect in the
+             * render callback; desk→surface + dpy_gfx_update are bounded now). */
+            for (i = 0; i < n_desk_rects; i++) {
+                glaccel_blit_rect(s, dst, dst_stride, &desk_rects[i]);
+            }
+            for (i = 0; i < n_win_rects; i++) {
+                glaccel_blit_rect(s, dst, dst_stride, &win_rects[i]);
+            }
+        }
+
+        /* remember this frame's window geometry for next frame's change test */
+        s->prev_n_win_rects = n_win_rects;
+        for (i = 0; i < n_win_rects; i++) {
+            s->prev_win_rects[i] = win_rects[i];
+        }
         return;   /* unified path — never fall through to legacy paths */
     }
 
@@ -1255,8 +1347,24 @@ QemuConsole *sgi_glaccel_get_console(void)
 /* Per-frame GL-overlay composite: copy active frames + occluder rects from per-context
  * state into the on-stack window array, then composite each over *desk.  Returns the
  * number of visible windows composited. */
+/* Clamp a window rect [x,y,w,h] to the screen and store it in *out (Phase D:
+ * so the caller can bound its blit/dpy_gfx_update to composited window rects). */
+static void glaccel_clamp_rect(PVDeskRect *out, int x, int y, int wpx, int hpx,
+                               int dw, int dh)
+{
+    int x0 = x, y0 = y, x1 = x + wpx, y1 = y + hpx;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > dw) x1 = dw;
+    if (y1 > dh) y1 = dh;
+    out->x = x0; out->y = y0;
+    out->w = (x1 > x0) ? x1 - x0 : 0;
+    out->h = (y1 > y0) ? y1 - y0 : 0;
+}
+
 static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
-                                      int dw, int dh)
+                                      int dw, int dh,
+                                      PVDeskRect *out_rects, int max_out)
 {
     PVGPUWindow wins[PVGPU_MAXCTX];
     int n_wins, wi, gy, gx, oi;
@@ -1307,6 +1415,9 @@ static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
                     desk[(size_t)fy * dw + fx] = w->frame[(size_t)gy * w->w + gx];
                 }
             }
+        }
+        if (out_rects && wi < max_out) {
+            glaccel_clamp_rect(&out_rects[wi], w->x, w->y, w->w, w->h, dw, dh);
         }
     }
     return n_wins;

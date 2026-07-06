@@ -54,10 +54,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 /* ---- desktop layer types (used by SGIGLAccelState, must precede it) ---- */
 typedef struct { int x, y, w, h; } PVDeskRect;
 
-/* Desktop render callback: fills *dst (w*h xRGB32) with full desktop pixels; returns true
- * if any pixels changed.  When force_full is true the desktop MUST repaint every pixel
- * (the caller has discarded the previous buffer contents). */
-typedef bool (*PVDeskRenderFn)(void *opaque, uint32_t *dst, int w, int h, bool force_full);
+/* Max damage rects the desktop render reports back per frame (Phase D). */
+#define PVDESK_MAX_RECTS 16
+/* Render callback return sentinel: the whole screen changed (repaint everything). */
+#define PVDESK_FULL      (-1)
+
+/* Desktop render callback (Phase D dirty-rect scanout): converts the changed
+ * regions of the desktop into *dst (w*h xRGB32).  When force_full is true the
+ * desktop MUST repaint every pixel (the caller discarded the previous buffer).
+ * Otherwise it repaints only the regions dirtied since the last call and reports
+ * them in rects[0..max_rects) (post-window-offset screen space, == dst space).
+ * Return value:
+ *   PVDESK_FULL (-1) — the whole screen was repainted (rects[] undefined);
+ *   0               — nothing changed (dst untouched, rects[] undefined);
+ *   n > 0           — n dirty rects written to rects[], only those were repainted. */
+typedef int (*PVDeskRenderFn)(void *opaque, uint32_t *dst, int w, int h,
+                              bool force_full, PVDeskRect *rects, int max_rects);
 /* Desktop invalidate: called when the engine needs the desktop to invalidate its cache
  * (surface reallocation, display-backend switch, etc.). */
 typedef void (*PVDeskInvalidateFn)(void *opaque);
@@ -152,6 +164,11 @@ struct SGIGLAccelState {
     int         prev_n_windows;   /* one-frame GL-overlay restore: count of windows last frame */
     uint64_t    last_composite_sig; /* signature of last frame's GL overlay set (idle-skip) */
     bool        have_composite_sig; /* last_composite_sig is valid (a frame was blitted) */
+    /* Phase D bounded scanout: previous frame's GL window rects (for detecting
+     * geometry changes that need a full desktop restore vs. content-only frames
+     * that only reblit the window rect). */
+    PVDeskRect  prev_win_rects[PVGPU_MAXCTX];
+    int         prev_n_win_rects;
 
     /* ---- Stage 2 shadow framebuffer (Variant B) ---- */
     uint64_t    shadow_base;       /* guest physical address of shadow fb */

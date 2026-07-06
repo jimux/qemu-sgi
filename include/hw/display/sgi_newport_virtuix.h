@@ -228,6 +228,9 @@ struct SGINewportVirtuixState {
     #define NEWPORT_DIRTY_MAX 16
     struct { int x, y, w, h; } dirty_rects[NEWPORT_DIRTY_MAX];
     int  dirty_n;                   /* number of valid rects (0 = clean, MAX = full) */
+    uint32_t dirty_touch;           /* bumped by every dirty_rect/dirty_full call
+                                     * (lets the command dispatcher tell whether a
+                                     * primitive already reported its bbox) */
 
     /* REX3 drawing registers */
     uint32_t drawmode0;
