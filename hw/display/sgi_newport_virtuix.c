@@ -3821,6 +3821,14 @@ static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
     SGINewportVirtuixState *s = opaque;
     uint32_t bpp;
 
+    /* PVDisplay Phase 2b/3: log every scanout enable/disable transition so the
+     * cold-boot timeline can be verified (the flip must go live only AFTER the
+     * desktop session is up, never during clogin — session 12 desktop-gating). */
+    if (active != s->scanout_active) {
+        fprintf(stderr, "PVDISPLAY_SCANOUT: %s base=0x%" PRIx64 " w=%u h=%u fmt=%u\n",
+                active ? "ENABLE" : "disable", base, w, h, fmt);
+    }
+
     if (!active) {
         s->scanout_active = false;
         newport_dirty_full(s);
