@@ -390,6 +390,15 @@ static void sgi_virtuix_init(MachineState *machine) {
     create_gio_empty_slot(system_memory, "gio-gfx-low", SGI_GIO_GFX_BASE,
                           REX3_REG_OFFSET);
 
+    /* Paravirtual GL accelerator: must realize BEFORE Newport because Newport
+     * registers as a desktop renderer with glaccel during its own realize. */
+    {
+        DeviceState *glaccel_dev = qdev_new(TYPE_SGI_GLACCEL);
+        qdev_set_id(glaccel_dev, g_strdup("glaccel"), &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(glaccel_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(glaccel_dev), 0, 0x1fa20000ULL);
+    }
+
     newport_dev = qdev_new(TYPE_SGI_NEWPORT_VIRTUIX);
     object_property_add_child(OBJECT(machine), "newport", OBJECT(newport_dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(newport_dev), &error_fatal);
@@ -408,14 +417,7 @@ static void sgi_virtuix_init(MachineState *machine) {
   create_gio_empty_slot(system_memory, "gio-exp0", SGI_GIO_EXP0_BASE, 2 * MiB);
   create_gio_empty_slot(system_memory, "gio-exp1", SGI_GIO_EXP1_BASE, 4 * MiB);
 
-  /* Paravirtual GL accelerator: the host renderer (glserver) streams PVGL frames to its
-   * gl-listen socket (enable with -global sgi-glaccel.gl-listen=PORT); the device
-   * composites the latest frame into its own QEMU console (visible with -display gtk). */
   {
-      DeviceState *glaccel_dev = qdev_new(TYPE_SGI_GLACCEL);
-      qdev_set_id(glaccel_dev, g_strdup("glaccel"), &error_fatal);  /* parents it + lets `screendump glaccel` work */
-      sysbus_realize_and_unref(SYS_BUS_DEVICE(glaccel_dev), &error_fatal);
-      sysbus_mmio_map(SYS_BUS_DEVICE(glaccel_dev), 0, 0x1fa20000ULL);
   }
 
   /*

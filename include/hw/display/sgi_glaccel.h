@@ -25,6 +25,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 #define SGI_GLACCEL_STRIDE   0x20   /* Bytes per scanline (0 = width*bpp) */
 #define SGI_GLACCEL_CONTEXT  0x24   /* GL context (window) id; a CMD_BASE write latches per ctx */
 #define SGI_GLACCEL_DOORBELL 0x28   /* atomic submit: write (ctx<<24)|len -> process ctx's ring */
+#define SGI_GLACCEL_CTX_FREE 0x2C   /* Phase B: write ctx id -> free context (unmap lifecycle) */
 
 /* Execution Commands */
 #define GLACCEL_CMD_RESET   (1 << 0)
@@ -46,6 +47,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 
 #define PVGPU_MAX_OCC 16     /* max occluder rects tracked for desktop overlay clipping */
 #define PVGPU_MAXCTX  8      /* max concurrent GL windows (contexts) */
+
+/* ---- desktop layer types (used by SGIGLAccelState, must precede it) ---- */
+typedef struct { int x, y, w, h; } PVDeskRect;
+
+/* Desktop render callback: fills *dst (w*h xRGB32) with full desktop pixels; returns true
+ * if any pixels changed.  When force_full is true the desktop MUST repaint every pixel
+ * (the caller has discarded the previous buffer contents). */
+typedef bool (*PVDeskRenderFn)(void *opaque, uint32_t *dst, int w, int h, bool force_full);
+/* Desktop invalidate: called when the engine needs the desktop to invalidate its cache
+ * (surface reallocation, display-backend switch, etc.). */
+typedef void (*PVDeskInvalidateFn)(void *opaque);
 
 /* Per-GL-window (per-context) device state: its own glserver forward connection, its own
  * gl-listen frame connection, its latest frame, screen placement, and occluder rects. */
@@ -127,6 +139,16 @@ struct SGIGLAccelState {
      * in-process path); set sgi-glaccel.inproc=off to fall back to the socket/glserver
      * path for debugging or if the renderer .so is unavailable. */
     bool        inproc;           /* qom prop: in-process glr_submit instead of the socket */
+
+    /* ---- unified display engine (Phase A) ---- */
+    uint32_t   *desk;             /* engine-owned desktop buffer, xRGB, desk_w*desk_h */
+    int         desk_w, desk_h;   /* desktop resolution (e.g. 1280x1024) */
+    PVDeskRenderFn      desk_render;      /* desktop render callback */
+    PVDeskInvalidateFn  desk_invalidate;  /* desktop invalidate callback */
+    void               *desk_opaque;      /* opaque for the desktop callbacks */
+    int         prev_n_windows;   /* one-frame GL-overlay restore: count of windows last frame */
+    uint64_t    last_composite_sig; /* signature of last frame's GL overlay set (idle-skip) */
+    bool        have_composite_sig; /* last_composite_sig is valid (a frame was blitted) */
 };
 
 /* Desktop overlay: fill out[] with every active host-rendered GL window (frame + tracked
@@ -135,5 +157,15 @@ struct SGIGLAccelState {
  * rather than in the glaccel device's own console. Returns the count of active windows.
  * frame pixels are host xRGB (0x00RRGGBB). */
 int sgi_glaccel_get_windows(PVGPUWindow *out, int max);
+
+/* Register a desktop renderer with the unified display engine.  The engine owns the console
+ * after registration; Newport (or any future desktop device) demotes itself to a renderer.
+ * Only one desktop layer may be registered.  w/h must be the native desktop resolution. */
+void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn invalidate,
+                                  void *opaque, int w, int h);
+
+/* Phase E: return the unified engine's console for hardware-cursor setup.
+ * Only valid after register_desktop (asserts otherwise). */
+QemuConsole *sgi_glaccel_get_console(void);
 
 #endif /* SGI_GLACCEL_H */

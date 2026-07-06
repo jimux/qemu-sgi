@@ -505,6 +505,23 @@ static void pvgpu_gl_submit_inproc(SGIGLAccelState *s, PVGPUCtx *c,
     const unsigned char *rgb = NULL;
     int fw = 0, fh = 0, cid = (int)(c - s->ctx), serial;
 
+    /* Thread-migration detection: log if submits arrive on different host threads.
+     * glXMakeContextCurrent is thread-affine; under MTTCG a doorbell on a different
+     * vCPU thread would silently no-op.  This counter tells us if migration happens
+     * in practice before we commit to a dedicated render thread. */
+    {
+        static pthread_t last_thread;
+        static int warned;
+        pthread_t cur = pthread_self();
+        if (last_thread && !pthread_equal(cur, last_thread) && !warned) {
+            fprintf(stderr, "pvgpu: THREAD MIGRATION — GL submit on ctx %d moved from "
+                    "thread %lu to %lu (GLX context may be stale on old thread)\n",
+                    cid, (unsigned long)last_thread, (unsigned long)cur);
+            warned = 1;  /* log once per session — it either happens or it doesn't */
+        }
+        last_thread = cur;
+    }
+
     if (resp) {
         memset(resp, 0, sizeof *resp);
     }
@@ -715,11 +732,114 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
  * gfx_update callback — called at ~60Hz by the QEMU display subsystem.
  * DMA the guest framebuffer and blit to the console surface.
  */
+static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
+                                      int dw, int dh);
+
+/*
+ * Cheap signature of the GL overlay set (which windows exist, their latest
+ * frame serials, placement and occluders). If it is unchanged from the last
+ * blitted frame AND the desktop render reported no change AND nothing forced a
+ * repaint, the composited output is byte-identical to what the surface already
+ * holds, so the whole composite/blit/dpy_gfx_update can be skipped (idle-frame
+ * regression fix — restores the old "if (!display_dirty) return" early-out).
+ */
+static uint64_t glaccel_composite_signature(SGIGLAccelState *s)
+{
+    uint64_t sig = 1469598103934665603ULL; /* FNV-ish seed */
+    int i, k;
+    for (i = 0; i < PVGPU_MAXCTX; i++) {
+        PVGPUCtx *c = &s->ctx[i];
+        if (!c->active || !c->frame || c->w <= 0 || c->h <= 0) {
+            continue;
+        }
+        sig = (sig ^ (uint32_t)i) * 1099511628211ULL;
+        sig = (sig ^ c->frame_serial) * 1099511628211ULL;
+        sig = (sig ^ (uint32_t)c->x) * 1099511628211ULL;
+        sig = (sig ^ (uint32_t)c->y) * 1099511628211ULL;
+        sig = (sig ^ (uint32_t)c->w) * 1099511628211ULL;
+        sig = (sig ^ (uint32_t)c->h) * 1099511628211ULL;
+        sig = (sig ^ (uint32_t)c->n_occ) * 1099511628211ULL;
+        for (k = 0; k < c->n_occ && k < PVGPU_MAX_OCC; k++) {
+            sig = (sig ^ (uint32_t)c->occ[k][0]) * 1099511628211ULL;
+            sig = (sig ^ (uint32_t)c->occ[k][1]) * 1099511628211ULL;
+            sig = (sig ^ (uint32_t)c->occ[k][2]) * 1099511628211ULL;
+            sig = (sig ^ (uint32_t)c->occ[k][3]) * 1099511628211ULL;
+        }
+    }
+    return sig;
+}
+
 static void sgi_glaccel_update(void *opaque)
 {
     SGIGLAccelState *s = opaque;
     DisplaySurface *surface;
     int width, height, src_stride;
+
+    /* ---- unified display path (Phase A) — runs when a desktop layer is registered ---- */
+    if (s->desk_render) {
+        int y, dst_stride, n_wins;
+        uint8_t *dst;
+        bool desk_changed;
+        uint64_t sig;
+
+        /* pin the console to desktop resolution */
+        surface = qemu_console_surface(s->con);
+        if (!surface || surface_width(surface) != s->desk_w ||
+            surface_height(surface) != s->desk_h) {
+            qemu_console_resize(s->con, s->desk_w, s->desk_h);
+            surface = qemu_console_surface(s->con);
+            s->invalidate = true;
+        }
+        if (!surface) return;
+
+
+        /* render the desktop into the engine buffer */
+        {
+            bool force = s->invalidate;
+            /* one-frame restore: if GL windows just vanished, force a full desktop repaint
+             * so the surface underneath is restored instead of showing the last GL frame */
+            if (!force && s->prev_n_windows > 0) {
+                int n_now = 0;
+                for (int i = 0; i < PVGPU_MAXCTX; i++)
+                    if (s->ctx[i].active && s->ctx[i].frame) n_now++;
+                if (n_now == 0) force = true;
+            }
+            desk_changed = s->desk_render(s->desk_opaque, s->desk,
+                                          s->desk_w, s->desk_h, force);
+            s->invalidate = false;
+        }
+
+        /* Idle-frame skip: the desktop reported no change (force was false, so
+         * no pending invalidate / console-resize / restore-frame either). If the
+         * GL overlay set is also identical to the last blitted frame, the
+         * composited output is unchanged — the surface already holds it — so
+         * skip the composite, the desk->surface blit and dpy_gfx_update_full
+         * entirely. The invalidate chain still forces a repaint because a pending
+         * invalidate makes force (hence desk_changed) true above. */
+        sig = glaccel_composite_signature(s);
+        if (!desk_changed && s->have_composite_sig &&
+            sig == s->last_composite_sig) {
+            return;   /* nothing changed; leave the surface as-is */
+        }
+        s->last_composite_sig = sig;
+        s->have_composite_sig = true;
+
+        /* composite GL overlays onto the desktop buffer */
+        n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w, s->desk_h);
+        s->prev_n_windows = n_wins;
+
+        /* blit engine buffer → display surface */
+        dst_stride = surface_stride(surface);
+        dst = surface_data(surface);
+        for (y = 0; y < s->desk_h; y++)
+            memcpy(dst + (size_t)y * dst_stride,
+                   s->desk + (size_t)y * s->desk_w,
+                   (size_t)s->desk_w * 4);
+        dpy_gfx_update_full(s->con);
+        return;   /* unified path — never fall through to legacy paths */
+    }
+
+    /* ---- legacy paths — only reachable when no desktop layer is registered ---- */
 
     /* Paravirtual-GPU path: present the internal framebuffer (2D command output), with any
      * host-rendered GL frame composited in at its position. */
@@ -835,6 +955,10 @@ static void sgi_glaccel_invalidate(void *opaque)
 {
     SGIGLAccelState *s = opaque;
     s->invalidate = true;
+    /* forward to the desktop layer so its cached state (dirty flag, mode cache) is invalidated */
+    if (s->desk_invalidate) {
+        s->desk_invalidate(s->desk_opaque);
+    }
 }
 
 static uint64_t sgi_glaccel_read(void *opaque, hwaddr addr, unsigned size)
@@ -962,6 +1086,31 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
         s->status |= GLACCEL_STATUS_DONE;
         break;
     }
+    case SGI_GLACCEL_CTX_FREE: {
+        /* Phase B: guest unmaps ring -> explicit context teardown.
+         * Fired on munmap, process exit, AND kill -9 (ddmap.h last-reference). */
+        int c = (int)val;
+        if (c < 0 || c >= PVGPU_MAXCTX) break;
+        {
+            PVGPUCtx *ctx = &s->ctx[c];
+            if (ctx->active || ctx->frame) {
+                qemu_log_mask(LOG_UNIMP, "pvgpu: CTX_FREE ctx %d (was active=%d w=%d h=%d)\n",
+                              c, ctx->active, ctx->w, ctx->h);
+            }
+            ctx->active = false;
+            g_free(ctx->frame);  ctx->frame = NULL;
+            ctx->w = ctx->h = ctx->x = ctx->y = 0;
+            ctx->n_occ = 0;
+            ctx->pending = 0;
+            ctx->frame_serial = 0;
+            ctx->cmd_base = 0;
+            if (ctx->fwd_fd >= 0) { close(ctx->fwd_fd); ctx->fwd_fd = -1; }
+            if (ctx->conn_fd >= 0) { close(ctx->conn_fd); ctx->conn_fd = -1; }
+            if (ctx->rxbuf) { g_byte_array_unref(ctx->rxbuf); ctx->rxbuf = NULL; }
+            s->invalidate = true;
+        }
+        break;
+    }
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad register offset 0x%" HWADDR_PRIx "\n",
@@ -991,8 +1140,10 @@ static SGIGLAccelState *g_glaccel_overlay;
 /* A GL app that exits/is killed simply stops submitting frames (the device can't see the
  * guest process die). Treat the overlay as gone once frames stop for a short window, so the
  * desktop is restored instead of freezing on the last frame. (~1s: atlantis-class demos
- * animate continuously; a 1s gap means the window is gone or stalled.) */
-#define GLACCEL_OVERLAY_IDLE_US (1200 * 1000)
+ * animate continuously.  Phase B: lengthened to a 5 s backstop — CTX_FREE now
+ * tears down windows explicitly; this timeout should never fire in normal operation
+ * and a firing backstop is a bug signal. */
+#define GLACCEL_OVERLAY_IDLE_US (5000 * 1000)
 
 int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
 {
@@ -1004,7 +1155,10 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
     for (i = 0; i < PVGPU_MAXCTX && n < max; i++) {
         PVGPUCtx *c = &s->ctx[i];
         if (!c->active || !c->frame || c->w <= 0 || c->h <= 0) continue;
-        if (now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {   /* app gone/stalled -> drop */
+        if (now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {   /* backstop — should never fire */
+            qemu_log_mask(LOG_UNIMP, "pvgpu: BACKSTOP ctx %d idle timeout fired "
+                          "(%.1fs) — CTX_FREE path may be broken\n",
+                          i, (now - c->last_us) / 1e6);
             c->active = false;
             continue;
         }
@@ -1018,6 +1172,90 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
         n++;
     }
     return n;
+}
+
+/* ---- unified display engine (Phase A) ---- */
+
+void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn invalidate,
+                                  void *opaque, int w, int h)
+{
+    SGIGLAccelState *s = g_glaccel_overlay;
+    assert(s);                       /* glaccel must be realized first */
+    assert(!s->desk_render);         /* only one desktop layer */
+    assert(w > 0 && h > 0);
+    s->desk_render = render;
+    s->desk_invalidate = invalidate;
+    s->desk_opaque = opaque;
+    s->desk_w = w;  s->desk_h = h;
+    s->desk = g_new0(uint32_t, (size_t)w * h);
+    s->invalidate = true;            /* force full first render */
+}
+
+QemuConsole *sgi_glaccel_get_console(void)
+{
+    SGIGLAccelState *s = g_glaccel_overlay;
+    assert(s && s->con);
+    return s->con;
+}
+
+/* Per-frame GL-overlay composite: copy active frames + occluder rects from per-context
+ * state into the on-stack window array, then composite each over *desk.  Returns the
+ * number of visible windows composited. */
+static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
+                                      int dw, int dh)
+{
+    PVGPUWindow wins[PVGPU_MAXCTX];
+    int n_wins, wi, gy, gx, oi;
+    int64_t now = g_get_monotonic_time();
+
+    /* gather active windows, applying the idle timeout */
+    n_wins = 0;
+    for (int i = 0; i < PVGPU_MAXCTX && n_wins < PVGPU_MAXCTX; i++) {
+        PVGPUCtx *c = &s->ctx[i];
+        if (!c->active || !c->frame || c->w <= 0 || c->h <= 0) continue;
+        if (now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {   /* backstop */
+            qemu_log_mask(LOG_UNIMP, "pvgpu: BACKSTOP ctx %d idle timeout fired "
+                          "(%.1fs) in composite\n",
+                          i, (now - c->last_us) / 1e6);
+            c->active = false;
+            continue;
+        }
+        wins[n_wins].frame = c->frame; wins[n_wins].x = c->x; wins[n_wins].y = c->y;
+        wins[n_wins].w = c->w; wins[n_wins].h = c->h;
+        wins[n_wins].n_occ = c->n_occ < PVGPU_MAX_OCC ? c->n_occ : PVGPU_MAX_OCC;
+        for (int k = 0; k < wins[n_wins].n_occ; k++) {
+            wins[n_wins].occ[k][0] = c->occ[k][0];
+            wins[n_wins].occ[k][1] = c->occ[k][1];
+            wins[n_wins].occ[k][2] = c->occ[k][2];
+            wins[n_wins].occ[k][3] = c->occ[k][3];
+        }
+        n_wins++;
+    }
+
+    /* composite each window over the desktop */
+    for (wi = 0; wi < n_wins; wi++) {
+        PVGPUWindow *w = &wins[wi];
+        for (gy = 0; gy < w->h; gy++) {
+            int fy = w->y + gy;
+            if (fy < 0 || fy >= dh) continue;
+            for (gx = 0; gx < w->w; gx++) {
+                int fx = w->x + gx;
+                if (fx < 0 || fx >= dw) continue;
+                /* occluder check: skip if pixel is inside any occluding rect */
+                bool occ = false;
+                for (oi = 0; oi < w->n_occ; oi++) {
+                    if (fx >= w->occ[oi][0] && fx < w->occ[oi][0] + w->occ[oi][2] &&
+                        fy >= w->occ[oi][1] && fy < w->occ[oi][1] + w->occ[oi][3]) {
+                        occ = true; break;
+                    }
+                }
+                if (!occ) {
+                    desk[(size_t)fy * dw + fx] = w->frame[(size_t)gy * w->w + gx];
+                }
+            }
+        }
+    }
+    return n_wins;
 }
 
 static void sgi_glaccel_realize(DeviceState *dev, Error **errp)

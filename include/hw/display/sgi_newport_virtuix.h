@@ -217,14 +217,17 @@ struct SGINewportVirtuixState {
 
     MemoryRegion iomem;
 
-    /* Display console */
-    QemuConsole *con;
-
     /* VRAM — matches MAME layout */
     uint32_t *vram_rgbci;           /* RGB/CI pixel data */
     uint32_t *vram_cidaux;          /* CID/overlay/popup data */
-    bool display_dirty;
-    bool gl_overlay_was_active;     /* paravirtual-GL window present last frame (restore on clear) */
+    bool display_dirty;             /* derived: dirty-rect list non-empty (Phase D) */
+
+    /* Phase D dirty-rect scanout: instead of regenerating all 1280x1024 every frame,
+     * track which regions were touched by REX3 commands.  Fixed-size list + coalesce;
+     * overflow → full-screen dirty.  Rects are in post-window-offset VRAM space. */
+    #define NEWPORT_DIRTY_MAX 16
+    struct { int x, y, w, h; } dirty_rects[NEWPORT_DIRTY_MAX];
+    int  dirty_n;                   /* number of valid rects (0 = clean, MAX = full) */
 
     /* REX3 drawing registers */
     uint32_t drawmode0;

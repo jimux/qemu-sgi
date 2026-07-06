@@ -40,6 +40,12 @@
 #include "ui/pixel_ops.h"
 #include "trace.h"
 
+/* Phase D dirty-rect forward declarations (used in REX3 dispatch, defined below) */
+static void newport_dirty_full(SGINewportVirtuixState *s);
+static void newport_dirty_rect(SGINewportVirtuixState *s, int rx, int ry, int rw, int rh);
+/* Phase E hardware cursor (used in VC2 write handler) */
+static void newport_update_hw_cursor(SGINewportVirtuixState *s);
+
 /* NewView binary log record (20 bytes, MAME-compatible layout) */
 static void newport_newview_log(SGINewportVirtuixState *s, uint32_t offset,
                                 uint32_t data)
@@ -1432,7 +1438,7 @@ static void newport_do_rex3_command(SGINewportVirtuixState *s)
         break;
     }
 
-    s->display_dirty = true;
+    newport_dirty_full(s);
 }
 
 /*
@@ -1790,7 +1796,8 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                         s->vc2_ram_addr = (val >> 8) & 0x7fff;
                     }
                     if (vc2_reg_affects_cursor(s->vc2_reg_idx)) {
-                        s->display_dirty = true;
+                        newport_dirty_full(s);
+                        newport_update_hw_cursor(s);
                     }
                 }
                 break;
@@ -1808,7 +1815,7 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                      * cursor tracks at the display refresh rate.
                      */
                     if (vc2_reg_affects_cursor(s->vc2_reg_idx)) {
-                        s->display_dirty = true;
+                        newport_dirty_full(s);
                     }
                 }
                 break;
@@ -1841,7 +1848,7 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                                                   masked_val >> 8, dw);
             if (s->cmap_palette_idx < 8192) {
                 s->cmap0_palette[s->cmap_palette_idx] = masked_val >> 8;
-                s->display_dirty = true;
+                newport_dirty_full(s);
             }
             s->cmap_palette_idx++;
             break;
@@ -2878,7 +2885,131 @@ static void newport_dump_vram_ppm(SGINewportVirtuixState *s, const char *path)
 static void newport_invalidate(void *opaque)
 {
     SGINewportVirtuixState *s = opaque;
-    s->display_dirty = true;
+    newport_dirty_full(s);
+}
+
+/*
+ * Phase E: build a QEMUCursor from VC2 cursor state and push it to the
+ * unified display engine's console via dpy_cursor_define + dpy_mouse_set.
+ * Kept behind PVDISPLAY_SOFT_CURSOR=1 — when set, the software cursor
+ * (newport_draw_cursor) is used instead of the hardware cursor.
+ */
+static void newport_update_hw_cursor(SGINewportVirtuixState *s)
+{
+    static int soft_cursor = -1;
+    /* Track cursor content to avoid redundant dpy_cursor_define per frame */
+    static uint16_t last_entry = 0xffff, last_cmap = 0xffff;
+    static bool     last_64 = false;
+    static uint32_t last_ram_hash = 0;
+    QemuConsole *con;
+    uint16_t dc, cx, cy, cursor_entry, cursor_msb;
+    bool is_64, visible, content_changed;
+    int size, gx, gy, sx, sy;
+    uint32_t ram_hash;
+    QEMUCursor *cur;
+
+    if (soft_cursor < 0) {
+        soft_cursor = getenv("PVDISPLAY_SOFT_CURSOR") ? 1 : 0;
+    }
+    if (soft_cursor) return;
+
+    con = sgi_glaccel_get_console();
+    if (!con) return;
+
+    dc = s->vc2_reg[VC2_DC_CONTROL];
+    visible = (dc & VC2_DC_ENA_CURSOR) && (dc & VC2_DC_CURSOR_DISP);
+    cx = (int16_t)s->vc2_reg[VC2_CURSOR_X];
+    cy = (int16_t)s->vc2_reg[VC2_CURSOR_Y];
+    cursor_entry = s->vc2_reg[VC2_CURSOR_ENTRY];
+    is_64 = dc & VC2_DC_CURSOR_SIZE64;
+    size = is_64 ? 64 : 32;
+    cursor_msb = (uint16_t)s->xmap_cursor_cmap << 5;
+
+    /* NP_CURSOR trace */
+    {
+        static int np_cursor_trace = -1;
+        if (np_cursor_trace < 0)
+            np_cursor_trace = getenv("NP_CURSOR") ? 1 : 0;
+        if (np_cursor_trace) {
+            static int16_t last_cx = -32768, last_cy = -32768;
+            if (cx != last_cx || cy != last_cy) {
+                last_cx = cx; last_cy = cy;
+                fprintf(stderr, "cursor=(%d,%d)\n", cx, cy);
+            }
+        }
+    }
+
+    if (!visible) {
+        dpy_mouse_set(con, cx, cy, false);
+        return;
+    }
+
+    /* Detect content change: entry, cmap, size, or RAM content */
+    ram_hash = 0;
+    {
+        int n_words = is_64 ? 256 : 128;  /* 64x64=4 words/row*64, 32x32=2 words/row*32=64 words * 2 planes=128 */
+        for (int i = 0; i < n_words; i++)
+            ram_hash = ram_hash * 31 + s->vc2_ram[(cursor_entry + i) & 0x7fff];
+    }
+    content_changed = (cursor_entry != last_entry || cursor_msb != last_cmap ||
+                       is_64 != last_64 || ram_hash != last_ram_hash);
+    if (content_changed) {
+        last_entry = cursor_entry; last_cmap = cursor_msb;
+        last_64 = is_64; last_ram_hash = ram_hash;
+    }
+
+    if (!content_changed) {
+        dpy_mouse_set(con, cx, cy, true);  /* position-only update */
+        return;
+    }
+
+    /* Build QEMUCursor: allocate, fill ARGB data */
+    cur = cursor_alloc(size, size);
+    /* hotspot: VC2 CURSOR_X/Y is the bottom-right corner (anchor).
+     * QEMU positions the hotspot, so hot = size-1 per the plan doc. */
+    cur->hot_x = cur->hot_y = size - 1;
+
+    for (gy = 0; gy < size; gy++) {
+        sy = cy - (size - 1) + gy;
+        for (gx = 0; gx < size; gx++) {
+            uint8_t pixel = 0;
+            int shift = 15 - (gx & 15);
+            uint32_t argb = 0;  /* transparent */
+
+            if (sy >= 0 && sy < NEWPORT_SCREEN_H) {
+                sx = cx - (size - 1) + gx;
+                if (sx >= 0 && sx < NEWPORT_SCREEN_W) {
+                    if (is_64) {
+                        int addr = gy * 4 + (gx / 16);
+                        uint16_t word =
+                            s->vc2_ram[(cursor_entry + addr) & 0x7fff];
+                        pixel = (word >> shift) & 1;
+                    } else {
+                        int addr = gy * 2 + (gx / 16);
+                        uint16_t w0 =
+                            s->vc2_ram[(cursor_entry + addr) & 0x7fff];
+                        uint16_t w1 =
+                            s->vc2_ram[(cursor_entry + addr + 64) & 0x7fff];
+                        pixel = ((w0 >> shift) & 1) |
+                                (((w1 >> shift) & 1) << 1);
+                    }
+                }
+            }
+            if (pixel) {
+                uint32_t rgb = s->cmap0_palette[
+                    (cursor_msb | (pixel & 0x3)) & 0x1fff];
+                uint8_t r = s->ramdac_lut_r[(rgb >> 16) & 0xff];
+                uint8_t g = s->ramdac_lut_g[(rgb >> 8) & 0xff];
+                uint8_t b = s->ramdac_lut_b[rgb & 0xff];
+                argb = (0xffu << 24) | (r << 16) | (g << 8) | b;
+            }
+            cur->data[(size_t)gy * size + gx] = argb;
+        }
+    }
+
+    dpy_cursor_define(con, cur);
+    cursor_unref(cur);  /* console holds its own ref */
+    dpy_mouse_set(con, cx, cy, true);
 }
 
 /*
@@ -2976,43 +3107,68 @@ static void newport_draw_cursor(SGINewportVirtuixState *s, uint32_t *dest)
  * RAMDAC gamma correction.
  * MAME ref: screen_update() at newport.cpp:1282-1529
  */
-static void newport_update_display(void *opaque)
+/* Phase D: saturate the dirty rect list to full-screen (for blanket invalidators). */
+static void newport_dirty_full(SGINewportVirtuixState *s)
+{
+    s->dirty_n = NEWPORT_DIRTY_MAX;  /* saturate */
+    s->display_dirty = true;
+}
+
+/* Phase D: add a dirty rect (post-window-offset VRAM space). Coalesces with
+ * existing rects; overflow → saturate to full-screen.
+ * Currently unused — will be called by per-primitive bounds tracking. */
+static void __attribute__((unused))
+newport_dirty_rect(SGINewportVirtuixState *s, int rx, int ry, int rw, int rh)
+{
+    int i;
+    if (rw <= 0 || rh <= 0) return;
+    if (s->dirty_n >= NEWPORT_DIRTY_MAX) return;  /* already saturated */
+    /* clip to screen */
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > NEWPORT_SCREEN_W) rw = NEWPORT_SCREEN_W - rx;
+    if (ry + rh > NEWPORT_SCREEN_H) rh = NEWPORT_SCREEN_H - ry;
+    if (rw <= 0 || rh <= 0) return;
+    /* coalesce with existing overlapping rect */
+    for (i = 0; i < s->dirty_n; i++) {
+        int *dr = (int *)&s->dirty_rects[i];
+        if (rx < dr[0] + dr[2] && rx + rw > dr[0] &&
+            ry < dr[1] + dr[3] && ry + rh > dr[1]) {
+            int x2 = dr[0] + dr[2], y2 = dr[1] + dr[3];
+            if (rx < dr[0]) dr[0] = rx;
+            if (ry < dr[1]) dr[1] = ry;
+            if (rx + rw > x2) x2 = rx + rw;
+            if (ry + rh > y2) y2 = ry + rh;
+            dr[2] = x2 - dr[0]; dr[3] = y2 - dr[1];
+            newport_dirty_full(s);
+            return;
+        }
+    }
+    if (s->dirty_n < NEWPORT_DIRTY_MAX) {
+        s->dirty_rects[s->dirty_n].x = rx; s->dirty_rects[s->dirty_n].y = ry;
+        s->dirty_rects[s->dirty_n].w = rw; s->dirty_rects[s->dirty_n].h = rh;
+        s->dirty_n++;
+    }
+    newport_dirty_full(s);
+}
+
+/* Render the desktop REX3/VC2/CMAP/RAMDAC pipeline into *dst (w*h xRGB32).
+ * Called by the unified display engine on every frame tick.  force_full means
+ * repaint every pixel (the caller discarded the previous buffer).  Returns true
+ * if any pixels were written (false = completely idle frame, nothing changed). */
+static bool newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
+                                   bool force_full)
 {
     SGINewportVirtuixState *s = opaque;
-    DisplaySurface *surface;
-    uint32_t *dest;
     int x, y;
     uint16_t did_entry_ptr;
     bool use_did;
     uint16_t popup_msb = (uint16_t)s->xmap_popup_cmap << 5;
-    bool ov, do_full;
 
-    {
-        /* Live paravirtual-GL windows (atlantis etc.) animate independently of the desktop;
-         * keep recompositing while any is present even if the desktop is clean. */
-        PVGPUWindow probe[PVGPU_MAXCTX];
-        ov = sgi_glaccel_get_windows(probe, PVGPU_MAXCTX) > 0;
-        /* redraw while a GL window is live, AND for exactly one frame after it clears, so
-         * the desktop underneath is restored instead of keeping the last GL frame. */
-        if (!s->display_dirty && !ov && !s->gl_overlay_was_active) {
-            return;
-        }
-        s->gl_overlay_was_active = ov;
-    }
-    /* Fast path for a smooth GL window: when ONLY the GL window animates (desktop clean),
-     * skip the expensive full-screen DID/CMAP/RAMDAC regeneration — the surface still holds
-     * the last desktop — and just re-composite the GL rect below. Full regen only when the
-     * desktop actually changed, or for the one frame that restores it after the GL clears. */
-    do_full = s->display_dirty || !ov;
-
-    surface = qemu_console_surface(s->con);
-    if (!surface) {
-        return;
+    if (!force_full && !s->display_dirty) {
+        return false;  /* nothing changed; engine can skip the blit */
     }
 
-    dest = (uint32_t *)surface_data(surface);
-
-    if (do_full) {
     did_entry_ptr = s->vc2_reg[VC2_DID_ENTRY];
     use_did = (s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS)
               && did_entry_ptr != 0;
@@ -3020,8 +3176,8 @@ static void newport_update_display(void *opaque)
     for (y = 0; y < NEWPORT_SCREEN_H; y++) {
         const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W];
         const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W];
-        uint8_t pix_mode = 0;   /* 0=CI, 1=RGB Map0, 2=Map1, 3=Map2 */
-        uint8_t pix_size = 1;   /* 0=4bpp, 1=8bpp, 2=12bpp, 3=24bpp */
+        uint8_t pix_mode = 0;
+        uint8_t pix_size = 1;
         uint16_t ci_msb = 0;
         uint16_t aux_msb = 0;
         uint32_t mode_entry = 0;
@@ -3030,12 +3186,6 @@ static void newport_update_display(void *opaque)
         uint16_t next_did_entry = 0;
 
         if (use_did) {
-            /*
-             * DID per-scanline mode: follow frame → line table.
-             * Each DID entry: bits [15:5] = X pos of next mode change,
-             *                 bits [4:0]  = DID (mode table index).
-             * MAME ref: begin_did_line() at newport.cpp:656
-             */
             uint16_t frame_ptr = did_entry_ptr + (uint16_t)y;
             did_line_ptr = s->vc2_ram[frame_ptr & 0x7fff];
             uint16_t entry = s->vc2_ram[did_line_ptr & 0x7fff];
@@ -3050,7 +3200,6 @@ static void newport_update_display(void *opaque)
             case 2: ci_msb = 0x1e00; break;
             case 3: ci_msb = 0x1f00; break;
             }
-            /* Prepare next DID entry — MAME ref: next_did_line_entry() */
             did_line_ptr++;
             next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
         }
@@ -3061,13 +3210,8 @@ static void newport_update_display(void *opaque)
             uint32_t rgb;
             uint8_t r, g, b;
 
-            /*
-             * Check for DID mode change at this X position.
-             * MAME ref: screen_update() at newport.cpp:1298-1312
-             */
             if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
-                mode_entry =
-                    s->xmap_mode_table[next_did_entry & 0x1f];
+                mode_entry = s->xmap_mode_table[next_did_entry & 0x1f];
                 pix_mode = (mode_entry >> 8) & 3;
                 pix_size = (mode_entry >> 10) & 3;
                 aux_pix_mode = (mode_entry >> 16) & 7;
@@ -3082,154 +3226,85 @@ static void newport_update_display(void *opaque)
                 next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
             }
 
-            /*
-             * Compositing priority (MAME ref: screen_update lines 1338-1438):
-             *  1. Cursor pixel (handled in newport_draw_cursor post-loop)
-             *  2. Popup planes (cidaux bits 3,2,6,7 → popup_msb lookup)
-             *  3. Overlay/aux planes (underlay 1,7 always; overlay 2-6
-             *     only when aux pixel is non-zero — zero is transparent)
-             *  4. Main RGBCI pixel
-             *
-             * XL8 cidaux bit layout (8-bit mode, xmap_config bit 2):
-             *   [3:0] = CID (per-window visual mode tag)
-             *   [7:4] = popup planes (bits 2,3) + reserved (bits 6,7)
-             *   [9:8] = overlay/underlay planes
-             */
             if (cidaux & 0xcc) {
-                /* Popup planes active — MAME ref: lines 1343-1347 */
                 uint8_t popup_ci = (cidaux >> 2) & 3;
                 rgb = s->cmap0_palette[(popup_msb | popup_ci) & 0x1fff];
             } else if (aux_pix_mode != 0) {
-                /*
-                 * Overlay/underlay compositing — per-mode handling.
-                 * XL8 (8-bit mode): overlay bits at cidaux[9:8].
-                 * MAME ref: newport.cpp lines 1350-1393
-                 */
                 bool overlay_hit = false;
                 switch (aux_pix_mode) {
-                case 1: /* 2-Bit Underlay — always drawn */
-                    rgb = s->cmap0_palette[
-                        (aux_msb | ((cidaux >> 8) & 3)) & 0x1fff];
+                case 1:
+                    rgb = s->cmap0_palette[(aux_msb | ((cidaux >> 8) & 3)) & 0x1fff];
                     overlay_hit = true;
                     break;
-                case 2: /* 2-Bit Overlay — zero is transparent */ {
+                case 2: {
                     uint32_t ovl = (cidaux >> 8) & 3;
                     if (ovl) {
-                        rgb = s->cmap0_palette[
-                            (aux_msb | ovl) & 0x1fff];
+                        rgb = s->cmap0_palette[(aux_msb | ovl) & 0x1fff];
                         overlay_hit = true;
                     }
                     break;
                 }
-                case 6: /* 1-Bit Overlay */ {
+                case 6: {
                     uint32_t shift = (mode_entry & 2) ? 9 : 8;
                     uint32_t ovl = (cidaux >> shift) & 1;
                     if (ovl) {
-                        rgb = s->cmap0_palette[
-                            (aux_msb | ovl) & 0x1fff];
+                        rgb = s->cmap0_palette[(aux_msb | ovl) & 0x1fff];
                         overlay_hit = true;
                     }
                     break;
                 }
-                case 7: /* 1-Bit Overlay + 1-Bit Underlay */ {
+                case 7: {
                     uint32_t ovl = (cidaux >> 8) & 1;
-                    if (ovl) {
-                        rgb = s->cmap0_palette[
-                            (aux_msb | ovl) & 0x1fff];
-                    } else {
-                        rgb = s->cmap0_palette[
-                            (aux_msb | ((cidaux >> 9) & 1)) & 0x1fff];
-                    }
+                    rgb = s->cmap0_palette[
+                        (aux_msb | (ovl ? ovl : ((cidaux >> 9) & 1))) & 0x1fff];
                     overlay_hit = true;
                     break;
                 }
-                default:
-                    break;
+                default: break;
                 }
-                if (!overlay_hit) {
-                    goto main_pixel;
-                }
+                if (!overlay_hit) goto main_pixel;
             } else {
             main_pixel:
             if (pix_mode == 0) {
-                /* CI mode — look up in CMAP palette */
                 uint16_t ci;
                 switch (pix_size) {
                 case 0: ci = pixel & 0xf; break;
                 case 1: ci = pixel & 0xff; break;
-                case 2: ci = pixel & 0xfff; break;  /* 12bpp CI */
+                case 2: ci = pixel & 0xfff; break;
                 default: ci = pixel & 0xff; break;
                 }
                 rgb = s->cmap0_palette[(ci_msb | ci) & 0x1fff];
             } else {
-                /* RGB mode — unpack packed BGR pixel (MAME ref:
-                 * convert_{4,8,12}bpp_bgr_to_24bpp_rgb()) */
                 rgb = newport_rgb_unpack(pixel, pix_size, mode_entry);
             }
             }
 
-            /* RAMDAC gamma correction — MAME ref: ramdac_remap() line 1550 */
             r = s->ramdac_lut_r[(rgb >> 16) & 0xff];
             g = s->ramdac_lut_g[(rgb >> 8) & 0xff];
             b = s->ramdac_lut_b[rgb & 0xff];
 
-            dest[y * NEWPORT_SCREEN_W + x] = rgb_to_pixel32(r, g, b);
+            dst[(size_t)y * w + x] = rgb_to_pixel32(r, g, b);
         }
     }
-    }   /* if (do_full) — else the surface keeps the last desktop, just recomposite the GL rect */
 
-    /* Paravirtual-GL desktop overlay: composite EVERY active host-rendered GL window into the
-     * live desktop at its tracked screen position — windows on the 4Dwm desktop, not separate
-     * consoles — each clipped so windows stacked above it correctly occlude it. Pixels are
-     * host xRGB (RAMDAC-final); re-pack through rgb_to_pixel32. */
+    /* Cursor overlay — hardware path (Phase E) or software fallback */
     {
-        PVGPUWindow wins[PVGPU_MAXCTX];
-        int nw = sgi_glaccel_get_windows(wins, PVGPU_MAXCTX);
-        int wi, yy, xx, k;
-        for (wi = 0; wi < nw; wi++) {
-            PVGPUWindow *gw = &wins[wi];
-            for (yy = 0; yy < gw->h; yy++) {
-                int dy = gw->y + yy;
-                if (dy < 0 || dy >= NEWPORT_SCREEN_H) {
-                    continue;
-                }
-                for (xx = 0; xx < gw->w; xx++) {
-                    int dx = gw->x + xx;
-                    uint32_t px;
-                    if (dx < 0 || dx >= NEWPORT_SCREEN_W) {
-                        continue;
-                    }
-                    for (k = 0; k < gw->n_occ; k++) {  /* skip pixels under a higher window */
-                        if (dx >= gw->occ[k][0] && dx < gw->occ[k][0] + gw->occ[k][2] &&
-                            dy >= gw->occ[k][1] && dy < gw->occ[k][1] + gw->occ[k][3]) {
-                            break;
-                        }
-                    }
-                    if (k < gw->n_occ) {
-                        continue;
-                    }
-                    px = gw->frame[yy * gw->w + xx];
-                    dest[dy * NEWPORT_SCREEN_W + dx] =
-                        rgb_to_pixel32((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff);
-                }
-            }
-        }
+        static int hw_cursor = -1;
+        if (hw_cursor < 0)
+            hw_cursor = getenv("PVDISPLAY_SOFT_CURSOR") ? 0 : 1;
+        if (hw_cursor)
+            newport_update_hw_cursor(s);
+        else
+            newport_draw_cursor(s, dst);
     }
-
-    /* Cursor overlay (drawn on top of everything) */
-    newport_draw_cursor(s, dest);
 
     /* NewView frame boundary marker */
     newport_newview_log(s, 0x80000000, 0);
 
-    dpy_gfx_update(s->con, 0, 0, NEWPORT_SCREEN_W, NEWPORT_SCREEN_H);
     s->display_dirty = false;
+    s->dirty_n = 0;  /* Phase D: clear dirty rects */
+    return true;
 }
-
-static const GraphicHwOps newport_gfx_ops = {
-    .invalidate = newport_invalidate,
-    .gfx_update = newport_update_display,
-};
 
 /*
  * ============================================================
@@ -3365,7 +3440,7 @@ static void sgi_newport_virtuix_reset(DeviceState *dev)
                NEWPORT_VRAM_W * NEWPORT_VRAM_H * sizeof(uint32_t));
     }
 
-    s->display_dirty = true;
+    newport_dirty_full(s);
 }
 
 static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
@@ -3392,9 +3467,10 @@ static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 60);
 
-    /* Create display console */
-    s->con = graphic_console_init(dev, 0, &newport_gfx_ops, s);
-    qemu_console_resize(s->con, NEWPORT_SCREEN_W, NEWPORT_SCREEN_H);
+    /* Register as the desktop renderer with the unified display engine.
+     * The engine owns the QemuConsole; we only render pixels into its buffer. */
+    sgi_glaccel_register_desktop(newport_render_desktop, newport_invalidate,
+                                  s, NEWPORT_SCREEN_W, NEWPORT_SCREEN_H);
 
     /* Open NewView binary log file if property is set */
     if (s->newview_log_path && s->newview_log_path[0] != '\0') {
@@ -3406,7 +3482,7 @@ static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
         }
     }
 
-    s->display_dirty = true;
+    newport_dirty_full(s);
 }
 
 static void sgi_newport_virtuix_init(Object *obj)
@@ -3868,7 +3944,7 @@ static void newport_set_fb_dump(Object *obj, const char *value, Error **errp)
 
     if (value && value[0] != '\0') {
         /* Force display dirty so the surface gets updated too */
-        s->display_dirty = true;
+        newport_dirty_full(s);
         newport_dump_vram_ppm(s, value);
     }
 }
@@ -3886,7 +3962,7 @@ static int sgi_newport_virtuix_post_load(void *opaque, int version_id)
     newport_decode_drawmode0(s);
 
     /* Force display refresh */
-    s->display_dirty = true;
+    newport_dirty_full(s);
 
     return 0;
 }
