@@ -760,90 +760,314 @@ static const int16_t rwpacked_max_len[2][4] = {
 };
 
 /*
- * Host-offloaded fast path for the common solid rectangle fill (root weave,
- * window clears, opaque panel fills) — the bulk of 4Dwm's REX3 traffic and the
- * single most host-CPU-expensive thing the per-pixel emulator does. When the
- * fill is solid-color, opaque, unclipped, no-stipple, full-rect with a logic op
- * whose result is independent of the destination, every pixel of a row is the
- * same constant store to a CONTIGUOUS run of VRAM, so we fill each row with a
- * tight word loop instead of ~4 function calls + clip/offset/bounds recompute
- * per pixel. Output is bit-identical to the newport_output_pixel path; the
- * caller gates entry on exactly the conditions assumed here, and we leave the
- * coordinate registers exactly where the slow loop would (iter = x_save, end_y).
+ * ============================================================
+ * Phase C 2D instrumentation + A/B oracle
+ * ============================================================
+ *
+ * NP_2D_FORCE_SLOW=1 bypasses every host-native 2D fast path (scr2scr memmove
+ * and fast_block_fill), forcing the per-pixel reference paths. It is the
+ * bit-exact A/B oracle and must change nothing else.
+ *
+ * NP_2D_STATS=1 accumulates a per-primitive histogram (keyed so fills / copies /
+ * spans / images are distinguishable — this doubles as the Stage 2 op-ranking
+ * input) with a fast-vs-slow split inside each primitive that has a host fast
+ * path. Counted once per primitive at dispatch — NEVER per pixel (Phase C
+ * pitfall "instrumentation in the hot path"). Dumped to stderr roughly every
+ * 10s (checked on a primitive tick, not with a timer/per-pixel fprintf) and at
+ * process exit, one parseable "NP_2D_STATS:" line per non-zero bucket.
  */
-static void newport_fast_block_fill(SGINewportVirtuixState *s,
-                                    int16_t start_x, int16_t start_y,
-                                    int16_t end_x, int16_t end_y,
-                                    int16_t dx, int16_t dy, uint32_t color)
+static int np_2d_force_slow = -1;
+static inline bool newport_2d_force_slow(void)
+{
+    if (np_2d_force_slow < 0) {
+        np_2d_force_slow = getenv("NP_2D_FORCE_SLOW") ? 1 : 0;
+    }
+    return np_2d_force_slow;
+}
+
+enum {
+    NP2D_NOOP, NP2D_READ,
+    NP2D_BLOCK_FAST, NP2D_BLOCK_SLOW,   /* fills */
+    NP2D_SPAN,                          /* plain spans */
+    NP2D_IMAGE,                         /* colorhost span/block = image/text blit */
+    NP2D_ILINE, NP2D_FLINE,             /* lines */
+    NP2D_SCR2SCR_FAST, NP2D_SCR2SCR_SLOW, /* copies */
+    NP2D_DRAW_OTHER,
+    NP2D_NBUCKET
+};
+static const char *const np2d_names[NP2D_NBUCKET] = {
+    "noop", "read", "block_fast", "block_slow", "span", "image",
+    "iline", "fline", "scr2scr_fast", "scr2scr_slow", "draw_other"
+};
+static uint64_t np2d_count[NP2D_NBUCKET];
+static int np_2d_stats = -1;
+
+/* NP_2D_DIAG: reason a fill/copy fell to the slow path (temporary). */
+enum {
+    DIAG_BF_STOP, DIAG_BF_STOPX, DIAG_BF_STOPY,
+    DIAG_BF_SHADE, DIAG_BF_RGB, DIAG_BF_PAT, DIAG_BF_PEND,
+    DIAG_BF_CLIP, DIAG_BF_PLANE, DIAG_BF_XSAVE, DIAG_BF_LOGIC,
+    DIAG_SS_STOP, DIAG_SS_CLIP, DIAG_SS_LOGIC, DIAG_SS_HOST, DIAG_SS_PAT,
+    DIAG_SS_SHADE, DIAG_SS_PLANE, DIAG_SS_OOB,
+    DIAG_N
+};
+static const char *const diag_names[DIAG_N] = {
+    "bf_1px", "bf_1col", "bf_1row",
+    "bf_shade", "bf_rgb", "bf_pat", "bf_pend", "bf_clip",
+    "bf_plane", "bf_xsave", "bf_logic",
+    "ss_stop", "ss_clip", "ss_logic", "ss_host", "ss_pat", "ss_shade",
+    "ss_plane", "ss_oob"
+};
+static uint64_t diag_count[DIAG_N];
+static int np_2d_diag = -1;
+static inline void newport_2d_diag(int r)
+{
+    if (np_2d_diag < 0) {
+        np_2d_diag = getenv("NP_2D_DIAG") ? 1 : 0;
+    }
+    if (np_2d_diag) {
+        diag_count[r]++;
+    }
+}
+
+static void newport_2d_stats_dump(void)
+{
+    int i;
+    for (i = 0; i < NP2D_NBUCKET; i++) {
+        if (np2d_count[i]) {
+            fprintf(stderr, "NP_2D_STATS: %-13s %" PRIu64 "\n",
+                    np2d_names[i], np2d_count[i]);
+        }
+    }
+    for (i = 0; i < DIAG_N; i++) {
+        if (diag_count[i]) {
+            fprintf(stderr, "NP_2D_DIAG: %-10s %" PRIu64 "\n",
+                    diag_names[i], diag_count[i]);
+        }
+    }
+}
+
+static void newport_2d_stats_atexit(void)
+{
+    if (np_2d_stats > 0) {
+        newport_2d_stats_dump();
+    }
+}
+
+static inline void newport_2d_stat(int bucket)
+{
+    if (np_2d_stats < 0) {
+        np_2d_stats = getenv("NP_2D_STATS") ? 1 : 0;
+        if (np_2d_stats) {
+            atexit(newport_2d_stats_atexit);
+        }
+    }
+    if (!np_2d_stats) {
+        return;
+    }
+    np2d_count[bucket]++;
+    /* time-based dump ~every 10s, checked on a primitive tick (never per pixel) */
+    {
+        static int64_t last_us;
+        int64_t now = g_get_monotonic_time();   /* microseconds */
+        if (last_us == 0) {
+            last_us = now;
+        } else if (now - last_us >= (int64_t)10 * 1000 * 1000) {
+            last_us = now;
+            newport_2d_stats_dump();
+        }
+    }
+}
+
+/*
+ * If the enabled screenmask clip region is expressible as a SINGLE rectangle,
+ * write its inclusive bounds in RAW (pre-window-offset) fill coordinates — the
+ * same space as x_start_int/y_start_int — to *x0..*y1 and return true.  Returns
+ * false when more than one of masks 1-4 is enabled (their pass-if-inside-ANY
+ * semantics form a union, not a rectangle) so the caller must use the slow
+ * per-pixel path.  clip_mode==0 is handled by the caller (unbounded); this
+ * helper is only called when clip_mode != 0.
+ *
+ * Derivation matches newport_pixel_clip_pass():
+ *   mask 0    — compares raw x in [smask_x[0]>>16 .. smask_x[0]&0xffff]
+ *   masks 1-4 — compare wx = x+winx-0x1000 in [(smask>>16)-0x1000 ..
+ *               (smask&0xffff)-0x1000], i.e. raw x in
+ *               [(smask>>16)-winx .. (smask&0xffff)-winx].
+ */
+typedef struct { int x0, y0, x1, y1; } NPClipRect;   /* inclusive raw coords */
+
+/*
+ * Decompose the enabled screenmask clip (clip_mode != 0) into a set of
+ * rectangles in the RAW coordinate space that output_pixel receives (for a
+ * fill: the draw coords; for scr2scr: the destination coords).  Overall pass =
+ *   (inside mask0, if mask0 enabled) AND (inside ANY of the enabled masks 1-4).
+ * So the passing region is the union of (mask0 ∩ maski) over the enabled i, or
+ * just mask0 when none of 1-4 are enabled.  Returns the sub-rect count (1..4);
+ * out[] holds inclusive raw bounds.  Coordinate derivation matches
+ * newport_pixel_clip_pass() exactly.  Only valid when clip_mode != 0.
+ */
+static int newport_clip_subrects(SGINewportVirtuixState *s, NPClipRect *out)
+{
+    int winx = (int16_t)((s->xy_window >> 16) & 0xffff);
+    int winy = (int16_t)(s->xy_window & 0xffff);
+    int bx0 = INT_MIN, by0 = INT_MIN, bx1 = INT_MAX, by1 = INT_MAX;
+    int n = 0, bit;
+
+    if (s->clip_mode & 1) {                    /* mask 0: raw coordinates */
+        bx0 = (int16_t)(s->smask_x[0] >> 16);
+        bx1 = (int16_t)(s->smask_x[0] & 0xffff);
+        by0 = (int16_t)(s->smask_y[0] >> 16);
+        by1 = (int16_t)(s->smask_y[0] & 0xffff);
+    }
+    for (bit = 1; bit < 5; bit++) {
+        if (!(s->clip_mode & (1 << bit))) {
+            continue;
+        }
+        /* masks 1-4: wx = x+winx-0x1000 in [(smask>>16)-0x1000 ..
+         * (smask&0xffff)-0x1000] ⇒ raw x in [(smask>>16)-winx ..
+         * (smask&0xffff)-winx]. */
+        int a = (int16_t)(s->smask_x[bit] >> 16) - winx;
+        int b = (int16_t)(s->smask_x[bit] & 0xffff) - winx;
+        int c = (int16_t)(s->smask_y[bit] >> 16) - winy;
+        int d = (int16_t)(s->smask_y[bit] & 0xffff) - winy;
+        out[n].x0 = MAX(bx0, a); out[n].x1 = MIN(bx1, b);
+        out[n].y0 = MAX(by0, c); out[n].y1 = MIN(by1, d);
+        n++;
+    }
+    if (n == 0) {
+        out[0].x0 = bx0; out[0].y0 = by0; out[0].x1 = bx1; out[0].y1 = by1;
+        n = 1;
+    }
+    return n;
+}
+
+/*
+ * Host-offloaded fast path for solid rectangle / single-row fills (root weave,
+ * window clears, opaque panel fills, and — dominant on the 4Dwm desktop — the
+ * stop-on-x-only single-row fills Xsgi emits row by row).  Every covered pixel
+ * is the same constant store to a CONTIGUOUS run of VRAM, so we fill each row
+ * with a tight word loop instead of ~4 function calls per pixel.  Output is
+ * bit-identical to the newport_output_pixel path.
+ *
+ * The WRITE extent [fx0..fx1] x [fy0..fy1] (raw, inclusive, pre-clip) and the
+ * register end-state (reg_x, reg_y) are computed by the caller from the stop
+ * bits — clipping only suppresses writes, never changes the register end-state,
+ * so the two are passed independently.  clip[] is the (possibly multi-rect)
+ * clip decomposition intersected with the write extent; pass one INT_MIN/INT_MAX
+ * rect when unclipped.  Registers are written once by the caller.
+ */
+/* Apply plane-lane shift + logic op to a raw pixel value, matching
+ * newport_logic_pixel (only dst-independent logic ops reach the fast path). */
+static inline uint32_t np_fast_cval(SGINewportVirtuixState *s, uint32_t v)
+{
+    if (s->dm1_planes == 5) {
+        v <<= 2;
+    } else if (s->dm1_planes == 4) {
+        v <<= 8;
+    }
+    switch (s->dm1_logicop) {
+    case 0x0: return 0;
+    case 0xc: return ~v;
+    case 0xf: return 0xffffffff;
+    default:  return v;            /* 0x3 SRC — the overwhelmingly common case */
+    }
+}
+
+static void newport_fast_fill_rect(SGINewportVirtuixState *s,
+                                   int fx0, int fy0, int fx1, int fy1,
+                                   uint32_t color, uint32_t color_back,
+                                   uint32_t pattern, bool opaque,
+                                   int start_x, int dx)
 {
     uint32_t *buf = (s->dm1_planes == 4 || s->dm1_planes == 5 ||
                      s->dm1_planes == 6) ? s->vram_cidaux : s->vram_rgbci;
-    uint32_t src = color;
-    uint32_t cval, mask, cm, nm;
-    int winx, winy, xa, xb, ya, yb, y;
+    uint32_t cval = np_fast_cval(s, color);
+    uint32_t cbak = np_fast_cval(s, color_back);
+    uint32_t mask = s->write_mask & s->global_mask;
+    uint32_t cm = cval & mask, cbm = cbak & mask, nm = ~mask;
+    int winx = (int16_t)((s->xy_window >> 16) & 0xffff);
+    int winy = (int16_t)(s->xy_window & 0xffff);
+    int y;
 
-    /* plane-lane shift — matches newport_logic_pixel */
-    if (s->dm1_planes == 5) {
-        src <<= 2;
-    } else if (s->dm1_planes == 4) {
-        src <<= 8;
-    }
-    /* logic op — only dst-independent ops reach here (gated by caller) */
-    switch (s->dm1_logicop) {
-    case 0x0: cval = 0; break;
-    case 0xc: cval = ~src; break;
-    case 0xf: cval = 0xffffffff; break;
-    default:  cval = src; break;   /* 0x3 SRC — the overwhelmingly common case */
-    }
-    mask = s->write_mask & s->global_mask;
-    cm = cval & mask; nm = ~mask;
-
-    winx = (int16_t)((s->xy_window >> 16) & 0xffff);
-    winy = (int16_t)(s->xy_window & 0xffff);
-
-    /* inclusive pixel ranges the slow loop draws: x in [start_x,end_x) step dx */
-    xa = (dx > 0) ? start_x : (end_x + 1);
-    xb = (dx > 0) ? (end_x - 1) : start_x;
-    ya = (dy > 0) ? start_y : (end_y + 1);
-    yb = (dy > 0) ? (end_y - 1) : start_y;
-
-    for (y = ya; y <= yb; y++) {
+    for (y = fy0; y <= fy1; y++) {
         int wy = y + winy - 0x1000;
-        int wxa = xa + winx - 0x1000;
-        int wxb = xb + winx - 0x1000;
-        uint32_t base;
-        int n, i;
+        uint32_t rowoff;
 
         if (wy < 0 || wy >= NEWPORT_VRAM_H) {
-            continue;                      /* out-of-bounds row: slow path skips too */
+            continue;                  /* out-of-bounds row: slow path skips too */
         }
-        if (wxa < 0) {
-            wxa = 0;
-        }
-        if (wxb >= NEWPORT_VRAM_W) {
-            wxb = NEWPORT_VRAM_W - 1;
-        }
-        if (wxa > wxb) {
-            continue;
-        }
-        base = (uint32_t)wy * NEWPORT_VRAM_W + (uint32_t)wxa;
-        n = wxb - wxa + 1;
-        if (mask == 0xffffffff) {
-            for (i = 0; i < n; i++) {
-                buf[base + i] = cval;
+        rowoff = (uint32_t)wy * NEWPORT_VRAM_W;
+
+        if (pattern == 0xffffffff) {
+            /* solid: one contiguous run per row */
+            int wxa = fx0 + winx - 0x1000;
+            int wxb = fx1 + winx - 0x1000;
+            uint32_t base;
+            int n, i;
+            if (wxa < 0) wxa = 0;
+            if (wxb >= NEWPORT_VRAM_W) wxb = NEWPORT_VRAM_W - 1;
+            if (wxa > wxb) continue;
+            base = rowoff + (uint32_t)wxa;
+            n = wxb - wxa + 1;
+            if (mask == 0xffffffff) {
+                for (i = 0; i < n; i++) buf[base + i] = cval;
+            } else {
+                for (i = 0; i < n; i++) buf[base + i] = (buf[base + i] & nm) | cm;
             }
         } else {
-            for (i = 0; i < n; i++) {
-                buf[base + i] = (buf[base + i] & nm) | cm;
+            /* stipple: per-pixel pattern (32-bit, phase reset each row to bit 31
+             * at start_x).  Bit for raw x = (31 - |x-start_x|) & 31. */
+            int lo = 0x1000 - winx;                       /* raw x for wx=0 */
+            int hi = lo + NEWPORT_VRAM_W - 1;             /* raw x for wx=W-1 */
+            int xa = MAX(fx0, lo), xb = MIN(fx1, hi), x;
+            for (x = xa; x <= xb; x++) {
+                int i = (dx > 0) ? (x - start_x) : (start_x - x);
+                int bit = (31 - (i & 31)) & 31;
+                uint32_t addr = rowoff + (uint32_t)(x + winx - 0x1000);
+                if (pattern & (1u << bit)) {
+                    buf[addr] = (buf[addr] & nm) | cm;
+                } else if (opaque) {
+                    buf[addr] = (buf[addr] & nm) | cbm;
+                }
             }
         }
     }
 
-    /* leave the coordinate registers where the per-pixel loop would */
-    s->iter_x = s->x_save_int;
-    s->iter_y = end_y;
-    newport_write_x_start(s, (int32_t)s->x_save_int << 11);
-    newport_write_y_start(s, (int32_t)end_y << 11);
+    if (fx0 <= fx1 && fy0 <= fy1) {
+        newport_dirty_rect(s, fx0 + winx - 0x1000, fy0 + winy - 0x1000,
+                           fx1 - fx0 + 1, fy1 - fy0 + 1);
+    }
+}
+
+/*
+ * Fill the (raw, inclusive) extent [wx0..wx1] x [wy0..wy1], honouring the
+ * screenmask clip: unclipped fills the whole extent; clipped intersects the
+ * extent with each clip sub-rectangle and fills each (constant colour, so
+ * overlapping sub-rects are idempotent).  Does NOT touch coordinate registers.
+ */
+static void newport_fast_block_fill(SGINewportVirtuixState *s,
+                                    int wx0, int wy0, int wx1, int wy1,
+                                    uint32_t color, uint32_t color_back,
+                                    uint32_t pattern, bool opaque,
+                                    int start_x, int dx)
+{
+    if (s->clip_mode == 0) {
+        newport_fast_fill_rect(s, wx0, wy0, wx1, wy1, color, color_back,
+                               pattern, opaque, start_x, dx);
+        return;
+    }
+    {
+        NPClipRect cr[4];
+        int nc = newport_clip_subrects(s, cr), ci;
+        for (ci = 0; ci < nc; ci++) {
+            int fx0 = MAX(wx0, cr[ci].x0), fx1 = MIN(wx1, cr[ci].x1);
+            int fy0 = MAX(wy0, cr[ci].y0), fy1 = MIN(wy1, cr[ci].y1);
+            if (fx0 <= fx1 && fy0 <= fy1) {
+                newport_fast_fill_rect(s, fx0, fy0, fx1, fy1, color, color_back,
+                                       pattern, opaque, start_x, dx);
+            }
+        }
+    }
 }
 
 /*
@@ -923,14 +1147,67 @@ static void newport_draw_block(SGINewportVirtuixState *s)
      * reproduces it with a per-row word fill. Anything else falls through to
      * the faithful per-pixel path unchanged.
      */
-    if (stop_on_x && stop_on_y && !shade && !lr_abort &&
-        !s->dm0_colorhost && (!s->dm1_rgbmode || s->dm1_fastclear) &&
-        pattern == 0xffffffff && prim_end_x == end_x && s->clip_mode == 0 &&
-        s->dm1_planes != 0 && s->x_save_int == start_x &&
-        (s->dm1_logicop == 0x3 || s->dm1_logicop == 0x0 ||
-         s->dm1_logicop == 0xc || s->dm1_logicop == 0xf)) {
-        newport_fast_block_fill(s, start_x, start_y, end_x, end_y, dx, dy, color);
-        return;
+    {
+        /*
+         * Fast path gate.  Requires stop-on-x (so the inner loop draws a full
+         * contiguous row and the row-complete branch runs, leaving x at
+         * x_save_int); stop-on-y is optional:
+         *   stop_on_y  ⇒ fill the rectangle [x_start..x_end] x [y_start..y_end],
+         *                registers end at (x_save_int, y_end+dy);
+         *   !stop_on_y ⇒ the outer loop runs exactly once, so ONE row
+         *                (y=start_y) is filled regardless of y_end, and
+         *                registers end at (x_save_int, start_y+dy).  This is the
+         *                dominant Xsgi form (row-by-row fills).
+         * Clipping (any clip_mode) is honoured inside newport_fast_block_fill by
+         * intersecting with the clip sub-rectangles; it never changes the
+         * register end-state (the slow loop iterates the full extent regardless
+         * of clip).  Gated to the main RGBCI planes (1/2) so no overlay/popup/
+         * CID plane-lane shift is involved.
+         */
+        bool fast_ok = stop_on_x && !shade && !lr_abort &&
+            !s->dm0_colorhost && (!s->dm1_rgbmode || s->dm1_fastclear) &&
+            prim_end_x == end_x &&
+            (s->dm1_planes == 1 || s->dm1_planes == 2) &&
+            s->x_save_int == start_x &&
+            (s->dm1_logicop == 0x3 || s->dm1_logicop == 0x0 ||
+             s->dm1_logicop == 0xc || s->dm1_logicop == 0xf);
+        if (fast_ok && !newport_2d_force_slow()) {
+            int16_t orig_end_x = s->x_end_int;   /* end_x is already exclusive */
+            int16_t orig_end_y = s->y_end_int;
+            int wx0 = MIN(start_x, orig_end_x);
+            int wx1 = MAX(start_x, orig_end_x);
+            int wy0, wy1, reg_y;
+            if (stop_on_y) {
+                wy0 = MIN(start_y, orig_end_y);
+                wy1 = MAX(start_y, orig_end_y);
+                reg_y = orig_end_y + dy;
+            } else {
+                wy0 = wy1 = start_y;             /* single row */
+                reg_y = start_y + dy;
+            }
+            newport_2d_stat(NP2D_BLOCK_FAST);
+            newport_fast_block_fill(s, wx0, wy0, wx1, wy1, color, s->color_back,
+                                    pattern, s->dm0_opaque, start_x, dx);
+            /* register end-state (independent of clip) */
+            s->iter_x = s->x_save_int;
+            s->iter_y = reg_y;
+            newport_write_x_start(s, (int32_t)s->x_save_int << 11);
+            newport_write_y_start(s, (int32_t)reg_y << 11);
+            return;
+        }
+        newport_2d_stat(s->dm0_colorhost ? NP2D_IMAGE : NP2D_BLOCK_SLOW);
+        if (!s->dm0_colorhost && !newport_2d_force_slow()) {
+            if (!stop_on_x) {
+                if (!stop_on_y) newport_2d_diag(DIAG_BF_STOP);       /* 1 pixel */
+                else newport_2d_diag(DIAG_BF_STOPX);                 /* 1 col */
+            }
+            else if (shade || lr_abort) newport_2d_diag(DIAG_BF_SHADE);
+            else if (s->dm1_rgbmode && !s->dm1_fastclear) newport_2d_diag(DIAG_BF_RGB);
+            else if (prim_end_x != end_x) newport_2d_diag(DIAG_BF_PEND);
+            else if (!(s->dm1_planes == 1 || s->dm1_planes == 2)) newport_2d_diag(DIAG_BF_PLANE);
+            else if (s->x_save_int != start_x) newport_2d_diag(DIAG_BF_XSAVE);
+            else newport_2d_diag(DIAG_BF_LOGIC);
+        }
     }
 
     sx = start_x;
@@ -1044,6 +1321,8 @@ static void newport_draw_span(SGINewportVirtuixState *s)
             prim_end_x = start_x + dx * ml;
         }
     }
+
+    newport_2d_stat(s->dm0_colorhost ? NP2D_IMAGE : NP2D_SPAN);
 
     sx = start_x;
     do {
@@ -1229,6 +1508,137 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
     trace_sgi_newport_draw_scr2scr(start_x, start_y, end_x, end_y,
                                    move_x, move_y);
 
+    /*
+     * ---- Phase C host-fast scr2scr (the REAL desktop copy form) ----
+     *
+     * 4Dwm window drags and terminal scrolls arrive as OP_SCR2SCR that is
+     * BLOCK-addressed (stop-on-x AND stop-on-y set), logic op SRC, no
+     * colorhost/pattern/shade, on the main RGBCI planes.  Reproduce the slow
+     * loop's result with a per-row memmove:
+     *   - iterate source rows in the slow loop's dy order (this is what makes
+     *     vertical overlap safe: for a downward copy the guest picks dy<0 so
+     *     the bottom rows move first);
+     *   - memmove copies each contiguous run and handles horizontal overlap
+     *     within a row; the masked variant does a read-modify-write in the
+     *     non-clobbering direction;
+     *   - leave x_start/y_start exactly where the slow loop leaves them
+     *     (x_save_int, end_y+dy) — nothing else (the slow scr2scr does not
+     *     touch iter_x/iter_y).
+     * Clip (any clip_mode) is honoured by intersecting the DESTINATION extent
+     * with a SINGLE clip sub-rectangle (multi-rect clip stays slow: filling a
+     * copy region out of raw y-order across disjoint sub-rects could clobber an
+     * overlapping source — not worth the risk for the rare case).  Gated to the
+     * main RGBCI planes and to copies whose (clipped) source AND destination
+     * rectangles are fully on-screen, so none of the per-pixel clipping
+     * subtleties the slow loop has (OOB source reads as 0, OOB dest write
+     * skipped) can diverge; anything partially off-screen or on the overlay/
+     * popup/CID planes falls through to the faithful per-pixel loop.  The
+     * register end-state (x_save_int, end_y+dy) is independent of clip.
+     */
+    if (!newport_2d_force_slow() &&
+        stop_on_x && stop_on_y &&
+        s->dm1_logicop == 0x3 &&
+        !s->dm0_colorhost &&
+        !s->dm0_lspattern && !s->dm0_zpattern &&
+        !(s->drawmode0 & DM0_SHADE) &&
+        (s->dm1_planes == 1 || s->dm1_planes == 2)) {
+
+        int winx = (int16_t)((s->xy_window >> 16) & 0xffff);
+        int winy = (int16_t)(s->xy_window & 0xffff);
+        int xlo = MIN(start_x, end_x), xhi = MAX(start_x, end_x);
+        int ylo = MIN(start_y, end_y), yhi = MAX(start_y, end_y);
+        /* destination extent in raw (output_pixel) coords */
+        int Dxl = xlo + move_x, Dxh = xhi + move_x;
+        int Dyl = ylo + move_y, Dyh = yhi + move_y;
+        bool clip_ok = true;
+
+        if (s->clip_mode != 0) {
+            NPClipRect cr[4];
+            if (newport_clip_subrects(s, cr) != 1) {
+                clip_ok = false;                 /* multi-rect copy → slow */
+            } else {
+                Dxl = MAX(Dxl, cr[0].x0); Dxh = MIN(Dxh, cr[0].x1);
+                Dyl = MAX(Dyl, cr[0].y0); Dyh = MIN(Dyh, cr[0].y1);
+            }
+        }
+
+        if (clip_ok) {
+            bool empty = (Dxl > Dxh) || (Dyl > Dyh);
+            bool inb = true;
+            if (!empty) {
+                int dsx0 = Dxl + winx - 0x1000, dsx1 = Dxh + winx - 0x1000;
+                int ssx0 = (Dxl - move_x) + winx - 0x1000;
+                int ssx1 = (Dxh - move_x) + winx - 0x1000;
+                int dsy0 = Dyl + winy - 0x1000, dsy1 = Dyh + winy - 0x1000;
+                int ssy0 = (Dyl - move_y) + winy - 0x1000;
+                int ssy1 = (Dyh - move_y) + winy - 0x1000;
+                inb = dsx0 >= 0 && dsx1 < NEWPORT_VRAM_W &&
+                      ssx0 >= 0 && ssx1 < NEWPORT_VRAM_W &&
+                      dsy0 >= 0 && dsy1 < NEWPORT_VRAM_H &&
+                      ssy0 >= 0 && ssy1 < NEWPORT_VRAM_H;
+            }
+
+            if (inb) {
+                newport_2d_stat(NP2D_SCR2SCR_FAST);
+                if (!empty) {
+                    uint32_t *buf = s->vram_rgbci;
+                    uint32_t mask = s->write_mask & s->global_mask;
+                    int row_w = Dxh - Dxl + 1;
+                    int dst_x0 = Dxl + winx - 0x1000;
+                    int src_x0 = (Dxl - move_x) + winx - 0x1000;
+                    int Yr_start = (dy > 0) ? Dyl : Dyh;
+                    int Yr_end   = (dy > 0) ? Dyh : Dyl;
+                    int Yr;
+
+                    for (Yr = Yr_start; (dy > 0) ? Yr <= Yr_end : Yr >= Yr_end;
+                         Yr += dy) {
+                        int dst_y = Yr + winy - 0x1000;
+                        int src_y = (Yr - move_y) + winy - 0x1000;
+                        uint32_t *drow =
+                            &buf[(size_t)dst_y * NEWPORT_VRAM_W + dst_x0];
+                        uint32_t *srow =
+                            &buf[(size_t)src_y * NEWPORT_VRAM_W + src_x0];
+                        if (mask == 0xffffffff) {
+                            memmove(drow, srow, (size_t)row_w * 4);
+                        } else {
+                            uint32_t nm = ~mask;
+                            int xi;
+                            if (move_x <= 0) {   /* dest left of src: L→R */
+                                for (xi = 0; xi < row_w; xi++) {
+                                    drow[xi] = (drow[xi] & nm) | (srow[xi] & mask);
+                                }
+                            } else {             /* dest right of src: R→L */
+                                for (xi = row_w - 1; xi >= 0; xi--) {
+                                    drow[xi] = (drow[xi] & nm) | (srow[xi] & mask);
+                                }
+                            }
+                        }
+                    }
+                    newport_dirty_rect(s, dst_x0, Dyl + winy - 0x1000,
+                                       row_w, Dyh - Dyl + 1);
+                }
+                /* register end-state (independent of clip) */
+                newport_write_x_start(s, (int32_t)s->x_save_int << 11);
+                newport_write_y_start(s, (int32_t)(end_y + dy) << 11);
+                return;
+            }
+        }
+    }
+
+    newport_2d_stat(NP2D_SCR2SCR_SLOW);
+    if (!newport_2d_force_slow()) {
+        NPClipRect cr[4];
+        if (!(stop_on_x && stop_on_y)) newport_2d_diag(DIAG_SS_STOP);
+        else if (s->dm1_logicop != 0x3) newport_2d_diag(DIAG_SS_LOGIC);
+        else if (s->dm0_colorhost) newport_2d_diag(DIAG_SS_HOST);
+        else if (s->dm0_lspattern || s->dm0_zpattern) newport_2d_diag(DIAG_SS_PAT);
+        else if (s->drawmode0 & DM0_SHADE) newport_2d_diag(DIAG_SS_SHADE);
+        else if (!(s->dm1_planes == 1 || s->dm1_planes == 2)) newport_2d_diag(DIAG_SS_PLANE);
+        else if (s->clip_mode != 0 && newport_clip_subrects(s, cr) != 1)
+            newport_2d_diag(DIAG_SS_CLIP);
+        else newport_2d_diag(DIAG_SS_OOB);
+    }
+
     end_x += dx;
     end_y += dy;
 
@@ -1409,11 +1819,14 @@ static void newport_do_rex3_command(SGINewportVirtuixState *s)
 
     switch (opcode) {
     case DM0_OP_NOOP:
+        newport_2d_stat(NP2D_NOOP);
         break;
     case DM0_OP_READ:
+        newport_2d_stat(NP2D_READ);
         newport_do_pixel_read(s);
         break;
     case DM0_OP_DRAW:
+        /* span/block classify (fast/slow, image) inside the primitive */
         switch (adrmode) {
         case DM0_ADR_SPAN:
             newport_draw_span(s);
@@ -1422,18 +1835,22 @@ static void newport_do_rex3_command(SGINewportVirtuixState *s)
             newport_draw_block(s);
             break;
         case DM0_ADR_ILINE:
+            newport_2d_stat(NP2D_ILINE);
             newport_draw_iline(s);
             break;
         case DM0_ADR_FLINE:
+            newport_2d_stat(NP2D_FLINE);
             newport_draw_fline(s);
             break;
         default:
+            newport_2d_stat(NP2D_DRAW_OTHER);
             qemu_log_mask(LOG_UNIMP,
                           "newport: unimplemented draw adrmode %d\n", adrmode);
             break;
         }
         break;
     case DM0_OP_SCR2SCR:
+        /* scr2scr classify (fast/slow) inside the primitive */
         newport_draw_scr2scr(s);
         break;
     }
