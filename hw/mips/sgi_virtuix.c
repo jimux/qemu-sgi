@@ -287,7 +287,15 @@ static void sgi_virtuix_init(MachineState *machine) {
    * emulated Indy -- avoiding the CP0_Cause cross-thread race that a
    * software-interrupt bit would reintroduce (an IP54 lesson).
    */
-  if (ncpus > 1) {
+  /*
+   * Always instantiate the sgi-smp block, even at -smp 1. The IP55 kernel reads
+   * the CPU_COUNT register (offset 0) unconditionally during early boot
+   * (`lui a0,0xbfa8; lw a0,0(a0)` at kernel 0x8822c86c). If the region is
+   * unmapped it takes a bus error that loops forever at that PC (no console
+   * output — the classic "-smp 1 won't boot" hang). At ncpus==1 the IPI/BOOT_GO
+   * paths are simply never exercised; CPU_COUNT reads 1 and CPU_ID reads 0.
+   */
+  {
     DeviceState *smp = qdev_new(TYPE_SGI_SMP);
     qdev_prop_set_uint32(smp, "num-cpus", ncpus);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(smp), &error_fatal);
