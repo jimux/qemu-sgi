@@ -44,6 +44,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 #define PVGPU_OP_PRESENT 6   /* [op] : present the framebuffer to the console */
 #define PVGPU_OP_WINCLIP 7   /* [op][n] then n*[x][y][w][h] : screen rects of windows stacked
                               * ABOVE the GL window that occlude it (desktop overlay clipping) */
+#define PVGPU_OP_SCANOUT_SET 8  /* Stage 2: [op][base_lo][base_hi][w][h][stride][format]
+                                 * register shadow framebuffer in guest RAM */
+#define PVGPU_OP_DAMAGE      9  /* Stage 2: [op][x][y][w][h] — shadowfb region changed */
 
 #define PVGPU_MAX_OCC 16     /* max occluder rects tracked for desktop overlay clipping */
 #define PVGPU_MAXCTX  8      /* max concurrent GL windows (contexts) */
@@ -149,6 +152,13 @@ struct SGIGLAccelState {
     int         prev_n_windows;   /* one-frame GL-overlay restore: count of windows last frame */
     uint64_t    last_composite_sig; /* signature of last frame's GL overlay set (idle-skip) */
     bool        have_composite_sig; /* last_composite_sig is valid (a frame was blitted) */
+
+    /* ---- Stage 2 shadow framebuffer (Variant B) ---- */
+    uint64_t    shadow_base;       /* guest physical address of shadow fb */
+    uint32_t    shadow_w, shadow_h, shadow_stride;
+    uint32_t    shadow_format;     /* 0=CI8, 1=xRGB */
+    bool        shadow_active;     /* shadowfb registered → scan out from guest RAM */
+    uint32_t   *shadow_cmap;       /* CI8→xRGB LUT, 256 entries, when format==0 */
 };
 
 /* Desktop overlay: fill out[] with every active host-rendered GL window (frame + tracked

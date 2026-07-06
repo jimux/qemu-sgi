@@ -721,6 +721,31 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
         }
         case PVGPU_OP_PRESENT:
             s->invalidate = true; break;
+        case PVGPU_OP_SCANOUT_SET: {
+            /* Stage 2 Variant B: register shadow framebuffer in guest RAM.
+             * [op:u32][base_lo:u32][base_hi:u32][w:u32][h:u32][stride:u32][fmt:u32] */
+            uint32_t lo, hi;
+            if (p + 24 > len) return;
+            lo = pv_be32(buf + p); hi = pv_be32(buf + p + 4);
+            s->shadow_base   = ((uint64_t)hi << 32) | lo;
+            s->shadow_w      = pv_be32(buf + p + 8);
+            s->shadow_h      = pv_be32(buf + p + 12);
+            s->shadow_stride = pv_be32(buf + p + 16);
+            s->shadow_format = pv_be32(buf + p + 20);
+            p += 24;
+            s->shadow_active = (s->shadow_base != 0 && s->shadow_w > 0
+                                && s->shadow_h > 0);
+            s->invalidate   = true;
+            break;
+        }
+        case PVGPU_OP_DAMAGE: {
+            /* Stage 2: shadowfb region changed — invalidate for next scanout.
+             * [op:u32][x:u32][y:u32][w:u32][h:u32] */
+            if (p + 16 > len) return;
+            p += 16;
+            s->invalidate = true;
+            break;
+        }
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "pvgpu: bad op %u at %u\n", op, p - 4);
             return;
@@ -792,6 +817,34 @@ static void sgi_glaccel_update(void *opaque)
         }
         if (!surface) return;
 
+        /* Stage 2 shadowfb path: when a shadow framebuffer is registered,
+         * DMA it from guest RAM instead of calling the desktop render callback. */
+        if (s->shadow_active && s->shadow_base) {
+            uint8_t *shadow = g_malloc(s->shadow_stride * s->shadow_h);
+            dma_memory_read(&address_space_memory,
+                            (hwaddr)(s->shadow_base & 0x1FFFFFFFULL),
+                            shadow, (size_t)s->shadow_stride * s->shadow_h,
+                            MEMTXATTRS_UNSPECIFIED);
+            if (s->shadow_format == 0 && s->shadow_cmap) {
+                /* CI8 → xRGB via LUT */
+                for (int sy = 0; sy < s->shadow_h && sy < s->desk_h; sy++) {
+                    for (int sx = 0; sx < s->shadow_w && sx < s->desk_w; sx++) {
+                        uint8_t ci = shadow[(size_t)sy * s->shadow_stride + sx];
+                        s->desk[(size_t)sy * s->desk_w + sx] = s->shadow_cmap[ci];
+                    }
+                }
+            } else {
+                /* xRGB direct copy */
+                for (int sy = 0; sy < s->shadow_h && sy < s->desk_h; sy++) {
+                    memcpy(&s->desk[(size_t)sy * s->desk_w],
+                           &shadow[(size_t)sy * s->shadow_stride],
+                           (size_t)s->shadow_w * 4);
+                }
+            }
+            g_free(shadow);
+            s->invalidate = false;
+            goto composite_overlays;
+        }
 
         /* render the desktop into the engine buffer */
         {
@@ -824,6 +877,7 @@ static void sgi_glaccel_update(void *opaque)
         s->last_composite_sig = sig;
         s->have_composite_sig = true;
 
+composite_overlays:
         /* composite GL overlays onto the desktop buffer */
         n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w, s->desk_h);
         s->prev_n_windows = n_wins;
