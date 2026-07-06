@@ -45,6 +45,7 @@
 #include "hw/misc/sgi_arcs.h"
 #include "hw/misc/sgi_hpc3_virtuix.h"
 #include "hw/misc/sgi_mc_virtuix.h"
+#include "hw/misc/sgi_pvchan.h"
 #include "hw/misc/sgi_smp.h"
 #include "hw/misc/unimp.h"
 #include "hw/scsi/scsi.h"
@@ -77,6 +78,9 @@
  * (virtuix/kernel/ip55mp_addrs.h) as the single source of truth.
  */
 #define SGI_VIRTUIX_SMP_BASE 0x1fa80000ULL
+
+/* Paravirtual host<->guest channel */
+#define SGI_VIRTUIX_PVCHAN_BASE 0x1fa90000ULL
 
 #define SGI_PROM_SIZE (512 * KiB)
 /* Virtuix RAM cap: 2 GiB (Indy stays at the authentic 256 MiB). */
@@ -417,7 +421,15 @@ static void sgi_virtuix_init(MachineState *machine) {
   create_gio_empty_slot(system_memory, "gio-exp0", SGI_GIO_EXP0_BASE, 2 * MiB);
   create_gio_empty_slot(system_memory, "gio-exp1", SGI_GIO_EXP1_BASE, 4 * MiB);
 
+  /* Paravirtual host<->guest channel: ring+doorbell device for the resident
+   * guest agent, replacing serial-scraping + gdbstub-halt + slirp dependence. */
   {
+      DeviceState *pvchan_dev = qdev_new(TYPE_SGI_PVCHAN);
+      sysbus_realize_and_unref(SYS_BUS_DEVICE(pvchan_dev), &error_fatal);
+      sysbus_mmio_map(SYS_BUS_DEVICE(pvchan_dev), 0, SGI_VIRTUIX_PVCHAN_BASE);
+      /* pvchan IRQ → CPU IP1 (unused on virtuix; PROM and IRIX route IP1 only
+       * for GIO slot 2, which virtuix doesn't populate). */
+      sysbus_connect_irq(SYS_BUS_DEVICE(pvchan_dev), 0, cpu->env.irq[1]);
   }
 
   /*

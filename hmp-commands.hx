@@ -1867,3 +1867,32 @@ SRST
   List event channels in the guest
 ERST
 #endif
+
+#if defined(CONFIG_SGI_PVCHAN)
+    {
+        .name       = "pvchan-send",
+        .args_type  = "op:i,data:s",
+        .params     = "op hexdata",
+        .help       = "send a message to the guest via sgi-pvchan (op=int, data=hex string)",
+        .cmd        = hmp_pvchan_send,
+    },
+
+SRST
+``pvchan-send`` *op* *hexdata*
+  Send a message to the guest via the sgi-pvchan device.
+  *op* is the numeric operation code. *hexdata* is the payload as a hex string.
+ERST
+
+    {
+        .name       = "pvchan-recv",
+        .args_type  = "",
+        .params     = "",
+        .help       = "read a message from the guest via sgi-pvchan",
+        .cmd        = hmp_pvchan_recv,
+    },
+
+SRST
+``pvchan-recv``
+  Read and display a message from the guest via the sgi-pvchan device.
+ERST
+#endif

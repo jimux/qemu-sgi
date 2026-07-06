@@ -169,6 +169,9 @@ config SGI_PVMEM
 config SGI_PVNET
     bool
 
+config SGI_PVCHAN
+    bool
+
 config SGI_PVAUDIO
     bool
 
