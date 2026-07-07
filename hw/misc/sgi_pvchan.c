@@ -27,7 +27,22 @@
 /* ---- singleton (for HMP lookups) ------------------------------------------ */
 static SGIPvChanState *pvchan_instance;
 
-/* ---- ring helpers (operate on guest RAM) --------------------------------- */
+/*
+ * Ring convention (2026-07-07 D1 redesign — replaces the internally inconsistent
+ * original that mixed `%rlen` producer publishing with `%(len*2)` consumer
+ * publishing and a `pi += len` reader; that could not survive an index wrap).
+ *
+ * Both rings live in guest RAM: [producer:u32 LE][consumer:u32 LE] then LEN
+ * bytes of data.  Indices are FREE-RUNNING uint32 that wrap naturally at 2^32.
+ * The byte position in the data region is `idx & (LEN-1)` — so LEN MUST be a
+ * power of two, which makes `idx % LEN` seamless across the 2^32 wrap
+ * (2^32 % LEN == 0).  Bytes available to the consumer = (uint32)(prod - cons),
+ * correct across wrap while < LEN bytes are outstanding.  This is the standard
+ * virtio-shaped scheme and is byte-for-byte matched by the guest driver/agent.
+ *
+ * Message framing in the data region (LE for host convenience):
+ *   op:u32  status:u32  payload_len:u32  payload:u8[payload_len]
+ */
 static uint32_t rd32_le(SGIPvChanState *s, uint64_t pa)
 {
     uint32_t v;
@@ -41,110 +56,107 @@ static void wr32_le(SGIPvChanState *s, uint64_t pa, uint32_t v)
     dma_memory_write(&address_space_memory, pa, &v, 4, MEMTXATTRS_UNSPECIFIED);
 }
 
-static void rd_buf(SGIPvChanState *s, uint64_t pa, void *dst, uint32_t n)
+/* read `n` bytes from the data region starting at free-running index `idx`
+ * (wraps within LEN); `base` is the ring header physical address. */
+static void ring_read(SGIPvChanState *s, uint64_t base, uint32_t len,
+                      uint32_t idx, uint8_t *dst, uint32_t n)
 {
-    dma_memory_read(&address_space_memory, pa, dst, n, MEMTXATTRS_UNSPECIFIED);
-}
-
-static void wr_buf(SGIPvChanState *s, uint64_t pa, const void *src, uint32_t n)
-{
-    dma_memory_write(&address_space_memory, pa, src, n, MEMTXATTRS_UNSPECIFIED);
-}
-
-static void ring_read_bytes(SGIPvChanState *s, uint64_t base, uint32_t len,
-                            uint32_t *prod, uint32_t *cons,
-                            uint8_t *out, uint32_t want, uint32_t *got)
-{
-    uint32_t pi = rd32_le(s, base);
-    uint32_t ci = rd32_le(s, base + 4);
-    uint32_t avail, data_off = base + PVCHAN_RING_HDR_SZ;
-    *cons = ci; *prod = pi; *got = 0;
-    if (pi <= ci) pi += len;
-    avail = pi - ci;
-    if (avail > len * 2) avail = 0; /* desync guard */
-    if (avail < 4 || want == 0) return;
-    want = MIN(want, avail);
-    /* linear read if within ring, or two-part wrap */
-    uint32_t off = ci % len;
+    uint64_t data = base + PVCHAN_RING_HDR_SZ;
+    uint32_t off = idx & (len - 1);
     uint32_t chunk = len - off;
-    if (chunk >= want) {
-        rd_buf(s, data_off + off, out, want);
+    if (chunk >= n) {
+        dma_memory_read(&address_space_memory, data + off, dst, n,
+                        MEMTXATTRS_UNSPECIFIED);
     } else {
-        rd_buf(s, data_off + off, out, chunk);
-        rd_buf(s, data_off, out + chunk, want - chunk);
+        dma_memory_read(&address_space_memory, data + off, dst, chunk,
+                        MEMTXATTRS_UNSPECIFIED);
+        dma_memory_read(&address_space_memory, data, dst + chunk, n - chunk,
+                        MEMTXATTRS_UNSPECIFIED);
     }
-    *got = want;
 }
 
-static void ring_consume(SGIPvChanState *s, uint64_t base, uint32_t len,
-                         uint32_t ci, uint32_t bytes)
+/* write `n` bytes into the data region starting at free-running index `idx`. */
+static void ring_write(SGIPvChanState *s, uint64_t base, uint32_t len,
+                       uint32_t idx, const uint8_t *src, uint32_t n)
 {
-    wr32_le(s, base + 4, (ci + bytes) % (len * 2));
-}
-
-static void ring_produce(SGIPvChanState *s, uint64_t base, uint32_t len,
-                         uint32_t pi, const uint8_t *data, uint32_t bytes)
-{
-    uint32_t data_off = base + PVCHAN_RING_HDR_SZ;
-    uint32_t off = pi % len;
+    uint64_t data = base + PVCHAN_RING_HDR_SZ;
+    uint32_t off = idx & (len - 1);
     uint32_t chunk = len - off;
-    if (chunk >= bytes) {
-        wr_buf(s, data_off + off, data, bytes);
+    if (chunk >= n) {
+        dma_memory_write(&address_space_memory, data + off, src, n,
+                         MEMTXATTRS_UNSPECIFIED);
     } else {
-        wr_buf(s, data_off + off, data, chunk);
-        wr_buf(s, data_off, data + chunk, bytes - chunk);
+        dma_memory_write(&address_space_memory, data + off, src, chunk,
+                         MEMTXATTRS_UNSPECIFIED);
+        dma_memory_write(&address_space_memory, data, src + chunk, n - chunk,
+                         MEMTXATTRS_UNSPECIFIED);
     }
-    wr32_le(s, base, pi + bytes);
+}
+
+/* LEN must be a power of two >= 4KB and <= 64MB. */
+static bool ring_len_ok(uint32_t len)
+{
+    return len >= PVCHAN_RING_MIN && len <= (64u << 20) &&
+           (len & (len - 1)) == 0;
 }
 
 /* ---- host-side helpers (called from Python via QMP/HMP or monitor) -------- */
 
+/* Read one message from the G2H ring (host is consumer).  Returns payload
+ * length (>=0) on success, 0 if no complete message is ready, -1 on error. */
 int pvchan_host_read_msg(SGIPvChanState *s, uint32_t *op, uint32_t *status,
                          uint8_t *buf, uint32_t max)
 {
     uint64_t base = s->g2h_base & 0x1FFFFFFFULL;
     uint32_t len  = s->g2h_len;
-    uint32_t pi, ci, got;
+    uint32_t prod, cons, avail, plen;
     uint32_t hdr[3]; /* op, status, plen — LE */
-    if (!base || !len || len > (64 << 20)) return -1;
-    ring_read_bytes(s, base, len, &pi, &ci, (uint8_t *)hdr, 12, &got);
-    if (got < 12) return 0;
-    uint32_t plen = le32_to_cpu(hdr[2]);
-    if (plen > PVCHAN_MAX_MSG || plen > max) { ring_consume(s, base, len, ci, 12); return -1; }
+    if (!base || !ring_len_ok(len)) return -1;
+    prod = rd32_le(s, base);
+    cons = rd32_le(s, base + 4);
+    avail = prod - cons;                 /* wrap-correct */
+    if (avail > len) return -1;          /* desync guard */
+    if (avail < 12) return PVCHAN_NOMSG; /* no complete header yet */
+    ring_read(s, base, len, cons, (uint8_t *)hdr, 12);
+    plen = le32_to_cpu(hdr[2]);
+    if (plen > PVCHAN_MAX_MSG) { s->g2h_read = cons + 12; wr32_le(s, base + 4, cons + 12); return -1; }
+    if (avail < 12 + plen) return PVCHAN_NOMSG; /* payload not fully written yet */
     *op = le32_to_cpu(hdr[0]);
     *status = le32_to_cpu(hdr[1]);
     if (plen > 0) {
-        uint32_t g2;
-        ring_read_bytes(s, base, len, &pi, &ci, buf, plen, &g2);
-        if (g2 < plen) { ring_consume(s, base, len, ci, plen + 12); return -1; }
+        ring_read(s, base, len, cons + 12, buf, MIN(plen, max));
     }
-    ring_consume(s, base, len, ci, plen + 12);
-    s->g2h_read = ci + plen + 12;
-    return (int)plen;
+    cons += 12 + plen;
+    wr32_le(s, base + 4, cons);          /* publish host consumer */
+    s->g2h_read = cons;
+    return (plen > max) ? -1 : (int)plen;
 }
 
+/* Write one message into the H2G ring (host is producer).  Returns total
+ * bytes written (>0) or -1 bad-arg / -2 ring-full. */
 int pvchan_host_write_msg(SGIPvChanState *s, uint32_t op,
                           const uint8_t *payload, uint32_t len)
 {
     uint64_t base = s->h2g_base & 0x1FFFFFFFULL;
     uint32_t rlen = s->h2g_len;
-    uint32_t pi, ci, space, total;
-    if (!base || !rlen || rlen > (64 << 20) || len > PVCHAN_MAX_MSG) return -1;
-    pi = rd32_le(s, base);
-    ci = rd32_le(s, base + 4);
-    if (pi < ci) pi += rlen;
-    space = rlen - (pi - ci);
-    total = 12 + len;
-    if (space < total + 4) return -2; /* no room */
+    uint32_t prod, cons, avail, freeb, total;
     uint8_t hdr[12];
+    if (!base || !ring_len_ok(rlen) || len > PVCHAN_MAX_MSG) return -1;
+    prod = rd32_le(s, base);
+    cons = rd32_le(s, base + 4);
+    avail = prod - cons;                 /* wrap-correct */
+    freeb = rlen - avail;
+    total = 12 + len;
+    if (freeb < total) return -2;        /* no room */
     *(uint32_t *)(hdr + 0) = cpu_to_le32(op);
     *(uint32_t *)(hdr + 4) = cpu_to_le32(0);
     *(uint32_t *)(hdr + 8) = cpu_to_le32(len);
-    uint32_t wpos = pi % rlen;
-    ring_produce(s, base, rlen, wpos, hdr, 12);
-    if (len > 0) ring_produce(s, base, rlen, wpos + 12, payload, len);
-    s->h2g_write = wpos + 12 + len;
-    /* kick guest IRQ */
+    ring_write(s, base, rlen, prod, hdr, 12);
+    if (len > 0) ring_write(s, base, rlen, prod + 12, payload, len);
+    prod += total;
+    wr32_le(s, base, prod);              /* publish host producer */
+    s->h2g_write = prod;
+    /* kick guest IRQ (only if guest enabled it; agent may instead poll) */
     s->h2g_dbell = 1;
     if (s->irq_enable) qemu_irq_raise(s->irq);
     return (int)total;
@@ -270,7 +282,7 @@ static int hex_decode(const char *hex, uint8_t *out, int max)
 void hmp_pvchan_send(Monitor *mon, const QDict *qdict)
 {
     uint32_t op = (uint32_t)qdict_get_int(qdict, "op");
-    const char *hex = qdict_get_str(qdict, "data");
+    const char *hex = qdict_get_try_str(qdict, "data");  /* NULL => empty payload */
     uint8_t payload[PVCHAN_MAX_MSG];
     int plen;
     SGIPvChanState *s;
@@ -281,7 +293,7 @@ void hmp_pvchan_send(Monitor *mon, const QDict *qdict)
         return;
     }
     s = pvchan_instance;
-    plen = hex_decode(hex, payload, sizeof(payload));
+    plen = hex ? hex_decode(hex, payload, sizeof(payload)) : 0;
     if (plen < 0) {
         monitor_printf(mon, "pvchan-send: invalid hex data\n");
         return;
@@ -291,6 +303,42 @@ void hmp_pvchan_send(Monitor *mon, const QDict *qdict)
         monitor_printf(mon, "pvchan-send: failed (ring full or device not ready? rc=%d)\n", rc);
     } else {
         monitor_printf(mon, "pvchan-send: ok, %d bytes written\n", rc);
+    }
+}
+
+/* Send an op whose payload is the contents of a host file (up to
+ * PVCHAN_MAX_MSG bytes).  Avoids the ~4KB HMP input-line limit that makes
+ * inline hex impractical for large transfers; this is also the shape real
+ * host-side tooling uses (read file bytes, push them). */
+void hmp_pvchan_sendfile(Monitor *mon, const QDict *qdict)
+{
+    uint32_t op = (uint32_t)qdict_get_int(qdict, "op");
+    const char *path = qdict_get_str(qdict, "path");
+    SGIPvChanState *s;
+    uint8_t *payload;
+    FILE *f;
+    size_t n;
+    int rc;
+
+    if (!pvchan_instance) {
+        monitor_printf(mon, "pvchan: no device (virtuix not running?)\n");
+        return;
+    }
+    s = pvchan_instance;
+    f = fopen(path, "rb");
+    if (!f) {
+        monitor_printf(mon, "pvchan-sendfile: cannot open %s\n", path);
+        return;
+    }
+    payload = g_malloc(PVCHAN_MAX_MSG);
+    n = fread(payload, 1, PVCHAN_MAX_MSG, f);
+    fclose(f);
+    rc = pvchan_host_write_msg(s, op, payload, (uint32_t)n);
+    g_free(payload);
+    if (rc < 0) {
+        monitor_printf(mon, "pvchan-sendfile: failed (ring full/not ready? rc=%d)\n", rc);
+    } else {
+        monitor_printf(mon, "pvchan-sendfile: ok, %d bytes written\n", rc);
     }
 }
 
@@ -307,34 +355,29 @@ void hmp_pvchan_recv(Monitor *mon, const QDict *qdict)
     }
     s = pvchan_instance;
     plen = pvchan_host_read_msg(s, &op, &status, buf, sizeof(buf));
-    if (plen < 0) {
-        monitor_printf(mon, "pvchan-recv: error %d\n", plen);
-    } else if (plen == 0) {
+    if (plen == PVCHAN_NOMSG) {
         monitor_printf(mon, "pvchan-recv: no message ready\n");
+    } else if (plen < 0) {
+        monitor_printf(mon, "pvchan-recv: error %d\n", plen);
     } else {
         monitor_printf(mon, "pvchan-recv: op=%u status=%u plen=%d\n", op, status, plen);
         if (plen > 0) {
-            /* print hex + ASCII preview */
-            monitor_printf(mon, "  hex: ");
-            for (int i = 0; i < plen && i < 256; i++) {
-                monitor_printf(mon, "%02x", buf[i]);
+            /* emit the FULL payload as one hex line so the host harness can
+             * sha256-verify multi-KB replies (no 256-byte truncation).  Build
+             * into a heap buffer and print in one call — a per-byte
+             * monitor_printf loop is prohibitively slow at 64KB. */
+            static const char hx[] = "0123456789abcdef";
+            char *line = g_malloc((size_t)plen * 2 + 16);
+            int i;
+            memcpy(line, "  hex: ", 7);
+            for (i = 0; i < plen; i++) {
+                line[7 + i * 2]     = hx[(buf[i] >> 4) & 0xf];
+                line[7 + i * 2 + 1] = hx[buf[i] & 0xf];
             }
-            if (plen > 256) monitor_printf(mon, "...");
-            monitor_printf(mon, "\n");
-            /* try to print as text if it looks like ASCII */
-            bool printable = true;
-            for (int i = 0; i < plen && i < 2048; i++) {
-                if (buf[i] == 0) { /* NUL — truncate display, not error */
-                    break;
-                }
-                if (buf[i] < 0x20 && buf[i] != '\n' && buf[i] != '\r' && buf[i] != '\t') {
-                    printable = false;
-                    break;
-                }
-            }
-            if (printable) {
-                monitor_printf(mon, "  text: %.*s\n", plen, (const char *)buf);
-            }
+            line[7 + plen * 2] = '\n';
+            line[7 + plen * 2 + 1] = '\0';
+            monitor_puts(mon, line);
+            g_free(line);
         }
     }
 }

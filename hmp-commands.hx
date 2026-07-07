@@ -1871,7 +1871,7 @@ ERST
 #if defined(CONFIG_SGI_PVCHAN)
     {
         .name       = "pvchan-send",
-        .args_type  = "op:i,data:s",
+        .args_type  = "op:i,data:s?",
         .params     = "op hexdata",
         .help       = "send a message to the guest via sgi-pvchan (op=int, data=hex string)",
         .cmd        = hmp_pvchan_send,
@@ -1882,6 +1882,14 @@ SRST
   Send a message to the guest via the sgi-pvchan device.
   *op* is the numeric operation code. *hexdata* is the payload as a hex string.
 ERST
+
+    {
+        .name       = "pvchan-sendfile",
+        .args_type  = "op:i,path:s",
+        .params     = "op path",
+        .help       = "send a message to the guest via sgi-pvchan; payload = host file contents (op=int, path=host file, up to 64KB)",
+        .cmd        = hmp_pvchan_sendfile,
+    },
 
     {
         .name       = "pvchan-recv",

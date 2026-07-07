@@ -70,6 +70,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIPvChanState, SGI_PVCHAN)
 #define PVCHAN_RING_HDR_SZ    8
 #define PVCHAN_MAX_MSG        65536  /* 64KB max per message */
 #define PVCHAN_RING_MIN       4096
+#define PVCHAN_NOMSG          (-3)   /* host_read_msg: no complete message ready
+                                      * (distinct from a valid zero-payload msg) */
 
 struct SGIPvChanState {
     SysBusDevice  parent_obj;
