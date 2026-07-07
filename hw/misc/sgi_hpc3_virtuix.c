@@ -3358,7 +3358,21 @@ static void sgi_hpc3_virtuix_reset(DeviceState *dev)
 
     sgi_hpc3_virtuix_enet_reset(s);
 
-    /* SCSI controllers are reset by their own device reset */
+    /*
+     * The WD33C93 controllers are created bus-less (qdev_realize(dev, NULL))
+     * so the machine-wide reset traversal does NOT reach them or their child
+     * SCSI buses. Propagate the reset explicitly. Without this, scsi-hd's
+     * reset never runs at machine init, so qdev.max_lba is only ever set by a
+     * guest READ CAPACITY — which a MIGRATED guest never re-issues, leaving
+     * max_lba=0 after an -incoming restore and every valid-LBA I/O rejected
+     * with LBA_OUT_OF_RANGE (asc=0x21). Found by the checkpoint/restore
+     * campaign (progress_notes/agent_tooling/08-checkpoint-implementation.md).
+     */
+    for (int i = 0; i < 2; i++) {
+        if (s->scsi[i]) {
+            device_cold_reset(DEVICE(s->scsi[i]));
+        }
+    }
 
     for (int i = 0; i < 8; i++) {
         s->pbus_dmacfg[i] = 0;
@@ -3686,8 +3700,8 @@ static const Property sgi_hpc3_virtuix_properties[] = {
 
 static const VMStateDescription vmstate_sgi_hpc3 = {
     .name = "sgi-hpc3-virtuix",
-    .version_id = 6,
-    .minimum_version_id = 6,
+    .version_id = 7,
+    .minimum_version_id = 7,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(bbram, SGIHPC3VirtuixState, 8192),
         VMSTATE_UINT32(intstat, SGIHPC3VirtuixState),
@@ -3750,6 +3764,18 @@ static const VMStateDescription vmstate_sgi_hpc3 = {
         VMSTATE_UINT32(int3_error_status, SGIHPC3VirtuixState),
         VMSTATE_UINT8_ARRAY(serial_cmd, SGIHPC3VirtuixState, 2),
         VMSTATE_UINT8_ARRAY(serial_data, SGIHPC3VirtuixState, 2),
+        /* v7: SCC console state — without these, RX interrupts (scc_wr1/wr9)
+         * and the RX FIFO are lost across migration and the restored guest's
+         * serial console goes deaf (checkpoint/restore campaign, doc 08). */
+        VMSTATE_UINT8_ARRAY(serial_reg_ptr, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8_2DARRAY(serial_rx_fifo, SGIHPC3VirtuixState, 2, SCC_RX_FIFO_SIZE),
+        VMSTATE_UINT8_ARRAY(serial_rx_fifo_head, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8_ARRAY(serial_rx_fifo_tail, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8_ARRAY(serial_rx_fifo_count, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8_ARRAY(scc_wr1, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8_ARRAY(scc_wr5, SGIHPC3VirtuixState, 2),
+        VMSTATE_UINT8(scc_wr9, SGIHPC3VirtuixState),
+        VMSTATE_UINT8(scc_rr3, SGIHPC3VirtuixState),
         VMSTATE_INT64(rtc_time_offset, SGIHPC3VirtuixState),
         VMSTATE_UINT16_ARRAY(pit_count, SGIHPC3VirtuixState, 3),
         VMSTATE_UINT16_ARRAY(pit_latch, SGIHPC3VirtuixState, 3),
