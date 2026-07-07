@@ -40,6 +40,8 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "chardev/char-fe.h"
+#include "qemu/notify.h"
 
 #define TYPE_SGI_PVCHAN "sgi-pvchan"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIPvChanState, SGI_PVCHAN)
@@ -73,6 +75,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIPvChanState, SGI_PVCHAN)
 #define PVCHAN_NOMSG          (-3)   /* host_read_msg: no complete message ready
                                       * (distinct from a valid zero-payload msg) */
 
+/*
+ * Wire ops shared with the guest agent (irixga).  1..4 are the request ops the
+ * host sends into H2G; 5/6 are the two host-side-relevant extensions D2/D3 add:
+ *   5 = ANNOUNCE  guest→host, unprompted at agent startup (liveness beacon)
+ *   6 = SHUTDOWN  host→guest, pushed by the QEMU powerdown notifier so the agent
+ *                 runs `sync; sync; init 0` (graceful lifecycle, D3)
+ */
+#define PVCHAN_OP_EXEC        1
+#define PVCHAN_OP_PUSH        2
+#define PVCHAN_OP_PULL        3
+#define PVCHAN_OP_PING        4
+#define PVCHAN_OP_ANNOUNCE    5
+#define PVCHAN_OP_SHUTDOWN    6
+
+/* Host-side chardev frame sizes: request [op:u32][len:u32][payload],
+ * reply [op:u32][status:u32][len:u32][payload].  All little-endian. */
+#define PVCHAN_REQ_HDR        8
+#define PVCHAN_REP_HDR        12
+#define PVCHAN_RX_MAX         (PVCHAN_REQ_HDR + PVCHAN_MAX_MSG)
+
 struct SGIPvChanState {
     SysBusDevice  parent_obj;
     MemoryRegion  mmio;
@@ -90,6 +112,18 @@ struct SGIPvChanState {
 
     /* host-side poll fd (read end of the G2H doorbell event) — set up via qom prop */
     int notify_fd;
+
+    /* D2/D3 proper transport: a persistent chardev socket carrying framed
+     * request/reply messages, replacing the per-op HMP monitor reconnect.
+     * Default-off: with no chardev bound the HMP path still works. */
+    CharFrontend  chr;
+    bool          chr_connected;      /* a client socket is actually attached */
+    uint8_t       rx[PVCHAN_RX_MAX];  /* request-frame reassembly buffer */
+    uint32_t      rx_len;
+    Notifier      powerdown_notifier; /* system_powerdown -> OP_SHUTDOWN to guest */
+    bool          powerdown_registered;
+    bool          powerdown_pending;  /* host pressed power: await guest sync-ack
+                                       * then request a clean QEMU shutdown */
 };
 
 /*

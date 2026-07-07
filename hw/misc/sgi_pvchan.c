@@ -16,6 +16,7 @@
 #include "hw/misc/sgi_pvchan.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "monitor/monitor.h"
 #include "monitor/hmp.h"
 #include "qapi/error.h"
@@ -23,6 +24,8 @@
 #include "qemu/log.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "system/runstate.h"
+#include "chardev/char-fe.h"
 
 /* ---- singleton (for HMP lookups) ------------------------------------------ */
 static SGIPvChanState *pvchan_instance;
@@ -162,6 +165,131 @@ int pvchan_host_write_msg(SGIPvChanState *s, uint32_t op,
     return (int)total;
 }
 
+/* ---- chardev transport (the D2/D3 "off-HMP" persistent socket) ------------
+ *
+ * A single persistent socket carries length-framed messages, virtio-serial in
+ * spirit.  Host client -> device: request frames [op:u32][len:u32][payload].
+ * Device -> host client: reply frames [op:u32][status:u32][len:u32][payload],
+ * drained from the G2H ring whenever the guest rings the doorbell (or when the
+ * client (re)connects, to pick up an unprompted ANNOUNCE).  Both directions are
+ * little-endian.  All of this runs under the BQL (MMIO write handlers and
+ * chardev callbacks both hold it), so no extra locking is needed. */
+
+static void pvchan_put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
+    p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
+}
+
+static uint32_t pvchan_get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * Process every complete G2H message the guest produced.  Two consumers:
+ *   - if a client socket is attached, each message is forwarded as a reply
+ *     frame [op][status][len][payload];
+ *   - an OP_SHUTDOWN reply is the agent saying "I have synced; safe to power
+ *     off" (D3) — turn it into a clean QEMU shutdown request so the host power
+ *     button completes unattended (see pvchan_powerdown_notify).
+ *
+ * We must NOT consume messages when there is neither a client nor a pending
+ * power-off: the unprompted startup ANNOUNCE has to stay in the ring until a
+ * client connects (CHR_EVENT_OPENED flushes it).  `powerdown_pending` lets us
+ * drain-to-find-shutdown even with no client, without eating the ANNOUNCE in
+ * the normal case.
+ */
+static void pvchan_process_g2h(SGIPvChanState *s)
+{
+    static uint8_t payload[PVCHAN_MAX_MSG];
+    uint8_t hdr[PVCHAN_REP_HDR];
+    uint32_t op, status;
+    int n;
+
+    if (!s->chr_connected && !s->powerdown_pending) {
+        return;
+    }
+    for (;;) {
+        n = pvchan_host_read_msg(s, &op, &status, payload, sizeof(payload));
+        if (n == PVCHAN_NOMSG || n < 0) {
+            break;  /* nothing more ready (or a desync we already skipped past) */
+        }
+        if (s->chr_connected) {
+            pvchan_put_le32(hdr + 0, op);
+            pvchan_put_le32(hdr + 4, status);
+            pvchan_put_le32(hdr + 8, (uint32_t)n);
+            qemu_chr_fe_write_all(&s->chr, hdr, PVCHAN_REP_HDR);
+            if (n > 0) {
+                qemu_chr_fe_write_all(&s->chr, payload, n);
+            }
+        }
+        if (op == PVCHAN_OP_SHUTDOWN && s->powerdown_pending) {
+            qemu_log("sgi-pvchan: guest synced -> requesting QEMU shutdown\n");
+            s->powerdown_pending = false;
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        }
+    }
+}
+
+/* Host client can always take a full frame's worth. */
+static int pvchan_chr_can_receive(void *opaque)
+{
+    SGIPvChanState *s = opaque;
+    return sizeof(s->rx) - s->rx_len;
+}
+
+/* Accumulate bytes, dispatch each complete request frame into the H2G ring. */
+static void pvchan_chr_receive(void *opaque, const uint8_t *buf, int size)
+{
+    SGIPvChanState *s = opaque;
+    uint32_t op, plen, consumed;
+
+    if (size <= 0) {
+        return;
+    }
+    if ((uint32_t)size > sizeof(s->rx) - s->rx_len) {
+        /* impossible given can_receive, but never overrun */
+        size = sizeof(s->rx) - s->rx_len;
+    }
+    memcpy(s->rx + s->rx_len, buf, size);
+    s->rx_len += size;
+
+    while (s->rx_len >= PVCHAN_REQ_HDR) {
+        op   = pvchan_get_le32(s->rx + 0);
+        plen = pvchan_get_le32(s->rx + 4);
+        if (plen > PVCHAN_MAX_MSG) {
+            /* framing lost — resync by dropping the buffer */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sgi-pvchan: chardev frame len %u > max, resync\n", plen);
+            s->rx_len = 0;
+            break;
+        }
+        if (s->rx_len < PVCHAN_REQ_HDR + plen) {
+            break;  /* wait for the rest of the payload */
+        }
+        pvchan_host_write_msg(s, op, s->rx + PVCHAN_REQ_HDR, plen);
+        consumed = PVCHAN_REQ_HDR + plen;
+        memmove(s->rx, s->rx + consumed, s->rx_len - consumed);
+        s->rx_len -= consumed;
+    }
+}
+
+static void pvchan_chr_event(void *opaque, QEMUChrEvent ev)
+{
+    SGIPvChanState *s = opaque;
+    if (ev == CHR_EVENT_OPENED) {
+        /* fresh client: drop any half-frame, then flush pending G2H (announce) */
+        s->rx_len = 0;
+        s->chr_connected = true;
+        pvchan_process_g2h(s);
+    } else if (ev == CHR_EVENT_CLOSED) {
+        s->rx_len = 0;
+        s->chr_connected = false;
+    }
+}
+
 /* ---- MMIO handlers -------------------------------------------------------- */
 
 static uint64_t sgi_pvchan_read(void *opaque, hwaddr addr, unsigned size)
@@ -235,6 +363,8 @@ static void sgi_pvchan_write(void *opaque, hwaddr addr, uint64_t val, unsigned s
                 uint8_t b = 1;
                 if (write(s->notify_fd, &b, 1) != 1) { /* ignore - pipe full etc */ }
             }
+            /* proper transport: push replies straight out the chardev socket */
+            pvchan_process_g2h(s);
         } else { /* host acknowledges */
             s->g2h_dbell = 0;
             s->status &= ~PVCHAN_S_G2H_PENDING;
@@ -386,7 +516,35 @@ void hmp_pvchan_recv(Monitor *mon, const QDict *qdict)
 
 static const Property sgi_pvchan_props[] = {
     DEFINE_PROP_INT32("notify-fd", SGIPvChanState, notify_fd, -1),
+    DEFINE_PROP_CHR("chardev", SGIPvChanState, chr),
 };
+
+/*
+ * Host power button (system_powerdown).  Pushes OP_SHUTDOWN into the H2G ring
+ * (the agent polls it, so this works with or without a chardev) and arms
+ * `powerdown_pending`.  The agent syncs the filesystems and replies OP_SHUTDOWN;
+ * pvchan_process_g2h turns that reply into a clean qemu_system_shutdown_request.
+ *
+ * Why not have the guest halt itself: on this IP22/Mode-K kernel `init 0`,
+ * `uadmin(A_SHUTDOWN, AD_HALT)` and `/etc/halt` do NOT reach ARCS Halt from a
+ * daemon/non-console context (telinit's runlevel change needs a login session;
+ * the halt vector is only reached from the console).  So the disk-safe,
+ * unattended power button = guest syncs (crash-consistent under
+ * cache=writethrough), then the host cleanly exits QEMU.
+ */
+static void pvchan_powerdown_notify(Notifier *n, void *opaque)
+{
+    SGIPvChanState *s = container_of(n, SGIPvChanState, powerdown_notifier);
+    int rc;
+    s->powerdown_pending = true;
+    rc = pvchan_host_write_msg(s, PVCHAN_OP_SHUTDOWN, NULL, 0);
+    qemu_log("sgi-pvchan: powerdown -> OP_SHUTDOWN to guest (rc=%d)\n", rc);
+    if (rc < 0) {
+        /* guest ring not ready (no agent yet) — power off directly */
+        s->powerdown_pending = false;
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    }
+}
 
 static void sgi_pvchan_realize(DeviceState *dev, Error **errp)
 {
@@ -396,6 +554,20 @@ static void sgi_pvchan_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->mmio);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     s->status = PVCHAN_S_READY;
+    s->rx_len = 0;
+
+    /* bind the chardev transport if one was configured (-global .chardev=id) */
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_set_handlers(&s->chr, pvchan_chr_can_receive,
+                                 pvchan_chr_receive, pvchan_chr_event,
+                                 NULL, s, NULL, true);
+    }
+
+    /* graceful lifecycle (D3): fire OP_SHUTDOWN on host system_powerdown */
+    s->powerdown_notifier.notify = pvchan_powerdown_notify;
+    qemu_register_powerdown_notifier(&s->powerdown_notifier);
+    s->powerdown_registered = true;
+
     pvchan_instance = s;
 }
 
