@@ -45,6 +45,7 @@
 #include "hw/misc/sgi_arcs.h"
 #include "hw/misc/sgi_hpc3_virtuix.h"
 #include "hw/misc/sgi_mc_virtuix.h"
+#include "hw/misc/sgi_pvaudio.h"
 #include "hw/misc/sgi_pvchan.h"
 #include "hw/misc/sgi_smp.h"
 #include "hw/misc/unimp.h"
@@ -81,6 +82,10 @@
 
 /* Paravirtual host<->guest channel */
 #define SGI_VIRTUIX_PVCHAN_BASE 0x1fa90000ULL
+
+/* Paravirtual audio (ring-buffer PCM → host -audiodev).  Free MMIO hole between
+ * glaccel (0x1fa20000) and the SMP controller (0x1fa80000). */
+#define SGI_VIRTUIX_PVAUDIO_BASE 0x1fa30000ULL
 
 #define SGI_PROM_SIZE (512 * KiB)
 /* Virtuix RAM cap: 2 GiB (Indy stays at the authentic 256 MiB). */
@@ -438,6 +443,19 @@ static void sgi_virtuix_init(MachineState *machine) {
       /* pvchan IRQ → CPU IP1 (unused on virtuix; PROM and IRIX route IP1 only
        * for GIO slot 2, which virtuix doesn't populate). */
       sysbus_connect_irq(SYS_BUS_DEVICE(pvchan_dev), 0, cpu->env.irq[1]);
+  }
+
+  /* Paravirtual audio: ring-buffer PCM device drained to the host -audiodev.
+   * Always instantiated so the guest pvaudio driver can attach; produces sound
+   * only when `-global sgi-pvaudio.audiodev=aud0` explicitly wires a backend
+   * (no-audiodev boots stay silent — see sgi_pvaudio_realize).  IRQ kept masked
+   * driver-side (userland throttles via BUF_TAIL polling); wire to IP1 like
+   * pvchan for hygiene. */
+  {
+      DeviceState *pvaudio_dev = qdev_new(TYPE_SGI_PVAUDIO);
+      sysbus_realize_and_unref(SYS_BUS_DEVICE(pvaudio_dev), &error_fatal);
+      sysbus_mmio_map(SYS_BUS_DEVICE(pvaudio_dev), 0, SGI_VIRTUIX_PVAUDIO_BASE);
+      sysbus_connect_irq(SYS_BUS_DEVICE(pvaudio_dev), 0, cpu->env.irq[1]);
   }
 
   /*

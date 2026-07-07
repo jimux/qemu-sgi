@@ -99,6 +99,11 @@ static void sgi_pvaudio_open_voice(SGIPVAudioState *s)
 {
     struct audsettings as;
 
+    /* No host backend wired (no explicit audiodev): stay silent. */
+    if (!s->audio_be) {
+        return;
+    }
+
     if (s->voice) {
         AUD_close_out(s->audio_be, s->voice);
         s->voice = NULL;
@@ -254,10 +259,13 @@ static void sgi_pvaudio_realize(DeviceState *dev, Error **errp)
 {
     SGIPVAudioState *s = SGI_PVAUDIO(dev);
 
-    if (!AUD_backend_check(&s->audio_be, errp)) {
-        return;
-    }
-
+    /* MMIO + IRQ are always present so the guest driver can attach to the
+     * device regardless of whether a host audio backend is wired.  The MMIO
+     * region responds; playback is only produced when an audiodev is
+     * EXPLICITLY configured (`-global sgi-pvaudio.audiodev=aud0`).  This keeps
+     * default (no-audiodev) boots byte-for-byte silent and side-effect free —
+     * we do NOT fall back to audio_get_default_audio_be() (which would try to
+     * open a real host device on headless/CI boots). */
     memory_region_init_io(&s->mmio, OBJECT(s), &sgi_pvaudio_ops, s,
                           "sgi-pvaudio", SGI_PVAUDIO_MMIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
@@ -268,7 +276,11 @@ static void sgi_pvaudio_realize(DeviceState *dev, Error **errp)
     s->channels = 2;
     s->bits = 16;
 
-    sgi_pvaudio_open_voice(s);
+    /* audio_be is set by DEFINE_AUDIO_PROPERTIES only when audiodev= is given.
+     * Open the host voice only in that explicit case. */
+    if (s->audio_be) {
+        sgi_pvaudio_open_voice(s);
+    }
 }
 
 static const Property sgi_pvaudio_properties[] = {
