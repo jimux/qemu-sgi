@@ -45,6 +45,7 @@
 #include "hw/misc/sgi_arcs.h"
 #include "hw/misc/sgi_hpc3_virtuix.h"
 #include "hw/misc/sgi_mc_virtuix.h"
+#include "hw/mips/sgi_xfs.h"
 #include "hw/misc/sgi_pvaudio.h"
 #include "hw/misc/sgi_pvchan.h"
 #include "hw/misc/sgi_smp.h"
@@ -261,111 +262,237 @@ static uint32_t sgi_be32(const uint8_t *p) {
          ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static void sgi_virtuix_mode_c_probe(MachineState *machine) {
+static uint16_t sgi_be16(const uint8_t *p) {
+  return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+/*
+ * Parse an ARCS device path ("dksc(c,u,p)" or the canonical
+ * "scsi(c)disk(u)rdisk(0)partition(p)") into a SCSI unit + partition index.
+ * Defaults: unit 1, partition 0 (the canonical golden boot device).
+ */
+static void sgi_devpath_parse(const char *dp, int *unit, int *part) {
+  int c = 0, u = 1, p = 0;
+  const char *q;
+
+  *unit = 1;
+  *part = 0;
+  if (!dp || !*dp) {
+    return;
+  }
+  if (sscanf(dp, "dksc(%d,%d,%d)", &c, &u, &p) == 3) {
+    *unit = u;
+    *part = p;
+    return;
+  }
+  if ((q = strstr(dp, "disk(")) != NULL) {
+    *unit = atoi(q + 5);
+  }
+  if ((q = strstr(dp, "partition(")) != NULL) {
+    *part = atoi(q + 10);
+  } else if ((q = strstr(dp, "part(")) != NULL) {
+    *part = atoi(q + 5);
+  }
+}
+
+/*
+ * Load an ELF32-MSB MIPS image from a host memory buffer into guest physical
+ * RAM (as reset-time ROM blobs, exactly like the -kernel path's load_elf).
+ * Sets *entry (virtual) and *high_phys (end-of-image physical). Returns 0 ok.
+ */
+static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
+                             uint32_t *high_phys) {
+  if (len < 52 || memcmp(img, "\x7f" "ELF", 4) != 0) {
+    return -1;
+  }
+  if (img[4] != 1 /*ELFCLASS32*/ || img[5] != 2 /*ELFDATA2MSB*/) {
+    return -2;
+  }
+  if (sgi_be16(&img[18]) != EM_MIPS) {
+    return -3;
+  }
+
+  uint32_t e_entry = sgi_be32(&img[24]);
+  uint32_t e_phoff = sgi_be32(&img[28]);
+  uint16_t e_phentsize = sgi_be16(&img[42]);
+  uint16_t e_phnum = sgi_be16(&img[44]);
+  uint32_t high = 0;
+  int loaded = 0;
+
+  for (int i = 0; i < e_phnum; i++) {
+    const uint8_t *ph = &img[e_phoff + (size_t)i * e_phentsize];
+    if (e_phoff + (size_t)(i + 1) * e_phentsize > len) {
+      return -4;
+    }
+    uint32_t p_type = sgi_be32(&ph[0]);
+    if (p_type != 1 /*PT_LOAD*/) {
+      continue;
+    }
+    uint32_t p_offset = sgi_be32(&ph[4]);
+    uint32_t p_vaddr = sgi_be32(&ph[8]);
+    uint32_t p_filesz = sgi_be32(&ph[16]);
+    uint32_t p_memsz = sgi_be32(&ph[20]);
+    if ((uint64_t)p_offset + p_filesz > len) {
+      return -5;
+    }
+    uint32_t phys = p_vaddr & 0x1FFFFFFF;  /* kseg0/kseg1 -> physical */
+    if (p_filesz > 0) {
+      char *nm = g_strdup_printf("modec-kernel-seg%d", i);
+      rom_add_blob_fixed(nm, img + p_offset, p_filesz, phys);
+      g_free(nm);
+    }
+    uint32_t seg_end = (p_vaddr + p_memsz) & 0x1FFFFFFF;
+    if (seg_end > high) {
+      high = seg_end;
+    }
+    loaded++;
+  }
+  if (!loaded) {
+    return -6;
+  }
+  *entry = e_entry;
+  *high_phys = high;
+  return 0;
+}
+
+/*
+ * Mode C boot (Path C — director decision 2026-07-07): our paravirtual ARCS
+ * PROM reads the disk's /unix host-side from the XFS root partition, loads it,
+ * and jumps — no guest sash, no -kernel, no borrowed Indy -bios. Reuses the
+ * exact Mode K tail (kernel trampoline + ARCS SPB/FV/env/memdesc stubs), so the
+ * kernel sees an identical firmware ABI; only the kernel's *source* differs.
+ * The XFS reader (hw/mips/sgi_xfs.c) is the generic substrate the future ARCS
+ * Open/Read/Seek/Close services (Path A sash) reuse verbatim.
+ */
+static void sgi_virtuix_mode_c_boot(MachineState *machine,
+                                    MemoryRegion *system_memory) {
   DriveInfo *dinfo;
   BlockBackend *blk;
   uint8_t vh[SGI_VH_SECTOR];
-  uint8_t sash_hdr[SGI_VH_SECTOR];
+  uint32_t part_firstlbn[SGI_VH_NPARTAB] = {0};
+  uint32_t part_type[SGI_VH_NPARTAB] = {0};
   int i;
-  int64_t sash_lbn = -1, sash_nbytes = 0;
-  int root_part = -1;
 
-  qemu_log("Virtuix: Mode C (our IP55 PROM) — probing boot disk\n");
+  qemu_log("Virtuix: Mode C (our IP55 PROM) — booting disk /unix host-side\n");
 
   /* Boot disk is if=scsi,bus=0,unit=1 (the canonical golden convention). */
   dinfo = drive_get(IF_SCSI, 0, 1);
-  if (!dinfo) {
-    error_report("Mode C: no boot disk at scsi bus=0 unit=1 "
-                 "(need -drive ...,if=scsi,bus=0,unit=1)");
-    return;
-  }
-  blk = blk_by_legacy_dinfo(dinfo);
-  if (!blk) {
-    error_report("Mode C: could not resolve BlockBackend for boot disk");
+  if (!dinfo || !(blk = blk_by_legacy_dinfo(dinfo))) {
+    error_report("Mode C: no boot disk at scsi bus=0 unit=1");
     return;
   }
 
-  if (blk_pread(blk, 0, SGI_VH_SECTOR, vh, 0) < 0) {
-    error_report("Mode C: failed to read volume header (block 0)");
+  if (blk_pread(blk, 0, SGI_VH_SECTOR, vh, 0) < 0 ||
+      sgi_be32(&vh[0]) != SGI_VH_MAGIC) {
+    error_report("Mode C: bad/absent SGI volume header on boot disk");
     return;
   }
 
-  uint32_t magic = sgi_be32(&vh[0]);
-  if (magic != SGI_VH_MAGIC) {
-    error_report("Mode C: bad volume-header magic 0x%08x (expected 0x%08x)",
-                 magic, SGI_VH_MAGIC);
-    return;
+  /* Parse the partition table. */
+  for (i = 0; i < SGI_VH_NPARTAB; i++) {
+    const uint8_t *pt = &vh[SGI_VH_PARTAB_OFF + i * SGI_VH_PT_ENTSZ];
+    part_firstlbn[i] = sgi_be32(pt + 4);
+    part_type[i] = sgi_be32(pt + 8);
   }
 
-  char bootfile[17];
-  memcpy(bootfile, &vh[SGI_VH_BOOTFILE_OFF], 16);
-  bootfile[16] = '\0';
-  qemu_log("Mode C: volume header OK, bootfile=\"%s\"\n", bootfile);
-
-  /* Volume directory: locate sash. */
+  /*
+   * Path-A prep (cheap, non-gating): locate the volume-header `sash` (the
+   * ECOFF the real PROM chain would load + run) and parse its a.out header.
+   * This proves the raw-voldir Open/Read + ECOFF-parse chain works; actually
+   * *running* it (Path A) still needs an ECOFF loader + a kuseg-0x10000000 TLB
+   * map, which Mode C (Path C) deliberately skips. See prom_c1_c2.md.
+   */
   for (i = 0; i < SGI_VH_NVDIR; i++) {
     const uint8_t *vd = &vh[SGI_VH_VOLDIR_OFF + i * SGI_VH_VD_ENTSZ];
-    char name[SGI_VH_VDNAMESIZE + 1];
-    memcpy(name, vd, SGI_VH_VDNAMESIZE);
-    name[SGI_VH_VDNAMESIZE] = '\0';
-    if (name[0] == '\0') {
+    if (memcmp(vd, "sash\0\0\0\0", SGI_VH_VDNAMESIZE) != 0) {
       continue;
     }
     uint32_t lbn = sgi_be32(vd + 8);
-    uint32_t nbytes = sgi_be32(vd + 12);
-    qemu_log("Mode C:   voldir[%d] \"%-8s\" lbn=%u nbytes=%u\n",
-             i, name, lbn, nbytes);
-    if (strcmp(name, "sash") == 0) {
-      sash_lbn = lbn;
-      sash_nbytes = nbytes;
+    uint8_t hdr[SGI_VH_SECTOR];
+    if (blk_pread(blk, (uint64_t)lbn * SGI_VH_SECTOR, SGI_VH_SECTOR, hdr, 0)
+        == 0) {
+      uint16_t coff = sgi_be16(&hdr[0]);
+      const uint8_t *ao = &hdr[20];
+      qemu_log("Mode C: [Path-A prep] volhdr sash lbn=%u coff_magic=0x%04x "
+               "aout_magic=0%o entry=0x%08x (ECOFF loader+kuseg TLB = future)\n",
+               lbn, coff, sgi_be16(ao), sgi_be32(ao + 16));
     }
+    break;
   }
 
-  /* Partition table: find the XFS (or EFS) root partition (firstlbn == 0 is
-   * the whole-volume/volhdr; the root fs partition is the one at the disk
-   * start after the volume header, conventionally partition 0). Report the
-   * first XFS/EFS partition as the /unix source. */
-  for (i = 0; i < SGI_VH_NPARTAB; i++) {
-    const uint8_t *pt = &vh[SGI_VH_PARTAB_OFF + i * SGI_VH_PT_ENTSZ];
-    uint32_t nblks = sgi_be32(pt + 0);
-    uint32_t firstlbn = sgi_be32(pt + 4);
-    uint32_t type = sgi_be32(pt + 8);
-    if (nblks == 0) {
-      continue;
-    }
-    qemu_log("Mode C:   partition[%d] nblks=%u firstlbn=%u type=%u%s\n",
-             i, nblks, firstlbn, type,
-             type == SGI_VH_PTYPE_XFS   ? " (XFS)"
-             : type == SGI_VH_PTYPE_EFS ? " (EFS)"
-                                        : "");
-    if (root_part < 0 &&
-        (type == SGI_VH_PTYPE_XFS || type == SGI_VH_PTYPE_EFS)) {
-      root_part = i;
-    }
+  /* Resolve the boot device + filename from the ARCS environment (the same
+   * OSLoadPartition/OSLoadFilename the stock PROM/sash chain consults). */
+  const char *osload_part = "dksc(0,1,0)";  /* matches arcs_env_vars */
+  const char *osload_file = "unix";
+  int unit = 1, part = 0;
+  sgi_devpath_parse(osload_part, &unit, &part);
+  if (part < 0 || part >= SGI_VH_NPARTAB) {
+    part = 0;
+  }
+  qemu_log("Mode C: OSLoadPartition=\"%s\" -> unit %d partition %d "
+           "(firstlbn=%u type=%u), OSLoadFilename=\"%s\"\n",
+           osload_part, unit, part, part_firstlbn[part], part_type[part],
+           osload_file);
+
+  /* Mount the XFS root partition host-side. */
+  SGIXfs fs;
+  if (sgi_xfs_mount(blk, part_firstlbn[part], &fs) < 0) {
+    error_report("Mode C: could not mount XFS at partition %d (firstlbn %u)",
+                 part, part_firstlbn[part]);
+    return;
   }
 
-  if (sash_lbn < 0) {
-    error_report("Mode C: 'sash' not found in volume directory");
-  } else if (blk_pread(blk, sash_lbn * SGI_VH_SECTOR, SGI_VH_SECTOR,
-                       sash_hdr, 0) < 0) {
-    error_report("Mode C: failed to read sash at lbn %" PRId64, sash_lbn);
-  } else {
-    uint16_t coff_magic = (sash_hdr[0] << 8) | sash_hdr[1];
-    /* ECOFF aouthdr immediately follows the 20-byte filehdr. */
-    const uint8_t *ao = &sash_hdr[20];
-    uint16_t ao_magic = (ao[0] << 8) | ao[1];
-    uint32_t entry = sgi_be32(ao + 16);
-    uint32_t text_start = sgi_be32(ao + 20);
-    qemu_log("Mode C: sash lbn=%" PRId64 " nbytes=%" PRId64
-             " coff_magic=0x%04x aout_magic=0%o entry=0x%08x text=0x%08x\n",
-             sash_lbn, sash_nbytes, coff_magic, ao_magic, entry, text_start);
+  /* Resolve + read the kernel file. */
+  char path[64];
+  snprintf(path, sizeof(path), "/%s", osload_file);
+  SGIXfsInode kino;
+  if (sgi_xfs_lookup(&fs, path, &kino) < 0) {
+    error_report("Mode C: '%s' not found on the XFS root partition", path);
+    return;
   }
 
-  qemu_log("Mode C: root fs partition = %d; SCAFFOLD ONLY — host-side file "
-           "reader + Execute not yet implemented (see prom_c1_c2.md "
-           "distance-to-C2). No transfer of control.\n", root_part);
-  error_report("Mode C: scaffold probe complete; boot chain not yet "
-               "implemented — use -kernel (Mode K) or -bios (Mode P) to boot");
+  uint64_t ksize = kino.size;
+  if (ksize == 0 || ksize > 64 * MiB) {
+    error_report("Mode C: implausible kernel size %" PRIu64, ksize);
+    sgi_xfs_inode_put(&kino);
+    return;
+  }
+  uint8_t *kbuf = g_malloc(ksize);
+  uint64_t got = 0;
+  if (sgi_xfs_read(&fs, &kino, 0, ksize, kbuf, &got) < 0 || got != ksize) {
+    error_report("Mode C: read of %s failed (%" PRIu64 "/%" PRIu64 ")", path,
+                 got, ksize);
+    g_free(kbuf);
+    sgi_xfs_inode_put(&kino);
+    return;
+  }
+  sgi_xfs_inode_put(&kino);
+  qemu_log("Mode C: read %s (%" PRIu64 " bytes) from XFS root\n", path, ksize);
+
+  /* Load the ELF into guest RAM (Execute). */
+  uint32_t kentry = 0, khigh_phys = 0;
+  int rc = sgi_load_elf32_be(kbuf, ksize, &kentry, &khigh_phys);
+  g_free(kbuf);
+  if (rc < 0) {
+    error_report("Mode C: %s is not a loadable ELF32-MSB MIPS kernel (rc=%d)",
+                 path, rc);
+    return;
+  }
+  qemu_log("Mode C: loaded kernel, entry 0x%08x, high phys 0x%08x\n", kentry,
+           khigh_phys);
+
+  /* Mode K tail: trampoline + ARCS firmware stubs (identical firmware ABI). */
+  write_kernel_trampoline(kentry);
+
+  DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
+  qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+  qdev_prop_set_uint32(arcs_dev, "kernel-end", khigh_phys);
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
+  memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
+                                      &SGI_ARCS(arcs_dev)->iomem, 10);
+  sgi_arcs_setup_stubs(SGI_ARCS(arcs_dev), &address_space_memory);
+
+  qemu_log("Mode C: firmware ready; handing off to disk /unix\n");
 }
 
 static void sgi_virtuix_init(MachineState *machine) {
@@ -663,10 +790,10 @@ static void sgi_virtuix_init(MachineState *machine) {
   } else if (getenv("SGI_MODE_C")) {
     /*
      * Mode C: our own IP55 PROM. Env-gated so the Mode K path above stays
-     * byte-identical. Currently a scaffold that probes + reports the disk
-     * boot assets host-side; see progress_notes/ip55/prom_c1_c2.md.
+     * byte-identical. Reads the disk's /unix host-side from the XFS root
+     * partition, loads + jumps to it (Path C). See prom_c1_c2.md.
      */
-    sgi_virtuix_mode_c_probe(machine);
+    sgi_virtuix_mode_c_boot(machine, system_memory);
   }
 }
 
