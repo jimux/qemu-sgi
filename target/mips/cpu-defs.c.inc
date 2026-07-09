@@ -604,7 +604,18 @@ const mips_def_t mips_defs[] =
         .CP0_LLAddr_shift = 4,
         .SYNCI_Step = 32,
         .CCRes = 2,
-        .CP0_Status_rw_bitmask = 0x3678FFFF,
+        /*
+         * CU3 (Status[31], the R5000 "XX" bit) MUST be writable: on real R5000
+         * hardware IRIX sets XX=1 to enable the MIPS IV COP1X FP multiply-add
+         * extensions (madd.d/msub.d/nmadd.d/nmsub.d).  QEMU only sets the
+         * MIPS_HFLAG_COP1X translation flag for a MIPS IV CPU when Status.CU3
+         * is set (target/mips/internal.h), so masking CU3 off (the old
+         * 0x3678FFFF) left COP1X permanently disabled and any mips4 user binary
+         * that used madd.d took a Reserved-Instruction -> SIGILL (e.g. the
+         * OCTANE2 sphere_demo, BL-32).  Adding bit 31 (0x80000000) is
+         * hardware-accurate and unblocks the mips4 FP-madd corpus.
+         */
+        .CP0_Status_rw_bitmask = 0xB678FFFF,
         .CP1_fcr0 = (0x23 << FCR0_PRID) | (0x0 << FCR0_REV),
         .CP1_fcr31 = 0,
         .CP1_fcr31_rw_bitmask = 0x0183FFFF,
