@@ -888,32 +888,59 @@ static void sgi_mc_virtuix_reset(DeviceState *dev)
     s->arb_burst_time = 0;
 
     /*
-     * Initialize per-bank state.
-     * Bank 0 gets all the installed RAM; banks 1-3 are empty SIMM slots.
-     * The PROM will probe banks by writing MEMCFG and testing addresses.
+     * Initialize per-bank state and seed a default MEMCFG that describes ALL
+     * of the installed RAM across the banks the IRIX kernel's szmem() scans.
+     *
+     * BL-39: the old code seeded a single bank 0 with the whole ram_size, but
+     * one MEMCFG size field saturates at 128MB (rev C: 4MB units, 5-bit size
+     * code 0x1f => 32*4MB).  The IP22 kernel sizes memory by reading MEMCFG0/1
+     * and summing banksz() over MAX_MEM_BANKS(=3) banks (irix ml/IP22.c), so a
+     * saturated bank 0 capped the guest at 128MB regardless of -m.
+     *
+     * The IP22/IP24 physical layout the kernel expects (irix kern/sys/mc.h,
+     * kern/sys/IP22.h):
+     *   SEG0 @ 0x08000000, max 256MB  -> up to two 128MB banks (0, 1)
+     *   SEG1 @ 0x20000000, max 128MB  -> one 128MB bank (2)
+     * i.e. a 384MB architectural ceiling in the -DIP22 kernel lineage.  We
+     * fill SEG0 first, then SEG1; any RAM above 384MB is left unmapped and
+     * logged (raising it needs the IP55-native kernel: bigger SEG defs +
+     * MAX_MEM_BANKS).  In Mode P a real PROM rewrites MEMCFG during its own
+     * memory sizing; this default just makes Mode-K (-kernel) boots see all
+     * their RAM without a PROM.
      */
     for (int i = 0; i < MC_NUM_BANKS; i++) {
         sgi_mc_virtuix_unmap_bank(s, i);
         s->banks[i].installed_size = 0;
         s->banks[i].ram_offset = 0;
     }
-    s->banks[0].installed_size = s->ram_size;
-    s->banks[0].ram_offset = 0;
-
-    /*
-     * Set default MEMCFG0 with bank 0 configured at SEG0 base.
-     * SEG0 is 0x08000000 for MC rev < 5, 0x20000000 for rev >= 5.
-     * This ensures RAM is mapped at boot so exception vectors work.
-     * MEMCFG1 starts at 0 (no banks configured).
-     */
     {
         int shift = sgi_mc_virtuix_addr_shift(s);
-        uint32_t seg0_base = (shift >= 24) ? 0x20000000 : 0x08000000;
-        uint16_t bank0_cfg = sgi_mc_virtuix_memcfg_bank(seg0_base, s->ram_size,
-                                                  shift);
-        s->memcfg[0] = (uint32_t)bank0_cfg << 16;
+        uint32_t bank_max = 32u << shift;      /* size code 0x1f => 32 units */
+        /* Physical bank slots szmem() scans: two in SEG0, then SEG1. */
+        static const uint32_t bank_base[3] = {
+            0x08000000, 0x10000000, 0x20000000
+        };
+        uint32_t remaining = s->ram_size;
+        uint32_t ram_off = 0;
+        uint16_t fld[MC_NUM_BANKS] = { 0 };
+
+        for (int b = 0; b < 3 && b < MC_NUM_BANKS && remaining > 0; b++) {
+            uint32_t sz = MIN(remaining, bank_max);
+            s->banks[b].installed_size = sz;
+            s->banks[b].ram_offset = ram_off;
+            fld[b] = sgi_mc_virtuix_memcfg_bank(bank_base[b], sz, shift);
+            ram_off += sz;
+            remaining -= sz;
+        }
+        if (remaining) {
+            qemu_log("sgi_mc: %u MB RAM exceeds the IP22 384MB bank ceiling; "
+                     "%u MB left unmapped (needs the IP55-native kernel)\n",
+                     s->ram_size / (1024 * 1024),
+                     remaining / (1024 * 1024));
+        }
+        s->memcfg[0] = ((uint32_t)fld[0] << 16) | fld[1];
+        s->memcfg[1] = ((uint32_t)fld[2] << 16) | fld[3];
     }
-    s->memcfg[1] = 0;
 
     /* Apply the initial mapping */
     sgi_mc_virtuix_update_ram_mapping(s);

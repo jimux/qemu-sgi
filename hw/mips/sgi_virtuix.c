@@ -737,13 +737,12 @@ static void sgi_virtuix_init(MachineState *machine) {
   create_unimplemented_device("high-mem-probe", SGI_RAM_HIGH_BASE, 256 * MiB);
   create_unimplemented_device("zero-mem-probe", 0x00000000, 512 * KiB);
 
-  /* Map high RAM natively if > 256MB */
-  if (machine->ram_size > 256 * MiB) {
-    MemoryRegion *high_ram = g_new(MemoryRegion, 1);
-    memory_region_init_alias(high_ram, NULL, "high-ram", machine->ram,
-                             256 * MiB, machine->ram_size - 256 * MiB);
-    memory_region_add_subregion(system_memory, 0x20000000, high_ram);
-  }
+  /*
+   * BL-39: SEG1 high RAM (0x20000000) is now mapped by the MC as bank 2
+   * (sgi_mc_virtuix_reset seeds MEMCFG so the IP22 kernel's szmem() counts it),
+   * so there is NO separate native high-ram alias here — that would collide
+   * with the MC's bank-2 subregion at 0x20000000.  The MC owns all RAM banks.
+   */
 
   create_unimplemented_device("extended-mem-probe0", 0x18000000, 0x07000000);
   create_unimplemented_device("extended-mem-probe1", 0x30000000, 0x50000000);
