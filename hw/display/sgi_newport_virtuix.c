@@ -47,6 +47,8 @@ static void newport_dirty_full(SGINewportVirtuixState *s);
 static void newport_dirty_rect(SGINewportVirtuixState *s, int rx, int ry, int rw, int rh);
 /* Phase E hardware cursor (used in VC2 write handler) */
 static void newport_update_hw_cursor(SGINewportVirtuixState *s);
+/* NP_2D_ROWHIST diagnostic (used by output_pixel + fast fills, defined below) */
+static inline void newport_rowhist_bump(int wy);
 
 /* NewView binary log record (20 bytes, MAME-compatible layout) */
 static void newport_newview_log(SGINewportVirtuixState *s, uint32_t offset,
@@ -689,6 +691,7 @@ static void newport_output_pixel(SGINewportVirtuixState *s, int16_t x, int16_t y
     }
 
     addr = (uint32_t)wy * NEWPORT_VRAM_W + (uint32_t)wx;
+    newport_rowhist_bump(wy);
     newport_logic_pixel(s, addr, color);
 }
 
@@ -785,6 +788,99 @@ static inline bool newport_2d_force_slow(void)
         np_2d_force_slow = getenv("NP_2D_FORCE_SLOW") ? 1 : 0;
     }
     return np_2d_force_slow;
+}
+
+/*
+ * NP_2D_VERIFY=1 (diagnostic): for each primitive that would take a host fast
+ * path, speculatively run the fast path into a scratch, restore VRAM, then run
+ * the faithful slow path, and byte-compare the two over the affected VRAM rows.
+ * The FIRST divergence is logged with the op parameters (op, extent, pattern,
+ * clip, logic, planes, window) so a fast-path bug can be pinpointed in one boot.
+ * Only the base rgbci plane is compared (the fast paths only touch it).
+ */
+/* Fine-grained bisect gates: disable a single host fast path (keep the others)
+ * to localize a fast-path regression that per-op differential testing misses. */
+static int np_2d_no_block = -1, np_2d_no_scr2scr = -1;
+static inline bool newport_2d_no_block(void)
+{
+    if (np_2d_no_block < 0) {
+        np_2d_no_block = getenv("NP_2D_NO_BLOCK") ? 1 : 0;
+    }
+    return np_2d_no_block;
+}
+static inline bool newport_2d_no_scr2scr(void)
+{
+    if (np_2d_no_scr2scr < 0) {
+        np_2d_no_scr2scr = getenv("NP_2D_NO_SCR2SCR") ? 1 : 0;
+    }
+    return np_2d_no_scr2scr;
+}
+
+/* NP_2D_ROWHIST=1: per-VRAM-row count of pixel writes, dumped at exit. Compares
+ * the VRAM-row COVERAGE of a pure-fast vs pure-slow boot (catches op-sequence /
+ * coverage divergence the per-op pixel verify cannot see). */
+static uint64_t g_rowwrite[NEWPORT_VRAM_H];
+static int np_2d_rowhist;    /* 0 default; set once in realize from env (cheap
+                             * inline branch at the per-pixel call sites) */
+static void newport_rowhist_dump(void)
+{
+    int y;
+    if (!np_2d_rowhist) {
+        return;
+    }
+    for (y = 0; y < NEWPORT_VRAM_H; y++) {
+        if (g_rowwrite[y]) {
+            fprintf(stderr, "NP_ROWHIST %d %" PRIu64 "\n", y, g_rowwrite[y]);
+        }
+    }
+}
+/* one predictable, never-taken-when-off branch; wy is already in-bounds */
+static inline void newport_rowhist_bump(int wy)
+{
+    if (np_2d_rowhist) {
+        g_rowwrite[wy]++;
+    }
+}
+
+static int np_2d_verify = -1;
+static int np_verify_reported;
+static inline bool newport_2d_verify(void)
+{
+    if (np_2d_verify < 0) {
+        np_2d_verify = getenv("NP_2D_VERIFY") ? 1 : 0;
+    }
+    return np_2d_verify;
+}
+/* Compare rows [ry0..ry1] full-width of `fast` (captured) vs current vram_rgbci
+ * (holding the slow result). Logs the first differing (x,y) + count. */
+static void newport_verify_cmp(SGINewportVirtuixState *s, const uint32_t *fast,
+                               int ry0, int ry1, const char *op, int wx0,
+                               int wy0, int wx1, int wy1, uint32_t pattern)
+{
+    int y, x, first_x = -1, first_y = -1, ndiff = 0, ndiffrows = 0;
+    for (y = ry0; y <= ry1; y++) {
+        const uint32_t *fr = &fast[(size_t)(y - ry0) * NEWPORT_VRAM_W];
+        const uint32_t *sr = &s->vram_rgbci[(size_t)y * NEWPORT_VRAM_W];
+        int rowdiff = 0;
+        for (x = 0; x < NEWPORT_VRAM_W; x++) {
+            if (fr[x] != sr[x]) {
+                if (first_x < 0) { first_x = x; first_y = y; }
+                ndiff++; rowdiff = 1;
+            }
+        }
+        ndiffrows += rowdiff;
+    }
+    if (ndiff && !np_verify_reported) {
+        np_verify_reported = 1;
+        fprintf(stderr,
+            "NP_2D_VERIFY: DIVERGE op=%s ndiff=%d diffrows=%d first=(%d,%d) "
+            "extent[wx %d..%d wy %d..%d] pat=0x%08x logic=0x%x planes=%d "
+            "clip_mode=0x%x opaque=%d win=(%d,%d)\n",
+            op, ndiff, ndiffrows, first_x, first_y, wx0, wx1, wy0, wy1,
+            pattern, s->dm1_logicop, s->dm1_planes, s->clip_mode, s->dm0_opaque,
+            (int16_t)((s->xy_window >> 16) & 0xffff),
+            (int16_t)(s->xy_window & 0xffff));
+    }
 }
 
 enum {
@@ -998,6 +1094,7 @@ static void newport_fast_fill_rect(SGINewportVirtuixState *s,
         if (wy < 0 || wy >= NEWPORT_VRAM_H) {
             continue;                  /* out-of-bounds row: slow path skips too */
         }
+        newport_rowhist_bump(wy);
         rowoff = (uint32_t)wy * NEWPORT_VRAM_W;
 
         if (pattern == 0xffffffff) {
@@ -1095,6 +1192,9 @@ static void newport_draw_block(SGINewportVirtuixState *s)
     uint32_t pat_bit;
     bool shade = !!(s->drawmode0 & DM0_SHADE);
     bool lr_abort = !!(s->drawmode0 & DM0_LR_ABORT) && dx < 0;
+    /* NP_2D_VERIFY stash (fast-vs-slow compare deferred to end of the slow loop) */
+    uint32_t *vf_snap = NULL, *vf_fast = NULL, vf_pat = 0;
+    int vf_ry0 = 0, vf_ry1 = -1, vf_wx0 = 0, vf_wx1 = 0, vf_wy0 = 0, vf_wy1 = 0;
 
     trace_sgi_newport_draw_block(start_x, start_y, end_x, end_y);
     color = newport_get_default_color(s);
@@ -1173,7 +1273,7 @@ static void newport_draw_block(SGINewportVirtuixState *s)
             s->x_save_int == start_x &&
             (s->dm1_logicop == 0x3 || s->dm1_logicop == 0x0 ||
              s->dm1_logicop == 0xc || s->dm1_logicop == 0xf);
-        if (fast_ok && !newport_2d_force_slow()) {
+        if (fast_ok && !newport_2d_force_slow() && !newport_2d_no_block()) {
             int16_t orig_end_x = s->x_end_int;   /* end_x is already exclusive */
             int16_t orig_end_y = s->y_end_int;
             int wx0 = MIN(start_x, orig_end_x);
@@ -1188,14 +1288,41 @@ static void newport_draw_block(SGINewportVirtuixState *s)
                 reg_y = start_y + dy;
             }
             newport_2d_stat(NP2D_BLOCK_FAST);
-            newport_fast_block_fill(s, wx0, wy0, wx1, wy1, color, s->color_back,
-                                    pattern, s->dm0_opaque, start_x, dx);
-            /* register end-state (independent of clip) */
-            s->iter_x = s->x_save_int;
-            s->iter_y = reg_y;
-            newport_write_x_start(s, (int32_t)s->x_save_int << 11);
-            newport_write_y_start(s, (int32_t)reg_y << 11);
-            return;
+            if (newport_2d_verify() && !np_verify_reported) {
+                /* speculative fast run for comparison, then fall through to slow */
+                int winy = (int16_t)(s->xy_window & 0xffff);
+                int ry0 = wy0 + winy - 0x1000, ry1 = wy1 + winy - 0x1000;
+                if (ry0 < 0) ry0 = 0;
+                if (ry1 >= NEWPORT_VRAM_H) ry1 = NEWPORT_VRAM_H - 1;
+                if (ry0 <= ry1) {
+                    size_t nrows = (size_t)(ry1 - ry0 + 1);
+                    size_t nb = nrows * NEWPORT_VRAM_W * 4;
+                    vf_snap = g_malloc(nb);
+                    vf_fast = g_malloc(nb);
+                    memcpy(vf_snap, &s->vram_rgbci[(size_t)ry0 * NEWPORT_VRAM_W],
+                           nb);
+                    newport_fast_block_fill(s, wx0, wy0, wx1, wy1, color,
+                                            s->color_back, pattern,
+                                            s->dm0_opaque, start_x, dx);
+                    memcpy(vf_fast, &s->vram_rgbci[(size_t)ry0 * NEWPORT_VRAM_W],
+                           nb);
+                    memcpy(&s->vram_rgbci[(size_t)ry0 * NEWPORT_VRAM_W], vf_snap,
+                           nb);
+                    vf_ry0 = ry0; vf_ry1 = ry1; vf_pat = pattern;
+                    vf_wx0 = wx0; vf_wx1 = wx1; vf_wy0 = wy0; vf_wy1 = wy1;
+                }
+                /* do NOT return: run the faithful slow loop below as ground truth */
+            } else {
+                newport_fast_block_fill(s, wx0, wy0, wx1, wy1, color,
+                                        s->color_back, pattern, s->dm0_opaque,
+                                        start_x, dx);
+                /* register end-state (independent of clip) */
+                s->iter_x = s->x_save_int;
+                s->iter_y = reg_y;
+                newport_write_x_start(s, (int32_t)s->x_save_int << 11);
+                newport_write_y_start(s, (int32_t)reg_y << 11);
+                return;
+            }
         }
         newport_2d_stat(s->dm0_colorhost ? NP2D_IMAGE : NP2D_BLOCK_SLOW);
         if (!s->dm0_colorhost && !newport_2d_force_slow()) {
@@ -1272,6 +1399,13 @@ static void newport_draw_block(SGINewportVirtuixState *s)
     s->iter_y = sy;
     newport_write_x_start(s, (int32_t)sx << 11);
     newport_write_y_start(s, (int32_t)sy << 11);
+
+    if (vf_ry1 >= vf_ry0 && vf_fast) {
+        newport_verify_cmp(s, vf_fast, vf_ry0, vf_ry1, "block",
+                           vf_wx0, vf_wy0, vf_wx1, vf_wy1, vf_pat);
+    }
+    g_free(vf_snap);
+    g_free(vf_fast);
 }
 
 /*
@@ -1506,6 +1640,9 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
     bool stop_on_y = s->dm0_stopony;
     int src_wx, src_wy;
     uint32_t src_addr, pixel;
+    /* NP_2D_VERIFY stash for scr2scr (compare deferred to end of slow loop) */
+    uint32_t *sf_snap = NULL, *sf_fast = NULL;
+    int sf_ry0 = 0, sf_ry1 = -1, sf_wx0 = 0, sf_wx1 = 0;
 
     trace_sgi_newport_draw_scr2scr(start_x, start_y, end_x, end_y,
                                    move_x, move_y);
@@ -1537,7 +1674,7 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
      * popup/CID planes falls through to the faithful per-pixel loop.  The
      * register end-state (x_save_int, end_y+dy) is independent of clip.
      */
-    if (!newport_2d_force_slow() &&
+    if (!newport_2d_force_slow() && !newport_2d_no_scr2scr() &&
         stop_on_x && stop_on_y &&
         s->dm1_logicop == 0x3 &&
         !s->dm0_colorhost &&
@@ -1581,6 +1718,24 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
             }
 
             if (inb) {
+                bool vmode = newport_2d_verify() && !np_verify_reported &&
+                             !empty;
+                int vry0 = 0, vry1 = -1;
+                if (vmode) {
+                    vry0 = Dyl + winy - 0x1000;
+                    vry1 = Dyh + winy - 0x1000;
+                    if (vry0 < 0) vry0 = 0;
+                    if (vry1 >= NEWPORT_VRAM_H) vry1 = NEWPORT_VRAM_H - 1;
+                    if (vry0 <= vry1) {
+                        size_t nb = (size_t)(vry1 - vry0 + 1) *
+                                    NEWPORT_VRAM_W * 4;
+                        sf_snap = g_malloc(nb);
+                        sf_fast = g_malloc(nb);
+                        memcpy(sf_snap,
+                               &s->vram_rgbci[(size_t)vry0 * NEWPORT_VRAM_W],
+                               nb);
+                    }
+                }
                 newport_2d_stat(NP2D_SCR2SCR_FAST);
                 if (!empty) {
                     uint32_t *buf = s->vram_rgbci;
@@ -1596,6 +1751,7 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
                          Yr += dy) {
                         int dst_y = Yr + winy - 0x1000;
                         int src_y = (Yr - move_y) + winy - 0x1000;
+                        newport_rowhist_bump(dst_y);
                         uint32_t *drow =
                             &buf[(size_t)dst_y * NEWPORT_VRAM_W + dst_x0];
                         uint32_t *srow =
@@ -1619,10 +1775,24 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
                     newport_dirty_rect(s, dst_x0, Dyl + winy - 0x1000,
                                        row_w, Dyh - Dyl + 1);
                 }
-                /* register end-state (independent of clip) */
-                newport_write_x_start(s, (int32_t)s->x_save_int << 11);
-                newport_write_y_start(s, (int32_t)(end_y + dy) << 11);
-                return;
+                if (vmode && sf_fast && vry0 <= vry1) {
+                    /* capture fast result, restore VRAM, fall through to slow
+                     * (ground truth); compare at end of function. */
+                    size_t nb = (size_t)(vry1 - vry0 + 1) * NEWPORT_VRAM_W * 4;
+                    memcpy(sf_fast,
+                           &s->vram_rgbci[(size_t)vry0 * NEWPORT_VRAM_W], nb);
+                    memcpy(&s->vram_rgbci[(size_t)vry0 * NEWPORT_VRAM_W],
+                           sf_snap, nb);
+                    sf_ry0 = vry0; sf_ry1 = vry1;
+                    sf_wx0 = Dxl + winx - 0x1000;
+                    sf_wx1 = Dxh + winx - 0x1000;
+                    /* fall through to the faithful slow loop below */
+                } else {
+                    /* register end-state (independent of clip) */
+                    newport_write_x_start(s, (int32_t)s->x_save_int << 11);
+                    newport_write_y_start(s, (int32_t)(end_y + dy) << 11);
+                    return;
+                }
             }
         }
     }
@@ -1683,6 +1853,13 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
 
     newport_write_x_start(s, (int32_t)start_x << 11);
     newport_write_y_start(s, (int32_t)start_y << 11);
+
+    if (sf_ry1 >= sf_ry0 && sf_fast) {
+        newport_verify_cmp(s, sf_fast, sf_ry0, sf_ry1, "scr2scr",
+                           sf_wx0, sf_ry0, sf_wx1, sf_ry1, 0);
+    }
+    g_free(sf_snap);
+    g_free(sf_fast);
 }
 
 /*
@@ -3898,6 +4075,31 @@ static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
      * from VRAM regardless, so only the base plane needs seeding.  Post-flip live
      * draws paint over the seed as before.  NP_SCANOUT_NOSEED=1 restores the old
      * blank-shadow behaviour for A/B. */
+    /* NP_VRAM_DUMP diagnostic: write the raw vram_rgbci low-byte plane (index
+     * plane, pre-CMAP) to a PGM at seed time, so a banded run can be checked for
+     * whether the bands live in the VRAM CONTENT (guest/emulation) or only in the
+     * convert/display path.  Off unless NP_VRAM_DUMP names a path. */
+    {
+        const char *vd = getenv("NP_VRAM_DUMP");
+        if (vd && s->vram_rgbci) {
+            FILE *f = fopen(vd, "wb");
+            if (f) {
+                int yy2, xx2;
+                fprintf(f, "P5\n%d %d\n255\n", NEWPORT_SCREEN_W,
+                        NEWPORT_SCREEN_H);
+                for (yy2 = 0; yy2 < NEWPORT_SCREEN_H; yy2++) {
+                    for (xx2 = 0; xx2 < NEWPORT_SCREEN_W; xx2++) {
+                        uint8_t b = (uint8_t)
+                            (s->vram_rgbci[(size_t)yy2 * NEWPORT_VRAM_W + xx2]
+                             & 0xff);
+                        fputc(b, f);
+                    }
+                }
+                fclose(f);
+                fprintf(stderr, "NP_VRAM_DUMP: wrote %s\n", vd);
+            }
+        }
+    }
     if (fmt == 0 && s->vram_rgbci && !newport_scanout_noseed()) {
         uint32_t cols = MIN(w, (uint32_t)NEWPORT_SCREEN_W);
         uint32_t rows = MIN(h, (uint32_t)NEWPORT_SCREEN_H);
@@ -4302,6 +4504,13 @@ static void sgi_newport_virtuix_reset(DeviceState *dev)
 static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
 {
     SGINewportVirtuixState *s = SGI_NEWPORT_VIRTUIX(dev);
+
+    /* NP_2D_ROWHIST diagnostic: latch the gate once so the per-pixel call sites
+     * are a single predictable branch (never taken when off). */
+    if (getenv("NP_2D_ROWHIST")) {
+        np_2d_rowhist = 1;
+        atexit(newport_rowhist_dump);
+    }
 
     /* Allocate VRAM */
     s->vram_rgbci = g_malloc0(NEWPORT_VRAM_W * NEWPORT_VRAM_H *
