@@ -3603,6 +3603,18 @@ static inline bool newport_scanout_full(void)
     return np_scanout_full;
 }
 
+/* PVDisplay session 22 (BL-43): disable the VRAM->shadow seed at flip
+ * activation (A/B escape hatch — reproduces the pre-session-22 blank-shadow
+ * behaviour where pre-flip app-cached content was lost to index-0 black). */
+static inline bool newport_scanout_noseed(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("NP_SCANOUT_NOSEED") ? 1 : 0;
+    }
+    return v;
+}
+
 /* Phase D: saturate the dirty-rect list to full-screen.  Used by the broad
  * invalidators (palette / DID-table / mode-table / RAMDAC-LUT changes, cursor
  * moves, backend invalidate) whose effect can't be bounded to a small rect. */
@@ -3868,6 +3880,44 @@ static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
     if (!s->scanout_row) {
         s->scanout_row = g_new0(uint32_t, NEWPORT_SCREEN_W);
     }
+
+    /* PVDisplay session 22 (BL-43 fix): SEED the shadow framebuffer from the
+     * currently-visible VRAM base plane at flip activation.  The DDX's flip
+     * memsets its shadow to 0 (black) and scans it out blank, so any content
+     * painted into VRAM BEFORE the flip goes live — the app-cached Icon-Catalog
+     * body (labels, menu bar, status line, "pedestal" region) and every other
+     * pre-flip pixel — was lost to index-0 black (the "added black bars" / missing
+     * body text of BL-43).  We own both surfaces here, so copying VRAM->shadow
+     * is generic and race-free: it runs synchronously inside the SCANOUT_SET
+     * handler BEFORE scanout_active goes true, hence completes before the first
+     * shadow frame is scanned out (and after the guest's memset, which precedes
+     * the ring doorbell that drove us here).  CI8 only: the shadow byte is the
+     * VRAM rgbci low byte, which convert_row renders byte-identically whether the
+     * base plane is sourced from the shadow or VRAM (see newport_scanout_ci_row /
+     * newport_scanout_ab_check).  The aux planes (popup/overlay/CID) always source
+     * from VRAM regardless, so only the base plane needs seeding.  Post-flip live
+     * draws paint over the seed as before.  NP_SCANOUT_NOSEED=1 restores the old
+     * blank-shadow behaviour for A/B. */
+    if (fmt == 0 && s->vram_rgbci && !newport_scanout_noseed()) {
+        uint32_t cols = MIN(w, (uint32_t)NEWPORT_SCREEN_W);
+        uint32_t rows = MIN(h, (uint32_t)NEWPORT_SCREEN_H);
+        uint32_t yy, xx;
+        for (yy = 0; yy < rows; yy++) {
+            const uint32_t *vrow = &s->vram_rgbci[(size_t)yy * NEWPORT_VRAM_W];
+            for (xx = 0; xx < cols; xx++) {
+                s->scanout_rowbytes[xx] = (uint8_t)(vrow[xx] & 0xff);
+            }
+            for (; xx < stride; xx++) {
+                s->scanout_rowbytes[xx] = 0;   /* pad cols beyond VRAM width */
+            }
+            dma_memory_write(&address_space_memory,
+                             (hwaddr)((s->scanout_base & 0x1FFFFFFFULL) +
+                                      (uint64_t)yy * stride),
+                             s->scanout_rowbytes, stride,
+                             MEMTXATTRS_UNSPECIFIED);
+        }
+    }
+
     s->scanout_active = true;
     newport_dirty_full(s);   /* first shadowfb frame repaints everything */
 }
