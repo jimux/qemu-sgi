@@ -803,8 +803,20 @@ static void sgi_pvchan_realize(DeviceState *dev, Error **errp)
 
     /* D5 absolute pointer: register the abs input handler (always).  Only emits
      * H2G frames once the guest agent has programmed the ring, and only under a
-     * display that sends abs events — headless/CI boots are unaffected. */
+     * display that sends abs events — headless/CI boots are unaffected.
+     *
+     * activate() moves this handler to the HEAD of the global input-handler
+     * list so qemu_input_find_handler(REL|ABS) returns it first, making
+     * qemu_input_is_absolute() true.  Without this the earlier-registered PS/2
+     * REL mouse wins that lookup, so GTK/VNC send RELATIVE motion (to the PS/2
+     * mouse) instead of absolute position (to us) for REAL display input — the
+     * D5 gate only ever passed because QMP input-send-event abs events route to
+     * this handler by event-type, bypassing is_absolute.  Buttons still reach
+     * the PS/2 mouse (routed by BTN event-type, independent of head order), so
+     * guest-local clicking is unchanged.  Headless/CI boots have no display and
+     * are unaffected. */
     s->input_handler = qemu_input_handler_register(dev, &pvchan_ptr_handler);
+    qemu_input_handler_activate(s->input_handler);
 
     pvchan_instance = s;
 
