@@ -117,6 +117,8 @@ void hmp_xen_event_list(Monitor *mon, const QDict *qdict);
 void hmp_pvchan_send(Monitor *mon, const QDict *qdict);
 void hmp_pvchan_recv(Monitor *mon, const QDict *qdict);
 void hmp_pvchan_sendfile(Monitor *mon, const QDict *qdict);
+void hmp_pvchan_clipget(Monitor *mon, const QDict *qdict);
+void hmp_pvchan_clipset(Monitor *mon, const QDict *qdict);
 void object_add_completion(ReadLineState *rs, int nb_args, const char *str);
 void object_del_completion(ReadLineState *rs, int nb_args, const char *str);
 void device_add_completion(ReadLineState *rs, int nb_args, const char *str);

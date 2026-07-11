@@ -1903,4 +1903,27 @@ SRST
 ``pvchan-recv``
   Read and display a message from the guest via the sgi-pvchan device.
 ERST
+
+    {
+        .name       = "pvchan-clipget",
+        .args_type  = "",
+        .params     = "",
+        .help       = "print the current host clipboard text (D4 guest->host proof)",
+        .cmd        = hmp_pvchan_clipget,
+    },
+
+    {
+        .name       = "pvchan-clipset",
+        .args_type  = "text:s",
+        .params     = "text",
+        .help       = "set the host clipboard (simulates a host copy; D4 host->guest)",
+        .cmd        = hmp_pvchan_clipset,
+    },
+
+SRST
+``pvchan-clipget`` / ``pvchan-clipset`` *text*
+  Read or set the host clipboard bridged by the sgi-pvchan device (needs
+  ``-global sgi-pvchan.clipboard=on``).  clipset simulates a host-side copy so
+  the guest agent receives it; clipget shows text the guest grabbed.
+ERST
 #endif

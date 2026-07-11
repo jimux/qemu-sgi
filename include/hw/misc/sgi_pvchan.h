@@ -42,6 +42,7 @@
 #include "qom/object.h"
 #include "chardev/char-fe.h"
 #include "qemu/notify.h"
+#include "ui/input.h"
 
 #define TYPE_SGI_PVCHAN "sgi-pvchan"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIPvChanState, SGI_PVCHAN)
@@ -88,6 +89,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIPvChanState, SGI_PVCHAN)
 #define PVCHAN_OP_PING        4
 #define PVCHAN_OP_ANNOUNCE    5
 #define PVCHAN_OP_SHUTDOWN    6
+/*
+ * 7 = ABSPTR  host→guest, unsolicited (fire-and-forget, NO reply).  D5 absolute
+ *     pointer: the device registers a QEMU absolute input handler; on host
+ *     pointer motion over the display it pushes the latest position into the
+ *     H2G ring and the resident agent (irixga) XWarpPointer's the guest cursor
+ *     there.  Payload [x:u32][y:u32][xmax:u32][ymax:u32] LE, x/y in 0..xmax
+ *     (INPUT_EVENT_ABS_MAX = 0x7FFF); the agent scales to its X screen.
+ * 8 = CLIP_GRAB  guest→host, unsolicited: the guest asserted a text selection;
+ *     payload = UTF-8 text (transcoded from Latin-1 by the agent).  The device
+ *     forwards it to the host clipboard (D4 guest→host).
+ * 9 = CLIP_DATA  host→guest, unsolicited: the host clipboard changed; payload =
+ *     UTF-8 text.  The agent owns PRIMARY+CLIPBOARD and serves it (D4 host→guest).
+ */
+#define PVCHAN_OP_ABSPTR      7
+#define PVCHAN_OP_CLIP_GRAB   8
+#define PVCHAN_OP_CLIP_DATA   9
 
 /* Host-side chardev frame sizes: request [op:u32][len:u32][payload],
  * reply [op:u32][status:u32][len:u32][payload].  All little-endian. */
@@ -124,6 +141,26 @@ struct SGIPvChanState {
     bool          powerdown_registered;
     bool          powerdown_pending;  /* host pressed power: await guest sync-ack
                                        * then request a clean QEMU shutdown */
+
+    /* D5 absolute pointer: a QEMU abs input handler feeds the latest host
+     * pointer position; the sync callback pushes one OP_ABSPTR per batch into
+     * H2G (coalesced — dropped if the ring is momentarily full).  ABS-only mask,
+     * so buttons/wheel keep flowing to the PS/2 mouse (guest-local clicking). */
+    QemuInputHandlerState *input_handler;
+    int32_t       abs_x, abs_y;       /* latest, 0..INPUT_EVENT_ABS_MAX */
+    bool          abs_dirty;          /* motion since last push */
+
+    /* D4 clipboard: pvchan registers as a QEMU clipboard peer (opt-in via the
+     * `clipboard` property, default off).  Guest CLIP_GRAB updates the host
+     * clipboard; a host clipboard change pushes CLIP_DATA to the guest.  When
+     * enabled, G2H is drained unconditionally (to catch unsolicited guest grabs
+     * with no PvChanClient attached), so an unconsumed startup ANNOUNCE is
+     * stashed here and re-emitted when a chardev client connects. */
+    bool          clip_enabled;       /* `clipboard=on` */
+    char         *clip_from_guest;    /* last text the guest grabbed (host serves) */
+    bool          pending_ann_valid;  /* a startup ANNOUNCE was consumed pre-client */
+    uint32_t      pending_ann_op, pending_ann_status, pending_ann_len;
+    uint8_t       pending_ann[128];   /* stashed ANNOUNCE payload */
 };
 
 /*

@@ -26,6 +26,8 @@
 #include "system/dma.h"
 #include "system/runstate.h"
 #include "chardev/char-fe.h"
+#include "ui/input.h"
+#include "ui/clipboard.h"
 
 /* ---- singleton (for HMP lookups) ------------------------------------------ */
 static SGIPvChanState *pvchan_instance;
@@ -187,6 +189,10 @@ static uint32_t pvchan_get_le32(const uint8_t *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* D4 clipboard: defined below, used by pvchan_process_g2h (guest CLIP_GRAB). */
+static void pvchan_clip_from_guest(SGIPvChanState *s, const uint8_t *text,
+                                   uint32_t len);
+
 /*
  * Process every complete G2H message the guest produced.  Two consumers:
  *   - if a client socket is attached, each message is forwarded as a reply
@@ -208,13 +214,34 @@ static void pvchan_process_g2h(SGIPvChanState *s)
     uint32_t op, status;
     int n;
 
-    if (!s->chr_connected && !s->powerdown_pending) {
+    /* Drain when a client is attached, a power-off is pending, OR clipboard
+     * mode is on (guest CLIP_GRAB is unsolicited — nobody polls for it). */
+    if (!s->chr_connected && !s->powerdown_pending && !s->clip_enabled) {
         return;
     }
     for (;;) {
         n = pvchan_host_read_msg(s, &op, &status, payload, sizeof(payload));
         if (n == PVCHAN_NOMSG || n < 0) {
             break;  /* nothing more ready (or a desync we already skipped past) */
+        }
+        /* guest clipboard grab: consume internally, never forward to a client */
+        if (op == PVCHAN_OP_CLIP_GRAB) {
+            if (s->clip_enabled) {
+                pvchan_clip_from_guest(s, payload, (uint32_t)n);
+            }
+            continue;
+        }
+        /* clipboard mode may drain the startup ANNOUNCE before any client is
+         * attached; stash it so CHR_EVENT_OPENED can re-emit it (wait_announce). */
+        if (op == PVCHAN_OP_ANNOUNCE && !s->chr_connected) {
+            s->pending_ann_op = op;
+            s->pending_ann_status = status;
+            s->pending_ann_len = MIN((uint32_t)n, sizeof(s->pending_ann));
+            if (s->pending_ann_len) {
+                memcpy(s->pending_ann, payload, s->pending_ann_len);
+            }
+            s->pending_ann_valid = true;
+            continue;
         }
         if (s->chr_connected) {
             pvchan_put_le32(hdr + 0, op);
@@ -283,11 +310,146 @@ static void pvchan_chr_event(void *opaque, QEMUChrEvent ev)
         /* fresh client: drop any half-frame, then flush pending G2H (announce) */
         s->rx_len = 0;
         s->chr_connected = true;
+        /* If clipboard mode already drained the startup ANNOUNCE before any
+         * client attached, re-emit it now so wait_announce() still sees it. */
+        if (s->pending_ann_valid) {
+            uint8_t hdr[PVCHAN_REP_HDR];
+            pvchan_put_le32(hdr + 0, s->pending_ann_op);
+            pvchan_put_le32(hdr + 4, s->pending_ann_status);
+            pvchan_put_le32(hdr + 8, s->pending_ann_len);
+            qemu_chr_fe_write_all(&s->chr, hdr, PVCHAN_REP_HDR);
+            if (s->pending_ann_len) {
+                qemu_chr_fe_write_all(&s->chr, s->pending_ann, s->pending_ann_len);
+            }
+            s->pending_ann_valid = false;
+        }
         pvchan_process_g2h(s);
     } else if (ev == CHR_EVENT_CLOSED) {
         s->rx_len = 0;
         s->chr_connected = false;
     }
+}
+
+/* ---- D5 absolute pointer -------------------------------------------------
+ *
+ * A QEMU absolute input handler (ABS mask only).  With it registered+active,
+ * the GTK display switches to absolute mode (no grab) and delivers pointer
+ * position as ABS x/y events; BUTTON/wheel events keep their own mask and route
+ * to the PS/2 mouse, so guest-local clicking is unchanged.  On each input batch
+ * (sync) we push ONE OP_ABSPTR frame with the latest position into the H2G ring;
+ * the resident agent (irixga) XWarpPointer's the guest cursor there.  If the
+ * ring is momentarily full the push is dropped — positions are idempotent-latest
+ * so this coalesces cleanly under backpressure.  Values are 0..INPUT_EVENT_ABS_MAX
+ * (0x7FFF); the guest scales to its X screen. */
+static void pvchan_ptr_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
+{
+    SGIPvChanState *s = SGI_PVCHAN(dev);
+    InputMoveEvent *move;
+    if (evt->type != INPUT_EVENT_KIND_ABS) {
+        return;
+    }
+    move = evt->u.abs.data;
+    if (move->axis == INPUT_AXIS_X) {
+        s->abs_x = move->value;
+        s->abs_dirty = true;
+    } else if (move->axis == INPUT_AXIS_Y) {
+        s->abs_y = move->value;
+        s->abs_dirty = true;
+    }
+}
+
+static void pvchan_ptr_sync(DeviceState *dev)
+{
+    SGIPvChanState *s = SGI_PVCHAN(dev);
+    uint8_t pl[16];
+    if (!s->abs_dirty) {
+        return;
+    }
+    s->abs_dirty = false;
+    pvchan_put_le32(pl + 0,  (uint32_t)s->abs_x);
+    pvchan_put_le32(pl + 4,  (uint32_t)s->abs_y);
+    pvchan_put_le32(pl + 8,  (uint32_t)INPUT_EVENT_ABS_MAX);
+    pvchan_put_le32(pl + 12, (uint32_t)INPUT_EVENT_ABS_MAX);
+    /* fire-and-forget; -1 (agent not attached) / -2 (ring full) both just drop */
+    (void)pvchan_host_write_msg(s, PVCHAN_OP_ABSPTR, pl, sizeof(pl));
+}
+
+static const QemuInputHandler pvchan_ptr_handler = {
+    .name  = "sgi-pvchan tablet",
+    .mask  = INPUT_EVENT_MASK_ABS,
+    .event = pvchan_ptr_event,
+    .sync  = pvchan_ptr_sync,
+};
+
+/* ---- D4 clipboard (opt-in `clipboard=on`) --------------------------------
+ *
+ * pvchan registers as a QEMU clipboard peer.  Guest→host: the agent sends
+ * OP_CLIP_GRAB with the UTF-8 selection text; we publish it to the host
+ * clipboard for BOTH selections (PRIMARY + CLIPBOARD) so a host paste or
+ * middle-click both work.  Host→guest: when another peer (GTK) updates the host
+ * clipboard we request its text and push OP_CLIP_DATA to the guest, which then
+ * owns PRIMARY+CLIPBOARD and serves it to IRIX apps.  Text only; the agent does
+ * the Latin-1<->UTF-8 transcode. */
+static QemuClipboardPeer pvchan_clip_peer;
+
+/* guest grabbed a selection: make its text the host clipboard content. */
+static void pvchan_clip_from_guest(SGIPvChanState *s, const uint8_t *text, uint32_t len)
+{
+    int sel;
+    g_free(s->clip_from_guest);
+    s->clip_from_guest = g_strndup((const char *)text, len);
+    qemu_log("sgi-pvchan: CLIP_GRAB from guest (%u bytes) -> host clipboard\n", len);
+    for (sel = 0; sel < 2; sel++) {   /* CLIPBOARD(0) + PRIMARY(1) */
+        QemuClipboardInfo *info =
+            qemu_clipboard_info_new(&pvchan_clip_peer, sel);
+        info->types[QEMU_CLIPBOARD_TYPE_TEXT].available = true;
+        qemu_clipboard_update(info);
+        qemu_clipboard_set_data(&pvchan_clip_peer, info,
+                                QEMU_CLIPBOARD_TYPE_TEXT, len,
+                                s->clip_from_guest, true);
+        qemu_clipboard_info_unref(info);
+    }
+}
+
+/* host clipboard changed (some other peer) -> push text to the guest. */
+static void pvchan_clip_notify(Notifier *notifier, void *data)
+{
+    SGIPvChanState *s = pvchan_instance;
+    QemuClipboardNotify *notify = data;
+    QemuClipboardInfo *info;
+    QemuClipboardContent *c;
+    if (!s || notify->type != QEMU_CLIPBOARD_UPDATE_INFO) {
+        return;
+    }
+    info = notify->info;
+    if (!info || info->owner == &pvchan_clip_peer) {
+        return;   /* our own update — don't echo back to the guest */
+    }
+    if (info != qemu_clipboard_info(info->selection)) {
+        return;   /* not the current clipboard */
+    }
+    c = &info->types[QEMU_CLIPBOARD_TYPE_TEXT];
+    if (!c->available) {
+        return;   /* no text on this selection */
+    }
+    if (!c->data) {
+        /* ask the owner to provide the bytes; it re-notifies when ready */
+        qemu_clipboard_request(info, QEMU_CLIPBOARD_TYPE_TEXT);
+        return;
+    }
+    (void)pvchan_host_write_msg(s, PVCHAN_OP_CLIP_DATA, c->data, c->size);
+}
+
+/* peer request callback: the host UI wants the data behind a grab we announced.
+ * We already hold the guest's text in clip_from_guest, so serve it directly. */
+static void pvchan_clip_request(QemuClipboardInfo *info, QemuClipboardType type)
+{
+    SGIPvChanState *s = pvchan_instance;
+    if (!s || type != QEMU_CLIPBOARD_TYPE_TEXT || !s->clip_from_guest) {
+        return;
+    }
+    qemu_clipboard_set_data(&pvchan_clip_peer, info, type,
+                            strlen(s->clip_from_guest), s->clip_from_guest, true);
 }
 
 /* ---- MMIO handlers -------------------------------------------------------- */
@@ -512,11 +674,82 @@ void hmp_pvchan_recv(Monitor *mon, const QDict *qdict)
     }
 }
 
+/* ---- D4 clipboard host-side HMP hooks (test + future host CLI) ------------
+ *
+ * pvchan-clipget:  print the current host clipboard text (guest->host proof).
+ * pvchan-clipset:  simulate a host-side copy (host->guest proof) — registers a
+ *                  throwaway "hosttest" peer and updates the clipboard, which
+ *                  fires pvchan's notifier and pushes OP_CLIP_DATA to the guest. */
+static QemuClipboardPeer pvchan_hosttest_peer;
+static char *pvchan_hosttest_text;
+
+/* Every registered peer's notifier is invoked on qemu_clipboard_update — a NULL
+ * notify pointer would crash, so the hosttest peer needs a (no-op) notifier. */
+static void pvchan_hosttest_notify(Notifier *n, void *data) { }
+
+static void pvchan_hosttest_request(QemuClipboardInfo *info, QemuClipboardType t)
+{
+    if (t == QEMU_CLIPBOARD_TYPE_TEXT && pvchan_hosttest_text) {
+        qemu_clipboard_set_data(&pvchan_hosttest_peer, info, t,
+                                strlen(pvchan_hosttest_text),
+                                pvchan_hosttest_text, true);
+    }
+}
+
+void hmp_pvchan_clipget(Monitor *mon, const QDict *qdict)
+{
+    static const char *names[2] = { "CLIPBOARD", "PRIMARY" };
+    int sel;
+    for (sel = 0; sel < 2; sel++) {
+        QemuClipboardInfo *info = qemu_clipboard_info(sel);
+        QemuClipboardContent *c = info ?
+            &info->types[QEMU_CLIPBOARD_TYPE_TEXT] : NULL;
+        if (c && c->available && c->data) {
+            monitor_printf(mon, "%s: %.*s\n", names[sel], (int)c->size,
+                           (const char *)c->data);
+        } else {
+            monitor_printf(mon, "%s: <empty>\n", names[sel]);
+        }
+    }
+}
+
+void hmp_pvchan_clipset(Monitor *mon, const QDict *qdict)
+{
+    const char *text = qdict_get_str(qdict, "text");
+    int sel;
+    if (!pvchan_instance || !pvchan_instance->clip_enabled) {
+        monitor_printf(mon, "pvchan: clipboard not enabled (clipboard=on?)\n");
+        return;
+    }
+    if (!pvchan_hosttest_peer.name) {
+        pvchan_hosttest_peer.name = "hosttest";
+        pvchan_hosttest_peer.notifier.notify = pvchan_hosttest_notify;
+        pvchan_hosttest_peer.request = pvchan_hosttest_request;
+        qemu_clipboard_peer_register(&pvchan_hosttest_peer);
+    }
+    g_free(pvchan_hosttest_text);
+    pvchan_hosttest_text = g_strdup(text);
+    for (sel = 0; sel < 2; sel++) {
+        QemuClipboardInfo *info =
+            qemu_clipboard_info_new(&pvchan_hosttest_peer, sel);
+        info->types[QEMU_CLIPBOARD_TYPE_TEXT].available = true;
+        qemu_clipboard_update(info);
+        qemu_clipboard_set_data(&pvchan_hosttest_peer, info,
+                                QEMU_CLIPBOARD_TYPE_TEXT, strlen(text),
+                                text, true);
+        qemu_clipboard_info_unref(info);
+    }
+    monitor_printf(mon, "pvchan-clipset: ok (%zu bytes -> guest)\n", strlen(text));
+}
+
 /* ---- device lifecycle ---------------------------------------------------- */
 
 static const Property sgi_pvchan_props[] = {
     DEFINE_PROP_INT32("notify-fd", SGIPvChanState, notify_fd, -1),
     DEFINE_PROP_CHR("chardev", SGIPvChanState, chr),
+    /* D4 clipboard bridge — default off (drains G2H unconditionally, which
+     * changes ANNOUNCE timing; keep the proven A5/D2 config unperturbed). */
+    DEFINE_PROP_BOOL("clipboard", SGIPvChanState, clip_enabled, false),
 };
 
 /*
@@ -568,7 +801,20 @@ static void sgi_pvchan_realize(DeviceState *dev, Error **errp)
     qemu_register_powerdown_notifier(&s->powerdown_notifier);
     s->powerdown_registered = true;
 
+    /* D5 absolute pointer: register the abs input handler (always).  Only emits
+     * H2G frames once the guest agent has programmed the ring, and only under a
+     * display that sends abs events — headless/CI boots are unaffected. */
+    s->input_handler = qemu_input_handler_register(dev, &pvchan_ptr_handler);
+
     pvchan_instance = s;
+
+    /* D4 clipboard peer (opt-in) */
+    if (s->clip_enabled) {
+        pvchan_clip_peer.name = "sgi-pvchan";
+        pvchan_clip_peer.notifier.notify = pvchan_clip_notify;
+        pvchan_clip_peer.request = pvchan_clip_request;
+        qemu_clipboard_peer_register(&pvchan_clip_peer);
+    }
 }
 
 static void sgi_pvchan_reset(DeviceState *dev)
@@ -579,6 +825,8 @@ static void sgi_pvchan_reset(DeviceState *dev)
     s->h2g_dbell = s->g2h_dbell = 0;
     s->irq_enable = 0;
     s->status = PVCHAN_S_READY;
+    s->abs_dirty = false;
+    s->pending_ann_valid = false;
     qemu_irq_lower(s->irq);
 }
 
