@@ -26,11 +26,26 @@ typedef struct SGIHPC3VirtuixHal2Tctx {
 } SGIHPC3VirtuixHal2Tctx;
 
 /*
- * HPC3 DMA uses physical addresses, but IRIX passes KSEG0/KSEG1
- * virtual addresses to DMA registers. Strip the top bits to get
- * physical addresses (MAME uses the CPU address space instead).
+ * Translate an HPC3 DMA descriptor address to a guest physical address.
+ *
+ * IRIX programs these descriptors with *raw physical* addresses, which on
+ * IP22/IP24 span two RAM segments: SEG0 @ 0x08000000 (up to 256MB) and
+ * SEG1 @ 0x20000000 (next 128MB).  A plain `& 0x1fffffff` (29-bit) mask
+ * silently drops bit 29 (0x20000000) and therefore corrupts every DMA that
+ * targets a buffer in SEG1 — reading/writing the wrong low physical page.
+ * That is harmless for <=256MB guests (SEG0 only) but breaks all DMA to/from
+ * SEG1 at >=384MB, which manifested as the BL-54 Docker guest->slirp wedge
+ * (the guest's TX Ethernet buffers land in SEG1 under memory pressure, so the
+ * NIC transmitted zeroed frames that slirp dropped).  See
+ * progress_notes/ip55/bl54_docker_slirp.md.
+ *
+ * A defensive translation: KSEG0/KSEG1 *virtual* addresses (bit 31 set) still
+ * map to a 29-bit physical address; raw physical addresses (bit 31 clear) are
+ * masked to 30 bits so SEG1 (bit 29) survives.
  */
-#define HPC3_DMA_ADDR(a)  ((uint32_t)(a) & 0x1fffffffU)
+#define HPC3_DMA_ADDR(a)                                            \
+    (((uint32_t)(a) & 0x80000000U) ? ((uint32_t)(a) & 0x1fffffffU)  \
+                                   : ((uint32_t)(a) & 0x3fffffffU))
 
 /*
  * SGI-specific PS/2 keyboard subtype with real-time typematic repeat.
