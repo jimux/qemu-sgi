@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/misc/sgi_pvchan.h"
+#include "hw/misc/sgi_virtuix_gpa.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -105,6 +106,38 @@ static bool ring_len_ok(uint32_t len)
            (len & (len - 1)) == 0;
 }
 
+/*
+ * Translate a guest-programmed ring base to a guest physical address.
+ *
+ * The guest driver (virtuix/kernel/drivers/pvchan.c) programs kvtophys() of its
+ * page-aligned kernel-BSS rings -- a *raw physical* base (bit 31 clear).  On a
+ * >256MB guest that base can land in RAM SEG1 (physical bit 29 set); the old
+ * `& 0x1FFFFFFF` mask dropped bit 29 and pointed the rings at a wrong low page.
+ * SGI_VIRTUIX_GPA preserves SEG1 for physical bases (and still strips KSEG for a
+ * virtual one).  Kernel BSS is normally allocated low (SEG0), so this was latent
+ * -- but the rings are not pinned low by contract, so the fix hardens the
+ * announce / abs-pointer / clipboard channel for the -m 512M configs.
+ *
+ * PVCHAN_SEG1_TRACE=1 logs (rate-limited) when a base actually lands in SEG1.
+ */
+static uint64_t pvchan_ring_gpa(uint64_t base)
+{
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("PVCHAN_SEG1_TRACE") ? 1 : 0;
+    }
+    if (trace && (base & 0x20000000ULL) && !(base & 0x80000000ULL)) {
+        static uint32_t n;
+        if ((n++ & 0xff) == 0) {
+            fprintf(stderr, "PVCHAN_SEG1_TRACE: ring base=0x%" PRIx64
+                    " in SEG1 (bit29 set) -- old mask would truncate to 0x%"
+                    PRIx64 " (hit #%u)\n",
+                    base, (uint64_t)(base & 0x1FFFFFFFULL), n);
+        }
+    }
+    return SGI_VIRTUIX_GPA(base);
+}
+
 /* ---- host-side helpers (called from Python via QMP/HMP or monitor) -------- */
 
 /* Read one message from the G2H ring (host is consumer).  Returns payload
@@ -112,7 +145,7 @@ static bool ring_len_ok(uint32_t len)
 int pvchan_host_read_msg(SGIPvChanState *s, uint32_t *op, uint32_t *status,
                          uint8_t *buf, uint32_t max)
 {
-    uint64_t base = s->g2h_base & 0x1FFFFFFFULL;
+    uint64_t base = pvchan_ring_gpa(s->g2h_base);
     uint32_t len  = s->g2h_len;
     uint32_t prod, cons, avail, plen;
     uint32_t hdr[3]; /* op, status, plen — LE */
@@ -142,7 +175,7 @@ int pvchan_host_read_msg(SGIPvChanState *s, uint32_t *op, uint32_t *status,
 int pvchan_host_write_msg(SGIPvChanState *s, uint32_t op,
                           const uint8_t *payload, uint32_t len)
 {
-    uint64_t base = s->h2g_base & 0x1FFFFFFFULL;
+    uint64_t base = pvchan_ring_gpa(s->h2g_base);
     uint32_t rlen = s->h2g_len;
     uint32_t prod, cons, avail, freeb, total;
     uint8_t hdr[12];

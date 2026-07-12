@@ -18,6 +18,7 @@
 #include "qemu/audio.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "hw/misc/sgi_virtuix_gpa.h"
 
 /* Per-channel context for the HAL2 audio-DMA completion timers (below). */
 typedef struct SGIHPC3VirtuixHal2Tctx {
@@ -41,11 +42,11 @@ typedef struct SGIHPC3VirtuixHal2Tctx {
  *
  * A defensive translation: KSEG0/KSEG1 *virtual* addresses (bit 31 set) still
  * map to a 29-bit physical address; raw physical addresses (bit 31 clear) are
- * masked to 30 bits so SEG1 (bit 29) survives.
+ * masked to 30 bits so SEG1 (bit 29) survives.  The translation is the shared
+ * SGI_VIRTUIX_GPA() (sgi_virtuix_gpa.h) so every virtuix device masks
+ * identically; HPC3_DMA_ADDR remains the name used throughout this device.
  */
-#define HPC3_DMA_ADDR(a)                                            \
-    (((uint32_t)(a) & 0x80000000U) ? ((uint32_t)(a) & 0x1fffffffU)  \
-                                   : ((uint32_t)(a) & 0x3fffffffU))
+#define HPC3_DMA_ADDR(a) SGI_VIRTUIX_GPA(a)
 
 /*
  * SGI-specific PS/2 keyboard subtype with real-time typematic repeat.

@@ -33,6 +33,7 @@
 #include "qemu/module.h"
 #include "hw/display/sgi_newport_virtuix.h"
 #include "hw/display/sgi_glaccel.h"
+#include "hw/misc/sgi_virtuix_gpa.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
 #include "hw/core/qdev-properties.h"
@@ -4000,6 +4001,39 @@ static void newport_convert_row(SGINewportVirtuixState *s, uint32_t *dst, int w,
 #define NP_SCANOUT_MAX_H      4096
 #define NP_SCANOUT_MAX_STRIDE (NP_SCANOUT_MAX_W * 4)
 
+/*
+ * Translate the guest-supplied shadowfb base to a guest physical address.
+ *
+ * The DDX registers a *raw physical* base (PVGPU_MAP_FB -> kvtophys of the
+ * driver's contiguous shadow fb; bit 31 clear).  A >256MB guest can place that
+ * fb in RAM SEG1 (physical bit 29 set); the historical `& 0x1FFFFFFF` mask here
+ * dropped bit 29 and pointed scanout at a wrong low page -- the BL-54 class
+ * (progress_notes/ip55/seg1_mask_sweep.md).  SGI_VIRTUIX_GPA preserves SEG1 for
+ * physical bases while still stripping KSEG for any virtual base.
+ *
+ * NP_SEG1_TRACE=1 logs (rate-limited) whenever the base actually lands in SEG1
+ * -- the ground-truth signal that this site was a *live* truncation before the
+ * fix rather than merely latent.
+ */
+static inline uint64_t newport_scanout_base_gpa(SGINewportVirtuixState *s)
+{
+    uint64_t base = s->scanout_base;
+    static int trace = -1;
+    if (trace < 0) {
+        trace = getenv("NP_SEG1_TRACE") ? 1 : 0;
+    }
+    if (trace && (base & 0x20000000ULL) && !(base & 0x80000000ULL)) {
+        static uint32_t n;
+        if ((n++ & 0x3ff) == 0) {
+            fprintf(stderr, "NP_SEG1_TRACE: scanout base=0x%" PRIx64
+                    " in SEG1 (bit29 set) -- old 29-bit mask would truncate to "
+                    "0x%" PRIx64 " (hit #%u)\n",
+                    base, (uint64_t)(base & 0x1FFFFFFFULL), n);
+        }
+    }
+    return SGI_VIRTUIX_GPA(base);
+}
+
 /* SCANOUT_SET handler (invoked from glaccel via the desk_scanout callback).
  * Validates the guest values, (re)allocates the per-row DMA scratch, latches the
  * geometry, and forces a full repaint so the first shadowfb frame is complete. */
@@ -4043,10 +4077,12 @@ static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
         return;
     }
 
-    /* Note: base is a guest phys addr masked to KSEG0 (0x1FFFFFFF) at read time;
-     * an out-of-RAM base can't over-read (dma_memory_read clamps to the address
-     * space, returning zeros), so the geometry caps above are the real defense
-     * against hostile values (they bound the scratch allocations). */
+    /* Note: base is a guest phys addr translated via newport_scanout_base_gpa()
+     * (SGI_VIRTUIX_GPA) at read time -- SEG1-preserving, so a >256MB shadowfb is
+     * addressed correctly; an out-of-RAM base can't over-read (dma_memory_read
+     * clamps to the address space, returning zeros), so the geometry caps above
+     * are the real defense against hostile values (they bound the scratch
+     * allocations). */
 
     s->scanout_base   = base;
     s->scanout_w      = w;
@@ -4113,7 +4149,7 @@ static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
                 s->scanout_rowbytes[xx] = 0;   /* pad cols beyond VRAM width */
             }
             dma_memory_write(&address_space_memory,
-                             (hwaddr)((s->scanout_base & 0x1FFFFFFFULL) +
+                             (hwaddr)(newport_scanout_base_gpa(s) +
                                       (uint64_t)yy * stride),
                              s->scanout_rowbytes, stride,
                              MEMTXATTRS_UNSPECIFIED);
@@ -4151,7 +4187,7 @@ static const uint32_t *newport_scanout_ci_row(SGINewportVirtuixState *s, int y)
         return row;
     }
     dma_memory_read(&address_space_memory,
-                    (hwaddr)((s->scanout_base & 0x1FFFFFFFULL) +
+                    (hwaddr)(newport_scanout_base_gpa(s) +
                              (uint64_t)y * s->scanout_stride),
                     s->scanout_rowbytes, s->scanout_stride,
                     MEMTXATTRS_UNSPECIFIED);
@@ -4235,7 +4271,7 @@ static void newport_scanout_xrgb_row(SGINewportVirtuixState *s, uint32_t *dst,
         return;
     }
     dma_memory_read(&address_space_memory,
-                    (hwaddr)((s->scanout_base & 0x1FFFFFFFULL) +
+                    (hwaddr)(newport_scanout_base_gpa(s) +
                              (uint64_t)y * s->scanout_stride),
                     s->scanout_rowbytes, s->scanout_stride,
                     MEMTXATTRS_UNSPECIFIED);

@@ -110,7 +110,7 @@ static void sgi_hpc3_virtuix_enet_reset(SGIHPC3VirtuixState *s);
  */
 static void sgi_hpc3_virtuix_scsi_dma_fetch_chain(SGIHPC3VirtuixState *s, int ch)
 {
-    uint32_t desc_addr = s->scsi_nbdp[ch];
+    uint32_t desc_addr = HPC3_DMA_ADDR(s->scsi_nbdp[ch]);
     uint32_t cbp, bc, nbdp;
 
     cbp = address_space_ldl_be(&address_space_memory, desc_addr, MEMTXATTRS_UNSPECIFIED, NULL);
@@ -197,11 +197,11 @@ static void sgi_hpc3_virtuix_scsi_dma_run(SGIHPC3VirtuixState *s, int ch)
 
         if (s->scsi_dma_to_device[ch]) {
             /* Memory → device (write to SCSI) */
-            address_space_read(&address_space_memory, s->scsi_cbp[ch],
+            address_space_read(&address_space_memory, HPC3_DMA_ADDR(s->scsi_cbp[ch]),
                                MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
         } else {
             /* Device → memory (read from SCSI) */
-            address_space_write(&address_space_memory, s->scsi_cbp[ch],
+            address_space_write(&address_space_memory, HPC3_DMA_ADDR(s->scsi_cbp[ch]),
                                 MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
         }
 
