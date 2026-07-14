@@ -843,6 +843,26 @@ static inline void newport_rowhist_bump(int wy)
     }
 }
 
+/*
+ * NP_HOSTRW_TRACE=1 (BL-44 diagnostic): trace the REX3 colorhost / HOSTRW
+ * host-data image-blit handshake — the path that paints the tiled granite
+ * desktop backdrop and drops scanlines under concurrent-emulator jitter.
+ * Gated, colorhost-only, and PER-PRIMITIVE (one summary line per GO command,
+ * never a per-pixel fprintf in the inner loop — Phase C pitfall). Logs setup
+ * writes (XSTARTI-family, drawmode0), each HOSTRW push, and each colorhost
+ * draw's extent/host-shift/pixels so a banded boot's granite upload can be
+ * diffed line-for-line against a clean boot's.
+ */
+static int np_hostrw_trace = -1;
+static inline bool newport_hostrw_trace(void)
+{
+    if (np_hostrw_trace < 0) {
+        np_hostrw_trace = getenv("NP_HOSTRW_TRACE") ? 1 : 0;
+    }
+    return np_hostrw_trace;
+}
+static uint64_t g_hrw_seq;      /* monotonic colorhost-primitive counter */
+
 static int np_2d_verify = -1;
 static int np_verify_reported;
 static inline bool newport_2d_verify(void)
@@ -1196,6 +1216,11 @@ static void newport_draw_block(SGINewportVirtuixState *s)
     /* NP_2D_VERIFY stash (fast-vs-slow compare deferred to end of the slow loop) */
     uint32_t *vf_snap = NULL, *vf_fast = NULL, vf_pat = 0;
     int vf_ry0 = 0, vf_ry1 = -1, vf_wx0 = 0, vf_wx1 = 0, vf_wy0 = 0, vf_wy1 = 0;
+    /* BL-44 host-data trace: per-primitive pixel/row counters (colorhost only) */
+    bool hrw_tr = s->dm0_colorhost && newport_hostrw_trace();
+    uint32_t hrw_pixels = 0, hrw_rows = 0, hrw_shift_in = s->host_shift;
+    uint32_t hrw_c0 = 0, hrw_cmax = 0, hrw_cmin = 0xffffffff;
+    uint64_t hrw_seq = hrw_tr ? ++g_hrw_seq : 0;
 
     trace_sgi_newport_draw_block(start_x, start_y, end_x, end_y);
     color = newport_get_default_color(s);
@@ -1353,8 +1378,14 @@ static void newport_draw_block(SGINewportVirtuixState *s)
             }
             if (pattern & (1U << pat_bit)) {
                 if (s->dm0_colorhost) {
-                    newport_output_pixel(s, sx, sy,
-                                         newport_get_host_color(s));
+                    uint32_t hc = newport_get_host_color(s);
+                    newport_output_pixel(s, sx, sy, hc);
+                    if (hrw_tr) {
+                        if (!hrw_pixels) hrw_c0 = hc;
+                        if (hc > hrw_cmax) hrw_cmax = hc;
+                        if (hc < hrw_cmin) hrw_cmin = hc;
+                        hrw_pixels++;
+                    }
                 } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
                     newport_output_pixel(s, sx, sy,
                                          newport_get_rgb_color(s));
@@ -1378,6 +1409,7 @@ static void newport_draw_block(SGINewportVirtuixState *s)
          */
         if ((dx > 0 && sx >= end_x) || (dx < 0 && sx <= end_x) || lr_abort) {
             newport_reset_curr_colors(s);
+            if (hrw_tr) hrw_rows++;
             sx = s->x_save_int;
             sy += dy;
             /* Recalculate prim_end_x for the new row */
@@ -1400,6 +1432,23 @@ static void newport_draw_block(SGINewportVirtuixState *s)
     s->iter_y = sy;
     newport_write_x_start(s, (int32_t)sx << 11);
     newport_write_y_start(s, (int32_t)sy << 11);
+
+    if (hrw_tr) {
+        int16_t ml = s->dm1_rwpacked
+            ? rwpacked_max_len[s->dm1_rwdouble ? 1 : 0][s->dm1_hostdepth] : -1;
+        fprintf(stderr,
+            "NP_HRW BLOCK #%" PRIu64 " start=(%d,%d) end=(%d,%d) prim_end=%d "
+            "ml=%d xsave=%d win=(%d,%d) clip=0x%x pl=%d hd=%d rwp=%d rwd=%d "
+            "shift_in=%u shift_out=%u px=%u rows=%u iter=(%d,%d) "
+            "c0=0x%x cmin=0x%x cmax=0x%x dp=0x%016" PRIx64 "\n",
+            hrw_seq, start_x, start_y, s->x_end_int, s->y_end_int, prim_end_x,
+            ml, s->x_save_int, (int16_t)((s->xy_window >> 16) & 0xffff),
+            (int16_t)(s->xy_window & 0xffff), s->clip_mode, s->dm1_planes,
+            s->dm1_hostdepth, s->dm1_rwpacked, s->dm1_rwdouble,
+            hrw_shift_in, s->host_shift, hrw_pixels, hrw_rows, sx, sy,
+            hrw_c0, (hrw_cmin == 0xffffffff ? 0 : hrw_cmin), hrw_cmax,
+            s->host_dataport);
+    }
 
     if (vf_ry1 >= vf_ry0 && vf_fast) {
         newport_verify_cmp(s, vf_fast, vf_ry0, vf_ry1, "block",
@@ -1429,6 +1478,10 @@ static void newport_draw_span(SGINewportVirtuixState *s)
     uint32_t pat_bit = 31;
     bool shade = !!(s->drawmode0 & DM0_SHADE);
     bool lr_abort = !!(s->drawmode0 & DM0_LR_ABORT) && dx < 0;
+    /* BL-44 host-data trace (colorhost only) */
+    bool hrw_tr = s->dm0_colorhost && newport_hostrw_trace();
+    uint32_t hrw_pixels = 0, hrw_shift_in = s->host_shift;
+    uint64_t hrw_seq = hrw_tr ? ++g_hrw_seq : 0;
 
     trace_sgi_newport_draw_span(start_x, y, end_x);
     color = newport_get_default_color(s);
@@ -1472,6 +1525,7 @@ static void newport_draw_span(SGINewportVirtuixState *s)
         if (pattern & (1U << pat_bit)) {
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, sx, y, newport_get_host_color(s));
+                if (hrw_tr) hrw_pixels++;
             } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
                 newport_output_pixel(s, sx, y, newport_get_rgb_color(s));
             } else {
@@ -1495,6 +1549,20 @@ static void newport_draw_span(SGINewportVirtuixState *s)
     /* Update X coordinate — span only updates X, not Y.
      * MAME ref: line 3414 — write_x_start(start_x << 11) */
     newport_write_x_start(s, (int32_t)sx << 11);
+
+    if (hrw_tr) {
+        int16_t ml = s->dm1_rwpacked
+            ? rwpacked_max_len[s->dm1_rwdouble ? 1 : 0][s->dm1_hostdepth] : -1;
+        fprintf(stderr,
+            "NP_HRW SPAN  #%" PRIu64 " start=(%d,%d) end=%d prim_end=%d ml=%d "
+            "xsave=%d win=(%d,%d) clip=0x%x pl=%d hd=%d rwp=%d rwd=%d "
+            "shift_in=%u shift_out=%u px=%u iter=(%d,%d) dp=0x%016" PRIx64 "\n",
+            hrw_seq, start_x, y, s->x_end_int, prim_end_x, ml, s->x_save_int,
+            (int16_t)((s->xy_window >> 16) & 0xffff),
+            (int16_t)(s->xy_window & 0xffff), s->clip_mode, s->dm1_planes,
+            s->dm1_hostdepth, s->dm1_rwpacked, s->dm1_rwdouble,
+            hrw_shift_in, s->host_shift, hrw_pixels, sx, y, s->host_dataport);
+    }
 }
 
 /*
@@ -2925,6 +2993,19 @@ static void sgi_newport_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
      */
     is_go = (addr >= REX3_GO_OFFSET && addr < 0x1000);
     reg = is_go ? (addr - REX3_GO_OFFSET) : addr;
+
+    /*
+     * BL-44 host-data handshake trace.  Log every REX3 write that occurs while a
+     * colorhost image-blit is in flight (or the DRAWMODE0 write that toggles it),
+     * so foreign interleaving (context-switch / another gfx client) and the
+     * HOSTRW push cadence are visible relative to the per-primitive draw lines.
+     */
+    if (newport_hostrw_trace() &&
+        (s->dm0_colorhost || reg == REX3_DRAWMODE0)) {
+        fprintf(stderr, "NP_HRW WR reg=0x%03x val=0x%08x go=%d shift=%u ch=%d\n",
+                (unsigned)reg, (uint32_t)val, is_go, s->host_shift,
+                s->dm0_colorhost);
+    }
 
     switch (reg) {
     /* Drawing registers */
@@ -4391,6 +4472,27 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
 
     /* NewView frame boundary marker */
     newport_newview_log(s, 0x80000000, 0);
+
+    /* BL-44 live VRAM dump: when NP_VRAM_DUMP_LIVE names a path, write the raw
+     * vram_rgbci index plane every render (last write = settled state), so a
+     * banded settled desktop can be checked: banded VRAM => draw/guest bug;
+     * clean VRAM => the bands live only in the incremental composite/display. */
+    {
+        static const char *vdl = (const char *)-1;
+        if (vdl == (const char *)-1) vdl = getenv("NP_VRAM_DUMP_LIVE");
+        if (vdl && s->vram_rgbci) {
+            FILE *f = fopen(vdl, "wb");
+            if (f) {
+                int yy, xx;
+                fprintf(f, "P5\n%d %d\n255\n", NEWPORT_SCREEN_W, NEWPORT_SCREEN_H);
+                for (yy = 0; yy < NEWPORT_SCREEN_H; yy++)
+                    for (xx = 0; xx < NEWPORT_SCREEN_W; xx++)
+                        fputc((uint8_t)(s->vram_rgbci[(size_t)yy * NEWPORT_VRAM_W
+                                                      + xx] & 0xff), f);
+                fclose(f);
+            }
+        }
+    }
 
     s->display_dirty = false;
     s->dirty_n = 0;  /* Phase D: clear dirty rects */
