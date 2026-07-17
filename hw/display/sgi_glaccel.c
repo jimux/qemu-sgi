@@ -187,7 +187,8 @@ static void glaccel_apply_frame(PVGPUCtx *c, int x, int y, int w, int h,
     c->frame = b;
     c->x = x; c->y = y; c->w = w; c->h = h;
     c->active = true;
-    c->last_us = g_get_monotonic_time();   /* for the exit/idle staleness timeout */
+    c->idle_warned = false;                /* fresh frame — re-arm the idle diagnostic */
+    c->last_us = g_get_monotonic_time();   /* for the exit/idle staleness diagnostic */
     if (c->dev) c->dev->invalidate = true;
 
     /* verification hook: dump the composited frame to a PPM. Default overwrites each frame;
@@ -1266,6 +1267,7 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
                               c, ctx->active, ctx->w, ctx->h);
             }
             ctx->active = false;
+            ctx->idle_warned = false;
             g_free(ctx->frame);  ctx->frame = NULL;
             ctx->w = ctx->h = ctx->x = ctx->y = 0;
             ctx->n_occ = 0;
@@ -1317,12 +1319,17 @@ static const GraphicHwOps sgi_glaccel_hw_ops = {
 /* singleton for the Newport desktop overlay (one paravirtual GPU per machine) */
 static SGIGLAccelState *g_glaccel_overlay;
 
-/* A GL app that exits/is killed simply stops submitting frames (the device can't see the
- * guest process die). Treat the overlay as gone once frames stop for a short window, so the
- * desktop is restored instead of freezing on the last frame. (~1s: atlantis-class demos
- * animate continuously.  Phase B: lengthened to a 5 s backstop — CTX_FREE now
- * tears down windows explicitly; this timeout should never fire in normal operation
- * and a firing backstop is a bug signal. */
+/* Overlay-idle diagnostic threshold.  History: an idle *reaper* once cleared an overlay
+ * that stopped submitting frames, on the theory the device couldn't see a guest GL process
+ * die.  BL-76 removed the reaping: CTX_FREE (guest driver pvgpuunmap on the ring's ddmap
+ * last-reference — munmap, exit, AND kill -9) now tears the context down explicitly and
+ * reliably, so the idle timeout is redundant.  Worse, it was actively wrong for a
+ * *single-buffered* SoXt/Inventor viewer, which legitimately renders ONE frame (a single
+ * glFlush, no glXSwapBuffers) and then sits idle in its event loop, alive — the 5 s reaper
+ * made its composited window vanish (revert to bare Motif orange) the instant anything else
+ * repainted the desktop.  A frame must persist until CTX_FREE, exactly like an animating
+ * double-buffered one.  The threshold is now diagnostic ONLY: it logs a one-shot warning
+ * (a firing backstop signals a broken CTX_FREE path) but never clears the overlay. */
 #define GLACCEL_OVERLAY_IDLE_US (5000 * 1000)
 
 int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
@@ -1335,12 +1342,12 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
     for (i = 0; i < PVGPU_MAXCTX && n < max; i++) {
         PVGPUCtx *c = &s->ctx[i];
         if (!c->active || !c->frame || c->w <= 0 || c->h <= 0) continue;
-        if (now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {   /* backstop — should never fire */
-            qemu_log_mask(LOG_UNIMP, "pvgpu: BACKSTOP ctx %d idle timeout fired "
-                          "(%.1fs) — CTX_FREE path may be broken\n",
-                          i, (now - c->last_us) / 1e6);
-            c->active = false;
-            continue;
+        if (!c->idle_warned && now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {
+            /* BL-76: diagnostic only — the overlay persists (single-buffered viewers are
+             * legitimately idle after one frame); a firing warning means CTX_FREE broke. */
+            qemu_log_mask(LOG_UNIMP, "pvgpu: ctx %d idle >%.1fs (single-buffered overlay; "
+                          "retained until CTX_FREE)\n", i, (now - c->last_us) / 1e6);
+            c->idle_warned = true;
         }
         out[n].frame = c->frame; out[n].x = c->x; out[n].y = c->y;
         out[n].w = c->w; out[n].h = c->h;
@@ -1412,12 +1419,12 @@ static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
     for (int i = 0; i < PVGPU_MAXCTX && n_wins < PVGPU_MAXCTX; i++) {
         PVGPUCtx *c = &s->ctx[i];
         if (!c->active || !c->frame || c->w <= 0 || c->h <= 0) continue;
-        if (now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {   /* backstop */
-            qemu_log_mask(LOG_UNIMP, "pvgpu: BACKSTOP ctx %d idle timeout fired "
-                          "(%.1fs) in composite\n",
+        if (!c->idle_warned && now - c->last_us > GLACCEL_OVERLAY_IDLE_US) {
+            /* BL-76: diagnostic only — do NOT reap (see GLACCEL_OVERLAY_IDLE_US note). */
+            qemu_log_mask(LOG_UNIMP, "pvgpu: ctx %d idle >%.1fs in composite "
+                          "(single-buffered overlay retained until CTX_FREE)\n",
                           i, (now - c->last_us) / 1e6);
-            c->active = false;
-            continue;
+            c->idle_warned = true;
         }
         wins[n_wins].frame = c->frame; wins[n_wins].x = c->x; wins[n_wins].y = c->y;
         wins[n_wins].w = c->w; wins[n_wins].h = c->h;

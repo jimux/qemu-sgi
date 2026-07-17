@@ -101,7 +101,8 @@ typedef struct PVGPUCtx {
     int         w, h;            /* frame dimensions */
     int         x, y;            /* tracked screen placement (window origin) */
     bool        active;          /* a frame is present */
-    int64_t     last_us;         /* monotonic time of last frame (overlay idle timeout) */
+    int64_t     last_us;         /* monotonic time of last frame (overlay idle diagnostic) */
+    bool        idle_warned;     /* BL-76: one-shot "idle backstop" diagnostic already logged */
     int         occ[PVGPU_MAX_OCC][4]; /* screen rects occluding this window */
     int         n_occ;
     int         frame_serial;    /* in-process path: last glr_get_last_frame serial composited */
