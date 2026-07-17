@@ -347,6 +347,15 @@ static bool pv_clip(SGIGLAccelState *s, int *x, int *y, int *w, int *h) {
 #define PVGPU_WB_MAX  64
 #define PVGPU_WB2_MAX 16
 #define PVGPU_RESP_BYTES (4 + 8 + 4 + 4 + PVGPU_WB_MAX + 4 + 4 + PVGPU_WB2_MAX)  /* 108 */
+
+/* BL-71 defense-in-depth: allocate every DMA'd command buffer with a zeroed slack
+ * tail. The in-process renderer executes pixel-upload ops (glTexImage2D/DrawPixels)
+ * that read w*h*bpp bytes of source data straight out of this buffer; a guest that
+ * leaves a stale GL_UNPACK_ROW_LENGTH set makes the driver read a larger strided
+ * span than the payload. The renderer now forces tight unpack (the real fix), but
+ * a zeroed slack margin turns any residual/future over-read of a few KB into a
+ * harmless read of zeros instead of a SEGV that wedges the whole VM. */
+#define PVGPU_CMD_SLACK 65536u
 typedef struct {
     int64_t  retval;
     uint32_t wb_addr, wb_len;   uint8_t wb_data[PVGPU_WB_MAX];
@@ -1198,7 +1207,8 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
              * test + cmd-file). Don't raise IRQ — the driver polls STATUS_DONE. */
             uint32_t base = s->ctx[s->cur_ctx].cmd_base;
             if (base && s->cmd_len && s->cmd_len <= 64 * 1024 * 1024) {
-                uint8_t *cmd = g_malloc(s->cmd_len);
+                uint8_t *cmd = g_malloc(s->cmd_len + PVGPU_CMD_SLACK);
+                memset(cmd + s->cmd_len, 0, PVGPU_CMD_SLACK);
                 if (dma_memory_read(&address_space_memory, base, cmd, s->cmd_len,
                                     MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
                     pvgpu_exec(s, cmd, s->cmd_len, base);
@@ -1219,7 +1229,8 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
         s->cur_ctx = c;
         base = s->ctx[c].cmd_base;
         if (base && glen && glen <= 64 * 1024 * 1024) {
-            uint8_t *cmd = g_malloc(glen);
+            uint8_t *cmd = g_malloc(glen + PVGPU_CMD_SLACK);
+            memset(cmd + glen, 0, PVGPU_CMD_SLACK);
             if (dma_memory_read(&address_space_memory, base, cmd, glen,
                                 MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
                 pvgpu_exec(s, cmd, glen, base);
