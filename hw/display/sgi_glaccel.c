@@ -60,6 +60,7 @@ struct glr_result_abi {
 typedef int  (*glr_submit_fn)(const unsigned char *, int, struct glr_result_abi *);
 typedef void (*glr_set_ctxid_fn)(int);
 typedef int  (*glr_get_last_frame_fn)(int, const unsigned char **, int *, int *);
+typedef void (*glr_free_ctx_fn)(int);
 typedef int  (*glr_get_dmabuf_fn)(int ctxid, int *w, int *h, int *stride,
                                   int *offset, int *fourcc, uint64_t *modifier);
 
@@ -67,6 +68,7 @@ static glr_submit_fn          gi_submit;
 static glr_set_ctxid_fn        gi_set_ctxid;
 static glr_get_last_frame_fn   gi_get_last_frame;
 static glr_get_dmabuf_fn       gi_get_dmabuf;
+static glr_free_ctx_fn         gi_free_ctx;      /* BL-73: optional per-ctx teardown */
 static int                     gi_tried;
 
 /* dlopen the renderer once (mirror glbridge.c::load_renderer). Returns true if usable. */
@@ -91,6 +93,7 @@ static bool glaccel_inproc_load(void)
     gi_set_ctxid      = (glr_set_ctxid_fn)dlsym(h, "glr_set_ctxid");
     gi_get_last_frame = (glr_get_last_frame_fn)dlsym(h, "glr_get_last_frame");
     gi_get_dmabuf     = (glr_get_dmabuf_fn)dlsym(h, "glr_get_dmabuf");
+    gi_free_ctx       = (glr_free_ctx_fn)dlsym(h, "glr_free_ctx");   /* BL-73; NULL on old .so */
     if (!gi_submit || !gi_get_last_frame) {
         fprintf(stderr, "sgi-glaccel: in-process renderer missing glr_submit/glr_get_last_frame\n");
         gi_submit = NULL;
@@ -1261,6 +1264,18 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
             if (ctx->fwd_fd >= 0) { close(ctx->fwd_fd); ctx->fwd_fd = -1; }
             if (ctx->conn_fd >= 0) { close(ctx->conn_fd); ctx->conn_fd = -1; }
             if (ctx->rxbuf) { g_byte_array_unref(ctx->rxbuf); ctx->rxbuf = NULL; }
+            /* BL-73: tear down the HOST renderer's per-context frame too.  The
+             * in-process renderer keeps ONE global GL context + `last_frame`; if we
+             * only free the device-side PVGPUCtx, a context id reused by the NEXT
+             * guest GL client inherits this dead client's final frame (the device
+             * composites the stale readback at the new window's position — Cycles'
+             * splash re-appearing over roam/sphere_demo).  Invalidate it at the
+             * source so the reused context starts frame-less until it renders its
+             * own.  Optional symbol: an older libglrender without it simply keeps
+             * the pre-fix behaviour. */
+            if (glaccel_inproc_load() && gi_free_ctx) {
+                gi_free_ctx(c);
+            }
             s->invalidate = true;
         }
         break;
