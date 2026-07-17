@@ -1203,8 +1203,19 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
             s->invalidate = true;
             qemu_irq_lower(s->irq);
         }
-        fprintf(stderr, "pvgpu: EXEC val=0x%x cmd_base=0x%x cmd_len=%u\n",
-                 (unsigned)val, s->cmd_base, s->cmd_len);
+        {
+            /* BL-71-era debug: fires once per doorbell (very noisy). Gate it
+             * behind SGI_GLACCEL_EXEC_DBG like the other opt-in device/renderer
+             * knobs (GLRENDER_SO/SGI_GLACCEL_DUMP/...). Cached — read once. */
+            static int exec_dbg = -1;
+            if (exec_dbg < 0) {
+                exec_dbg = getenv("SGI_GLACCEL_EXEC_DBG") ? 1 : 0;
+            }
+            if (exec_dbg) {
+                fprintf(stderr, "pvgpu: EXEC val=0x%x cmd_base=0x%x cmd_len=%u\n",
+                         (unsigned)val, s->cmd_base, s->cmd_len);
+            }
+        }
         if (val & GLACCEL_CMD_PROCESS) {
             /* Legacy EXEC path: process the current context's latched ring (used by the 2D
              * test + cmd-file). Don't raise IRQ — the driver polls STATUS_DONE. */
