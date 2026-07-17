@@ -143,6 +143,17 @@ struct SGIGLAccelState {
     /* Internal state */
     bool invalidate;
 
+    /* BL-76 recomposite-on-delivery: a GL frame is read back / applied on the
+     * doorbell (device-I/O) thread, out of band from any display refresh tick.
+     * With -display none (batch grading) or an idle 4Dwm desktop nothing ticks
+     * the gfx_update compositor, so a single-buffered one-shot frame (the static
+     * Inventor viewers) lands but never reaches the surface until external
+     * activity (screendump/xrefresh) forces graphic_hw_update.  This bottom-half
+     * runs graphic_hw_update(con) on the main loop whenever a frame is applied,
+     * so delivery itself drives the composite.  Idempotent scheduling coalesces
+     * bursts (animating demos) into one present per main-loop iteration. */
+    QEMUBH     *present_bh;
+
     /* --- live GL frame channel (host renderer -> device -> console) ---
      * The host renderer (glserver) connects and streams PVGL frames; the device
      * composites the latest one. Protocol (little-endian):

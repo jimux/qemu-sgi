@@ -170,6 +170,22 @@ static void glaccel_draw_line_rgb565(void *opaque, uint8_t *dst,
  * GL "compositing" path — the guest GL is rendered on the host GPU and presented here in
  * the guest's framebuffer.  Protocol (LE): "PVGL"(4) + i32 x,y,w,h ; then w*h*4 RGBA.
  * ============================================================ */
+/* BL-76 recomposite-on-delivery: force the compositor to run + present now.
+ * Scheduled from glaccel_apply_frame (the single frame-receipt chokepoint) so a
+ * frame that lands while the desktop is idle (or under -display none) still
+ * reaches the display surface without waiting for a passive gfx_update tick or
+ * an external screendump/xrefresh.  Runs on the main loop; graphic_hw_update
+ * invokes sgi_glaccel_update which composites and blits into the surface.  The
+ * frame readback already happened on the doorbell thread, so this callback does
+ * no GL work (pure CPU composite) and is safe off the render thread. */
+static void glaccel_present_bh(void *opaque)
+{
+    SGIGLAccelState *s = opaque;
+    if (s->con) {
+        graphic_hw_update(s->con);
+    }
+}
+
 static void glaccel_apply_frame(PVGPUCtx *c, int x, int y, int w, int h,
                                 const uint8_t *rgba)
 {
@@ -189,7 +205,12 @@ static void glaccel_apply_frame(PVGPUCtx *c, int x, int y, int w, int h,
     c->active = true;
     c->idle_warned = false;                /* fresh frame — re-arm the idle diagnostic */
     c->last_us = g_get_monotonic_time();   /* for the exit/idle staleness diagnostic */
-    if (c->dev) c->dev->invalidate = true;
+    if (c->dev) {
+        c->dev->invalidate = true;
+        /* BL-76: delivery drives the composite — force a present on the main loop
+         * so an idle desktop / -display none still shows this frame.  Coalesced. */
+        if (c->dev->present_bh) qemu_bh_schedule(c->dev->present_bh);
+    }
 
     /* verification hook: dump the composited frame to a PPM. Default overwrites each frame;
      * with SGI_GLACCEL_DUMP_FRAME=N it is a one-shot at the Nth composited frame, giving a
@@ -1480,6 +1501,9 @@ static void sgi_glaccel_realize(DeviceState *dev, Error **errp)
     s->con = graphic_console_init(dev, 0, &sgi_glaccel_hw_ops, s);
     s->format = GLACCEL_FMT_RGBA8888;
     s->invalidate = true;
+    /* BL-76 recomposite-on-delivery: present a freshly-applied GL frame from the
+     * main loop (see glaccel_present_bh / glaccel_apply_frame). */
+    s->present_bh = qemu_bh_new(glaccel_present_bh, s);
 
     /* live GL frame channel — one accept socket, per-context connections */
     s->gl_listen_fd = -1;
