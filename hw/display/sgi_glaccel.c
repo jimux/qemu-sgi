@@ -2425,11 +2425,28 @@ static const Property sgi_glaccel_props[] = {
     /* IN-PROCESS GL end-goal gate (default OFF): only the launch that sets this uses the
      * in-process glr_submit path; every stock app keeps the proven socket/Newport path. */
     DEFINE_PROP_BOOL("inproc", SGIGLAccelState, inproc, true),
-    /* Server-published window model (memo 21).  Default OFF: the WM_* ring ops are
-     * parsed and discarded and the composite uses the submit-time origin + occluder
-     * rects — provably the pre-model path.  -global sgi-glaccel.winmodel=on to consume
-     * the model.  This is the device-side kill-switch of memo 21 §4. */
-    DEFINE_PROP_BOOL("winmodel", SGIGLAccelState, winmodel, false),
+    /* Server-published window model (memo 21).  Default ON since the bounded
+     * invalidation chain landed (notes 27/28/29): the WM_* ring ops are consumed,
+     * so a GL window's placement, stacking, MAPPED state and clip come from the X
+     * server's own view instead of the client's submit-time origin — which is what
+     * makes a frame follow its window (the M3 defect) instead of staying where it
+     * was drawn.
+     *
+     * It defaulted OFF for three legs because the model's correctness came at a
+     * measured cost: it roughly doubles the number of desktop presents, and while
+     * every present was a whole-desktop re-walk that was +7.5 points of host CPU on
+     * a resize storm (26-…md §2).  With the repaint and the invalidation both
+     * bounded, a present is now proportional to the window: on the same GL-bound
+     * A/B (medians of 3, 600 ops/phase, an animating client bound to two on-screen
+     * windows) ON vs publisher-only is resize +2.1 points, move -2.0 and
+     * whole-bench +1.1, against a ±4-point arm-to-arm drift bound and a flat
+     * ctl_prop floor (+0.7) — where the same rig measured +8.9 / +4.3 / +6.0 before
+     * this chain.
+     *
+     * -global sgi-glaccel.winmodel=off restores the pre-model composite (submit-time
+     * origin + occluder rects) exactly; it stays the device-side kill-switch of
+     * memo 21 §4 and the control arm of every A/B above. */
+    DEFINE_PROP_BOOL("winmodel", SGIGLAccelState, winmodel, true),
 };
 
 static void sgi_glaccel_class_init(ObjectClass *klass, const void *data)
