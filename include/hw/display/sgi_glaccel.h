@@ -95,7 +95,15 @@ typedef struct PVGPUWinRec {
 typedef struct { int x, y, w, h; } PVDeskRect;
 
 /* Max damage rects the desktop render reports back per frame (Phase D). */
-#define PVDESK_MAX_RECTS 16
+/* Kept EQUAL to NEWPORT_DIRTY_MAX: newport_render_desktop() renders every dirty
+ * rect but can only REPORT max_rects of them, and the engine blits only what is
+ * reported — a smaller cap here would leave rendered-but-unblitted regions stale.
+ * Raised 16 -> 64 with the bounded VC2/palette invalidation: once the direct
+ * whole-screen invalidators stopped firing, the 16-slot list became the binding
+ * saturator (81 % of frames still went FULL with dfull_total already down to 337).
+ * Note 27 6d's "list size is irrelevant" refutation was true only while
+ * newport_dirty_full() was assigning the saturated value on every table word. */
+#define PVDESK_MAX_RECTS 64
 /* Render callback return sentinel: the whole screen changed (repaint everything). */
 #define PVDESK_FULL      (-1)
 
@@ -127,6 +135,24 @@ typedef void (*PVDeskScanoutFn)(void *opaque, uint64_t base, uint32_t w,
                                 uint32_t h, uint32_t stride, uint32_t fmt,
                                 bool active);
 typedef void (*PVDeskDamageFn)(void *opaque, int x, int y, int w, int h);
+
+/* BL-81 — bounded geometry repaint.  When a server-published window model moves
+ * or resizes a GL window, the desktop UNDER the window's old rect must be
+ * repainted (and the new rect re-walked), but nothing else needs to change.
+ * Before BL-81 the engine expressed that as force_full=true on the render
+ * callback, i.e. a whole-desktop re-walk plus a full-screen blit on EVERY
+ * present of a resize/move storm (+7 points of host CPU, note 26 §5).
+ *
+ * This callback lets the engine express the same requirement as a bounded
+ * request: "repaint at least these rects next render".  The desktop layer folds
+ * them into whatever dirty-rect machinery it already has, so the next
+ * render_desktop() returns them in rects[] and the engine bounded-blits them.
+ *
+ * Contract, in the safe direction: the desktop layer may repaint MORE than
+ * asked (up to the whole screen — coalescing/saturation is always legal), never
+ * less.  If a desktop layer does not implement this callback the engine keeps
+ * the pre-BL-81 force_full path, so absence degrades to correct-but-slow. */
+typedef void (*PVDeskRepaintFn)(void *opaque, const PVDeskRect *rects, int n);
 
 /* Per-GL-window (per-context) device state: its own glserver forward connection, its own
  * gl-listen frame connection, its latest frame, screen placement, and occluder rects. */
@@ -274,6 +300,7 @@ struct SGIGLAccelState {
     PVDeskInvalidateFn  desk_invalidate;  /* desktop invalidate callback */
     PVDeskScanoutFn     desk_scanout;     /* Stage 2: register shadow fb (SCANOUT_SET) */
     PVDeskDamageFn      desk_damage;      /* Stage 2: shadow fb damage (DAMAGE) */
+    PVDeskRepaintFn     desk_repaint;     /* BL-81: bounded geometry repaint request */
     void               *desk_opaque;      /* opaque for the desktop callbacks */
     int         prev_n_windows;   /* one-frame GL-overlay restore: count of windows last frame */
     uint64_t    last_composite_sig; /* signature of last frame's GL overlay set (idle-skip) */
@@ -283,6 +310,53 @@ struct SGIGLAccelState {
      * that only reblit the window rect). */
     PVDeskRect  prev_win_rects[PVGPU_MAXCTX];
     int         prev_n_win_rects;
+    /* BL-81 pending bounded repaint.  A model commit that changed a bound window
+     * used to set s->invalidate (= repaint the whole desktop); it now records the
+     * rects it can have altered here.  Accumulates across commits because the
+     * present coalescer folds many WM_ENDs into one present; consumed and cleared
+     * by the next sgi_glaccel_update().  wm_repaint_full is the fail-safe: set
+     * whenever the changed region cannot be named, and it restores the old
+     * whole-desktop behaviour for that frame. */
+    PVDeskRect  wm_rrects[2 * PVGPU_MAXCTX];
+    int         wm_n_rrects;
+    bool        wm_repaint;
+    bool        wm_repaint_full;
+    /* BL-81 counters (SGI_GLACCEL_WM_STATS): how many changed frames took the
+     * bounded repaint vs. fell back to the whole-desktop repaint. */
+    uint64_t    geom_bounded_repaints;
+    uint64_t    geom_full_repaints;
+    /* PVDISPLAY_BOUND_VERIFY=1 differential oracle (debug only): scratch buffer for
+     * the from-scratch reference render, and how many bounded frames disagreed with
+     * it.  verify_bad_frames must be 0; anything else is a bounded-repaint miss. */
+    uint32_t   *verify_buf;
+    uint64_t    verify_frames;
+    uint64_t    verify_bad_frames;
+    uint64_t    verify_bad_pixels;
+    /* PVDISPLAY_TIME_BREAKDOWN=1 (debug only): where the host CPU of a model-driven
+     * present actually goes.  BL-81's A/B showed that bounding the desktop repaint
+     * recovers only ~2 of the ~7.5 points, so the residual has to be attributed by
+     * measurement rather than assumed.  All in ns. */
+    uint64_t    t_desk_render;    /* the desktop layer's render callback */
+    uint64_t    t_composite;      /* glaccel_composite_overlays (per-pixel + clip) */
+    uint64_t    t_blit;           /* desk -> surface copy + dpy_gfx_update */
+    uint64_t    t_wm_ops;         /* WM_* ring-op parse + commit + bound-changed */
+    uint64_t    n_updates;        /* sgi_glaccel_update calls that did work */
+    /* What the desktop layer ACTUALLY did, as opposed to what the engine asked for.
+     * BL-81's attribution run found t_desk_render identical whether the engine
+     * requested a bounded repaint or a full one, so the question "did the renderer
+     * honour the bound, or saturate to full-screen anyway?" needs its own counter. */
+    uint64_t    n_render_full;    /* render returned PVDESK_FULL */
+    uint64_t    n_render_rects;   /* render returned n > 0 bounded rects */
+    uint64_t    n_render_idle;    /* render returned 0 (nothing changed) */
+    /* Note 29 — attribution of the blanket `s->invalidate` (= force_full) that
+     * note 28's why_full(force=766) counted as the largest remaining cause of
+     * full desktop renders.  Which content op asked, and how many of those asks
+     * are now dropped as provably invisible to the desktop (see
+     * glaccel_content_dirty).  Reported by the PVDISPLAY_TIME_BREAKDOWN line. */
+    uint64_t    n_inv_frame;      /* a delivered GL frame */
+    uint64_t    n_inv_glop;       /* PVGPU_OP_GL submit */
+    uint64_t    n_inv_2d;         /* CLEAR / FILL / COPY / BLIT into s->fb */
+    uint64_t    n_inv_dropped;    /* … of the above, suppressed (content-only) */
 
     /* ---- Stage 2 Phase 2a shadow framebuffer (Variant B) ----
      * The engine only latches the SCANOUT_SET parameters for debug/echo; the
@@ -307,6 +381,7 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max);
  * Only one desktop layer may be registered.  w/h must be the native desktop resolution. */
 void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn invalidate,
                                   PVDeskScanoutFn scanout, PVDeskDamageFn damage,
+                                  PVDeskRepaintFn repaint,
                                   void *opaque, int w, int h);
 
 /* Phase E: return the unified engine's console for hardware-cursor setup.

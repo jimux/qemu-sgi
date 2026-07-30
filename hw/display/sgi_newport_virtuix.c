@@ -43,8 +43,25 @@
 #include "ui/pixel_ops.h"
 #include "trace.h"
 
-/* Phase D dirty-rect forward declarations (used in REX3 dispatch, defined below) */
-static void newport_dirty_full(SGINewportVirtuixState *s);
+/* PVDISPLAY_VC2_FULL=1 — restore the pre-fix behaviour of the VC2-SRAM (DID
+ * table) write handler: whole-screen invalidate per changed word.  The one-binary
+ * A/B control for the bounded VC2 invalidation, and its escape hatch. */
+static bool newport_vc2_full_oracle(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PVDISPLAY_VC2_FULL") ? 1 : 0;
+    return on != 0;
+}
+
+/* Phase D dirty-rect forward declarations (used in REX3 dispatch, defined below).
+ * newport_dirty_full() is a macro over newport_dirty_full_at() so the gated
+ * NEWPORT_DIRTYFULL_STATS histogram can attribute every whole-screen invalidation
+ * to its call site — the instrument that found the VC2-SRAM saturator (note 27
+ * §6d).  Call sites keep writing newport_dirty_full(s). */
+static void newport_dirty_full_at(SGINewportVirtuixState *s, int line);
+#define newport_dirty_full(s) newport_dirty_full_at((s), __LINE__)
+/* Phase D per-row DID resolution cache (used by the VC2/XMAP write handlers) */
+static void newport_did_cache_drop(SGINewportVirtuixState *s);
 static void newport_dirty_rect(SGINewportVirtuixState *s, int rx, int ry, int rw, int rh);
 /* Phase E hardware cursor (used in VC2 write handler) */
 static void newport_update_hw_cursor(SGINewportVirtuixState *s);
@@ -2496,9 +2513,13 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                     if (vc2_reg_affects_cursor(s->vc2_reg_idx)) {
                         newport_dirty_full(s);
                         newport_update_hw_cursor(s);
-                    } else if (s->vc2_reg_idx == VC2_DID_ENTRY) {
-                        /* Phase D: DID table base change re-maps every scanline's
-                         * visual → the whole screen must be re-walked. */
+                    } else if (s->vc2_reg_idx == VC2_DID_ENTRY ||
+                               s->vc2_reg_idx == VC2_DC_CONTROL) {
+                        /* Phase D: DID table base / DID-enable change re-maps every
+                         * scanline's visual → the whole screen must be re-walked,
+                         * and the per-row resolution cache now describes a
+                         * different table. */
+                        newport_did_cache_drop(s);
                         newport_dirty_full(s);
                     }
                 }
@@ -2507,7 +2528,9 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                 s->vc2_reg_data = val;
                 if (s->vc2_reg_idx < 32) {
                     s->vc2_reg[s->vc2_reg_idx] = vc2_data;
-                    if (s->vc2_reg_idx == VC2_DID_ENTRY) {
+                    if (s->vc2_reg_idx == VC2_DID_ENTRY ||
+                        s->vc2_reg_idx == VC2_DC_CONTROL) {
+                        newport_did_cache_drop(s);
                         newport_dirty_full(s);   /* Phase D: see above */
                     }
                     /*
@@ -2537,12 +2560,46 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                          * DCB data port, NOT via VC2 registers).  Xsgi rewrites
                          * them whenever windows move / restack, changing which
                          * visual each scanline shows with no REX3 draw at all.
-                         * Full-invalidate so the incremental scanout can't leave
-                         * a moved region rendering in a stale mode.  Cursor
-                         * sprite RAM lives here too — full-invalidate is safe for
-                         * it as well (rare event).
+                         * So the change MUST invalidate — but bounding it matters:
+                         * this site alone produced 99.05 % of all whole-screen
+                         * invalidations (814 per rendered frame) during a window-op
+                         * storm, which kept the desktop permanently full-dirty and
+                         * made Phase D's bounded scanout inoperative
+                         * (progress_notes/ip55/pvdisplay/27-bl81-bounded-repaint.md
+                         * §6d).  Instead of invalidating here, accumulate the
+                         * changed word's ADDRESS into a pending range and let
+                         * newport_vc2_ram_resolve() (run once per render) map it to
+                         * the scanlines whose DID walk consults those words.  That
+                         * both bounds the invalidation and coalesces the burst —
+                         * Xsgi writes these tables as runs through this
+                         * auto-incrementing port, so one resolution replaces
+                         * hundreds of full-invalidates.  Cursor sprite RAM lives
+                         * here too; the resolver detects that range and keeps the
+                         * old full-invalidate for it (rare event).
                          */
-                        newport_dirty_full(s);
+                        s->vc2_ram_writes++;
+                        if (newport_vc2_full_oracle()) {
+                            /* PVDISPLAY_VC2_FULL=1 — restore the pre-fix
+                             * per-word whole-screen invalidate.  The one-binary
+                             * A/B control for this change (and the escape hatch
+                             * if a DID/colormap artifact ever shows up). */
+                            newport_dirty_full(s);
+                            s->vc2_ram_addr = (s->vc2_ram_addr + 1) & 0x7fff;
+                            break;
+                        }
+                        if (s->vc2_ram_dirty_lo > s->vc2_ram_dirty_hi) {
+                            s->vc2_ram_dirty_lo = s->vc2_ram_addr;
+                            s->vc2_ram_dirty_hi = s->vc2_ram_addr;
+                        } else {
+                            if (s->vc2_ram_addr < s->vc2_ram_dirty_lo) {
+                                s->vc2_ram_dirty_lo = s->vc2_ram_addr;
+                            }
+                            if (s->vc2_ram_addr > s->vc2_ram_dirty_hi) {
+                                s->vc2_ram_dirty_hi = s->vc2_ram_addr;
+                            }
+                        }
+                        s->dirty_touch++;    /* parity with the invalidators */
+                        s->display_dirty = true;
                     }
                 }
                 s->vc2_ram_addr = (s->vc2_ram_addr + 1) & 0x7fff;
@@ -2566,8 +2623,25 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
                                                   val, masked_val,
                                                   masked_val >> 8, dw);
             if (s->cmap_palette_idx < 8192) {
-                s->cmap0_palette[s->cmap_palette_idx] = masked_val >> 8;
-                newport_dirty_full(s);
+                /* Only invalidate when the entry actually CHANGES.  Xsgi rewrites
+                 * whole palette blocks with identical values, and this site was the
+                 * #2 whole-screen-invalidation source once the VC2-SRAM one was
+                 * bounded: 11 341 invalidations (~7 per rendered frame) in one
+                 * wmbench run — on its own enough to keep the desktop full-dirty. */
+                if (s->cmap0_palette[s->cmap_palette_idx] !=
+                    (uint16_t)(masked_val >> 8)) {
+                    s->cmap0_palette[s->cmap_palette_idx] = masked_val >> 8;
+                    if (newport_vc2_full_oracle()) {
+                        newport_dirty_full(s);      /* pre-fix granularity */
+                    } else {
+                        /* Record the 256-entry bucket; newport_pal_resolve() (once
+                         * per render) turns the burst into the rows that read it. */
+                        s->pal_dirty_mask |=
+                            1u << ((s->cmap_palette_idx >> 8) & 31);
+                        s->dirty_touch++;
+                        s->display_dirty = true;
+                    }
+                }
             }
             s->cmap_palette_idx++;
             break;
@@ -2586,22 +2660,33 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
             s->xmap_config = val & 0xff;
             break;
         case 3: /* Cursor CMAP MSB — MAME ref: xmap9::write() CRS=3 */
-            s->xmap_cursor_cmap = (uint8_t)val;
-            newport_dirty_full(s);          /* Phase D: affects cursor colours */
+            /* Phase D: affects cursor colours.  Guarded on an actual change —
+             * re-writing the same value repaints nothing (same reasoning as the
+             * CMAP palette site above). */
+            if (s->xmap_cursor_cmap != (uint8_t)val) {
+                s->xmap_cursor_cmap = (uint8_t)val;
+                newport_dirty_full(s);
+            }
             break;
         case 4: /* Popup CMAP MSB — MAME ref: xmap9::write() CRS=4 */
-            s->xmap_popup_cmap = (uint8_t)val;
-            newport_dirty_full(s);          /* Phase D: recolours popup planes */
+            if (s->xmap_popup_cmap != (uint8_t)val) {   /* recolours popup planes */
+                s->xmap_popup_cmap = (uint8_t)val;
+                newport_dirty_full(s);
+            }
             break;
         case 5: /* Mode table write — MAME ref: xmap9::write() CRS=5 */
             /*
              * val bits [28:24] = mode table index
              * val bits [23:0]  = mode entry value
              */
-            s->xmap_mode_table[(val >> 24) & 0x1f] = val & 0xffffff;
-            /* Phase D: mode-table change re-resolves every scanline's pixel
-             * mode / CI-MSB → the whole screen must be re-walked. */
-            newport_dirty_full(s);
+            /* Phase D: a mode-table change re-resolves every scanline's pixel
+             * mode / CI-MSB → whole screen, and the per-row DID resolution cache
+             * is keyed on mode-table INDICES, so it must be dropped too. */
+            if (s->xmap_mode_table[(val >> 24) & 0x1f] != (val & 0xffffff)) {
+                s->xmap_mode_table[(val >> 24) & 0x1f] = val & 0xffffff;
+                newport_did_cache_drop(s);
+                newport_dirty_full(s);
+            }
             break;
         case 7: /* Mode table address — MAME ref: xmap9::write() CRS=7 */
             s->xmap_mode_table_idx = (uint8_t)val;
@@ -2618,13 +2703,20 @@ static void newport_dcb_write(SGINewportVirtuixState *s, uint32_t val)
             break;
         case 1: /* LUT data (RGB packed) */
             /* IRIX Bt445SetRGB() packs as (r << 24) | (g << 16) | (b << 8) */
-            s->ramdac_lut_r[s->ramdac_lut_index] = (uint8_t)(val >> 24);
-            s->ramdac_lut_g[s->ramdac_lut_index] = (uint8_t)(val >> 16);
-            s->ramdac_lut_b[s->ramdac_lut_index] = (uint8_t)(val >> 8);
-            s->ramdac_lut_index++;
             /* Phase D: the gamma LUT recolours every already-drawn pixel with no
-             * REX3 draw — full-invalidate so the incremental path re-applies it. */
-            newport_dirty_full(s);
+             * REX3 draw — full-invalidate so the incremental path re-applies it.
+             * Guarded on an actual change: Xsgi rewrites the whole 256-entry LUT
+             * with identical values (measured 1024 invalidations, one per rendered
+             * frame, in one wmbench run). */
+            if (s->ramdac_lut_r[s->ramdac_lut_index] != (uint8_t)(val >> 24) ||
+                s->ramdac_lut_g[s->ramdac_lut_index] != (uint8_t)(val >> 16) ||
+                s->ramdac_lut_b[s->ramdac_lut_index] != (uint8_t)(val >> 8)) {
+                s->ramdac_lut_r[s->ramdac_lut_index] = (uint8_t)(val >> 24);
+                s->ramdac_lut_g[s->ramdac_lut_index] = (uint8_t)(val >> 16);
+                s->ramdac_lut_b[s->ramdac_lut_index] = (uint8_t)(val >> 8);
+                newport_dirty_full(s);
+            }
+            s->ramdac_lut_index++;
             break;
         default:
             break;
@@ -3874,28 +3966,114 @@ static inline bool newport_scanout_noseed(void)
     return v;
 }
 
-/* Phase D: saturate the dirty-rect list to full-screen.  Used by the broad
- * invalidators (palette / DID-table / mode-table / RAMDAC-LUT changes, cursor
- * moves, backend invalidate) whose effect can't be bounded to a small rect. */
-static void newport_dirty_full(SGINewportVirtuixState *s)
+/*
+ * NEWPORT_DIRTYFULL_STATS=1 — per-call-site histogram of whole-screen
+ * invalidations, printed once per N renders (N = the value, default 512).
+ * "Which site saturated the dirty list?" is the first question whenever bounded
+ * scanout stops paying, and guessing it wrong cost note 27 two probe binaries.
+ * Process-wide statics: this is a diagnostic, not device state.
+ */
+#define NEWPORT_DFULL_SITES 32
+static struct { int line; uint64_t n; } newport_dfull_site[NEWPORT_DFULL_SITES];
+static uint64_t newport_dfull_total;
+
+static bool newport_dfull_stats_on(void)
 {
-    s->dirty_n = NEWPORT_DIRTY_MAX;  /* saturate — render walks the whole screen */
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NEWPORT_DIRTYFULL_STATS");
+        on = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return on != 0;
+}
+
+/* Phase D: saturate the dirty-rect list to full-screen.  Used by the broad
+ * invalidators (palette / DID-table base / mode-table / RAMDAC-LUT changes,
+ * cursor moves, backend invalidate) whose effect can't be bounded to a small
+ * rect.  NOTE: the VC2-SRAM (DID table) write path no longer comes here — it
+ * bounds itself via newport_vc2_ram_resolve() below. */
+static void newport_dirty_full_at(SGINewportVirtuixState *s, int line)
+{
+    if (newport_dfull_stats_on()) {
+        int i;
+        newport_dfull_total++;
+        for (i = 0; i < NEWPORT_DFULL_SITES; i++) {
+            if (newport_dfull_site[i].line == line) {
+                newport_dfull_site[i].n++;
+                break;
+            }
+            if (newport_dfull_site[i].line == 0) {
+                newport_dfull_site[i].line = line;
+                newport_dfull_site[i].n = 1;
+                break;
+            }
+        }
+    }
+    /* Note 29: dirty_full is the saturation signal (a full LIST is now an
+     * ordinary bounded state — see newport_dirty_rect).  dirty_n is still
+     * saturated so any code reading it as "everything" keeps working. */
+    s->dirty_full = true;
+    s->dirty_n = NEWPORT_DIRTY_MAX;
     s->display_dirty = true;
     s->dirty_touch++;
 }
 
-/* Phase D: add a dirty rect (post-window-offset VRAM space == scanout/dst
- * space).  Coalesces with an existing overlapping rect; when the fixed list
- * fills up it saturates to full-screen.  Called by every drawing primitive
- * (fast paths report an exact bbox, slow paths an over-approximation). */
+/*
+ * Phase D: add a dirty rect (post-window-offset VRAM space == scanout/dst
+ * space).  Called by every drawing primitive (fast paths report an exact bbox,
+ * slow paths an over-approximation) and by the VC2/palette resolvers' row runs.
+ *
+ * Note 29 — COALESCING, not capacity.  The original rule was "union with an
+ * existing rect only if it OVERLAPS, else append, and saturate to full-screen
+ * when the list fills".  Note 28 measured that rule saturating on 415 of 1181
+ * remaining full renders even with the list at 64 slots, and note 27 §6d had
+ * already refuted growing the list (16 → 64 bought ~0: `rrects` 271 → 278).
+ * Capacity is not the problem — the *merge rule* is.  Two fixes:
+ *
+ *  (1) Merge on CHEAPNESS, not overlap.  For each candidate the added area of
+ *      the union ("waste") is computed; the cheapest merge is taken when its
+ *      waste is under NEWPORT_DIRTY_WASTE.  Overlap is the waste≈0 case, so this
+ *      strictly subsumes the old rule, and it also folds the vertically-adjacent
+ *      full-width row runs the VC2 resolver emits (waste = the gap between them)
+ *      which the overlap test could never merge.
+ *  (2) A FULL LIST NO LONGER SATURATES.  The new rect is merged into whichever
+ *      slot it is cheapest to widen — the list stays bounded at
+ *      NEWPORT_DIRTY_MAX while coverage only ever grows, which is the safe
+ *      direction (repaint more, never less).
+ *
+ * The only remaining route to full-screen from here is the AREA guard: once the
+ * rects cover most of the screen, N bounded row walks plus N bounded blits cost
+ * more than one straight walk, so saturating is the cheaper *and* wider choice.
+ * Counted separately (rd_area) so it never hides inside "sat".
+ *
+ * Cost: O(dirty_n) per call with dirty_n ≤ 64 and integer arithmetic only — the
+ * same order as the old overlap scan, which also walked the whole list.
+ */
+#define NEWPORT_DIRTY_WASTE  (NEWPORT_SCREEN_W * 8)   /* ≈8 full rows of slack */
+/* Saturate to full once the accumulated rects cover this fraction (>= 3/4) of
+ * the screen: at that point the bounded path is not cheaper than a full walk. */
+#define NEWPORT_DIRTY_AREA_FULL \
+    ((int64_t)NEWPORT_SCREEN_W * NEWPORT_SCREEN_H * 3 / 4)
+
+static int64_t newport_dirty_area(SGINewportVirtuixState *s)
+{
+    int64_t a = 0;
+    int i;
+    for (i = 0; i < s->dirty_n; i++) {
+        a += (int64_t)s->dirty_rects[i].w * s->dirty_rects[i].h;
+    }
+    return a;
+}
+
 static void
 newport_dirty_rect(SGINewportVirtuixState *s, int rx, int ry, int rw, int rh)
 {
-    int i;
+    int i, best = -1;
+    int64_t best_waste = 0;
     s->dirty_touch++;
     if (rw <= 0 || rh <= 0) return;
-    if (s->dirty_n >= NEWPORT_DIRTY_MAX) {  /* already saturated to full */
-        s->display_dirty = true;
+    if (s->dirty_full) {
+        s->display_dirty = true;    /* already saturated to full-screen */
         return;
     }
     /* clip to screen */
@@ -3905,27 +4083,405 @@ newport_dirty_rect(SGINewportVirtuixState *s, int rx, int ry, int rw, int rh)
     if (ry + rh > NEWPORT_SCREEN_H) rh = NEWPORT_SCREEN_H - ry;
     if (rw <= 0 || rh <= 0) return;
     s->display_dirty = true;
-    /* coalesce with an existing overlapping rect (union in place) */
-    for (i = 0; i < s->dirty_n; i++) {
-        int *dr = (int *)&s->dirty_rects[i];
-        if (rx < dr[0] + dr[2] && rx + rw > dr[0] &&
-            ry < dr[1] + dr[3] && ry + rh > dr[1]) {
-            int x2 = dr[0] + dr[2], y2 = dr[1] + dr[3];
-            if (rx < dr[0]) dr[0] = rx;
-            if (ry < dr[1]) dr[1] = ry;
-            if (rx + rw > x2) x2 = rx + rw;
-            if (ry + rh > y2) y2 = ry + rh;
-            dr[2] = x2 - dr[0]; dr[3] = y2 - dr[1];
+
+    /*
+     * PVDISPLAY_DIRTY_SHRINK=<n> — the DETECTOR SANITY control (note 29 §5).
+     *
+     * Every deliberate narrowing of a specific invalidation request tried so far
+     * (VC2 row runs shrunk by 40, VC2 row runs dropped entirely, BL-81 geometry
+     * rects inset by 40, each with and without the coalescer) leaves
+     * PVDISPLAY_BOUND_VERIFY reporting ZERO mismatching pixels.  Two readings are
+     * possible and they matter very differently: either the oracle cannot see an
+     * under-repaint at all (note 27 §3's "toothless probe"), or those particular
+     * requests are REDUNDANT in the workload because the guest's own REX3 expose
+     * redraws already report the same damage through this very function.
+     *
+     * This knob distinguishes them: it insets EVERY dirty rect — including the
+     * REX3 primitives' — by n px on each side, so nothing in the incremental path
+     * covers the border.  If the oracle still reports 0, it is blind and no
+     * bounded-invalidation claim can rest on it.  If it fires, the oracle has
+     * teeth and the earlier controls passed because they were redundant, not
+     * because nothing is being checked.  Debug only, never on a shipping path.
+     */
+    {
+        static int dshrink = -1;
+        if (dshrink < 0) {
+            const char *e = getenv("PVDISPLAY_DIRTY_SHRINK");
+            dshrink = e ? atoi(e) : 0;
+        }
+        if (dshrink > 0) {
+            int sx = rw > 2 * dshrink ? dshrink : 0;
+            int sy = rh > 2 * dshrink ? dshrink : 0;
+            rx += sx; rw -= 2 * sx;
+            ry += sy; rh -= 2 * sy;
+            if (rw <= 0 || rh <= 0) return;
+        }
+    }
+
+    /* PVDISPLAY_DIRTY_NOCOALESCE=1— one-binary control: restore the pre-note-29
+     * overlap-only merge that saturates on a full list, so the coalescer's effect
+     * (and the correctness of what it merges) can be A/B'd in a single build. */
+    {
+        static int nocoal = -1;
+        if (nocoal < 0) nocoal = getenv("PVDISPLAY_DIRTY_NOCOALESCE") ? 1 : 0;
+        if (nocoal) {
+            for (i = 0; i < s->dirty_n; i++) {
+                int *dr = (int *)&s->dirty_rects[i];
+                if (rx < dr[0] + dr[2] && rx + rw > dr[0] &&
+                    ry < dr[1] + dr[3] && ry + rh > dr[1]) {
+                    int x2 = MAX(rx + rw, dr[0] + dr[2]);
+                    int y2 = MAX(ry + rh, dr[1] + dr[3]);
+                    dr[0] = MIN(rx, dr[0]); dr[1] = MIN(ry, dr[1]);
+                    dr[2] = x2 - dr[0];     dr[3] = y2 - dr[1];
+                    return;
+                }
+            }
+            if (s->dirty_n < NEWPORT_DIRTY_MAX) {
+                s->dirty_rects[s->dirty_n].x = rx; s->dirty_rects[s->dirty_n].y = ry;
+                s->dirty_rects[s->dirty_n].w = rw; s->dirty_rects[s->dirty_n].h = rh;
+                s->dirty_n++;
+            } else {
+                newport_dirty_full(s);
+            }
             return;
         }
     }
-    if (s->dirty_n < NEWPORT_DIRTY_MAX) {
+
+    /* cheapest merge candidate */
+    for (i = 0; i < s->dirty_n; i++) {
+        const int *dr = (const int *)&s->dirty_rects[i];
+        int ux = MIN(rx, dr[0]), uy = MIN(ry, dr[1]);
+        int ux2 = MAX(rx + rw, dr[0] + dr[2]);
+        int uy2 = MAX(ry + rh, dr[1] + dr[3]);
+        /* waste = union area - (area of the two, less their overlap) */
+        int ox = MIN(rx + rw, dr[0] + dr[2]) - MAX(rx, dr[0]);
+        int oy = MIN(ry + rh, dr[1] + dr[3]) - MAX(ry, dr[1]);
+        int64_t overlap = (ox > 0 && oy > 0) ? (int64_t)ox * oy : 0;
+        int64_t waste = (int64_t)(ux2 - ux) * (uy2 - uy)
+                        - (int64_t)rw * rh - (int64_t)dr[2] * dr[3] + overlap;
+        if (best < 0 || waste < best_waste) {
+            best = i; best_waste = waste;
+        }
+    }
+
+    if (best >= 0 && (best_waste <= NEWPORT_DIRTY_WASTE ||
+                      s->dirty_n >= NEWPORT_DIRTY_MAX)) {
+        int *dr = (int *)&s->dirty_rects[best];
+        int x2 = MAX(rx + rw, dr[0] + dr[2]), y2 = MAX(ry + rh, dr[1] + dr[3]);
+        dr[0] = MIN(rx, dr[0]); dr[1] = MIN(ry, dr[1]);
+        dr[2] = x2 - dr[0];     dr[3] = y2 - dr[1];
+    } else {
         s->dirty_rects[s->dirty_n].x = rx; s->dirty_rects[s->dirty_n].y = ry;
         s->dirty_rects[s->dirty_n].w = rw; s->dirty_rects[s->dirty_n].h = rh;
         s->dirty_n++;
-    } else {
-        newport_dirty_full(s);   /* list full → fall back to full-screen */
     }
+
+    /* area guard — the bounded path stopped being the cheap one */
+    if (newport_dirty_area(s) >= NEWPORT_DIRTY_AREA_FULL) {
+        s->rd_area++;
+        newport_dirty_full(s);
+    }
+}
+
+/*
+ * ============================================================
+ * Phase D / BL-81 follow-up: bounding the VC2 DID-table invalidation
+ * ============================================================
+ *
+ * Xsgi rewrites the per-scanline DID frame/line tables (in VC2 SRAM, through the
+ * DCB auto-incrementing data port) on every window move, resize, restack and
+ * clip change.  Phase D's original broad invalidator called newport_dirty_full()
+ * per changed word, which is correct but produced 814 whole-screen invalidations
+ * per rendered frame during a window-op storm — 99.05 % of all of them — leaving
+ * the desktop permanently full-dirty and the bounded scanout inoperative
+ * (`progress_notes/ip55/pvdisplay/27-bl81-bounded-repaint.md` §6d).
+ *
+ * Instead the write handler only records that VC2 SRAM changed (plus the changed
+ * address range, for the cursor-RAM test), and this resolver — run ONCE per render
+ * — decides which scanlines that actually affected.  Two things had to be right,
+ * and the first attempt only got one of them:
+ *
+ *  1. COALESCE THE BURST.  Xsgi writes these tables as long runs through the
+ *     auto-incrementing data port: measured 1 239 884 changed words in 806 bursts
+ *     (~1538 words/burst) over one wmbench run.  Resolving once per render turns
+ *     807 whole-screen invalidations per frame into 0.5 resolutions per frame.
+ *
+ *  2. ASK THE RIGHT QUESTION.  Bounding by "which words were written" does NOT
+ *     work: measured, it dirtied 1022 of 1024 rows per resolution, because a
+ *     window op rewrites essentially the whole table (line tables get rebuilt at
+ *     fresh addresses, so every frame-table pointer changes) even where the
+ *     resulting per-scanline visual is identical.  What decides whether a row
+ *     renders differently is its DID *resolution* — the sequence of entry words
+ *     its walk consults — not which addresses hold them.  So we cache that
+ *     sequence per row (note 01 Phase D item 2's "per-scanline mode cache") and
+ *     dirty exactly the rows whose sequence changed.
+ *
+ * Direction of safety: this may dirty MORE rows than strictly required, never
+ * fewer.  A row is dirtied whenever its consulted-word sequence differs from the
+ * cached one, and every case that cannot be represented — DIDs disabled, no DID
+ * base, the range touching cursor sprite RAM, a run longer than
+ * NEWPORT_DID_SIGLEN, too many disjoint row runs — is wider (a row run spanning
+ * everything marked, or the old whole-screen invalidate).  Dirtied rows are always
+ * dirtied full-width.  The cache is dropped wholesale on DID-base, DC_CONTROL,
+ * XMAP-mode-table, reset and post-load, i.e. everywhere its inputs change
+ * out-of-band.
+ *
+ * NOT changed: the DID walk itself, the XMAP/CMAP/popup/overlay semantics, and
+ * the VC2 *register* invalidators (DID base, cursor, mode table) — only the
+ * granularity of the dirty marking for SRAM writes.
+ */
+#define NEWPORT_DID_MAXRUNS   24   /* disjoint row runs before merging to one */
+#define NEWPORT_DID_RUNGAP    12   /* merge runs separated by <= this many
+                                    * clean rows: a few extra rows cost far
+                                    * less than an extra rect (and than
+                                    * saturating the list to full-screen) */
+#define NEWPORT_VC2_CURSOR_WORDS 256 /* cursor sprite RAM window (2 banks of 64
+                                      * 2-word rows, rounded up) */
+
+/*
+ * Walk row y's DID entry run exactly as newport_convert_row() does and return the
+ * sequence of entry words consulted, i.e. the row's DID *resolution*.  That
+ * sequence (plus xmap_mode_table, which is invalidated separately) is the complete
+ * input to how the row renders, so comparing it against the cached one answers the
+ * only question that matters: did THIS row's rendering change?
+ *
+ * Returns the number of words written to out[], or -1 for "cannot represent"
+ * (run longer than the cache) — which the caller treats as "always dirty".
+ */
+static int newport_did_row_sig(SGINewportVirtuixState *s, int y,
+                              uint16_t did_entry_ptr, uint16_t *out,
+                              uint32_t *pal_mask)
+{
+    uint16_t fa = (uint16_t)(did_entry_ptr + (uint16_t)y) & 0x7fff;
+    uint16_t lp = s->vc2_ram[fa];
+    int m;
+
+    *pal_mask = 0;
+    for (m = 0; m < NEWPORT_DID_SIGLEN; m++) {
+        uint16_t w = s->vc2_ram[(uint16_t)(lp + m) & 0x7fff];
+        out[m] = w;
+        /* Which palette buckets this segment's mode can read.  Mirrors
+         * newport_convert_row()'s index composition exactly:
+         *   base CI (pix_mode 0): cmap0_palette[(ci_msb | ci) & 0x1fff], ci width
+         *       4/8/12 bits by pix_size, ci_msb a multiple of 0x100 → the OR can
+         *       reach buckets (ci_msb>>8) | k for k up to (ci_max>>8);
+         *   overlay (aux_pix_mode != 0): cmap0_palette[(aux_msb | 0..3)], aux_msb
+         *       a multiple of 0x100 → one bucket.
+         *   RGB modes (pix_mode != 0) read no palette at all.
+         * Segments after the first are included whether or not the walk reaches
+         * them — wider is the safe direction. */
+        {
+            uint32_t me = s->xmap_mode_table[w & 0x1f];
+            uint8_t pmode = (me >> 8) & 3, psize = (me >> 10) & 3;
+            uint8_t amode = (me >> 16) & 7;
+            if (pmode == 0) {
+                uint16_t ci_msb = (uint16_t)((me & 0xf8) << 5);
+                uint32_t cimax = (psize == 0) ? 0xf : (psize == 2) ? 0xfff : 0xff;
+                uint32_t base = ci_msb >> 8, k;
+                for (k = 0; k <= (cimax >> 8); k++) {
+                    *pal_mask |= 1u << ((base | k) & 31);
+                }
+            } else {
+                /* pix_mode 1/2/3 select the fixed CI banks 0x1d/0x1e/0x1f only
+                 * when the pixel is CI; the RGB unpack path reads no palette, but
+                 * mark the bank anyway (wider is safe). */
+                *pal_mask |= 1u << ((0x1c + pmode) & 31);
+            }
+            if (amode != 0) {
+                *pal_mask |= 1u << (((me >> 11) & 0x1f00) >> 8);
+            }
+        }
+        /* entry[0] is the row's initial mode; entry[m>=1] is a segment boundary.
+         * The walk advances only when x reaches (entry >> 5), so the run ends at
+         * the first boundary whose x-start is off-screen — that word is read (it
+         * is the compared next_did_entry) but never applied. */
+        if (m >= 1 && (w >> 5) >= NEWPORT_SCREEN_W) {
+            return m + 1;
+        }
+    }
+    return -1;                  /* run does not terminate within the cache */
+}
+
+/* true if row y's DID resolution differs from the cached one; updates the cache */
+static bool newport_did_row_changed(SGINewportVirtuixState *s, int y,
+                                    uint16_t did_entry_ptr)
+{
+    uint16_t sig[NEWPORT_DID_SIGLEN];
+    uint32_t pal = 0;
+    int n = newport_did_row_sig(s, y, did_entry_ptr, sig, &pal);
+
+    if (n < 0) {
+        s->did_sig_n[y] = 0xff;         /* unmappable → always dirty */
+        s->did_row_pal[y] = 0xffffffffu;
+        return true;
+    }
+    if (s->did_sig_n[y] == (uint8_t)n &&
+        memcmp(s->did_sig[y], sig, (size_t)n * sizeof(uint16_t)) == 0) {
+        return false;                   /* same resolution → renders identically */
+    }
+    s->did_sig_n[y] = (uint8_t)n;
+    s->did_row_pal[y] = pal;
+    memcpy(s->did_sig[y], sig, (size_t)n * sizeof(uint16_t));
+    return true;
+}
+
+/* Drop the per-row DID cache (forces the next resolve to dirty every row).  Used
+ * wherever the DID base / mode table / whole device state changes underneath it. */
+static void newport_did_cache_drop(SGINewportVirtuixState *s)
+{
+    memset(s->did_sig_n, 0xff, sizeof(s->did_sig_n));
+    /* until a row is resolved again, assume it can read any palette bucket */
+    memset(s->did_row_pal, 0xff, sizeof(s->did_row_pal));
+}
+
+/* Emit the marked rows as full-width dirty rects (few runs), or one spanning rect
+ * when they are too fragmented for the list.  `rows` is the marked count.
+ * PVDISPLAY_VC2_SHRINK=<n> is the POSITIVE CONTROL: it dirties n rows FEWER at
+ * each end of every run, i.e. under-invalidates.  A probe that cannot fail proves
+ * nothing (note 27 s3), so every oracle for this change is self-tested with it. */
+static void newport_dirty_marked_rows(SGINewportVirtuixState *s,
+                                      const uint8_t *marked, int rows)
+{
+    struct { int y0, y1; } runs[NEWPORT_DID_MAXRUNS];
+    int nruns = 0, cur = -1, y, i, ymin = -1, ymax = -1;
+    bool overflow = false;
+    static int shrink = -1;
+
+    if (rows <= 0) return;
+    for (y = 0; y < NEWPORT_SCREEN_H; y++) {
+        if (!marked[y]) continue;
+        if (ymin < 0) ymin = y;
+        ymax = y;
+        if (cur >= 0 && y - runs[cur].y1 <= NEWPORT_DID_RUNGAP) {
+            runs[cur].y1 = y;      /* extend across a small clean gap */
+        } else if (nruns < NEWPORT_DID_MAXRUNS) {
+            cur = nruns++;
+            runs[cur].y0 = runs[cur].y1 = y;
+        } else {
+            overflow = true;
+        }
+    }
+    if (shrink < 0) {
+        const char *e = getenv("PVDISPLAY_VC2_SHRINK");
+        shrink = e ? atoi(e) : 0;
+    }
+    if (shrink > 0) {
+        for (i = 0; i < nruns; i++) {
+            runs[i].y0 += shrink;
+            runs[i].y1 -= shrink;
+            if (runs[i].y0 > runs[i].y1) runs[i].y0 = runs[i].y1 = -1;
+        }
+        if (overflow) { ymin += shrink; ymax -= shrink; }
+    }
+    if (overflow) {
+        if (ymin <= ymax) {
+            newport_dirty_rect(s, 0, ymin, NEWPORT_SCREEN_W, ymax - ymin + 1);
+        }
+        return;
+    }
+    for (i = 0; i < nruns; i++) {
+        if (runs[i].y0 < 0) continue;
+        newport_dirty_rect(s, 0, runs[i].y0, NEWPORT_SCREEN_W,
+                           runs[i].y1 - runs[i].y0 + 1);
+    }
+}
+
+/* Resolve any pending VC2-SRAM change window into dirty rows (or full). */
+static void newport_vc2_ram_resolve(SGINewportVirtuixState *s)
+{
+    uint32_t lo = s->vc2_ram_dirty_lo, hi = s->vc2_ram_dirty_hi;
+    uint16_t did_entry_ptr, cursor_entry;
+    bool use_did;
+    static uint8_t marked[NEWPORT_SCREEN_H];
+    int y, rows = 0;
+
+    if (lo > hi) {
+        return;                 /* nothing pending */
+    }
+    s->vc2_ram_dirty_lo = 0x8000;   /* consume the window */
+    s->vc2_ram_dirty_hi = 0;
+    s->vc2_resolve_calls++;
+
+    did_entry_ptr = s->vc2_reg[VC2_DID_ENTRY];
+    use_did = (s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS) &&
+              did_entry_ptr != 0;
+    cursor_entry = s->vc2_reg[VC2_CURSOR_ENTRY];
+
+    /* Cursor sprite RAM shares this SRAM and is not row-mappable from here. */
+    if (hi >= (uint32_t)cursor_entry &&
+        lo <= (uint32_t)cursor_entry + NEWPORT_VC2_CURSOR_WORDS - 1) {
+        s->vc2_resolve_full++;
+        newport_dirty_full(s);
+        return;
+    }
+    if (!use_did) {
+        /* the renderer isn't consulting the DID tables at all right now; the
+         * safe reading is "we cannot say what this changed" -> full. */
+        s->vc2_resolve_full++;
+        newport_dirty_full(s);
+        return;
+    }
+
+    memset(marked, 0, sizeof(marked));
+    for (y = 0; y < NEWPORT_SCREEN_H; y++) {
+        if (newport_did_row_changed(s, y, did_entry_ptr)) {
+            marked[y] = 1;
+            rows++;
+        }
+    }
+    if (rows == 0) {
+        return;                 /* the change is invisible (e.g. an inactive or
+                                 * non-DID region of VC2 SRAM) */
+    }
+    s->vc2_resolve_bounded++;
+    s->vc2_resolve_rows += rows;
+    newport_dirty_marked_rows(s, marked, rows);
+}
+
+/*
+ * Resolve pending CMAP-palette changes.  A palette entry recolours pixels with no
+ * REX3 draw, so it must invalidate — but only the rows that can READ it.  Which
+ * 256-entry buckets a row can read is decided by its DID resolution (base-plane
+ * ci_msb per segment, overlay aux_msb), cached in did_row_pal[] alongside the
+ * signature.  Cases that are not row-decidable fall back to whole-screen:
+ *   - the popup bucket (popup pixels are selected per-pixel by cidaux, anywhere)
+ *   - the hardware-cursor bucket
+ *   - DIDs disabled (every row resolves to bucket 0)
+ * This is the #2 saturator: with the DID tables bounded it was still forcing
+ * 3058 whole-screen invalidations (~2.4 per rendered frame) on its own.
+ */
+static void newport_pal_resolve(SGINewportVirtuixState *s)
+{
+    uint32_t mask = s->pal_dirty_mask;
+    uint16_t popup_msb, cursor_msb;
+    static uint8_t marked[NEWPORT_SCREEN_H];
+    int y, rows = 0;
+
+    if (!mask) return;
+    s->pal_dirty_mask = 0;
+
+    popup_msb = (uint16_t)s->xmap_popup_cmap << 5;
+    cursor_msb = (uint16_t)s->xmap_cursor_cmap << 5;
+    if (!((s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS) &&
+          s->vc2_reg[VC2_DID_ENTRY] != 0) ||
+        (mask & (1u << ((popup_msb >> 8) & 31))) ||
+        (mask & (1u << ((cursor_msb >> 8) & 31)))) {
+        s->pal_resolve_full++;
+        newport_dirty_full(s);
+        return;
+    }
+
+    memset(marked, 0, sizeof(marked));
+    for (y = 0; y < NEWPORT_SCREEN_H; y++) {
+        if (s->did_row_pal[y] & mask) {
+            marked[y] = 1;
+            rows++;
+        }
+    }
+    if (rows == 0) return;      /* no row can read the changed entries */
+    s->pal_resolve_bounded++;
+    s->pal_resolve_rows += rows;
+    newport_dirty_marked_rows(s, marked, rows);
 }
 
 /*
@@ -4253,6 +4809,27 @@ static void newport_scanout_damage(void *opaque, int x, int y, int w, int h)
     newport_dirty_rect(s, x, y, w, h);
 }
 
+/* BL-81 bounded geometry repaint (invoked from glaccel via the desk_repaint
+ * callback): a server-published window model moved/resized a GL window, so the
+ * desktop under the union of its old and new rects must be re-walked from VRAM
+ * next render — but nothing else.  Feed the rects straight into the same Phase D
+ * dirty-rect machinery every REX3 primitive uses, so newport_render_desktop()
+ * re-walks exactly them and reports them back for a bounded blit.
+ *
+ * Unlike newport_scanout_damage() this is NOT gated on scanout_active: the
+ * requirement is about the desktop under a GL overlay, which exists whether or
+ * not a paravirtual shadowfb is registered.  Coalescing and saturation
+ * (dirty_n == NEWPORT_DIRTY_MAX => full re-walk) are handled by
+ * newport_dirty_rect(), i.e. the safe direction: never repaint less than asked. */
+static void newport_desk_repaint(void *opaque, const PVDeskRect *rects, int n)
+{
+    SGINewportVirtuixState *s = opaque;
+    int i;
+    for (i = 0; i < n; i++) {
+        newport_dirty_rect(s, rects[i].x, rects[i].y, rects[i].w, rects[i].h);
+    }
+}
+
 /* Build one CI8 shadowfb scanline as rgbci words for the DID walk: DMA row y of
  * the shadow fb from guest RAM and zero-extend each CI byte into the low 8 bits
  * of an rgbci word (newport_convert_row's pix_size=1 path reads pixel & 0xff).
@@ -4385,6 +4962,12 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
         return 0;  /* nothing changed; engine can skip the blit */
     }
 
+    /* Phase D: fold any pending VC2 DID-table change into the dirty-rect list
+     * before do_full is decided (a burst of SRAM writes resolves to a handful of
+     * row ranges here instead of hundreds of full invalidations at write time). */
+    newport_vc2_ram_resolve(s);
+    newport_pal_resolve(s);
+
     {
         static int sc = -1;
         if (sc < 0) sc = getenv("PVDISPLAY_SOFT_CURSOR") ? 1 : 0;
@@ -4401,10 +4984,34 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
      * cursor is active (its old-position restore is only correct under a full
      * repaint — soft cursor is the debug escape hatch, so we don't chase the
      * incremental win there).
+     *
+     * Note 29: the saturation test is now the explicit s->dirty_full flag.  A
+     * FULL LIST is no longer a saturated one — newport_dirty_rect() merges into
+     * the cheapest existing slot instead of giving up (§the coalescing comment
+     * there), so dirty_n == NEWPORT_DIRTY_MAX is an ordinary bounded state.
+     *
+     * Also note 29, and a latent correctness fix: the bounded branch renders
+     * every dirty rect but can only REPORT max_rects of them, and the engine
+     * blits only what is reported — so more rects than the caller can carry must
+     * go full rather than leave rendered-but-unblitted rows on screen.  (It has
+     * been unreachable in practice since PVDESK_MAX_RECTS was pinned equal to
+     * NEWPORT_DIRTY_MAX, but the two are separate constants in separate files.)
+     *
+     * Each reason gets its own counter (why_full in the NEWPORT_DIRTYFULL_STATS
+     * line).  The increments were lost when note 28 §5b's probe knob was removed
+     * from this block, which left the printed why_full triple reading 0/0/0.
      */
-    do_full = force_full || newport_scanout_full() ||
-              s->dirty_n >= NEWPORT_DIRTY_MAX || soft_cursor;
-
+    {
+        bool oracle = newport_scanout_full() || soft_cursor;
+        bool overflow = (out_rects && s->dirty_n > max_rects);
+        do_full = force_full || oracle || s->dirty_full || overflow;
+        if (do_full) {
+            if (force_full)         s->rd_force++;
+            else if (oracle)        s->rd_oracle++;
+            else if (s->dirty_full) s->rd_sat++;
+            else                    s->rd_overflow++;
+        }
+    }
     /* Stage 2 Phase 2a: pixel-source selection.  When a CI8 shadowfb is active
      * the base plane's rgbci row comes from guest RAM (via the DID walk); the
      * xRGB32 shadowfb takes an experimental straight-copy path that bypasses the
@@ -4494,8 +5101,43 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
         }
     }
 
+    /* NEWPORT_DIRTYFULL_STATS=<n>: dump the per-call-site whole-screen-invalidation
+     * histogram plus the VC2 resolver's own counters every n renders (n>=2, or
+     * 512 for "1"), so "who is saturating the dirty list" is answerable from a log. */
+    if (newport_dfull_stats_on()) {
+        static uint64_t renders;
+        static int period = -1;
+        if (period < 0) {
+            const char *e = getenv("NEWPORT_DIRTYFULL_STATS");
+            period = e ? atoi(e) : 0;
+            if (period < 2) period = 512;
+        }
+        if (++renders % (uint64_t)period == 0) {
+            int k;
+            fprintf(stderr, "newport: DIRTYFULL renders=%llu dfull_total=%llu "
+                    "vc2_writes=%u vc2_resolve=%u (full=%u bounded=%u rows=%u) "
+                    "pal(full=%u bounded=%u rows=%u) "
+                    "why_full(force=%u sat=%u oracle=%u ovf=%u area=%u) sites:",
+                    (unsigned long long)renders,
+                    (unsigned long long)newport_dfull_total,
+                    s->vc2_ram_writes, s->vc2_resolve_calls,
+                    s->vc2_resolve_full, s->vc2_resolve_bounded,
+                    s->vc2_resolve_rows,
+                    s->pal_resolve_full, s->pal_resolve_bounded,
+                    s->pal_resolve_rows,
+                    s->rd_force, s->rd_sat, s->rd_oracle, s->rd_overflow,
+                    s->rd_area);
+            for (k = 0; k < NEWPORT_DFULL_SITES && newport_dfull_site[k].line; k++) {
+                fprintf(stderr, " L%d=%llu", newport_dfull_site[k].line,
+                        (unsigned long long)newport_dfull_site[k].n);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     s->display_dirty = false;
     s->dirty_n = 0;  /* Phase D: clear dirty rects */
+    s->dirty_full = false;
     return do_full ? PVDESK_FULL : nrects;
 }
 
@@ -4601,6 +5243,9 @@ static void sgi_newport_virtuix_reset(DeviceState *dev)
     s->vc2_reg_data = 0;
     memset(s->vc2_ram, 0, sizeof(s->vc2_ram));
     memset(s->vc2_reg, 0, sizeof(s->vc2_reg));
+    s->vc2_ram_dirty_lo = 0x8000;   /* lo > hi == "no pending DID change" */
+    s->vc2_ram_dirty_hi = 0;
+    newport_did_cache_drop(s);      /* per-row DID resolution cache */
 
     /* XMAP */
     s->xmap_config = 0;
@@ -4674,6 +5319,7 @@ static void sgi_newport_virtuix_realize(DeviceState *dev, Error **errp)
      * The engine owns the QemuConsole; we only render pixels into its buffer. */
     sgi_glaccel_register_desktop(newport_render_desktop, newport_invalidate,
                                   newport_set_scanout, newport_scanout_damage,
+                                  newport_desk_repaint,
                                   s, NEWPORT_SCREEN_W, NEWPORT_SCREEN_H);
 
     /* Open NewView binary log file if property is set */
@@ -5165,7 +5811,12 @@ static int sgi_newport_virtuix_post_load(void *opaque, int version_id)
     newport_decode_drawmode1(s);
     newport_decode_drawmode0(s);
 
-    /* Force display refresh */
+    /* Force display refresh.  The pending VC2-SRAM change window is transient and
+     * not migrated, so clear it explicitly (a zeroed pair would read as "word 0
+     * pending"); the full invalidate below covers anything it would have named. */
+    s->vc2_ram_dirty_lo = 0x8000;
+    s->vc2_ram_dirty_hi = 0;
+    newport_did_cache_drop(s);
     newport_dirty_full(s);
 
     return 0;

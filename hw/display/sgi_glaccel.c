@@ -186,8 +186,77 @@ static void glaccel_present_bh(void *opaque)
     }
 }
 
+/*
+ * ============================================================
+ * Note 29 — content-only dirty: the last blanket whole-desktop invalidator
+ * ============================================================
+ *
+ * Notes 27/28 bounded the geometry repaint and the VC2/CMAP/RAMDAC invalidators,
+ * and then MEASURED what was still driving 76 % of desktop renders onto the full
+ * 1280x1024 path.  The answer (note 28 §3) was `force = s->invalidate` — set
+ * unconditionally by the pvgpu content ops:
+ *
+ *   - a delivered GL frame (glaccel_apply_frame, BL-76 recomposite-on-delivery),
+ *   - PVGPU_OP_GL (the submit that produces it, in-process),
+ *   - the legacy 2D ops CLEAR / FILL / COPY / BLIT.
+ *
+ * None of those can alter a DESKTOP pixel:
+ *
+ *   - a GL frame changes pixels only inside its window's rect, which the
+ *     composite draws over s->desk every frame and the bounded blit copies; the
+ *     composite signature folds c->frame_serial, so a new frame already defeats
+ *     the idle-skip with no invalidate at all.  This is exactly the argument note
+ *     28 used to drop the PVGPU_OP_PRESENT invalidate, applied one op earlier.
+ *   - the 2D ops write s->fb, and s->fb is scanned out ONLY by the legacy
+ *     no-desktop-layer path at the bottom of sgi_glaccel_update().  With a
+ *     desktop layer registered (i.e. always, on virtuix) they cannot change a
+ *     displayed pixel at all, so the bounded request they owe is the empty set.
+ *     (No guest userland emits them today: the shim's ops are OP_GL/WM_*.  They
+ *     survive as the device's own 2D console path.)
+ *
+ * GEOMETRY changes are a different matter and are NOT touched here: they go
+ * through BL-81's bounded desk_repaint (or full, when unnameable) in the update
+ * path, and a context whose frame vanishes is caught by the geometry set-diff.
+ *
+ * Fail-safe direction: with no desktop layer registered, or under
+ * PVDISPLAY_CONTENT_FULL=1 (the one-binary A/B control), every site keeps the
+ * old blanket invalidate.  The socket (non-inproc) frame path also keeps it,
+ * because only the in-process path advances c->frame_serial — see the
+ * serial_tracked argument.
+ */
+static bool glaccel_content_full(void)
+{
+    static int cf = -1;
+    if (cf < 0) {
+        cf = getenv("PVDISPLAY_CONTENT_FULL") ? 1 : 0;
+    }
+    return cf != 0;
+}
+
+typedef enum {
+    GLACCEL_CD_FRAME,   /* a delivered GL frame */
+    GLACCEL_CD_GLOP,    /* PVGPU_OP_GL submit */
+    GLACCEL_CD_2D       /* CLEAR / FILL / COPY / BLIT into s->fb */
+} GlaccelCdSite;
+
+static void glaccel_content_dirty(SGIGLAccelState *s, GlaccelCdSite site,
+                                  bool serial_tracked)
+{
+    switch (site) {
+    case GLACCEL_CD_FRAME: s->n_inv_frame++; break;
+    case GLACCEL_CD_GLOP:  s->n_inv_glop++;  break;
+    default:               s->n_inv_2d++;    break;
+    }
+    if (!s->desk_render || glaccel_content_full() ||
+        (site == GLACCEL_CD_FRAME && !serial_tracked)) {
+        s->invalidate = true;
+        return;
+    }
+    s->n_inv_dropped++;
+}
+
 static void glaccel_apply_frame(PVGPUCtx *c, int x, int y, int w, int h,
-                                const uint8_t *rgba)
+                                const uint8_t *rgba, bool serial_tracked)
 {
     size_t npix = (size_t)w * h, i;
     uint32_t *b;
@@ -206,7 +275,11 @@ static void glaccel_apply_frame(PVGPUCtx *c, int x, int y, int w, int h,
     c->idle_warned = false;                /* fresh frame — re-arm the idle diagnostic */
     c->last_us = g_get_monotonic_time();   /* for the exit/idle staleness diagnostic */
     if (c->dev) {
-        c->dev->invalidate = true;
+        /* Note 29: a frame changes pixels only inside this window's rect; the
+         * composite + bounded blit cover it and frame_serial defeats the
+         * idle-skip.  Only the socket path (serial_tracked=false) still needs the
+         * whole-desktop invalidate. */
+        glaccel_content_dirty(c->dev, GLACCEL_CD_FRAME, serial_tracked);
         /* BL-76: delivery drives the composite — force a present on the main loop
          * so an idle desktop / -display none still shows this frame.  Coalesced. */
         if (c->dev->present_bh) qemu_bh_schedule(c->dev->present_bh);
@@ -258,7 +331,9 @@ static void glaccel_gl_parse(PVGPUCtx *c)
         if (rx->len < total) {
             break;                                 /* wait for the rest */
         }
-        glaccel_apply_frame(c, x, y, w, h, rx->data + 20);
+        /* socket path: nothing advances c->frame_serial here, so this delivery
+         * still needs the whole-desktop invalidate (debug fallback path only). */
+        glaccel_apply_frame(c, x, y, w, h, rx->data + 20, false);
         g_byte_array_remove_range(rx, 0, total);
     }
 }
@@ -619,7 +694,9 @@ static void pvgpu_gl_submit_inproc(SGIGLAccelState *s, PVGPUCtx *c,
                 rgba[i * 4 + 2] = rgb[i * 3 + 2];
                 rgba[i * 4 + 3] = 0xff;
             }
-            glaccel_apply_frame(c, c->x, c->y, fw, fh, rgba);
+            /* in-process path: c->frame_serial was advanced just above, so the
+             * composite signature sees this frame without a full invalidate. */
+            glaccel_apply_frame(c, c->x, c->y, fw, fh, rgba, true);
             g_free(rgba);
         }
     }
@@ -660,6 +737,19 @@ static void pvgpu_gl_submit_inproc(SGIGLAccelState *s, PVGPUCtx *c,
  * None of the three touches the resolution rules: the model STATE is still
  * committed synchronously and wholesale on every good batch, so the composite
  * that eventually runs always reads the FINAL state.
+ *
+ * BL-81 (the fourth, and what blocked default-on): with a GL context bound to an
+ * on-screen window the remaining cost was not present COUNT — the coalescer had
+ * that at one per refresh already — but per-present WORK.  Both a model commit
+ * (`s->invalidate = true` at WM_END) and the geometry-change test forced
+ * desk_render(force_full) => a 1280x1024 Newport re-walk plus a 5 MB full-screen
+ * memcpy + dpy_gfx_update_full, on every present of a move/resize storm: +7.5
+ * points of host CPU on resize, +6.6 on move (26-…md §2).  Both now name the
+ * rects the change can have altered — the union of each changed window's old and
+ * new rect — and hand them to the desktop layer's dirty-rect machinery
+ * (desk_repaint), so the render AND the blit are bounded to the window.  Every
+ * "cannot name it" case (first model, publisher death, bound-window retire, rect
+ * list overflow, no desk_repaint implementation) falls back to the old full path.
  * ------------------------------------------------------------------------------ */
 
 /* One display refresh (the pvgpu console runs at 60Hz). */
@@ -694,6 +784,49 @@ static bool glaccel_wm_rec_differs(const PVGPUWinRec *a, const PVGPUWinRec *b)
     return false;
 }
 
+static void glaccel_clamp_rect(PVDeskRect *out, int x, int y, int wpx, int hpx,
+                               int dw, int dh);
+static const PVGPUWinRec *glaccel_wm_find(SGIGLAccelState *s, uint32_t xid);
+
+/* BL-81 — accumulate one rect into the pending bounded-repaint request.
+ * Clamped to the desktop, exact-duplicate-suppressed, and saturating to
+ * "cannot be bounded" when the fixed list fills.  Consumed (and cleared) by the
+ * next sgi_glaccel_update(); it must accumulate ACROSS commits because the
+ * coalescer folds many WM_ENDs into one present. */
+static void glaccel_wm_add_rrect(SGIGLAccelState *s, int x, int y, int w, int h)
+{
+    PVDeskRect r;
+    int i;
+    if (w <= 0 || h <= 0 || s->desk_w <= 0 || s->desk_h <= 0) {
+        return;
+    }
+    glaccel_clamp_rect(&r, x, y, w, h, s->desk_w, s->desk_h);
+    if (r.w <= 0 || r.h <= 0) return;
+    for (i = 0; i < s->wm_n_rrects; i++) {
+        if (s->wm_rrects[i].x == r.x && s->wm_rrects[i].y == r.y &&
+            s->wm_rrects[i].w == r.w && s->wm_rrects[i].h == r.h) {
+            return;
+        }
+    }
+    if (s->wm_n_rrects >= (int)ARRAY_SIZE(s->wm_rrects)) {
+        s->wm_repaint_full = true;   /* out of slots — name nothing, repaint all */
+        return;
+    }
+    s->wm_rrects[s->wm_n_rrects++] = r;
+}
+
+/* BL-81 — the region one changed window record can have altered, at one
+ * generation: the window rect the server published UNION the rect the frame
+ * actually occupies (the ctx frame may be larger or smaller than the record's
+ * w/h, and the composite uses the ctx size with the model origin). */
+static void glaccel_wm_add_win_rrect(SGIGLAccelState *s, int ox, int oy,
+                                     int rw, int rh, int cw, int ch)
+{
+    int x1 = ox + (rw > cw ? rw : cw);
+    int y1 = oy + (rh > ch ? rh : ch);
+    glaccel_wm_add_rrect(s, ox, oy, x1 - ox, y1 - oy);
+}
+
 /* Would committing wm_shadow[] change a pixel?  Only through a context's bound_xid:
  * glaccel_wm_find() is keyed on it, so a window no context is bound to is never read
  * at composite time and its record moving cannot alter the output.  4Dwm republishes
@@ -706,27 +839,71 @@ static bool glaccel_wm_rec_differs(const PVGPUWinRec *a, const PVGPUWinRec *b)
 static bool glaccel_wm_bound_changed(SGIGLAccelState *s)
 {
     int k;
-    if (s->wm_gen == 0) return true;    /* no previous model to compare against */
+    bool changed = false;
+    if (s->wm_gen == 0) {
+        s->wm_repaint_full = true;      /* first model: nothing to bound against */
+        return true;
+    }
     for (k = 0; k < PVGPU_MAXCTX; k++) {
         uint32_t xid = s->ctx[k].bound_xid;
+        const PVGPUWinRec *ow, *nw;
         if (xid == 0) continue;
-        if (glaccel_wm_rec_differs(glaccel_wm_lookup(s->wm, s->wm_n, xid),
-                                   glaccel_wm_lookup(s->wm_shadow, s->wm_shadow_n, xid))) {
-            return true;
+        ow = glaccel_wm_lookup(s->wm, s->wm_n, xid);
+        nw = glaccel_wm_lookup(s->wm_shadow, s->wm_shadow_n, xid);
+        if (!glaccel_wm_rec_differs(ow, nw)) continue;
+        changed = true;
+        /*
+         * BL-81.  Every field glaccel_wm_rec_differs() compares — origin, size,
+         * stacking key, MAPPED, clip region — can only alter pixels inside the
+         * window's OLD rect (which the change may uncover, restack under, or
+         * newly clip away) or its NEW rect (where the frame now composites).
+         * Outside their union the model change is provably invisible, so record
+         * exactly that union as the bounded repaint request instead of the
+         * whole-screen `s->invalidate = true` this used to imply.
+         *
+         * A NULL on one side is an appear/retire: the surviving rect is the whole
+         * requirement (a window that did not exist has no old pixels to restore,
+         * a retired one has no new ones), so neither needs the full path.
+         */
+        if (ow) {
+            glaccel_wm_add_win_rrect(s, ow->x, ow->y, ow->w, ow->h,
+                                     s->ctx[k].w, s->ctx[k].h);
+        }
+        if (nw) {
+            glaccel_wm_add_win_rrect(s, nw->x, nw->y, nw->w, nw->h,
+                                     s->ctx[k].w, s->ctx[k].h);
         }
     }
-    return false;
+    return changed;
 }
 
 static void glaccel_wm_stats(SGIGLAccelState *s)
 {
     static int on = -1;
-    if (on < 0) on = getenv("SGI_GLACCEL_WM_STATS") ? 1 : 0;
-    if (!on || (s->wm_commits % 64) != 0) return;
+    static int every = 64;
+    if (on < 0) {
+        const char *e = getenv("SGI_GLACCEL_WM_STATS");
+        on = e ? 1 : 0;
+        /* SGI_GLACCEL_WM_STATS=all reports EVERY commit.  The default 1-in-64 is
+         * too coarse to attribute a single window op (BL-81's correctness probe
+         * needs to see the geombounded/geomfull counters move for one move). */
+        if (e && !strcmp(e, "all")) every = 1;
+    }
+    if (!on || (s->wm_commits % every) != 0) return;
     fprintf(stderr, "pvgpu: WMSTATS commits=%" PRIu64 " nop=%" PRIu64
-            " presents=%" PRIu64 " coalesced=%" PRIu64 " gen=%u sig=%u wm_n=%d\n",
+            " presents=%" PRIu64 " coalesced=%" PRIu64 " gen=%u sig=%u wm_n=%d"
+            " geombounded=%" PRIu64 " geomfull=%" PRIu64
+            " vfy=%" PRIu64 " vfybad=%" PRIu64 "/%" PRIu64
+            " upd=%" PRIu64 " t_render=%" PRIu64 " t_comp=%" PRIu64
+            " t_blit=%" PRIu64 " t_wmops=%" PRIu64 " (ms)"
+            " rfull=%" PRIu64 " rrects=%" PRIu64 " ridle=%" PRIu64 "\n",
             s->wm_commits, s->wm_commits_nop, s->wm_presents,
-            s->wm_presents_coalesced, s->wm_gen, s->wm_sig, s->wm_n);
+            s->wm_presents_coalesced, s->wm_gen, s->wm_sig, s->wm_n,
+            s->geom_bounded_repaints, s->geom_full_repaints,
+            s->verify_frames, s->verify_bad_frames, s->verify_bad_pixels,
+            s->n_updates, s->t_desk_render / 1000000, s->t_composite / 1000000,
+            s->t_blit / 1000000, s->t_wm_ops / 1000000,
+            s->n_render_full, s->n_render_rects, s->n_render_idle);
 }
 
 static void glaccel_wm_present_timer_cb(void *opaque)
@@ -743,11 +920,53 @@ static void glaccel_wm_present_timer_cb(void *opaque)
  * commit already happened, so whenever the deferred present runs it composites the
  * newest model — a burst of N commits inside one refresh yields ONE composite of the
  * final state.  Nothing is dropped: the only thing rate-limited is the repaint. */
+/* PVDISPLAY_TIME_BREAKDOWN=1 — per-phase host-time attribution (BL-81 §5). */
+static bool glaccel_timing_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PVDISPLAY_TIME_BREAKDOWN") ? 1 : 0;
+    return on != 0;
+}
+
+static uint64_t glaccel_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+#define GLACCEL_TIME(s, field, body) do {                                     \
+        if (glaccel_timing_on()) {                                            \
+            uint64_t _t0 = glaccel_now_ns();                                  \
+            body;                                                             \
+            (s)->field += glaccel_now_ns() - _t0;                             \
+        } else {                                                              \
+            body;                                                             \
+        }                                                                     \
+    } while (0)
+
+static int64_t glaccel_wm_present_period_ns(void)
+{
+    /* SGI_GLACCEL_WM_PRESENT_HZ=<n> overrides the one-per-refresh coalescing cap.
+     * BL-81 attribution knob: if the model's residual host cost is per-PRESENT it
+     * must fall roughly in proportion when this is lowered; if it is per-COMMIT
+     * (ring parse + model commit + bound-changed compare, which happen 9600 times
+     * either way) lowering it changes nothing.  Debug only. */
+    static int64_t period = -1;
+    if (period < 0) {
+        const char *e = getenv("SGI_GLACCEL_WM_PRESENT_HZ");
+        int hz = e ? atoi(e) : 0;
+        period = (hz > 0) ? NANOSECONDS_PER_SECOND / hz
+                          : GLACCEL_WM_PRESENT_PERIOD_NS;
+    }
+    return period;
+}
+
 static void glaccel_wm_request_present(SGIGLAccelState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    if (now - s->wm_last_present_ns >= GLACCEL_WM_PRESENT_PERIOD_NS ||
-        !s->wm_present_timer) {
+    int64_t period = glaccel_wm_present_period_ns();
+    if (now - s->wm_last_present_ns >= period || !s->wm_present_timer) {
         s->wm_last_present_ns = now;
         s->wm_presents++;
         if (s->present_bh) qemu_bh_schedule(s->present_bh);
@@ -756,8 +975,7 @@ static void glaccel_wm_request_present(SGIGLAccelState *s)
     s->wm_presents_coalesced++;
     if (!s->wm_present_pending) {
         s->wm_present_pending = true;
-        timer_mod_ns(s->wm_present_timer,
-                     s->wm_last_present_ns + GLACCEL_WM_PRESENT_PERIOD_NS);
+        timer_mod_ns(s->wm_present_timer, s->wm_last_present_ns + period);
     }
 }
 
@@ -766,10 +984,25 @@ static void glaccel_wm_request_present(SGIGLAccelState *s)
 static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uint32_t resp_base) {
     uint32_t p = 0;
     PVGPUCtx *wc = &s->ctx[s->cur_ctx < PVGPU_MAXCTX ? s->cur_ctx : 0];   /* this window */
-    fprintf(stderr, "pvgpu: exec ctx=%d %u bytes first_op=%u\n",
-            (int)(wc - s->ctx), len, len >= 4 ? pv_be32(buf) : 0);
+    /* One stderr write per submitted command buffer on the hottest device path —
+     * gated like its sibling in the doorbell handler (commit 1896ffea3c). */
+    {
+        static int exec_dbg = -1;
+        if (exec_dbg < 0) {
+            exec_dbg = getenv("SGI_GLACCEL_EXEC_DBG") ? 1 : 0;
+        }
+        if (exec_dbg) {
+            fprintf(stderr, "pvgpu: exec ctx=%d %u bytes first_op=%u\n",
+                    (int)(wc - s->ctx), len, len >= 4 ? pv_be32(buf) : 0);
+        }
+    }
     while (p + 4 <= len) {
         uint32_t op = pv_be32(buf + p); p += 4;
+        /* BL-81 attribution: charge the WM_* ops (10..15) their own host time, so
+         * "per-commit model work" can be separated from "per-present repaint work".
+         * Error paths inside the switch `return` and are simply not charged. */
+        uint64_t wm_t0 = (op >= PVGPU_OP_WM_BEGIN && op <= PVGPU_OP_WM_BIND
+                          && glaccel_timing_on()) ? glaccel_now_ns() : 0;
         switch (op) {
         case PVGPU_OP_CLEAR: {
             uint32_t c; size_t i;
@@ -778,7 +1011,8 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
             if (!s->fb) pvgpu_ensure_fb(s, s->width ? s->width : 800, s->height ? s->height : 600);
             if (s->fb) for (i = 0; i < (size_t)s->fb_w * s->fb_h; i++)
                 s->fb[i] = ((c >> 24 & 0xff) << 16) | ((c >> 16 & 0xff) << 8) | (c >> 8 & 0xff);
-            s->fb_active = true; s->invalidate = true; break;
+            s->fb_active = true;
+            glaccel_content_dirty(s, GLACCEL_CD_2D, false); break;
         }
         case PVGPU_OP_FILL: {
             int x, y, w, h, yy, xx; uint32_t c, px;
@@ -790,7 +1024,8 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
             if (pv_clip(s, &x, &y, &w, &h))
                 for (yy = y; yy < y + h; yy++) for (xx = x; xx < x + w; xx++)
                     s->fb[(size_t)yy * s->fb_w + xx] = px;
-            s->fb_active = true; s->invalidate = true; break;
+            s->fb_active = true;
+            glaccel_content_dirty(s, GLACCEL_CD_2D, false); break;
         }
         case PVGPU_OP_COPY: {
             int sx, sy, dx, dy, w, h, r;
@@ -804,7 +1039,8 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
             for (r = (dy > sy) ? h - 1 : 0; (dy > sy) ? r >= 0 : r < h; r += (dy > sy) ? -1 : 1)
                 memmove(s->fb + (size_t)(dy + r) * s->fb_w + dx,
                         s->fb + (size_t)(sy + r) * s->fb_w + sx, (size_t)w * 4);
-            s->fb_active = true; s->invalidate = true; break;
+            s->fb_active = true;
+            glaccel_content_dirty(s, GLACCEL_CD_2D, false); break;
         }
         case PVGPU_OP_BLIT: {
             int x, y, w, h, yy, xx; const uint8_t *img;
@@ -820,7 +1056,8 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
                 if (fx >= 0 && fy >= 0 && fx < s->fb_w && fy < s->fb_h)
                     s->fb[(size_t)fy * s->fb_w + fx] = (q[0] << 16) | (q[1] << 8) | q[2];
             }
-            s->fb_active = true; s->invalidate = true; break;
+            s->fb_active = true;
+            glaccel_content_dirty(s, GLACCEL_CD_2D, false); break;
         }
         case PVGPU_OP_GL: {
             int x, y; uint32_t need_reply, gllen, adv;
@@ -856,11 +1093,16 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
             }
             }
             adv = (gllen + 3) & ~3u; p += adv;
-            s->fb_active = true; s->invalidate = true; break;
+            s->fb_active = true;
+            glaccel_content_dirty(s, GLACCEL_CD_GLOP, false); break;
         }
         case PVGPU_OP_WINCLIP: {
             uint32_t n, i;
+            int old_occ[PVGPU_MAX_OCC][4];
+            int old_n = wc->n_occ;
+            bool occ_changed;
             if (p + 4 > len) return;
+            memcpy(old_occ, wc->occ, sizeof old_occ);
             n = pv_be32(buf + p); p += 4;
             if (n > PVGPU_MAX_OCC) n = PVGPU_MAX_OCC;
             for (i = 0; i < n; i++) {
@@ -870,10 +1112,49 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
                 p += 16;
             }
             wc->n_occ = n;
+            /*
+             * Note 29 — the CLIENT-side clip change needs a bounded desktop
+             * repaint of its own.  This op only ever set wc->occ; the composite
+             * signature folds the occluder set, so the frame was recomposited —
+             * but s->desk still holds the pixels the PREVIOUS clip composited,
+             * and a clip that SHRINKS leaves them behind inside the window rect.
+             * That was harmless only because the very next PVGPU_OP_GL blanket-
+             * invalidated the whole desktop and healed it; with the content
+             * invalidate bounded, the requirement has to be stated.  It is
+             * inside the window rect by construction (a clip cannot alter a pixel
+             * the window does not cover), so name that rect.  Independent of the
+             * window model: with the model ON the same change also arrives as a
+             * clip diff at WM_END, and the rect list de-duplicates.
+             */
+            occ_changed = (old_n != (int)n) ||
+                          memcmp(old_occ, wc->occ, (size_t)n * sizeof old_occ[0]) != 0;
+            if (occ_changed && wc->frame && wc->w > 0 && wc->h > 0) {
+                const PVGPUWinRec *m = glaccel_wm_find(s, wc->bound_xid);
+                glaccel_wm_add_rrect(s, wc->x, wc->y, wc->w, wc->h);
+                if (m) {
+                    glaccel_wm_add_rrect(s, m->x, m->y, wc->w, wc->h);
+                }
+                s->wm_repaint = true;
+            }
             break;
         }
         case PVGPU_OP_PRESENT:
-            s->invalidate = true; break;
+            /* A GL frame present changes pixels only INSIDE the presenting
+             * window's rect.  The composite + bounded blit below already handle
+             * that (the composite signature notices the new frame serial), so the
+             * whole-desktop re-render this used to request was pure waste — and
+             * once the VC2/palette invalidators were bounded it became the LAST
+             * saturator, holding 80 % of frames on the full path with an animating
+             * GL client on screen.  Geometry changes still take the bounded
+             * desk_repaint request (or full, when unnameable) a few hundred lines
+             * below; this is the content-only case.
+             * PVDISPLAY_PRESENT_FULL=1 restores the old whole-desktop invalidate. */
+            {
+                static int pf = -1;
+                if (pf < 0) pf = getenv("PVDISPLAY_PRESENT_FULL") ? 1 : 0;
+                if (pf) s->invalidate = true;
+            }
+            break;
         /* ---- server-published window model (memo 21 §3) --------------------
          * These six ops are ALWAYS parsed (so the ring stream stays in sync and
          * an unmodified device would not choke), but only acted on when the
@@ -971,7 +1252,13 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
                  * gadgets constantly — that case must not force a repaint. */
                 if (was_bound) {
                     s->wm_sig++;
-                    s->invalidate = true;
+                    /* BL-81 leaves this one on the full path deliberately: a
+                     * retire that dropped a live binding happens once per window
+                     * close (not per op of a move/resize storm), and the record
+                     * has already been removed from wm[] here, so no rect is in
+                     * hand to bound it with. */
+                    s->wm_repaint = true;
+                    s->wm_repaint_full = true;
                     glaccel_wm_request_present(s);
                 }
             }
@@ -996,7 +1283,16 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
                      * an unchanged republish leaves the idle-skip free to suppress the
                      * repaint.  A model commit re-composites with no GL activity at all. */
                     s->wm_sig++;
-                    s->invalidate = true;
+                    /* BL-81: this used to be `s->invalidate = true`, i.e. a
+                     * whole-desktop re-walk plus a 5 MB full-screen blit for EVERY
+                     * commit that touched a bound window — the dominant term in the
+                     * +7.5-point GL-bound cost of note 26 §2, and the one the note's
+                     * §5 mechanism (geom_changed) only half explained.  The commit
+                     * now names the rects it can have altered
+                     * (glaccel_wm_bound_changed) and the update path repaints just
+                     * those; wm_repaint_full is the fail-safe back to the old
+                     * behaviour whenever they cannot be named. */
+                    s->wm_repaint = true;
                     glaccel_wm_request_present(s);
                 } else {
                     s->wm_commits_nop++;
@@ -1070,6 +1366,7 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
             qemu_log_mask(LOG_GUEST_ERROR, "pvgpu: bad op %u at %u\n", op, p - 4);
             return;
         }
+        if (wm_t0) s->t_wm_ops += glaccel_now_ns() - wm_t0;
     }
 }
 
@@ -1080,9 +1377,8 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
 static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
                                       int dw, int dh,
                                       PVDeskRect *out_rects, int max_out);
-static void glaccel_clamp_rect(PVDeskRect *out, int x, int y, int wpx, int hpx,
-                               int dw, int dh);
-static const PVGPUWinRec *glaccel_wm_find(SGIGLAccelState *s, uint32_t xid);
+/* glaccel_clamp_rect and glaccel_wm_find are forward-declared above, at the
+ * BL-81 rect helpers (note 29's WINCLIP repaint request needs wm_find earlier). */
 
 /*
  * Cheap signature of the GL overlay set (which windows exist, their latest
@@ -1183,14 +1479,33 @@ static void sgi_glaccel_update(void *opaque)
          *  - all GL windows just vanished (one-frame restore of the desktop
          *    underneath — the old logic);
          *  - the GL window GEOMETRY changed vs. last frame (a window moved,
-         *    resized, appeared, or vanished): the desktop under the previous
-         *    positions must be restored, which the incremental path does not do,
-         *    so fall back to a full repaint.  Content-only changes (same
-         *    geometry, new frame_serial) stay on the cheap bounded path.
+         *    resized, appeared, or vanished) AND the desktop layer cannot take a
+         *    bounded repaint request: the desktop under the previous positions
+         *    must be restored, which the plain incremental path does not do.
+         *
+         * BL-81: when the desktop layer DOES implement desk_repaint, a geometry
+         * change is expressed as a bounded request instead — the union of every
+         * old and new GL-window rect involved in the change.  That is exactly the
+         * region whose desktop pixels can differ: inside the new rects the window
+         * covers the desktop (and is composited over it below), inside the old
+         * rects the desktop is newly uncovered, and outside both nothing moved.
+         * The renderer folds those rects into its dirty list, repaints them (or
+         * more — coalescing/saturating to full is always legal), returns them in
+         * desk_rects[], and the bounded blit below copies exactly them.  This
+         * replaces a 1280x1024 re-walk + 5 MB memcpy per present of a move/resize
+         * storm with work proportional to the window (note 26 §5).
+         *
+         * Content-only changes (same geometry, new frame_serial) stay on the
+         * cheap bounded path exactly as before.
          */
         force = s->invalidate;
         {
             int n_now = 0, j;
+            /* BL-81 union set: old ∪ new rects of the windows that changed.
+             * Snapshotted here because win_rects[] is overwritten later by
+             * glaccel_composite_overlays(). */
+            PVDeskRect geom_rects[2 * PVGPU_MAXCTX];
+            int n_geom_rects = 0;
             for (i = 0; i < PVGPU_MAXCTX; i++) {
                 PVGPUCtx *c = &s->ctx[i];
                 const PVGPUWinRec *m;
@@ -1220,40 +1535,150 @@ static void sgi_glaccel_update(void *opaque)
             if (!force && s->prev_n_windows > 0 && n_now == 0) {
                 force = true;
             }
+            /* Compare as an unordered SET: the composite emits out_rects in
+             * stacking order (model stack when modelled), which need not match
+             * this ctx-index walk, and a pure reordering is not a geometry
+             * change.  n <= PVGPU_MAXCTX (8), so O(n^2) is free.
+             *
+             * BL-81 walks the difference in BOTH directions and records the
+             * offending rects: a rect present now but not before is a new/moved-to
+             * position (must be re-walked), a rect present before but not now is a
+             * vacated position (the desktop under it is newly uncovered).  Their
+             * union is the complete set of pixels a geometry change can alter. */
             if (n_now != s->prev_n_win_rects) {
                 geom_changed = true;
-            } else {
-                /* Compare as an unordered SET: the composite emits out_rects in
-                 * stacking order (model stack when modelled), which need not match
-                 * this ctx-index walk, and a pure reordering is not a geometry
-                 * change.  n <= PVGPU_MAXCTX (8), so O(n^2) is free. */
-                for (i = 0; i < n_now && !geom_changed; i++) {
-                    bool found = false;
-                    for (j = 0; j < s->prev_n_win_rects; j++) {
-                        if (win_rects[i].x == s->prev_win_rects[j].x &&
-                            win_rects[i].y == s->prev_win_rects[j].y &&
-                            win_rects[i].w == s->prev_win_rects[j].w &&
-                            win_rects[i].h == s->prev_win_rects[j].h) {
-                            found = true; break;
-                        }
+            }
+            for (i = 0; i < n_now; i++) {
+                bool found = false;
+                for (j = 0; j < s->prev_n_win_rects; j++) {
+                    if (win_rects[i].x == s->prev_win_rects[j].x &&
+                        win_rects[i].y == s->prev_win_rects[j].y &&
+                        win_rects[i].w == s->prev_win_rects[j].w &&
+                        win_rects[i].h == s->prev_win_rects[j].h) {
+                        found = true; break;
                     }
-                    if (!found) geom_changed = true;
+                }
+                if (!found) {
+                    geom_changed = true;
+                    geom_rects[n_geom_rects++] = win_rects[i];
                 }
             }
-            if (geom_changed) {
-                force = true;
+            for (j = 0; j < s->prev_n_win_rects; j++) {
+                bool found = false;
+                for (i = 0; i < n_now; i++) {
+                    if (win_rects[i].x == s->prev_win_rects[j].x &&
+                        win_rects[i].y == s->prev_win_rects[j].y &&
+                        win_rects[i].w == s->prev_win_rects[j].w &&
+                        win_rects[i].h == s->prev_win_rects[j].h) {
+                        found = true; break;
+                    }
+                }
+                if (!found) {
+                    geom_changed = true;
+                    geom_rects[n_geom_rects++] = s->prev_win_rects[j];
+                }
             }
+            /* Fold in the rects the model commits themselves named (BL-81, set by
+             * glaccel_wm_bound_changed at WM_END): a clip/stacking/MAPPED change
+             * alters pixels inside a window rect without changing any rect, so the
+             * geometry diff above cannot see it. */
+            if (s->wm_repaint) {
+                for (i = 0; i < s->wm_n_rrects &&
+                            n_geom_rects < (int)ARRAY_SIZE(geom_rects); i++) {
+                    geom_rects[n_geom_rects++] = s->wm_rrects[i];
+                }
+                if (i < s->wm_n_rrects) s->wm_repaint_full = true;
+            }
+
+            if (geom_changed || s->wm_repaint) {
+                /*
+                 * BL-81 bounded repaint.  Conditions to take it — every one of
+                 * them fails SAFE (to the pre-BL-81 full repaint):
+                 *  - a desktop layer that implements desk_repaint;
+                 *  - a non-empty rect set.  An empty one means we cannot NAME the
+                 *    changed region (e.g. the window count changed with no rect
+                 *    differing — two windows sharing a rect, one closing), so
+                 *    repaint everything;
+                 *  - nothing set wm_repaint_full (first model ever, a bound window
+                 *    retired, or the rect list overflowed);
+                 *  - not already forced for another reason (console/backend
+                 *    invalidate, or all GL windows vanishing — a once-per-close
+                 *    event left on the full path deliberately);
+                 *  - PVDISPLAY_GEOM_FULL=1 not set (the A/B oracle: restores the
+                 *    exact pre-BL-81 behaviour in one binary).
+                 */
+                static int geom_full_oracle = -1;
+                if (geom_full_oracle < 0)
+                    geom_full_oracle = getenv("PVDISPLAY_GEOM_FULL") ? 1 : 0;
+
+                if (!force && !geom_full_oracle && !s->wm_repaint_full &&
+                    s->desk_repaint && n_geom_rects > 0) {
+                    /* PVDISPLAY_GEOM_SHRINK=N: POSITIVE control for the bounded
+                     * repaint's correctness probe — deliberately request N pixels
+                     * LESS on every side than the change requires, so a probe that
+                     * cannot see an under-repaint (stale desktop pixels left under
+                     * a window's old position) is proven toothless.  Debug only. */
+                    static int shrink = -1;
+                    if (shrink < 0) {
+                        const char *e = getenv("PVDISPLAY_GEOM_SHRINK");
+                        shrink = e ? atoi(e) : 0;
+                    }
+                    if (shrink > 0) {
+                        for (i = 0; i < n_geom_rects; i++) {
+                            PVDeskRect *r = &geom_rects[i];
+                            int sx = r->w > 2 * shrink ? shrink : 0;
+                            int sy = r->h > 2 * shrink ? shrink : 0;
+                            r->x += sx; r->w -= 2 * sx;
+                            r->y += sy; r->h -= 2 * sy;
+                        }
+                    }
+                    s->desk_repaint(s->desk_opaque, geom_rects, n_geom_rects);
+                    s->geom_bounded_repaints++;
+                } else {
+                    force = true;
+                    s->geom_full_repaints++;
+                }
+            }
+            s->wm_repaint = false;
+            s->wm_repaint_full = false;
+            s->wm_n_rrects = 0;
         }
 
         /* render the desktop into the engine buffer */
         {
-            int rc = s->desk_render(s->desk_opaque, s->desk, s->desk_w,
-                                    s->desk_h, force, desk_rects,
-                                    PVDESK_MAX_RECTS);
+            int rc = 0;
+            s->n_updates++;
+            GLACCEL_TIME(s, t_desk_render,
+                         rc = s->desk_render(s->desk_opaque, s->desk, s->desk_w,
+                                             s->desk_h, force, desk_rects,
+                                             PVDESK_MAX_RECTS));
             s->invalidate = false;
             desk_full = (rc == PVDESK_FULL);
             desk_changed = (rc != 0);
             n_desk_rects = desk_full ? 0 : rc;
+            if (desk_full)   s->n_render_full++;
+            else if (rc > 0) s->n_render_rects++;
+            else             s->n_render_idle++;
+            /* The timing block has to be reportable with the model OFF too — the
+             * whole point of the attribution is "how much does the model ADD to the
+             * device-side cost", and glaccel_wm_stats() only ever fires on a model
+             * commit.  Print independently, every 256 updates. */
+            if (glaccel_timing_on() && (s->n_updates % 256) == 0) {
+                fprintf(stderr, "pvgpu: TIMING upd=%" PRIu64 " t_render=%" PRIu64
+                        " t_comp=%" PRIu64 " t_blit=%" PRIu64 " t_wmops=%" PRIu64
+                        " (ms) rfull=%" PRIu64 " rrects=%" PRIu64 " ridle=%" PRIu64
+                        " presents=%" PRIu64 " geombounded=%" PRIu64
+                        " geomfull=%" PRIu64
+                        " inv(frame=%" PRIu64 " glop=%" PRIu64 " 2d=%" PRIu64
+                        " dropped=%" PRIu64 ")\n",
+                        s->n_updates, s->t_desk_render / 1000000,
+                        s->t_composite / 1000000, s->t_blit / 1000000,
+                        s->t_wm_ops / 1000000, s->n_render_full,
+                        s->n_render_rects, s->n_render_idle, s->wm_presents,
+                        s->geom_bounded_repaints, s->geom_full_repaints,
+                        s->n_inv_frame, s->n_inv_glop, s->n_inv_2d,
+                        s->n_inv_dropped);
+            }
         }
 
         /* Idle-frame skip: the desktop reported no change AND the GL overlay set
@@ -1269,10 +1694,62 @@ static void sgi_glaccel_update(void *opaque)
 
         /* composite GL overlays onto the desktop buffer; capture composited
          * (clamped) window rects for a bounded blit */
-        n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w, s->desk_h,
-                                            win_rects, PVGPU_MAXCTX);
+        GLACCEL_TIME(s, t_composite,
+                     n_wins = glaccel_composite_overlays(s, s->desk, s->desk_w,
+                                                         s->desk_h, win_rects,
+                                                         PVGPU_MAXCTX));
         s->prev_n_windows = n_wins;
         n_win_rects = n_wins < PVGPU_MAXCTX ? n_wins : PVGPU_MAXCTX;
+
+        /*
+         * PVDISPLAY_BOUND_VERIFY=1 — device-side differential oracle for BL-81.
+         *
+         * Screendump-based probes of the bounded repaint are hard to give teeth:
+         * transient staleness HEALS (any later whole-desktop repaint rebuilds the
+         * surface from VRAM), so a deliberately-broken control can pass.  This
+         * checks the actual invariant, per frame, inside the device: after a
+         * BOUNDED frame, s->desk must be pixel-identical to what a from-scratch
+         * full render + composite of the SAME state would have produced.  The
+         * comparison uses the same VRAM and the same GL frames within one update()
+         * call, so it is immune to guest timing and to boot-to-boot drift.
+         *
+         * Mismatches are reported and then HEALED (the verify buffer is the correct
+         * image), so the mode is a pure detector: it cannot mask a defect by
+         * leaving the screen wrong, and it cannot be mistaken for the shipping path
+         * (it forces a full blit and costs a whole extra render per frame).
+         */
+        {
+            static int bound_verify = -1;
+            if (bound_verify < 0)
+                bound_verify = getenv("PVDISPLAY_BOUND_VERIFY") ? 1 : 0;
+            if (bound_verify && !force) {
+                size_t npix = (size_t)s->desk_w * s->desk_h, k, bad = 0, fx = 0, fy = 0;
+                if (!s->verify_buf) {
+                    s->verify_buf = g_new0(uint32_t, npix);
+                }
+                s->desk_render(s->desk_opaque, s->verify_buf, s->desk_w, s->desk_h,
+                               true, NULL, 0);
+                glaccel_composite_overlays(s, s->verify_buf, s->desk_w, s->desk_h,
+                                           NULL, 0);
+                for (k = 0; k < npix; k++) {
+                    if ((s->desk[k] & 0xffffffu) != (s->verify_buf[k] & 0xffffffu)) {
+                        if (!bad) { fx = k % s->desk_w; fy = k / s->desk_w; }
+                        bad++;
+                    }
+                }
+                s->verify_frames++;
+                if (bad) {
+                    s->verify_bad_frames++;
+                    s->verify_bad_pixels += bad;
+                    fprintf(stderr, "pvgpu: BOUNDVERIFY MISMATCH frame=%" PRIu64
+                            " pixels=%zu first=%zu,%zu bounded=%" PRIu64
+                            " full=%" PRIu64 "\n", s->verify_frames, bad, fx, fy,
+                            s->geom_bounded_repaints, s->geom_full_repaints);
+                }
+                memcpy(s->desk, s->verify_buf, npix * 4);   /* heal */
+                desk_full = true;                           /* and blit it all */
+            }
+        }
 
         dst_stride = surface_stride(surface);
         dst = surface_data(surface);
@@ -1287,24 +1764,26 @@ static void sgi_glaccel_update(void *opaque)
             if (fb_oracle) desk_full = true;
         }
 
-        if (desk_full) {
-            /* full blit engine buffer → display surface */
-            for (y = 0; y < s->desk_h; y++)
-                memcpy(dst + (size_t)y * dst_stride,
-                       s->desk + (size_t)y * s->desk_w,
-                       (size_t)s->desk_w * 4);
-            dpy_gfx_update_full(s->con);
-        } else {
-            /* bounded blit: desktop dirty rects + composited GL window rects.
-             * Both copies are bounded here (VRAM→desk happened per-rect in the
-             * render callback; desk→surface + dpy_gfx_update are bounded now). */
-            for (i = 0; i < n_desk_rects; i++) {
-                glaccel_blit_rect(s, dst, dst_stride, &desk_rects[i]);
+        GLACCEL_TIME(s, t_blit, {
+            if (desk_full) {
+                /* full blit engine buffer → display surface */
+                for (y = 0; y < s->desk_h; y++)
+                    memcpy(dst + (size_t)y * dst_stride,
+                           s->desk + (size_t)y * s->desk_w,
+                           (size_t)s->desk_w * 4);
+                dpy_gfx_update_full(s->con);
+            } else {
+                /* bounded blit: desktop dirty rects + composited GL window rects.
+                 * Both copies are bounded here (VRAM→desk happened per-rect in the
+                 * render callback; desk→surface + dpy_gfx_update are bounded now). */
+                for (i = 0; i < n_desk_rects; i++) {
+                    glaccel_blit_rect(s, dst, dst_stride, &desk_rects[i]);
+                }
+                for (i = 0; i < n_win_rects; i++) {
+                    glaccel_blit_rect(s, dst, dst_stride, &win_rects[i]);
+                }
             }
-            for (i = 0; i < n_win_rects; i++) {
-                glaccel_blit_rect(s, dst, dst_stride, &win_rects[i]);
-            }
-        }
+        });
 
         /* remember this frame's window geometry for next frame's change test */
         s->prev_n_win_rects = n_win_rects;
@@ -1612,8 +2091,14 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
                 s->wm_batch_open = false;
                 s->wm_pub_ctx = -1;
                 for (int k = 0; k < PVGPU_MAXCTX; k++) s->ctx[k].bound_xid = 0;
-                /* a wholesale invalidation always changes what the composite reads */
+                /* a wholesale invalidation always changes what the composite reads,
+                 * and BL-81 cannot bound it: every modelled window's placement is
+                 * being discarded at once.  Stale rects would be worse than useless,
+                 * so drop them and keep the whole-desktop repaint. */
                 s->wm_sig++;
+                s->wm_n_rrects = 0;
+                s->wm_repaint = false;
+                s->wm_repaint_full = false;
                 s->invalidate = true;
                 glaccel_wm_request_present(s);
             }
@@ -1708,6 +2193,7 @@ int sgi_glaccel_get_windows(PVGPUWindow *out, int max)
 
 void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn invalidate,
                                   PVDeskScanoutFn scanout, PVDeskDamageFn damage,
+                                  PVDeskRepaintFn repaint,
                                   void *opaque, int w, int h)
 {
     SGIGLAccelState *s = g_glaccel_overlay;
@@ -1718,6 +2204,7 @@ void sgi_glaccel_register_desktop(PVDeskRenderFn render, PVDeskInvalidateFn inva
     s->desk_invalidate = invalidate;
     s->desk_scanout = scanout;
     s->desk_damage = damage;
+    s->desk_repaint = repaint;       /* BL-81; NULL => pre-BL-81 force_full path */
     s->desk_opaque = opaque;
     s->desk_w = w;  s->desk_h = h;
     s->desk = g_new0(uint32_t, (size_t)w * h);

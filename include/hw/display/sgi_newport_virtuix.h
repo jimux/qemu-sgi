@@ -225,12 +225,54 @@ struct SGINewportVirtuixState {
     /* Phase D dirty-rect scanout: instead of regenerating all 1280x1024 every frame,
      * track which regions were touched by REX3 commands.  Fixed-size list + coalesce;
      * overflow → full-screen dirty.  Rects are in post-window-offset VRAM space. */
-    #define NEWPORT_DIRTY_MAX 16
+    #define NEWPORT_DIRTY_MAX 64   /* == PVDESK_MAX_RECTS; see that comment */
     struct { int x, y, w, h; } dirty_rects[NEWPORT_DIRTY_MAX];
-    int  dirty_n;                   /* number of valid rects (0 = clean, MAX = full) */
+    int  dirty_n;                   /* number of valid rects (0 = clean) */
+    /* Note 29: THE saturation signal.  A full dirty_rects[] is no longer a
+     * saturated list — newport_dirty_rect() merges the arrival into the cheapest
+     * existing slot rather than giving up — so "repaint everything" needs its own
+     * flag.  Set by newport_dirty_full(), cleared with dirty_n by the render. */
+    bool dirty_full;
     uint32_t dirty_touch;           /* bumped by every dirty_rect/dirty_full call
                                      * (lets the command dispatcher tell whether a
                                      * primitive already reported its bbox) */
+
+    /* Phase D / BL-81 follow-up: pending VC2-SRAM (DID-table) change window.
+     * A VC2 RAM word write no longer full-invalidates; it records the changed
+     * word ADDRESS RANGE here, and newport_render_desktop() resolves the range
+     * to the scanlines whose DID walk actually consults those words (see
+     * newport_vc2_ram_resolve()).  lo > hi means "nothing pending".  Transient:
+     * deliberately NOT in vmstate — post_load full-invalidates anyway. */
+    uint32_t vc2_ram_dirty_lo;
+    uint32_t vc2_ram_dirty_hi;
+    /* Per-scanline DID resolution cache (note 01 Phase D item 2).  did_sig[y] is
+     * the exact sequence of VC2-RAM entry words row y's DID walk consults; a row
+     * whose sequence is unchanged renders identically and must NOT be dirtied,
+     * however many table words were rewritten underneath it.  did_sig_n[y] = 0xff
+     * marks "run longer than the cache / unmappable" => always dirty that row. */
+    #define NEWPORT_DID_SIGLEN 24
+    uint16_t did_sig[NEWPORT_SCREEN_H][NEWPORT_DID_SIGLEN];
+    uint8_t  did_sig_n[NEWPORT_SCREEN_H];
+    /* Which CMAP palette 256-entry buckets row y can read, derived from its DID
+     * resolution (base-plane ci_msb + overlay aux_msb per segment).  Lets a
+     * palette write dirty only the rows whose colours it can possibly change —
+     * the #2 saturator once the DID tables were bounded. */
+    uint32_t did_row_pal[NEWPORT_SCREEN_H];
+    uint32_t pal_dirty_mask;         /* buckets changed since the last resolve */
+    uint32_t pal_resolve_full;       /* diagnostics */
+    uint32_t pal_resolve_bounded;
+    uint32_t pal_resolve_rows;
+    /* why did a render go FULL?  (the do_full decision, attributed) */
+    uint32_t rd_force;               /* the engine asked for it (force_full) */
+    uint32_t rd_sat;                 /* the dirty list was saturated */
+    uint32_t rd_oracle;              /* NP_SCANOUT_FULL / soft cursor */
+    uint32_t rd_overflow;            /* more dirty rects than the caller can carry */
+    uint32_t rd_area;                /* note 29: rects covered ≥3/4 of the screen */
+    uint32_t vc2_resolve_calls;      /* diagnostics (NEWPORT_DIRTYFULL_STATS) */
+    uint32_t vc2_resolve_full;       /* … resolutions that had to saturate */
+    uint32_t vc2_resolve_bounded;    /* … resolutions bounded to row runs */
+    uint32_t vc2_resolve_rows;       /* … total rows dirtied by resolution */
+    uint32_t vc2_ram_writes;         /* … changed-word writes recorded */
 
     /* REX3 drawing registers */
     uint32_t drawmode0;
