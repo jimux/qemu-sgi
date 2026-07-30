@@ -493,16 +493,83 @@ static void sgi_mc_virtuix_update_dma_irq(SGIMCVirtuixState *s)
     qemu_set_irq(s->dma_irq, (s->dma_int_cause & (1 << 3)) ? 1 : 0);
 }
 
+/*
+ * BL-44 diagnostic (gated, off by default): MC_DMA_TRACE=1 traces the GIO DMA
+ * master's virtual-address translation.  BL-44's banded backdrop is fed by this
+ * engine (large REX3 host-data blits take the pixel-DMA path), and the question
+ * the trace answers is whether dma_translate() is resolving the guest's VDMA
+ * uTLB correctly or silently falling through to physical 0.
+ */
+static int mc_dma_trace = -1;
+static inline bool sgi_mc_dma_trace(void)
+{
+    if (mc_dma_trace < 0) {
+        mc_dma_trace = getenv("MC_DMA_TRACE") ? 1 : 0;
+    }
+    return mc_dma_trace;
+}
+/* Per-transfer translation accounting (only meaningful while tracing). */
+static uint32_t mc_xl_total, mc_xl_miss, mc_xl_badpte, mc_xl_logged;
+static uint64_t mc_dma_seq;
+
 static uint32_t sgi_mc_virtuix_dma_translate(SGIMCVirtuixState *s, uint32_t address)
 {
     for (int entry = 0; entry < 4; entry++) {
         if ((address & 0xffc00000) == (s->dma_tlb_hi[entry] & 0xffc00000)) {
             uint32_t vpn_lo = (address & 0x003ff000) >> 12;
+            /*
+             * BL-44 root cause: uTLB_LO holds the page-table page's PFN
+             * shifted left 6 (IRIX kern/io/vdma.c vdma_set_tlb():
+             * "uTLB_LO(i) = (pnum(kvtophys(ptep)) << (BPCSHIFT - 6))
+             * | DTLB_VALID"), i.e. a 26-bit field — kern/sys/mc.h
+             * TLBLO_HWBITS is 0x03ffffff, and vdma_fault() recovers the
+             * address as "(uTLB_LO(i) & ~DTLB_VALID) << 6" with NO
+             * truncation.  The mask here used to be 0x003fffc0, four bits
+             * short: it silently dropped bit 22 of the register = bit 28
+             * (0x10000000) of the page-table address.  virtuix maps RAM at
+             * 0x08000000 in banks of 128 MB, so any page-table page the
+             * kernel happened to place in the upper bank (>= 0x10000000)
+             * translated to an address BELOW the RAM base, the PTE read
+             * back as 0, and every source byte of the transfer resolved to
+             * physical page 0 — the DMA streamed the MIPS exception
+             * vectors into REX3's HOSTRW port instead of the pixmap.  That
+             * is the banded cold-boot desktop backdrop, and it is
+             * ~coin-flip because it depends on which RAM bank the page
+             * table landed in.
+             */
+            uint32_t pte_addr = ((s->dma_tlb_lo[entry] & 0x03ffffc0) << 6) +
+                                (vpn_lo << 2);
             uint32_t pte = address_space_ldl_be(&address_space_memory,
-                ((s->dma_tlb_lo[entry] & 0x003fffc0) << 6) + (vpn_lo << 2),
-                MEMTXATTRS_UNSPECIFIED, NULL);
+                pte_addr, MEMTXATTRS_UNSPECIFIED, NULL);
             uint32_t offset = address & 0xfff;
-            return ((pte & 0x03ffffc0) << 6) + offset;
+            uint32_t phys = ((pte & 0x03ffffc0) << 6) + offset;
+            if (sgi_mc_dma_trace()) {
+                mc_xl_total++;
+                /* Entry with a zeroed TLB_LO can never be a real mapping. */
+                if ((s->dma_tlb_lo[entry] & 0x03ffffc0) == 0 ||
+                    (pte & 0x03ffffc0) == 0) {
+                    mc_xl_badpte++;
+                }
+                if (mc_xl_logged < 8) {
+                    mc_xl_logged++;
+                    fprintf(stderr, "MC_DMA XL va=0x%08x e=%d hi=0x%08x "
+                            "lo=0x%08x ptea=0x%08x pte=0x%08x pa=0x%08x\n",
+                            address, entry, s->dma_tlb_hi[entry],
+                            s->dma_tlb_lo[entry], pte_addr, pte, phys);
+                }
+            }
+            return phys;
+        }
+    }
+    if (sgi_mc_dma_trace()) {
+        mc_xl_total++;
+        mc_xl_miss++;
+        if (mc_xl_logged < 8) {
+            mc_xl_logged++;
+            fprintf(stderr, "MC_DMA XL va=0x%08x MISS hi=[0x%08x 0x%08x "
+                    "0x%08x 0x%08x] -> pa=0x00000000\n", address,
+                    s->dma_tlb_hi[0], s->dma_tlb_hi[1],
+                    s->dma_tlb_hi[2], s->dma_tlb_hi[3]);
         }
     }
     return 0;
@@ -518,6 +585,23 @@ static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
     const uint32_t linewidth = s->dma_size & 0xffff;
     const uint32_t linezoom = (s->dma_stride >> 16) & 0x3ff;
     const int16_t stride = (int16_t)(s->dma_stride & 0xffff);
+
+    uint64_t dma_id = 0;
+
+    if (sgi_mc_dma_trace()) {
+        dma_id = ++mc_dma_seq;
+        mc_xl_total = mc_xl_miss = mc_xl_badpte = mc_xl_logged = 0;
+        fprintf(stderr, "MC_DMA BEGIN #%llu mem=0x%08x gio=0x%08x mode=0x%08x "
+                "ctl=0x%08x size=0x%08x stride=0x%08x count=0x%08x "
+                "lines=%u bytes=%u zoom=%u lw=%u str=%d "
+                "tlb=[%08x/%08x %08x/%08x %08x/%08x %08x/%08x]\n",
+                (unsigned long long)dma_id, memory_addr, gio_addr, s->dma_mode,
+                s->dma_control, s->dma_size, s->dma_stride, s->dma_count,
+                linecount, bytecount, zoomcount, linewidth, stride,
+                s->dma_tlb_hi[0], s->dma_tlb_lo[0], s->dma_tlb_hi[1],
+                s->dma_tlb_lo[1], s->dma_tlb_hi[2], s->dma_tlb_lo[2],
+                s->dma_tlb_hi[3], s->dma_tlb_lo[3]);
+    }
 
     s->dma_size &= 0x0000ffff;
     s->dma_count = 0;
@@ -586,6 +670,13 @@ static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
         }
         zoomcount = linezoom;
         memory_addr += stride;
+    }
+
+    if (sgi_mc_dma_trace()) {
+        fprintf(stderr, "MC_DMA END   #%llu xl_total=%u xl_miss=%u "
+                "xl_badpte=%u end_mem=0x%08x\n",
+                (unsigned long long)dma_id, mc_xl_total, mc_xl_miss,
+                mc_xl_badpte, memory_addr);
     }
 
     s->dma_mem_addr = memory_addr;

@@ -489,8 +489,27 @@ static uint32_t sgi_mc_dma_translate(SGIMCState *s, uint32_t address)
     for (int entry = 0; entry < 4; entry++) {
         if ((address & 0xffc00000) == (s->dma_tlb_hi[entry] & 0xffc00000)) {
             uint32_t vpn_lo = (address & 0x003ff000) >> 12;
+            /*
+             * uTLB_LO holds the page-table page's PFN shifted left 6, in a
+             * 26-bit field: IRIX kern/io/vdma.c vdma_set_tlb() writes
+             * "uTLB_LO(i) = (pnum(kvtophys(ptep)) << (BPCSHIFT - 6))
+             * | DTLB_VALID", kern/sys/mc.h defines TLBLO_HWBITS as
+             * 0x03ffffff, and vdma_fault() recovers the address as
+             * "(uTLB_LO(i) & ~DTLB_VALID) << 6" with no truncation.  The
+             * mask here used to be 0x003fffc0, four bits short: it dropped
+             * register bit 22 = bit 28 (0x10000000) of the page-table
+             * address.  Indy maps RAM at 0x08000000 (hw/mips/sgi_indy.c),
+             * so a page table the kernel placed at or above 0x10000000
+             * translated below the RAM base, the PTE read back 0, and the
+             * whole GIO DMA sourced physical page 0 (the exception
+             * vectors) into REX3's host port instead of the pixel data --
+             * a banded 4Dwm root weave.  Matches the PTE mask on the next
+             * line, which was always the correct 26 bits.
+             * (Same defect and same fix as sgi_mc_virtuix.c; see
+             * progress_notes/ip55/pvdisplay/22-bl44-root-cause.md.)
+             */
             uint32_t pte = address_space_ldl_be(&address_space_memory,
-                ((s->dma_tlb_lo[entry] & 0x003fffc0) << 6) + (vpn_lo << 2),
+                ((s->dma_tlb_lo[entry] & 0x03ffffc0) << 6) + (vpn_lo << 2),
                 MEMTXATTRS_UNSPECIFIED, NULL);
             uint32_t offset = address & 0xfff;
             return ((pte & 0x03ffffc0) << 6) + offset;
