@@ -642,6 +642,125 @@ static void pvgpu_gl_submit_inproc(SGIGLAccelState *s, PVGPUCtx *c,
     }
 }
 
+/* ---- window-model commit batching ---------------------------------------------
+ * The ON arm of the interaction A/B cost +17.7 points of host CPU and 3x resize
+ * latency (24-…md §3).  THREE causes, not the two the note named:
+ *   (a) every WM_END scheduled a full desktop re-composite, and wm_gen was folded
+ *       into the composite signature so the idle-skip could never suppress it
+ *       => present only when a window some context is BOUND to actually changed,
+ *          and fold wm_sig (bumped only then) instead of wm_gen;
+ *   (b) one present per publish, and 4Dwm publishes per validate/move/resize
+ *       => coalesce to at most one model-driven present per display refresh;
+ *   (c) [found while landing a+b, and the BIGGER one] sgi_glaccel_update()'s
+ *       geometry-change test built its rects from the SUBMIT-time origin while
+ *       prev_win_rects[] came from the composite's MODEL positions, so
+ *       geom_changed — and therefore a full desktop re-render plus a full-screen
+ *       blit — was true on EVERY composite while a model was live.  See the
+ *       comment at that site.
+ * None of the three touches the resolution rules: the model STATE is still
+ * committed synchronously and wholesale on every good batch, so the composite
+ * that eventually runs always reads the FINAL state.
+ * ------------------------------------------------------------------------------ */
+
+/* One display refresh (the pvgpu console runs at 60Hz). */
+#define GLACCEL_WM_PRESENT_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
+
+static const PVGPUWinRec *glaccel_wm_lookup(const PVGPUWinRec *v, int n, uint32_t xid)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        if (v[i].xid == xid) return &v[i];
+    }
+    return NULL;
+}
+
+/* Does this record differ in any way the composite READS?  Fields the composite
+ * ignores (PVGPU_WMF_OVERRIDE, HASCLIP) are deliberately excluded; everything
+ * glaccel_composite_overlays() consumes — origin, size, stacking key, MAPPED,
+ * and the clip region itself — is compared.  A NULL on exactly one side is a
+ * liveness change (the window appeared or was retired) and counts as differing. */
+static bool glaccel_wm_rec_differs(const PVGPUWinRec *a, const PVGPUWinRec *b)
+{
+    int i;
+    if (!a || !b) return a != b;
+    if (a->x != b->x || a->y != b->y || a->w != b->w || a->h != b->h) return true;
+    if (a->stack != b->stack) return true;
+    if ((a->flags & PVGPU_WMF_MAPPED) != (b->flags & PVGPU_WMF_MAPPED)) return true;
+    if (a->n_clip != b->n_clip) return true;
+    for (i = 0; i < a->n_clip && i < PVGPU_MAX_WM_CLIP; i++) {
+        if (a->clip[i][0] != b->clip[i][0] || a->clip[i][1] != b->clip[i][1] ||
+            a->clip[i][2] != b->clip[i][2] || a->clip[i][3] != b->clip[i][3]) return true;
+    }
+    return false;
+}
+
+/* Would committing wm_shadow[] change a pixel?  Only through a context's bound_xid:
+ * glaccel_wm_find() is keyed on it, so a window no context is bound to is never read
+ * at composite time and its record moving cannot alter the output.  4Dwm republishes
+ * its whole tree on every PostValidateTree, so the overwhelmingly common batch is one
+ * where every BOUND window is bit-identical — that batch must be free.
+ *
+ * Deliberately conservative in the "unknown" directions (risk 1 discipline: degrade to
+ * no-model, never to a stale guess): the first model after "none" always counts as a
+ * change, and any single differing field short-circuits to true. */
+static bool glaccel_wm_bound_changed(SGIGLAccelState *s)
+{
+    int k;
+    if (s->wm_gen == 0) return true;    /* no previous model to compare against */
+    for (k = 0; k < PVGPU_MAXCTX; k++) {
+        uint32_t xid = s->ctx[k].bound_xid;
+        if (xid == 0) continue;
+        if (glaccel_wm_rec_differs(glaccel_wm_lookup(s->wm, s->wm_n, xid),
+                                   glaccel_wm_lookup(s->wm_shadow, s->wm_shadow_n, xid))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void glaccel_wm_stats(SGIGLAccelState *s)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SGI_GLACCEL_WM_STATS") ? 1 : 0;
+    if (!on || (s->wm_commits % 64) != 0) return;
+    fprintf(stderr, "pvgpu: WMSTATS commits=%" PRIu64 " nop=%" PRIu64
+            " presents=%" PRIu64 " coalesced=%" PRIu64 " gen=%u sig=%u wm_n=%d\n",
+            s->wm_commits, s->wm_commits_nop, s->wm_presents,
+            s->wm_presents_coalesced, s->wm_gen, s->wm_sig, s->wm_n);
+}
+
+static void glaccel_wm_present_timer_cb(void *opaque)
+{
+    SGIGLAccelState *s = opaque;
+    s->wm_present_pending = false;
+    s->wm_last_present_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    s->wm_presents++;
+    if (s->present_bh) qemu_bh_schedule(s->present_bh);
+}
+
+/* Fix (b): coalesce.  If the last model-driven present was within one refresh, arm
+ * (once) a timer for the end of that refresh window instead of presenting now.  The
+ * commit already happened, so whenever the deferred present runs it composites the
+ * newest model — a burst of N commits inside one refresh yields ONE composite of the
+ * final state.  Nothing is dropped: the only thing rate-limited is the repaint. */
+static void glaccel_wm_request_present(SGIGLAccelState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - s->wm_last_present_ns >= GLACCEL_WM_PRESENT_PERIOD_NS ||
+        !s->wm_present_timer) {
+        s->wm_last_present_ns = now;
+        s->wm_presents++;
+        if (s->present_bh) qemu_bh_schedule(s->present_bh);
+        return;
+    }
+    s->wm_presents_coalesced++;
+    if (!s->wm_present_pending) {
+        s->wm_present_pending = true;
+        timer_mod_ns(s->wm_present_timer,
+                     s->wm_last_present_ns + GLACCEL_WM_PRESENT_PERIOD_NS);
+    }
+}
+
 /* execute a command buffer into the internal framebuffer. resp_base != 0 => DMA each OP_GL's
  * reply back to guest RAM at resp_base + align16(len) (the doorbell path; 0 for cmd-file). */
 static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uint32_t resp_base) {
@@ -755,6 +874,150 @@ static void pvgpu_exec(SGIGLAccelState *s, const uint8_t *buf, uint32_t len, uin
         }
         case PVGPU_OP_PRESENT:
             s->invalidate = true; break;
+        /* ---- server-published window model (memo 21 §3) --------------------
+         * These six ops are ALWAYS parsed (so the ring stream stays in sync and
+         * an unmodified device would not choke), but only acted on when the
+         * winmodel property is on.  With it off they are consumed and discarded
+         * and the composite path is byte-identical to the pre-model device. */
+        case PVGPU_OP_WM_BEGIN: {
+            uint32_t gen;
+            if (p + 4 > len) return;
+            gen = pv_be32(buf + p); p += 4;
+            if (!s->winmodel) break;
+            s->wm_shadow_n = 0;
+            s->wm_batch_gen = gen;
+            s->wm_batch_open = true;
+            s->wm_batch_bad = false;
+            /* the publisher is whichever ring context opened the batch; its
+             * CTX_FREE invalidates the model wholesale (xid reuse across an
+             * Xsgi restart must never be resolved against a stale model). */
+            s->wm_pub_ctx = (int)(wc - s->ctx);
+            break;
+        }
+        case PVGPU_OP_WM_WINDOW: {
+            uint32_t xid, flags, stack; int x, y, w, h;
+            if (p + 28 > len) return;
+            xid   = pv_be32(buf + p);
+            x     = (int)pv_be32(buf + p + 4);  y = (int)pv_be32(buf + p + 8);
+            w     = (int)pv_be32(buf + p + 12); h = (int)pv_be32(buf + p + 16);
+            flags = pv_be32(buf + p + 20);
+            stack = pv_be32(buf + p + 24);
+            p += 28;
+            if (!s->winmodel || !s->wm_batch_open) break;
+            if (s->wm_shadow_n >= PVGPU_MAX_WM_WINDOWS || xid == 0) {
+                s->wm_batch_bad = true; break;   /* reject wholesale, never truncate */
+            }
+            {
+                PVGPUWinRec *r = &s->wm_shadow[s->wm_shadow_n++];
+                memset(r, 0, sizeof *r);
+                r->xid = xid; r->x = x; r->y = y; r->w = w; r->h = h;
+                r->flags = flags; r->stack = stack;
+            }
+            break;
+        }
+        case PVGPU_OP_WM_CLIP: {
+            uint32_t xid, n, i;
+            if (p + 8 > len) return;
+            xid = pv_be32(buf + p); n = pv_be32(buf + p + 4); p += 8;
+            if (n > 0xffff || p + (uint64_t)n * 16 > len) return;   /* malformed ring */
+            {
+                PVGPUWinRec *r = NULL;
+                int k;
+                if (s->winmodel && s->wm_batch_open) {
+                    for (k = s->wm_shadow_n - 1; k >= 0; k--) {
+                        if (s->wm_shadow[k].xid == xid) { r = &s->wm_shadow[k]; break; }
+                    }
+                    if (!r || n > PVGPU_MAX_WM_CLIP) s->wm_batch_bad = true;
+                }
+                for (i = 0; i < n; i++) {
+                    if (r && i < PVGPU_MAX_WM_CLIP) {
+                        r->clip[i][0] = (int)pv_be32(buf + p);
+                        r->clip[i][1] = (int)pv_be32(buf + p + 4);
+                        r->clip[i][2] = (int)pv_be32(buf + p + 8);
+                        r->clip[i][3] = (int)pv_be32(buf + p + 12);
+                    }
+                    p += 16;
+                }
+                if (r && n <= PVGPU_MAX_WM_CLIP) r->n_clip = (int)n;
+            }
+            break;
+        }
+        case PVGPU_OP_WM_GONE: {
+            uint32_t xid; int k;
+            if (p + 4 > len) return;
+            xid = pv_be32(buf + p); p += 4;
+            if (!s->winmodel || xid == 0) break;
+            /* retire the window from the batch under construction AND from the
+             * live model, and drop any context binding to it — a live frame must
+             * never be composited into a retired window's rectangle. */
+            for (k = s->wm_shadow_n - 1; k >= 0; k--) {
+                if (s->wm_shadow[k].xid == xid) {
+                    s->wm_shadow[k] = s->wm_shadow[--s->wm_shadow_n];
+                }
+            }
+            for (k = s->wm_n - 1; k >= 0; k--) {
+                if (s->wm[k].xid == xid) { s->wm[k] = s->wm[--s->wm_n]; }
+            }
+            {
+                bool was_bound = false;
+                for (k = 0; k < PVGPU_MAXCTX; k++) {
+                    if (s->ctx[k].bound_xid == xid) {
+                        s->ctx[k].bound_xid = 0; was_bound = true;
+                    }
+                }
+                /* Only a retire that dropped a LIVE binding changes the output (the
+                 * desktop under that window must be restored).  Retiring a window no
+                 * context renders into cannot alter a pixel, and 4Dwm retires
+                 * gadgets constantly — that case must not force a repaint. */
+                if (was_bound) {
+                    s->wm_sig++;
+                    s->invalidate = true;
+                    glaccel_wm_request_present(s);
+                }
+            }
+            break;
+        }
+        case PVGPU_OP_WM_END: {
+            uint32_t gen;
+            if (p + 4 > len) return;
+            gen = pv_be32(buf + p); p += 4;
+            if (!s->winmodel) break;
+            if (s->wm_batch_open && !s->wm_batch_bad && gen == s->wm_batch_gen) {
+                /* Fix (a): decide BEFORE the swap, while wm[] still holds the
+                 * previous generation, whether any bound window actually moved. */
+                bool changed = glaccel_wm_bound_changed(s);
+                memcpy(s->wm, s->wm_shadow,
+                       (size_t)s->wm_shadow_n * sizeof s->wm[0]);
+                s->wm_n = s->wm_shadow_n;
+                s->wm_gen = gen ? gen : 1;   /* 0 is reserved for "no model" */
+                s->wm_commits++;
+                if (changed) {
+                    /* wm_sig — not wm_gen — is what the composite signature folds, so
+                     * an unchanged republish leaves the idle-skip free to suppress the
+                     * repaint.  A model commit re-composites with no GL activity at all. */
+                    s->wm_sig++;
+                    s->invalidate = true;
+                    glaccel_wm_request_present(s);
+                } else {
+                    s->wm_commits_nop++;
+                }
+                glaccel_wm_stats(s);
+            } else if (s->wm_batch_open) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "pvgpu: window-model batch discarded (bad=%d gen=%u/%u n=%d)\n",
+                              s->wm_batch_bad, gen, s->wm_batch_gen, s->wm_shadow_n);
+            }
+            s->wm_batch_open = false;
+            s->wm_batch_bad = false;
+            break;
+        }
+        case PVGPU_OP_WM_BIND: {
+            uint32_t xid;
+            if (p + 4 > len) return;
+            xid = pv_be32(buf + p); p += 4;
+            wc->bound_xid = xid;
+            break;
+        }
         case PVGPU_OP_SCANOUT_SET: {
             /* Stage 2 Phase 2a: register a shadow framebuffer in guest RAM.
              * [op:u32][base_lo:u32][base_hi:u32][w:u32][h:u32][stride:u32][fmt:u32]
@@ -819,6 +1082,7 @@ static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
                                       PVDeskRect *out_rects, int max_out);
 static void glaccel_clamp_rect(PVDeskRect *out, int x, int y, int wpx, int hpx,
                                int dw, int dh);
+static const PVGPUWinRec *glaccel_wm_find(SGIGLAccelState *s, uint32_t xid);
 
 /*
  * Cheap signature of the GL overlay set (which windows exist, their latest
@@ -832,12 +1096,21 @@ static uint64_t glaccel_composite_signature(SGIGLAccelState *s)
 {
     uint64_t sig = 1469598103934665603ULL; /* FNV-ish seed */
     int i, k;
+    /* Window model: fold wm_sig, NOT wm_gen.  wm_sig advances on (and only on) a
+     * commit that changed something a BOUND context resolves through, so a
+     * placement/clip/stacking change still repaints with no GL frame — while the
+     * constant no-op republishing of an unchanged 4Dwm tree leaves the signature
+     * alone and stays suppressible by the idle-skip below (24-…md §3: folding
+     * wm_gen made every republish a mandatory full-screen repaint).  Zero when no
+     * model has ever committed => unchanged signature. */
+    sig = (sig ^ s->wm_sig) * 1099511628211ULL;
     for (i = 0; i < PVGPU_MAXCTX; i++) {
         PVGPUCtx *c = &s->ctx[i];
         if (!c->active || !c->frame || c->w <= 0 || c->h <= 0) {
             continue;
         }
         sig = (sig ^ (uint32_t)i) * 1099511628211ULL;
+        sig = (sig ^ c->bound_xid) * 1099511628211ULL;
         sig = (sig ^ c->frame_serial) * 1099511628211ULL;
         sig = (sig ^ (uint32_t)c->x) * 1099511628211ULL;
         sig = (sig ^ (uint32_t)c->y) * 1099511628211ULL;
@@ -917,14 +1190,32 @@ static void sgi_glaccel_update(void *opaque)
          */
         force = s->invalidate;
         {
-            int n_now = 0;
+            int n_now = 0, j;
             for (i = 0; i < PVGPU_MAXCTX; i++) {
                 PVGPUCtx *c = &s->ctx[i];
-                if (c->active && c->frame && c->w > 0 && c->h > 0) {
+                const PVGPUWinRec *m;
+                if (!(c->active && c->frame && c->w > 0 && c->h > 0)) continue;
+                /* Resolve the rect the SAME way the composite will (window model
+                 * first, submit-time origin otherwise).  Getting this wrong is not
+                 * cosmetic: prev_win_rects[] is filled from glaccel_composite_
+                 * overlays()'s out_rects, which are MODEL positions, so comparing
+                 * them against submit-time origins made geom_changed — and hence
+                 * force, a full desktop re-render plus a full-screen blit — true on
+                 * EVERY composite for as long as a model placed any window away
+                 * from its submit origin.  That was a second, larger source of the
+                 * ON-arm host-CPU cost than the WM_END scheduling itself. */
+                m = glaccel_wm_find(s, c->bound_xid);
+                if (m) {
+                    /* an unmapped/fully-clipped modelled window composites nothing,
+                     * so it must not appear in the geometry set either */
+                    if (!(m->flags & PVGPU_WMF_MAPPED) || m->n_clip <= 0) continue;
+                    glaccel_clamp_rect(&win_rects[n_now], m->x, m->y, c->w, c->h,
+                                       s->desk_w, s->desk_h);
+                } else {
                     glaccel_clamp_rect(&win_rects[n_now], c->x, c->y, c->w, c->h,
                                        s->desk_w, s->desk_h);
-                    n_now++;
                 }
+                n_now++;
             }
             if (!force && s->prev_n_windows > 0 && n_now == 0) {
                 force = true;
@@ -932,14 +1223,21 @@ static void sgi_glaccel_update(void *opaque)
             if (n_now != s->prev_n_win_rects) {
                 geom_changed = true;
             } else {
-                for (i = 0; i < n_now; i++) {
-                    if (win_rects[i].x != s->prev_win_rects[i].x ||
-                        win_rects[i].y != s->prev_win_rects[i].y ||
-                        win_rects[i].w != s->prev_win_rects[i].w ||
-                        win_rects[i].h != s->prev_win_rects[i].h) {
-                        geom_changed = true;
-                        break;
+                /* Compare as an unordered SET: the composite emits out_rects in
+                 * stacking order (model stack when modelled), which need not match
+                 * this ctx-index walk, and a pure reordering is not a geometry
+                 * change.  n <= PVGPU_MAXCTX (8), so O(n^2) is free. */
+                for (i = 0; i < n_now && !geom_changed; i++) {
+                    bool found = false;
+                    for (j = 0; j < s->prev_n_win_rects; j++) {
+                        if (win_rects[i].x == s->prev_win_rects[j].x &&
+                            win_rects[i].y == s->prev_win_rects[j].y &&
+                            win_rects[i].w == s->prev_win_rects[j].w &&
+                            win_rects[i].h == s->prev_win_rects[j].h) {
+                            found = true; break;
+                        }
                     }
+                    if (!found) geom_changed = true;
                 }
             }
             if (geom_changed) {
@@ -1161,6 +1459,10 @@ static uint64_t sgi_glaccel_read(void *opaque, hwaddr addr, unsigned size)
         return s->stride;
     case SGI_GLACCEL_CONTEXT:
         return s->cur_ctx;
+    case SGI_GLACCEL_WINMODEL:
+        /* generation of the live server-published window model; 0 = nobody is
+         * publishing (or the device is not consuming), i.e. "keep guessing". */
+        return s->winmodel ? s->wm_gen : 0;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad register offset 0x%" HWADDR_PRIx "\n",
@@ -1295,6 +1597,26 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
             ctx->pending = 0;
             ctx->frame_serial = 0;
             ctx->cmd_base = 0;
+            ctx->bound_xid = 0;
+            /* Window model lifetime: if the PUBLISHER's ring context went away the
+             * server itself is gone (Xsgi exit/respawn).  X window ids are recycled
+             * across a server restart, so a surviving model could resolve a NEW
+             * client's binding against a DEAD window's rectangle — the worst failure
+             * this design can produce (memo 21 §6 risk 1).  Invalidate wholesale. */
+            if (s->wm_pub_ctx == c) {
+                qemu_log_mask(LOG_UNIMP, "pvgpu: window-model publisher ctx %d freed "
+                              "-> model invalidated (gen %u -> 0)\n", c, s->wm_gen);
+                s->wm_n = 0;
+                s->wm_shadow_n = 0;
+                s->wm_gen = 0;
+                s->wm_batch_open = false;
+                s->wm_pub_ctx = -1;
+                for (int k = 0; k < PVGPU_MAXCTX; k++) s->ctx[k].bound_xid = 0;
+                /* a wholesale invalidation always changes what the composite reads */
+                s->wm_sig++;
+                s->invalidate = true;
+                glaccel_wm_request_present(s);
+            }
             if (ctx->fwd_fd >= 0) { close(ctx->fwd_fd); ctx->fwd_fd = -1; }
             if (ctx->conn_fd >= 0) { close(ctx->conn_fd); ctx->conn_fd = -1; }
             if (ctx->rxbuf) { g_byte_array_unref(ctx->rxbuf); ctx->rxbuf = NULL; }
@@ -1427,6 +1749,22 @@ static void glaccel_clamp_rect(PVDeskRect *out, int x, int y, int wpx, int hpx,
     out->h = (y1 > y0) ? y1 - y0 : 0;
 }
 
+/* Window model lookup.  Returns NULL — meaning "no model for this context, use the
+ * shim-published origin + occluders" — unless a live model is being consumed AND the
+ * context carries a binding AND that binding resolves.  An unresolvable or suspect
+ * binding must NEVER fall back to a best guess: compositing a LIVE frame into another
+ * window's rectangle is strictly worse than today's stale-but-self-consistent position
+ * (memo 21 §6 risk 1). */
+static const PVGPUWinRec *glaccel_wm_find(SGIGLAccelState *s, uint32_t xid)
+{
+    int i;
+    if (!s->winmodel || s->wm_gen == 0 || xid == 0) return NULL;
+    for (i = 0; i < s->wm_n; i++) {
+        if (s->wm[i].xid == xid) return &s->wm[i];
+    }
+    return NULL;
+}
+
 static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
                                       int dw, int dh,
                                       PVDeskRect *out_rects, int max_out)
@@ -1447,16 +1785,45 @@ static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
                           i, (now - c->last_us) / 1e6);
             c->idle_warned = true;
         }
-        wins[n_wins].frame = c->frame; wins[n_wins].x = c->x; wins[n_wins].y = c->y;
-        wins[n_wins].w = c->w; wins[n_wins].h = c->h;
-        wins[n_wins].n_occ = c->n_occ < PVGPU_MAX_OCC ? c->n_occ : PVGPU_MAX_OCC;
-        for (int k = 0; k < wins[n_wins].n_occ; k++) {
-            wins[n_wins].occ[k][0] = c->occ[k][0];
-            wins[n_wins].occ[k][1] = c->occ[k][1];
-            wins[n_wins].occ[k][2] = c->occ[k][2];
-            wins[n_wins].occ[k][3] = c->occ[k][3];
+        {
+            const PVGPUWinRec *m = glaccel_wm_find(s, c->bound_xid);
+            PVGPUWindow *W = &wins[n_wins];
+            W->frame = c->frame; W->w = c->w; W->h = c->h;
+            W->n_clip = 0; W->n_occ = 0; W->stack = i;
+            if (m) {
+                /* The model is authoritative: placement and visibility resolved HERE,
+                 * at composite time, not at submit time.  The frame is content only.
+                 * A window the server reports as not visible composites nothing. */
+                if (!(m->flags & PVGPU_WMF_MAPPED) || m->n_clip <= 0) continue;
+                W->x = m->x; W->y = m->y;
+                W->stack = (int)m->stack;
+                W->n_clip = m->n_clip < PVGPU_MAX_WM_CLIP ? m->n_clip : PVGPU_MAX_WM_CLIP;
+                for (int k = 0; k < W->n_clip; k++) {
+                    W->clip[k][0] = m->clip[k][0]; W->clip[k][1] = m->clip[k][1];
+                    W->clip[k][2] = m->clip[k][2]; W->clip[k][3] = m->clip[k][3];
+                }
+            } else {
+                W->x = c->x; W->y = c->y;
+                W->n_occ = c->n_occ < PVGPU_MAX_OCC ? c->n_occ : PVGPU_MAX_OCC;
+                for (int k = 0; k < W->n_occ; k++) {
+                    W->occ[k][0] = c->occ[k][0]; W->occ[k][1] = c->occ[k][1];
+                    W->occ[k][2] = c->occ[k][2]; W->occ[k][3] = c->occ[k][3];
+                }
+            }
+            n_wins++;
         }
-        n_wins++;
+    }
+
+    /* Composite order.  Without a model this is ctx-allocation order (the historical
+     * behaviour, and the ctx-index-stacking defect of memo 21 §2.4 item 2); with one it
+     * is the server's own bottom-to-top stacking index.  Insertion sort on the key is
+     * stable, so a mixed desktop (some contexts modelled, some not) keeps the unmodelled
+     * ones in their old relative order. */
+    for (wi = 1; wi < n_wins; wi++) {
+        PVGPUWindow tmp = wins[wi];
+        int j = wi - 1;
+        while (j >= 0 && wins[j].stack > tmp.stack) { wins[j + 1] = wins[j]; j--; }
+        wins[j + 1] = tmp;
     }
 
     /* composite each window over the desktop */
@@ -1467,16 +1834,30 @@ static int glaccel_composite_overlays(SGIGLAccelState *s, uint32_t *desk,
             if (fy < 0 || fy >= dh) continue;
             for (gx = 0; gx < w->w; gx++) {
                 int fx = w->x + gx;
+                bool vis;
                 if (fx < 0 || fx >= dw) continue;
-                /* occluder check: skip if pixel is inside any occluding rect */
-                bool occ = false;
-                for (oi = 0; oi < w->n_occ; oi++) {
-                    if (fx >= w->occ[oi][0] && fx < w->occ[oi][0] + w->occ[oi][2] &&
-                        fy >= w->occ[oi][1] && fy < w->occ[oi][1] + w->occ[oi][3]) {
-                        occ = true; break;
+                if (w->n_clip > 0) {
+                    /* modelled: the pixel is visible iff it lies in the server's
+                     * clip region (which already accounts for ancestors, siblings
+                     * above, and a frame larger than its window). */
+                    vis = false;
+                    for (oi = 0; oi < w->n_clip; oi++) {
+                        if (fx >= w->clip[oi][0] && fx < w->clip[oi][0] + w->clip[oi][2] &&
+                            fy >= w->clip[oi][1] && fy < w->clip[oi][1] + w->clip[oi][3]) {
+                            vis = true; break;
+                        }
+                    }
+                } else {
+                    /* occluder check: skip if pixel is inside any occluding rect */
+                    vis = true;
+                    for (oi = 0; oi < w->n_occ; oi++) {
+                        if (fx >= w->occ[oi][0] && fx < w->occ[oi][0] + w->occ[oi][2] &&
+                            fy >= w->occ[oi][1] && fy < w->occ[oi][1] + w->occ[oi][3]) {
+                            vis = false; break;
+                        }
                     }
                 }
-                if (!occ) {
+                if (vis) {
                     desk[(size_t)fy * dw + fx] = w->frame[(size_t)gy * w->w + gx];
                 }
             }
@@ -1508,6 +1889,13 @@ static void sgi_glaccel_realize(DeviceState *dev, Error **errp)
     /* live GL frame channel — one accept socket, per-context connections */
     s->gl_listen_fd = -1;
     s->cur_ctx = 0;
+    s->wm_pub_ctx = -1;   /* no window-model publisher yet */
+    /* window-model present coalescer: at most one model-driven composite per
+     * display refresh (the model STATE is always committed synchronously). */
+    s->wm_present_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                       glaccel_wm_present_timer_cb, s);
+    s->wm_last_present_ns = 0;
+    s->wm_present_pending = false;
     {
         int i;
         for (i = 0; i < PVGPU_MAXCTX; i++) {
@@ -1550,6 +1938,11 @@ static const Property sgi_glaccel_props[] = {
     /* IN-PROCESS GL end-goal gate (default OFF): only the launch that sets this uses the
      * in-process glr_submit path; every stock app keeps the proven socket/Newport path. */
     DEFINE_PROP_BOOL("inproc", SGIGLAccelState, inproc, true),
+    /* Server-published window model (memo 21).  Default OFF: the WM_* ring ops are
+     * parsed and discarded and the composite uses the submit-time origin + occluder
+     * rects — provably the pre-model path.  -global sgi-glaccel.winmodel=on to consume
+     * the model.  This is the device-side kill-switch of memo 21 §4. */
+    DEFINE_PROP_BOOL("winmodel", SGIGLAccelState, winmodel, false),
 };
 
 static void sgi_glaccel_class_init(ObjectClass *klass, const void *data)

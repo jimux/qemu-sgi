@@ -26,6 +26,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 #define SGI_GLACCEL_CONTEXT  0x24   /* GL context (window) id; a CMD_BASE write latches per ctx */
 #define SGI_GLACCEL_DOORBELL 0x28   /* atomic submit: write (ctx<<24)|len -> process ctx's ring */
 #define SGI_GLACCEL_CTX_FREE 0x2C   /* Phase B: write ctx id -> free context (unmap lifecycle) */
+#define SGI_GLACCEL_WINMODEL 0x30   /* R: server-published window-model generation (0 = none) */
 
 /* Execution Commands */
 #define GLACCEL_CMD_RESET   (1 << 0)
@@ -48,8 +49,47 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
                                  * register shadow framebuffer in guest RAM */
 #define PVGPU_OP_DAMAGE      9  /* Stage 2: [op][x][y][w][h] — shadowfb region changed */
 
+/* ---- server-published window model (memo 21 / pvdisplay 24) ----------------
+ * The X server (parasite DDX) publishes an AUTHORITATIVE window model on its own
+ * ring context; a GL client publishes only the binding (its ctx <-> its X window
+ * id).  Neither publisher guesses.  When a model is live the composite resolves
+ * placement + clip + stacking from it AT COMPOSITE TIME instead of from the
+ * submit-time origin the frame carries.  Gated by the "winmodel" QOM property;
+ * with no model (generation 0) every path is byte-identical to the pre-model
+ * device.  See progress_notes/ip55/pvdisplay/24-winmodel-implementation.md. */
+#define PVGPU_OP_WM_BEGIN   10  /* [op][gen] : open an atomic model update */
+#define PVGPU_OP_WM_WINDOW  11  /* [op][xid][x][y][w][h][flags][stack] : one window record */
+#define PVGPU_OP_WM_CLIP    12  /* [op][xid][n] then n*[x][y][w][h] : visible region, screen */
+#define PVGPU_OP_WM_GONE    13  /* [op][xid] : window retired (unmapped/destroyed) */
+#define PVGPU_OP_WM_END     14  /* [op][gen] : commit — swap the shadow model in */
+#define PVGPU_OP_WM_BIND    15  /* [op][xid] : CLIENT ring — bind this context to that window */
+
+#define PVGPU_WMF_MAPPED    (1u << 0)  /* window is viewable (has a non-empty clip) */
+#define PVGPU_WMF_HASCLIP   (1u << 1)  /* a WM_CLIP for this xid follows in this batch */
+#define PVGPU_WMF_OVERRIDE  (1u << 2)  /* override-redirect (informational) */
+
+#define PVGPU_MAX_WM_WINDOWS 256 /* model capacity (a bigger batch is rejected wholesale).
+                                  * memo 21 §3.1 proposed 64; a live 4Dwm desktop publishes
+                                  * the whole tree INCLUDING every frame gadget (M1 logged 14
+                                  * windows for ONE client) — measured batches on the baked
+                                  * demo-runner desktop reach 5908 bytes, i.e. up to ~211
+                                  * records.  64 (or 128) would mean "no model, ever" on a
+                                  * real desktop; the publisher discards rather than truncates,
+                                  * so the cap must have real headroom. */
+#define PVGPU_MAX_WM_CLIP    32  /* per-window clip rects (publisher degrades to extents) */
+
 #define PVGPU_MAX_OCC 16     /* max occluder rects tracked for desktop overlay clipping */
 #define PVGPU_MAXCTX  8      /* max concurrent GL windows (contexts) */
+
+/* One published window: screen rect, stacking index (0 = bottom) and visible region. */
+typedef struct PVGPUWinRec {
+    uint32_t xid;
+    int      x, y, w, h;
+    uint32_t flags;
+    uint32_t stack;
+    int      clip[PVGPU_MAX_WM_CLIP][4];
+    int      n_clip;
+} PVGPUWinRec;
 
 /* ---- desktop layer types (used by SGIGLAccelState, must precede it) ---- */
 typedef struct { int x, y, w, h; } PVDeskRect;
@@ -106,6 +146,7 @@ typedef struct PVGPUCtx {
     int         occ[PVGPU_MAX_OCC][4]; /* screen rects occluding this window */
     int         n_occ;
     int         frame_serial;    /* in-process path: last glr_get_last_frame serial composited */
+    uint32_t    bound_xid;       /* window model: X window id this context renders into (0 = none) */
 } PVGPUCtx;
 
 /* One active GL window for the Newport desktop multi-composite. */
@@ -114,6 +155,10 @@ typedef struct PVGPUWindow {
     int x, y, w, h;
     int occ[PVGPU_MAX_OCC][4];
     int n_occ;
+    /* window model (n_clip > 0 => clip[] replaces the occluder test entirely) */
+    int clip[PVGPU_MAX_WM_CLIP][4];
+    int n_clip;
+    int stack;                   /* composite order key (model stack, else ctx index) */
 } PVGPUWindow;
 
 /* Pixel formats */
@@ -180,6 +225,47 @@ struct SGIGLAccelState {
      * in-process path); set sgi-glaccel.inproc=off to fall back to the socket/glserver
      * path for debugging or if the renderer .so is unavailable. */
     bool        inproc;           /* qom prop: in-process glr_submit instead of the socket */
+
+    /* ---- server-published window model (kill-switch: sgi-glaccel.winmodel) ----
+     * wm[] is the LIVE model, wm_shadow[] the batch under construction.  A batch is
+     * only ever swapped in whole (WM_END with a matching generation); a truncated,
+     * over-capacity or mismatched batch is discarded and the previous model stays
+     * live — the device never presents a half-state.  wm_gen == 0 means "no
+     * authoritative model": every context falls back to its own submit-time origin
+     * plus occluder rects, i.e. exactly the pre-model behaviour. */
+    bool        winmodel;         /* qom prop: consume the model (default off) */
+    PVGPUWinRec wm[PVGPU_MAX_WM_WINDOWS];
+    int         wm_n;
+    uint32_t    wm_gen;           /* live model generation (0 = none) */
+    PVGPUWinRec wm_shadow[PVGPU_MAX_WM_WINDOWS];
+    int         wm_shadow_n;
+    uint32_t    wm_batch_gen;
+    bool        wm_batch_open;
+    bool        wm_batch_bad;
+    int         wm_pub_ctx;       /* ring context the publisher owns (-1 = none) */
+
+    /* ---- commit batching (24-…md §3 "where the batching should go") ----
+     * 4Dwm revalidates its whole window tree constantly, so most committed batches
+     * are bit-identical for every window a GL context is actually BOUND to.  Such a
+     * republish cannot change a pixel and must therefore cost nothing: it bumps
+     * neither wm_sig (so the composite idle-skip can still suppress the repaint) nor
+     * schedules a present.  wm_sig — NOT wm_gen — is what the composite signature
+     * folds: it advances only on a commit that changed a bound window's rect, clip,
+     * stacking or liveness, or on a wholesale model invalidation.
+     *
+     * The present itself is coalesced to at most one per display refresh.  The model
+     * STATE is always committed synchronously; only the present is deferred, and the
+     * deferred composite reads the final committed state — so a burst of N publishes
+     * costs one composite of the last one, never a dropped commit. */
+    uint32_t    wm_sig;             /* commit serial: bumped only on a bound-visible change */
+    QEMUTimer  *wm_present_timer;   /* drains a coalesced present at the next refresh */
+    int64_t     wm_last_present_ns; /* REALTIME ns of the last model-driven present */
+    bool        wm_present_pending; /* wm_present_timer is armed */
+    /* counters (SGI_GLACCEL_WM_STATS=1 logs them periodically) */
+    uint64_t    wm_commits;         /* committed batches */
+    uint64_t    wm_commits_nop;     /* of which: no bound window changed => free */
+    uint64_t    wm_presents;        /* model-driven presents actually issued */
+    uint64_t    wm_presents_coalesced; /* presents folded into a pending one */
 
     /* ---- unified display engine (Phase A) ---- */
     uint32_t   *desk;             /* engine-owned desktop buffer, xRGB, desk_w*desk_h */
