@@ -33,9 +33,13 @@
 
 #include "cpu.h"
 #include "elf.h"
+#include "exec/cpu-common.h"
+#include "exec/cputlb.h"
+#include "hw/block/block.h"
 #include "hw/char/serial.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
+#include "hw/core/cpu.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
@@ -315,8 +319,8 @@ static void write_sash_trampoline(uint32_t sash_entry, uint32_t gp_value) {
   tramp[i++] = cpu_to_be32(MIPS_BNE(T0, T4, bne_off));
   tramp[i++] = cpu_to_be32(MIPS_NOP);
 
-  /* ARCS args: argc=1, argv=["dksc(0,1,0)/unix"], envp=[NULL] + stack. */
-  tramp[i++] = cpu_to_be32(MIPS_ORI(A0, ZERO, 1));       /* argc = 1 */
+  /* ARCS args: argc=2, argv=["dksc(0,1,0)/sash","OSLoadOptions=auto"], envp. */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(A0, ZERO, 2));       /* argc = 2 */
   tramp[i++] = cpu_to_be32(MIPS_LUI(A1,
       (MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_ARGV_OFF) >> 16));
   tramp[i++] = cpu_to_be32(MIPS_ORI(A1, A1,
@@ -501,6 +505,181 @@ static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
   *entry = e_entry;
   *high_phys = high;
   return 0;
+}
+
+/*
+ * Execute(path, argc, argv, envp) — the firmware's "load + run" for sash's
+ * autoboot (Path A). Reads the named /unix from the boot disk's XFS root
+ * host-side, loads it into RAM at runtime, and jumps to its entry. Registered
+ * on the ARCS device via sgi_arcs_set_execute_cb().
+ */
+static int sgi_load_elf32_be_runtime(const uint8_t *img, size_t len,
+                                     uint32_t *entry, uint32_t *high_phys);
+
+static void sgi_virtuix_execute(uint32_t path_va)
+{
+    CPUState *cs = first_cpu;
+    MIPSCPU *cpu = MIPS_CPU(cs);
+    CPUMIPSState *env = &cpu->env;
+    DriveInfo *dinfo = drive_get(IF_SCSI, 0, 1);
+    BlockBackend *blk;
+    uint8_t vh[512];
+    uint32_t part_firstlbn = 0;
+    char path[128];
+    const char *fname;
+    char *slash, *paren;
+    SGIXfs fs;
+    SGIXfsInode kino;
+    uint8_t *kbuf;
+    uint64_t ksize, got;
+    uint32_t kentry, khigh;
+    int i, rc;
+
+    if (!dinfo || !(blk = blk_by_legacy_dinfo(dinfo))) {
+        error_report("ARCS Execute: no boot disk at scsi bus=0 unit=1");
+        return;
+    }
+    if (cpu_memory_rw_debug(cs, path_va, path, sizeof(path) - 1, 0) < 0) {
+        error_report("ARCS Execute: cannot read path at 0x%08x", path_va);
+        return;
+    }
+    path[sizeof(path) - 1] = '\0';
+    /* sash's kernel_name() yields "dksc(c,u,p)name" (no slash); take the name
+     * after the last '/' or ')'. */
+    slash = strrchr(path, '/');
+    paren = strrchr(path, ')');
+    fname = (slash > paren ? slash : paren);
+    fname = fname ? fname + 1 : path;
+    if (!*fname) {
+        fname = "unix";
+    }
+    qemu_log("ARCS Execute: path=%s -> file=%s\n", path, fname);
+
+    if (blk_pread(blk, 0, 512, vh, 0) < 0 ||
+        sgi_be32(&vh[0]) != 0x0be5a941u) {
+        error_report("ARCS Execute: bad volume header");
+        return;
+    }
+    for (i = 0; i < SGI_VH_NPARTAB; i++) {
+        const uint8_t *pt = &vh[SGI_VH_PARTAB_OFF + i * SGI_VH_PT_ENTSZ];
+        if (sgi_be32(pt + 8) == SGI_VH_PTYPE_XFS) {
+            part_firstlbn = sgi_be32(pt + 4);
+            break;
+        }
+    }
+    if (!part_firstlbn) {
+        error_report("ARCS Execute: no XFS root partition");
+        return;
+    }
+    if (sgi_xfs_mount(blk, part_firstlbn, &fs) < 0) {
+        error_report("ARCS Execute: xfs mount failed");
+        return;
+    }
+    char kpath[160];
+    snprintf(kpath, sizeof(kpath), "/%s", fname);
+    if (sgi_xfs_lookup(&fs, kpath, &kino) < 0) {
+        error_report("ARCS Execute: '%s' not found", kpath);
+        return;
+    }
+    ksize = kino.size;
+    if (ksize == 0 || ksize > 64 * MiB) {
+        error_report("ARCS Execute: implausible size %" PRIu64, ksize);
+        sgi_xfs_inode_put(&kino);
+        return;
+    }
+    kbuf = g_malloc(ksize);
+    if (sgi_xfs_read(&fs, &kino, 0, ksize, kbuf, &got) < 0 || got != ksize) {
+        error_report("ARCS Execute: read failed");
+        g_free(kbuf);
+        sgi_xfs_inode_put(&kino);
+        return;
+    }
+    sgi_xfs_inode_put(&kino);
+    qemu_log("ARCS Execute: read %s (%" PRIu64 " bytes)\n", kpath, ksize);
+
+    rc = sgi_load_elf32_be_runtime(kbuf, ksize, &kentry, &khigh);
+    g_free(kbuf);
+    if (rc < 0) {
+        error_report("ARCS Execute: not a loadable ELF (rc=%d)", rc);
+        return;
+    }
+    qemu_log("ARCS Execute: entry 0x%08x, jumping to kernel\n", kentry);
+
+    env->active_tc.PC = kentry;
+    env->active_tc.gpr[4] = 0;                            /* a0 = argc */
+    env->active_tc.gpr[5] = 0;                            /* a1 = argv */
+    env->active_tc.gpr[6] = MIPS_K0BASE + ARCS_ENVIRON_PHYS;  /* a2 = environ */
+    env->CP0_Status = 0;      /* clear BEV/ERL/EXL, KSU=kernel */
+    env->CP0_EPC = 0;
+    env->CP0_Cause = 0;
+    env->active_tc.HI[0] = 0;
+    env->active_tc.LO[0] = 0;
+    tlb_flush(cs);
+    cpu_loop_exit(cs);
+}
+
+/* Runtime ELF32-MSB loader (address_space_write, for sash's Execute). */
+static int sgi_load_elf32_be_runtime(const uint8_t *img, size_t len,
+                                     uint32_t *entry, uint32_t *high_phys)
+{
+    uint32_t e_entry, e_phoff;
+    uint16_t e_phentsize, e_phnum;
+    int loaded = 0, i;
+
+    if (len < 52 || memcmp(img, "\x7f" "ELF", 4) != 0) {
+        return -1;
+    }
+    if (img[4] != 1 || img[5] != 2) {
+        return -2;
+    }
+    if (sgi_be16(&img[18]) != EM_MIPS) {
+        return -3;
+    }
+    e_entry = sgi_be32(&img[24]);
+    e_phoff = sgi_be32(&img[28]);
+    e_phentsize = sgi_be16(&img[42]);
+    e_phnum = sgi_be16(&img[44]);
+    uint32_t high = 0;
+
+    for (i = 0; i < e_phnum; i++) {
+        const uint8_t *ph = &img[e_phoff + (size_t)i * e_phentsize];
+        uint32_t p_type, p_offset, p_vaddr, p_filesz, p_memsz;
+        if (e_phoff + (size_t)(i + 1) * e_phentsize > len) {
+            return -4;
+        }
+        p_type = sgi_be32(&ph[0]);
+        if (p_type != 1 /* PT_LOAD */) {
+            continue;
+        }
+        p_offset = sgi_be32(&ph[4]);
+        p_vaddr = sgi_be32(&ph[8]);
+        p_filesz = sgi_be32(&ph[16]);
+        p_memsz = sgi_be32(&ph[20]);
+        if ((uint64_t)p_offset + p_filesz > len) {
+            return -5;
+        }
+        uint32_t phys = p_vaddr & 0x1FFFFFFF;
+        if (p_filesz > 0) {
+            address_space_write(&address_space_memory, phys,
+                                MEMTXATTRS_UNSPECIFIED, img + p_offset,
+                                p_filesz);
+        }
+        if (p_memsz > p_filesz) {
+            address_space_set(&address_space_memory, phys + p_filesz, 0,
+                              p_memsz - p_filesz, MEMTXATTRS_UNSPECIFIED);
+        }
+        uint32_t seg_end = (p_vaddr + p_memsz) & 0x1FFFFFFF;
+        if (seg_end > high) {
+            high = seg_end;
+        }
+        loaded++;
+    }
+    if (!loaded) {
+        return -6;
+    }
+    *entry = e_entry;
+    *high_phys = high;
+    return 0;
 }
 
 /*
@@ -853,6 +1032,9 @@ static void sgi_virtuix_init(MachineState *machine) {
   Clock *cpuclk;
   char *filename;
   int bios_size;
+
+  /* sash's Execute() (Path A) is implemented here (needs XFS + MIPS CPU). */
+  sgi_arcs_set_execute_cb(sgi_virtuix_execute);
 
   /* Validate RAM size (Virtuix cap = 2 GiB) */
   if (machine->ram_size > SGI_RAM_MAX) {

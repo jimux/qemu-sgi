@@ -33,6 +33,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/bswap.h"
+#include "hw/core/cpu.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/loader.h"
@@ -120,6 +121,35 @@ static char *read_guest_string(hwaddr phys_addr, int max_len)
 }
 
 /*
+ * Read a NUL-terminated string from a guest VIRTUAL address (handles kuseg ->
+ * TLB -> physical, unlike the raw & 0x1FFFFFFF mask which only works for
+ * kseg0/kseg1). Used for ARCS args that sash passes from its kuseg memory.
+ */
+static char *read_guest_string_va(uint32_t va, int max_len)
+{
+    char *buf = g_malloc(max_len + 1);
+    CPUState *cs = first_cpu;
+    int i;
+
+    if (cs == NULL) {
+        buf[0] = '\0';
+        return buf;
+    }
+    for (i = 0; i < max_len; i++) {
+        if (cpu_memory_rw_debug(cs, (vaddr)va + i, (uint8_t *)&buf[i], 1, 0)
+            != 0) {
+            buf[i] = '\0';
+            break;
+        }
+        if (buf[i] == '\0') {
+            break;
+        }
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+/*
  * Handle ARCS_FN_GETMEMORYDESC hypercall.
  *
  * arg0 = guest pointer to previous MEMORYDESCRIPTOR, or 0 for first.
@@ -180,11 +210,11 @@ static uint32_t arcs_get_env_var(SGIARCSState *s, uint32_t arg0)
         return 0;
     }
 
-    /* Read the variable name from guest memory */
-    hwaddr name_phys = arg0 & 0x1FFFFFFF;
-    name = read_guest_string(name_phys, 128);
+    /* Read the variable name from guest memory (a guest VA — kuseg for sash,
+     * kseg0 for the kernel; read_guest_string_va handles the TLB). */
+    name = read_guest_string_va(arg0, 128);
 
-    qemu_log_mask(LOG_UNIMP, "ARCS: GetEnvironmentVariable(\"%s\")\n", name);
+    qemu_log("ARCS: GetEnvironmentVariable(\"%s\") -> 0x%08x\n", name, result);
 
     /*
      * Scan through the environment data area.
@@ -239,7 +269,6 @@ static uint32_t arcs_get_env_var(SGIARCSState *s, uint32_t arg0)
 static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
                            uint32_t count)
 {
-    hwaddr buf_phys = buf_ptr & 0x1FFFFFFF;
     char *buf;
 
     if (count == 0 || count > 4096) {
@@ -247,8 +276,12 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
     }
 
     buf = g_malloc(count + 1);
-    address_space_read(&address_space_memory, buf_phys,
-                       MEMTXATTRS_UNSPECIFIED, buf, count);
+    /* buf_ptr is a guest VA (kuseg for sash, kseg0 for the kernel). */
+    if (cpu_memory_rw_debug(first_cpu, (vaddr)buf_ptr, (uint8_t *)buf, count,
+                            0) != 0) {
+        g_free(buf);
+        return 0;
+    }
     buf[count] = '\0';
 
     /* Output to QEMU log/stderr */
@@ -263,6 +296,14 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
  * Returns a monotonically increasing value (1ms resolution simulated).
  */
 static uint32_t arcs_relative_time;
+
+/* Execute() implementation, registered by the machine (sgi_virtuix.c). */
+static void (*arcs_execute_cb)(uint32_t path_va);
+
+void sgi_arcs_set_execute_cb(void (*cb)(uint32_t path_va))
+{
+    arcs_execute_cb = cb;
+}
 
 static void arcs_hypercall(SGIARCSState *s)
 {
@@ -331,6 +372,15 @@ static void arcs_hypercall(SGIARCSState *s)
         s->result = MIPS_K0BASE + ARCS_SCRATCH_PHYS + 0x10;
         break;
 
+    case ARCS_FN_EXECUTE:
+        /* Load + run the named /unix (sash autoboot). The implementation lives
+         * in the machine (sgi_virtuix.c) via the registered callback. */
+        if (arcs_execute_cb) {
+            arcs_execute_cb(s->arg0);
+        }
+        s->result = 0;  /* not reached if the jump succeeds */
+        break;
+
     case ARCS_FN_OPEN:
         /* Return error — no filesystem support */
         s->result = 2;  /* ENOENT equivalent */
@@ -348,7 +398,6 @@ static void arcs_hypercall(SGIARCSState *s)
     case ARCS_FN_SAVECONFIGURATION:
     case ARCS_FN_LOAD:
     case ARCS_FN_INVOKE:
-    case ARCS_FN_EXECUTE:
         s->result = 6;  /* EIO — not implemented */
         break;
 
@@ -671,16 +720,46 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
                            ARCS_RESTARTBLOCK_PHYS);
     }
 
-    /* ---- Build sash argv/envp (argv[0] = boot path) ---- */
+    /* ---- Build sash argv/envp (argc=2 + environ so getenv/kernel_name work) */
     {
-        uint8_t sash_args[0x20];
-        static const char bootpath[] = "dksc(0,1,0)/unix";
+        uint8_t sash_args[0x300];
+        uint32_t env_ptrs[16];
+        uint32_t cursor;
+        int nenv = 0, j;
+
         memset(sash_args, 0, sizeof(sash_args));
-        memcpy(&sash_args[ARCS_SASH_ARGS_STR_OFF], bootpath,
-               sizeof(bootpath));
+        memcpy(&sash_args[ARCS_SASH_ARGS_STR_OFF], "dksc(0,1,0)/sash",
+               sizeof("dksc(0,1,0)/sash"));
+        memcpy(&sash_args[ARCS_SASH_ARGS_STR1_OFF], "OSLoadOptions=auto",
+               sizeof("OSLoadOptions=auto"));
+
+        /* environ: the same vars the ARCS GetEnvironmentVariable serves. */
+        cursor = ARCS_SASH_ARGS_ENV_OFF;
+        for (j = 0; arcs_env_vars[j].key != NULL && nenv < 15; j++) {
+            int n = snprintf((char *)&sash_args[cursor],
+                             sizeof(sash_args) - cursor, "%s=%s",
+                             arcs_env_vars[j].key, arcs_env_vars[j].value);
+            if (n < 0 || cursor + n + 1 > ARCS_SASH_ARGS_ARGV_OFF) {
+                break;
+            }
+            env_ptrs[nenv++] = cursor;
+            cursor += n + 1;
+        }
+
+        /* argv array (fixed offset, used by the trampoline). */
         put_be32(sash_args, ARCS_SASH_ARGS_ARGV_OFF,
                  MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_STR_OFF);
-        /* argv[1] = NULL (already 0); envp[0] = NULL (already 0). */
+        put_be32(sash_args, ARCS_SASH_ARGS_ARGV_OFF + 4,
+                 MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_STR1_OFF);
+        /* argv[2] = NULL (already 0). */
+
+        /* envp array (fixed offset). */
+        for (j = 0; j < nenv; j++) {
+            put_be32(sash_args, ARCS_SASH_ARGS_ENVP_OFF + j * 4,
+                     MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + env_ptrs[j]);
+        }
+        /* envp[nenv] = NULL (already 0). */
+
         rom_add_blob_fixed("arcs-sash-args", sash_args, sizeof(sash_args),
                            ARCS_SASH_ARGS_PHYS);
     }

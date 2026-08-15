@@ -77,9 +77,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIARCSState, SGI_ARCS)
  * envp=[NULL] in the FirmwarePermanent pages, after the RestartBlock.
  */
 #define ARCS_SASH_ARGS_PHYS      0x00002230
-#define ARCS_SASH_ARGS_STR_OFF   0x00  /* argv[0] string */
-#define ARCS_SASH_ARGS_ARGV_OFF  0x10  /* argv pointer array (2 words) */
-#define ARCS_SASH_ARGS_ENVP_OFF  0x18  /* envp pointer array (1 word, NULL) */
+#define ARCS_SASH_ARGS_STR_OFF   0x00  /* argv[0] string (sash boot path) */
+#define ARCS_SASH_ARGS_STR1_OFF  0x10  /* argv[1] string (OSLoadOptions=auto) */
+#define ARCS_SASH_ARGS_ENV_OFF   0x30  /* environ "key=value" strings */
+#define ARCS_SASH_ARGS_ARGV_OFF  0x200 /* argv pointer array (3 words) */
+#define ARCS_SASH_ARGS_ENVP_OFF  0x210 /* envp pointer array (16 words) */
 
 /*
  * ARCS function IDs for the hypercall interface.
@@ -202,5 +204,12 @@ struct SGIARCSState {
  * and environment variable data into guest physical memory.
  */
 void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as);
+
+/*
+ * Register the Execute() implementation (load + run /unix from the boot disk).
+ * Lives in the machine (sgi_virtuix.c) because it needs the XFS reader and the
+ * per-target MIPS CPU — neither is reachable from the system-target sgi_arcs.c.
+ */
+void sgi_arcs_set_execute_cb(void (*cb)(uint32_t path_va));
 
 #endif /* HW_MISC_SGI_ARCS_H */
