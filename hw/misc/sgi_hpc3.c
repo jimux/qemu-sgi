@@ -1468,7 +1468,7 @@ static void sgi_hpc3_serial_event(void *opaque, QEMUChrEvent event)
 
 /*
  * ========================================================================
- * Ethernet (Seeq 80C03 EDLC via HPC3 DMA)
+ * Ethernet (Seeq 8003 EDLC via HPC3 DMA)
  * ========================================================================
  */
 
@@ -2197,7 +2197,7 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             }
         }
         /*
-         * Ethernet controller (SEEQ 80C03 at 0x54000-0x54fff)
+         * Ethernet controller (SEEQ 8003 at 0x54000-0x54fff)
          *
          * Registers are at 4-byte spacing. IRIX accesses byte 3 of each
          * 32-bit word (big-endian). With addr & ~7 normalization and
@@ -2848,7 +2848,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
             }
         }
         /*
-         * Ethernet controller (SEEQ 80C03 at 0x54000-0x54fff)
+         * Ethernet controller (SEEQ 8003 at 0x54000-0x54fff)
          *
          * Write side (bank 0 only for now):
          *   Reg 0-5: Station Address bytes 0-5
@@ -2861,7 +2861,7 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
             trace_sgi_hpc3_enet_seeq_write(reg, (uint32_t)val);
 
             /*
-             * Seeq 80C03 bank-selected register writes.
+             * Seeq 8003 bank-selected register writes.
              * TX command bits [6:5] select which register set regs 0-5 map to:
              *   Bank 0x00: Station address (regs 0-5)
              *   Bank 0x20: Multicast filter low (regs 0-5)
@@ -3225,7 +3225,7 @@ static void sgi_hpc3_realize(DeviceState *dev, Error **errp)
     s->scc_tx_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        sgi_hpc3_scc_tx_timer_cb, s);
 
-    /* Create ethernet NIC (Seeq 80C03 via HPC3 DMA) */
+    /* Create ethernet NIC (Seeq 8003 via HPC3 DMA) */
     qemu_macaddr_default_if_unset(&s->enet_conf.macaddr);
     s->nic = qemu_new_nic(&sgi_hpc3_enet_net_info, &s->enet_conf,
                            object_get_typename(OBJECT(dev)), dev->id,

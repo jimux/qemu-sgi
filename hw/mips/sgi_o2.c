@@ -1,4 +1,25 @@
 /*
+ * ============================ DIRTY / KNOWN-WRONG ============================
+ * DO NOT TRUST THIS FILE AS A REAL O2 (IP32) HARDWARE REFERENCE.
+ *
+ * The "sgi-o2" machine defined here was HIJACKED to run the project's invented
+ * IP54 paravirtual platform. By default it loads ip54.bin (NOT a real O2/IP32
+ * PROM) and unconditionally instantiates IP54 paravirtual devices that do not
+ * exist on real O2 hardware: SGI_SMP, SGI_PVMEM, SGI_PVNET, SGI_GLACCEL,
+ * SGI_BOOTDISK, plus a 64 GB PVMEM RAM ceiling. It is NOT a faithful O2 model.
+ *
+ * Consequently, comments/constants below describe that IP54 hybrid, not stock
+ * O2 (e.g. the "2GB"/64GB RAM notes are wrong -- real O2 caps at 1 GB). Treat
+ * every hardware claim in this file as suspect. Authoritative real-O2 facts
+ * live in the project wiki / resolved-notes (platform/ip32-o2, o2-crime,
+ * o2-mace, o2-gbe, o2-vice), sourced from the SGI CRIME/MACE/GBE/VICE ASIC
+ * specs -- NOT from this file.
+ *
+ * TODO (separate cleanup, intentionally NOT done here): disentangle a faithful
+ * sgi-o2 (real IP32 PROM; CRIME/MACE/GBE only; 1 GB cap) from the IP54
+ * paravirtual machine (which belongs in hw/mips/sgi_ip54pv.c).
+ * ===========================================================================
+ *
  * QEMU SGI O2 (IP32) machine emulation
  *
  * The SGI O2 is a uniprocessor workstation based on the CRIME/MACE/GBE

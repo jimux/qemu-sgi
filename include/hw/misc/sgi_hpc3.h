@@ -148,7 +148,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHPC3State, SGI_HPC3)
 #define SEEQ_TXS_OLD    0x80  /* Old status (already consumed) */
 #define SEEQ_TXS_SUCCESS 0x08 /* TX success */
 
-/* Seeq 80C03 TX command bank select (bits [6:5]) */
+/* Seeq 8003 TX command bank select (bits [6:5]) */
 #define SEEQ_TXC_BANK_MASK    0x60
 #define SEEQ_TXC_BANK_STATION 0x00  /* Bank 0: station address */
 #define SEEQ_TXC_BANK_MCAST_L 0x20  /* Bank 1: multicast filter low */
@@ -422,7 +422,7 @@ struct SGIHPC3State {
 
     bool autoload;  /* NVRAM AutoLoad: true='Y', false='N' */
 
-    /* Seeq 80C03 EDLC state */
+    /* Seeq 8003 EDLC state */
     uint8_t seeq_station_addr[6];  /* MAC address (regs 0-5) */
     uint8_t seeq_rx_cmd;           /* RX command register (mode + IE bits) */
     uint8_t seeq_tx_cmd;           /* TX command register (bank + IE bits) */

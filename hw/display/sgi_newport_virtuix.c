@@ -962,6 +962,50 @@ static inline bool newport_hostrw_trace(void)
 }
 static uint64_t g_hrw_seq;      /* monotonic colorhost-primitive counter */
 
+/*
+ * NP_HOSTRW_COUNT=1 (BL-44 discriminator, gated, off by default): count the
+ * HOSTRW words the device actually RECEIVES per colorhost host-data episode and
+ * compare them with the pixels actually drawn and the setup-implied w*h of the
+ * episode's first primitive.  Answers "were words lost upstream of the device?"
+ * with one number per episode instead of a 4 MB per-write trace.
+ * An "episode" runs from the DRAWMODE0 write that turns colorhost on to the one
+ * that turns it off.
+ */
+static int np_hostrw_count = -1;
+static inline bool newport_hostrw_count(void)
+{
+    if (np_hostrw_count < 0) {
+        np_hostrw_count = getenv("NP_HOSTRW_COUNT") ? 1 : 0;
+    }
+    return np_hostrw_count;
+}
+static uint64_t hc_words, hc_pixels, hc_prims, hc_episode;
+static int hc_x0, hc_y0, hc_x1, hc_y1;
+static bool hc_have_extent;
+
+static void newport_hostrw_count_flush(void)
+{
+    if (hc_prims == 0 && hc_words == 0) {
+        return;
+    }
+    if (hc_have_extent) {
+        int64_t w = (int64_t)hc_x1 - hc_x0 + 1;
+        int64_t h = (int64_t)hc_y1 - hc_y0 + 1;
+        fprintf(stderr, "NP_HC EPISODE #%" PRIu64 " words=%" PRIu64
+                " pixels=%" PRIu64 " prims=%" PRIu64
+                " rect=(%d,%d)-(%d,%d) implied_wh=%" PRId64 "\n",
+                hc_episode, hc_words, hc_pixels, hc_prims,
+                hc_x0, hc_y0, hc_x1, hc_y1, w * h);
+    } else {
+        fprintf(stderr, "NP_HC EPISODE #%" PRIu64 " words=%" PRIu64
+                " pixels=%" PRIu64 " prims=%" PRIu64 " rect=none\n",
+                hc_episode, hc_words, hc_pixels, hc_prims);
+    }
+    hc_words = hc_pixels = hc_prims = 0;
+    hc_have_extent = false;
+    hc_episode++;
+}
+
 static int np_2d_verify = -1;
 static int np_verify_reported;
 static inline bool newport_2d_verify(void)
@@ -1324,6 +1368,7 @@ static void newport_draw_block(SGINewportVirtuixState *s)
     trace_sgi_newport_draw_block(start_x, start_y, end_x, end_y);
     color = newport_get_default_color(s);
 
+
     /* Select pattern source — MAME ref: newport.cpp:3444-3445 */
     if (s->dm0_zpattern) {
         pattern = s->z_pattern;
@@ -1483,8 +1528,8 @@ static void newport_draw_block(SGINewportVirtuixState *s)
                         if (!hrw_pixels) hrw_c0 = hc;
                         if (hc > hrw_cmax) hrw_cmax = hc;
                         if (hc < hrw_cmin) hrw_cmin = hc;
-                        hrw_pixels++;
                     }
+                    hrw_pixels++;
                 } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
                     newport_output_pixel(s, sx, sy,
                                          newport_get_rgb_color(s, sx, sy));
@@ -1531,6 +1576,18 @@ static void newport_draw_block(SGINewportVirtuixState *s)
     s->iter_y = sy;
     newport_write_x_start(s, (int32_t)sx << 11);
     newport_write_y_start(s, (int32_t)sy << 11);
+
+    if (s->dm0_colorhost && newport_hostrw_count()) {
+        hc_prims++;
+        hc_pixels += hrw_pixels;
+        if (!hc_have_extent) {
+            hc_have_extent = true;
+            hc_x0 = start_x;
+            hc_y0 = start_y;
+            hc_x1 = s->x_end_int;
+            hc_y1 = s->y_end_int;
+        }
+    }
 
     if (hrw_tr) {
         int16_t ml = s->dm1_rwpacked
@@ -1624,7 +1681,7 @@ static void newport_draw_span(SGINewportVirtuixState *s)
         if (pattern & (1U << pat_bit)) {
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, sx, y, newport_get_host_color(s));
-                if (hrw_tr) hrw_pixels++;
+                hrw_pixels++;
             } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
                 newport_output_pixel(s, sx, y, newport_get_rgb_color(s, sx, y));
             } else {
@@ -1648,6 +1705,18 @@ static void newport_draw_span(SGINewportVirtuixState *s)
     /* Update X coordinate — span only updates X, not Y.
      * MAME ref: line 3414 — write_x_start(start_x << 11) */
     newport_write_x_start(s, (int32_t)sx << 11);
+
+    if (s->dm0_colorhost && newport_hostrw_count()) {
+        hc_prims++;
+        hc_pixels += hrw_pixels;
+        if (!hc_have_extent) {
+            hc_have_extent = true;
+            hc_x0 = start_x;
+            hc_y0 = y;
+            hc_x1 = s->x_end_int;
+            hc_y1 = y;
+        }
+    }
 
     if (hrw_tr) {
         int16_t ml = s->dm1_rwpacked
@@ -3183,10 +3252,16 @@ static void sgi_newport_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (reg) {
     /* Drawing registers */
-    case REX3_DRAWMODE0:
+    case REX3_DRAWMODE0: {
+        bool was_ch = s->dm0_colorhost;
         s->drawmode0 = val;
         newport_decode_drawmode0(s);
+        /* BL-44 discriminator: a colorhost episode ends when colorhost drops. */
+        if (newport_hostrw_count() && was_ch && !s->dm0_colorhost) {
+            newport_hostrw_count_flush();
+        }
         break;
+    }
     case REX3_DRAWMODE1:
         s->drawmode1 = val;
         newport_decode_drawmode1(s);
@@ -3378,6 +3453,9 @@ static void sgi_newport_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
         s->zero_overflow = val;
         break;
     case REX3_HOSTRW0:
+        if (s->dm0_colorhost && newport_hostrw_count()) {
+            hc_words++;         /* BL-44: word RECEIVED by the device */
+        }
         s->host_dataport = ((uint64_t)(uint32_t)val << 32) |
                            (s->host_dataport & 0xffffffffULL);
         /* Reset host shift position on new data write */
@@ -4657,6 +4735,7 @@ static void newport_convert_row(SGINewportVirtuixState *s, uint32_t *dst, int w,
 
         pixel = src_rgbci[x];
         cidaux = src_cidaux[x];
+
 
         if (cidaux & 0xcc) {
             uint8_t popup_ci = (cidaux >> 2) & 3;

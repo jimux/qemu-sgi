@@ -1,4 +1,21 @@
 /*
+ * ============================ DIRTY / KNOWN-WRONG ============================
+ * DO NOT TRUST THIS FILE AS A CLEAN OCTANE (IP30) REFERENCE.
+ *
+ * Besides the real "octane" machine, this file also hosts a bogus "sgi-ip55"
+ * machine (description "SGI IP54 Paravirtual Workstation") and instantiates
+ * IP54 paravirtual devices (SGI_SMP, SGI_PVMEM, SGI_PVNET, SGI_GLACCEL) that do
+ * not exist on real Octane hardware. The "sgi-ip55" type is stale and collides
+ * with the project's invented IP55/virtuix machine name.
+ *
+ * Treat the IP54/paravirtual residue here as suspect, and verify how much of it
+ * bleeds into the "octane" machine init vs. the bogus sgi-ip55 one. Authoritative
+ * real-Octane facts live in the wiki / resolved-notes (platform/ip30-octane).
+ *
+ * TODO (separate cleanup, intentionally NOT done here): remove the sgi-ip55
+ * type and the IP54 paravirtual residue; keep the octane machine faithful.
+ * ===========================================================================
+ *
  * QEMU SGI Octane (IP30) machine emulation
  *
  * The SGI Octane is a uniprocessor/dual-CPU workstation based on the
