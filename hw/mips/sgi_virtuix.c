@@ -948,6 +948,12 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
     DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
     qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
     qdev_prop_set_uint32(arcs_dev, "kernel-end", phys_bss + bsize);
+    /* Firmware console: bind to a SECOND -serial if one was provided (the
+     * first is the SCC/kernel console); else sash's console falls back to
+     * qemu_log/0-byte reads. */
+    if (serial_hd(1)) {
+        qdev_prop_set_chr(arcs_dev, "chardev", serial_hd(1));
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
     memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
                                         &SGI_ARCS(arcs_dev)->iomem, 10);
@@ -1028,6 +1034,9 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
   DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
   qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
   qdev_prop_set_uint32(arcs_dev, "kernel-end", khigh_phys);
+  if (serial_hd(1)) {
+      qdev_prop_set_chr(arcs_dev, "chardev", serial_hd(1));
+  }
   sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
   memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
                                       &SGI_ARCS(arcs_dev)->iomem, 10);
