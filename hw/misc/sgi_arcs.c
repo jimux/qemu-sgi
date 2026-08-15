@@ -404,8 +404,10 @@ static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
         return ARCS_ENODEV;
     }
 
-    /* Allocate an fd slot first (we write the fd only on success). */
-    for (fd = 0; fd < ARCS_MAX_FDS && arcs_fds[fd].in_use; fd++) {
+    /* Allocate an fd slot first (we write the fd only on success). ARCS
+     * reserves StandardIn/Out/Err = 0/1/2, so disk fds start at 3 — otherwise
+     * Read(fd=0) would be ambiguous with the console read. */
+    for (fd = 3; fd < ARCS_MAX_FDS && arcs_fds[fd].in_use; fd++) {
     }
     if (fd == ARCS_MAX_FDS) {
         return ARCS_EIO;
