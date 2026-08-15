@@ -31,6 +31,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIARCSState, SGI_ARCS)
 #define ARCS_REG_ARG0       0x04    /* First argument */
 #define ARCS_REG_ARG1       0x08    /* Second argument */
 #define ARCS_REG_ARG2       0x0C    /* Third argument */
+#define ARCS_REG_ARG3       0x14    /* Fourth argument (Read/Write count-out ptr) */
 #define ARCS_REG_RESULT     0x10    /* Return value (read) */
 #define ARCS_REG_SIZE       0x20
 
@@ -49,7 +50,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIARCSState, SGI_ARCS)
 #define ARCS_PV_PHYS        0x00001110  /* PrivateVector (after FV: 35*4=0x8C) */
 #define ARCS_MEMDESC_PHYS   0x00001200  /* Memory descriptors */
 #define ARCS_ENVDATA_PHYS   0x00001400  /* Environment variable strings */
-#define ARCS_STUBS_PHYS     0x00001600  /* MIPS stub code */
+#define ARCS_STUBS_PHYS     0x00001520  /* MIPS stub code (48 x 44 B) */
 #define ARCS_SCRATCH_PHYS   0x00001E00  /* Scratch/return buffers */
 /*
  * Kernel environ data — must stay below 0x2000!
@@ -186,6 +187,7 @@ struct SGIARCSState {
     uint32_t arg0;
     uint32_t arg1;
     uint32_t arg2;
+    uint32_t arg3;
     uint32_t result;
 
     /* Memory descriptor iteration state */

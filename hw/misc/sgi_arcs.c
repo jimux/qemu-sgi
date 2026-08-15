@@ -33,12 +33,15 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/bswap.h"
+#include "hw/block/block.h"
 #include "hw/core/cpu.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/loader.h"
 #include "hw/misc/sgi_arcs.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 #include "system/runstate.h"
 #include "qom/object.h"
 
@@ -93,8 +96,26 @@ static const struct {
  * Environment string storage in guest memory.
  * Strings are packed consecutively at ARCS_ENVDATA_PHYS.
  * The hypercall handler returns K0 pointers into this area.
+ * 288 bytes holds all 16 arcs_env_vars entries (259 bytes actual) with margin;
+ * shrunk from 512 to make room for the 44-byte stubs below.
  */
-#define ARCS_ENVDATA_SIZE 512
+#define ARCS_ENVDATA_SIZE 288
+
+/* SGI volume header (dvh) partition table — for Open()'s dksc(c,u,p) lookup. */
+#define SGI_VH_MAGIC        0x0be5a941u
+#define SGI_VH_PARTAB_OFF   0x138
+#define SGI_VH_NPARTAB      16
+#define SGI_VH_PT_ENTSZ     12   /* int nblks + int firstlbn + int type */
+#define SGI_VH_PTYPE_XFS    10
+
+/* ARCS errno (arcs/errno.h) */
+#define ARCS_ESUCCESS       0
+#define ARCS_EINVAL         7
+#define ARCS_EIO            8
+#define ARCS_ENODEV         13
+#define ARCS_ENOENT         14
+
+#define ARCS_MAX_FDS        20   /* ARCS_FOPEN_MAX */
 
 /* ------------------------------------------------------------------ */
 /* Hypercall MMIO handlers                                            */
@@ -317,6 +338,182 @@ void sgi_arcs_set_execute_cb(void (*cb)(uint32_t path_va))
     arcs_execute_cb = cb;
 }
 
+/* ------------------------------------------------------------------ */
+/* Raw-device file services (Open/Read/Seek/Close/GetReadStatus)       */
+/* ------------------------------------------------------------------ */
+/*
+ * These implement the firmware's raw block I/O: Open("dksc(c,u,p)") opens a
+ * whole-disk or partition slice on a SCSI disk and returns a small fd; Read/
+ * Seek/Close/GetReadStatus operate on that fd. sash's own filesystem layers
+ * (sdvh/xfs/efs install) build on these to read the volume header + XFS/EFS.
+ */
+
+typedef struct ARCSFd {
+    bool in_use;
+    BlockBackend *blk;
+    uint64_t base;      /* partition start, in bytes (512*firstlbn) */
+    uint64_t offset;    /* byte offset within the partition */
+    uint64_t size;      /* partition size, in bytes */
+} ARCSFd;
+
+static ARCSFd arcs_fds[ARCS_MAX_FDS];
+
+static uint32_t arcs_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static BlockBackend *arcs_scsi_backend(int bus, int unit)
+{
+    DriveInfo *dinfo = drive_get(IF_SCSI, bus, unit);
+    return dinfo ? blk_by_legacy_dinfo(dinfo) : NULL;
+}
+
+static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
+                          uint32_t fd_va)
+{
+    char *name;
+    int bus, unit, part;
+    BlockBackend *blk;
+    uint8_t vh[512];
+    const uint8_t *pt;
+    int fd;
+
+    if (mode != 0 /* OpenReadOnly */) {
+        return ARCS_EINVAL;
+    }
+
+    name = read_guest_string_va(path_va, 128);
+    if (sscanf(name, "dksc(%d,%d,%d)", &bus, &unit, &part) != 3) {
+        g_free(name);
+        return ARCS_ENODEV;
+    }
+    g_free(name);
+
+    blk = arcs_scsi_backend(bus, unit);
+    if (!blk) {
+        return ARCS_ENODEV;
+    }
+
+    /* Allocate an fd slot first (we write the fd only on success). */
+    for (fd = 0; fd < ARCS_MAX_FDS && arcs_fds[fd].in_use; fd++) {
+    }
+    if (fd == ARCS_MAX_FDS) {
+        return ARCS_EIO;
+    }
+
+    if (blk_pread(blk, 0, 512, vh, 0) < 0 || arcs_be32(&vh[0]) != SGI_VH_MAGIC) {
+        return ARCS_EIO;
+    }
+    if (part < 0 || part >= SGI_VH_NPARTAB) {
+        return ARCS_EINVAL;
+    }
+    pt = &vh[SGI_VH_PARTAB_OFF + part * SGI_VH_PT_ENTSZ];
+    uint32_t nblks = arcs_be32(pt + 0);
+    uint32_t firstlbn = arcs_be32(pt + 4);
+
+    arcs_fds[fd].in_use = true;
+    arcs_fds[fd].blk = blk;
+    arcs_fds[fd].base = (uint64_t)firstlbn * 512;
+    arcs_fds[fd].offset = 0;
+    arcs_fds[fd].size = (uint64_t)nblks * 512;
+
+    /* Write the fd back to the guest's output pointer. */
+    uint32_t fd_be = cpu_to_be32(fd);
+    cpu_memory_rw_debug(first_cpu, arcs_guest_va(fd_va), (uint8_t *)&fd_be,
+                        4, 1);
+    qemu_log("ARCS: Open(\"dksc(%d,%d,%d)\") -> fd %d (lbn %u, %u blks)\n",
+             bus, unit, part, fd, firstlbn, nblks);
+    return ARCS_ESUCCESS;
+}
+
+static uint32_t arcs_read(SGIARCSState *s, uint32_t fd, uint32_t buf_va,
+                          uint32_t cnt, uint32_t count_va)
+{
+    ARCSFd *f;
+    uint8_t *buf;
+    uint32_t got = 0;
+    uint32_t count_be;
+
+    if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
+        return ARCS_EINVAL;
+    }
+    f = &arcs_fds[fd];
+    if (f->offset >= f->size) {
+        /* EOF: report 0 bytes read */
+        count_be = cpu_to_be32(0);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
+                            (uint8_t *)&count_be, 4, 1);
+        return ARCS_ESUCCESS;
+    }
+    uint32_t avail = MIN((uint64_t)cnt, f->size - f->offset);
+    buf = g_malloc(avail);
+    if (blk_pread(f->blk, f->base + f->offset, avail, buf, 0) < 0) {
+        g_free(buf);
+        return ARCS_EIO;
+    }
+    cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_va), buf, avail, 1);
+    f->offset += avail;
+    got = avail;
+    g_free(buf);
+
+    count_be = cpu_to_be32(got);
+    cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
+                        (uint8_t *)&count_be, 4, 1);
+    qemu_log("ARCS: Read(fd=%u, %u) -> %u bytes\n", fd, cnt, got);
+    return ARCS_ESUCCESS;
+}
+
+static uint32_t arcs_seek(SGIARCSState *s, uint32_t fd, uint32_t off_va,
+                          uint32_t whence)
+{
+    ARCSFd *f;
+    uint8_t li[8];
+    int64_t off;
+
+    if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
+        return ARCS_EINVAL;
+    }
+    f = &arcs_fds[fd];
+    if (cpu_memory_rw_debug(first_cpu, arcs_guest_va(off_va), li, 8, 0) != 0) {
+        return ARCS_EINVAL;
+    }
+    /* LARGEINTEGER is big-endian {hi (int32), lo (uint32)}. */
+    off = ((int64_t)(int32_t)be32_to_cpu(*(uint32_t *)li) << 32) |
+          be32_to_cpu(*(uint32_t *)(li + 4));
+
+    if (whence == 0 /* SeekAbsolute */) {
+        f->offset = (uint64_t)off;
+    } else /* SeekRelative */ {
+        f->offset += off;
+    }
+    qemu_log("ARCS: Seek(fd=%u, %s %" PRId64 ") -> offset %" PRIu64 "\n",
+             fd, whence == 0 ? "abs" : "rel", off, f->offset);
+    return ARCS_ESUCCESS;
+}
+
+static uint32_t arcs_close(SGIARCSState *s, uint32_t fd)
+{
+    if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
+        return ARCS_EINVAL;
+    }
+    arcs_fds[fd].in_use = false;
+    qemu_log("ARCS: Close(fd=%u)\n", fd);
+    return ARCS_ESUCCESS;
+}
+
+static uint32_t arcs_get_read_status(SGIARCSState *s, uint32_t fd)
+{
+    ARCSFd *f;
+
+    if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
+        return ARCS_EINVAL;
+    }
+    f = &arcs_fds[fd];
+    return (f->offset < f->size) ? (uint32_t)(f->size - f->offset) : 0;
+}
+
 static void arcs_hypercall(SGIARCSState *s)
 {
     switch (s->func) {
@@ -394,14 +591,25 @@ static void arcs_hypercall(SGIARCSState *s)
         break;
 
     case ARCS_FN_OPEN:
-        /* Return error — no filesystem support */
-        s->result = 2;  /* ENOENT equivalent */
+        s->result = arcs_open(s, s->arg0, s->arg1, s->arg2);
         break;
 
     case ARCS_FN_CLOSE:
+        s->result = arcs_close(s, s->arg0);
+        break;
+
     case ARCS_FN_READ:
+        s->result = arcs_read(s, s->arg0, s->arg1, s->arg2, s->arg3);
+        break;
+
     case ARCS_FN_GETREADSTATUS:
+        s->result = arcs_get_read_status(s, s->arg0);
+        break;
+
     case ARCS_FN_SEEK:
+        s->result = arcs_seek(s, s->arg0, s->arg1, s->arg2);
+        break;
+
     case ARCS_FN_MOUNT:
     case ARCS_FN_GETDIRENTRY:
     case ARCS_FN_GETFILEINFO:
@@ -410,7 +618,7 @@ static void arcs_hypercall(SGIARCSState *s)
     case ARCS_FN_SAVECONFIGURATION:
     case ARCS_FN_LOAD:
     case ARCS_FN_INVOKE:
-        s->result = 6;  /* EIO — not implemented */
+        s->result = ARCS_EIO;  /* not implemented */
         break;
 
     case ARCS_FN_GETPEER:
@@ -511,6 +719,8 @@ static uint64_t sgi_arcs_read(void *opaque, hwaddr offset, unsigned size)
         return s->arg1;
     case ARCS_REG_ARG2:
         return s->arg2;
+    case ARCS_REG_ARG3:
+        return s->arg3;
     default:
         qemu_log_mask(LOG_UNIMP, "ARCS: read from unknown offset 0x%x\n",
                       (unsigned)offset);
@@ -532,6 +742,9 @@ static void sgi_arcs_write(void *opaque, hwaddr offset,
         break;
     case ARCS_REG_ARG2:
         s->arg2 = (uint32_t)value;
+        break;
+    case ARCS_REG_ARG3:
+        s->arg3 = (uint32_t)value;
         break;
     case ARCS_REG_FUNC:
         /* Writing the function ID triggers the hypercall */
@@ -574,9 +787,10 @@ static const MemoryRegionOps sgi_arcs_ops = {
  *   jr   ra               # return
  *   nop                   # branch delay slot
  *
- * All values are big-endian (MIPS BE).
+ * All values are big-endian (MIPS BE). 11 instructions (44 B) so the 4-arg
+ * Read/Write count-out pointer (a3) can be passed via ARCS_REG_ARG3.
  */
-#define STUB_INSN_COUNT 10
+#define STUB_INSN_COUNT 11
 #define STUB_SIZE       (STUB_INSN_COUNT * 4)
 
 /* MIPS instruction encoding helpers */
@@ -592,6 +806,7 @@ static const MemoryRegionOps sgi_arcs_ops = {
 #define REG_A0  4
 #define REG_A1  5
 #define REG_A2  6
+#define REG_A3  7
 #define REG_T0  8
 #define REG_T1  9
 #define REG_RA  31
@@ -610,17 +825,18 @@ static void generate_arcs_stub(uint32_t *buf, int func_id)
     buf[2] = cpu_to_be32(MIPS_SW(REG_A0, ARCS_REG_ARG0, REG_T0));
     buf[3] = cpu_to_be32(MIPS_SW(REG_A1, ARCS_REG_ARG1, REG_T0));
     buf[4] = cpu_to_be32(MIPS_SW(REG_A2, ARCS_REG_ARG2, REG_T0));
+    buf[5] = cpu_to_be32(MIPS_SW(REG_A3, ARCS_REG_ARG3, REG_T0));
 
     /* Load function ID into t1 and write to trigger */
-    buf[5] = cpu_to_be32(MIPS_ORI(REG_T1, 0, func_id));
-    buf[6] = cpu_to_be32(MIPS_SW(REG_T1, ARCS_REG_FUNC, REG_T0));
+    buf[6] = cpu_to_be32(MIPS_ORI(REG_T1, 0, func_id));
+    buf[7] = cpu_to_be32(MIPS_SW(REG_T1, ARCS_REG_FUNC, REG_T0));
 
     /* Read result */
-    buf[7] = cpu_to_be32(MIPS_LW(REG_V0, ARCS_REG_RESULT, REG_T0));
+    buf[8] = cpu_to_be32(MIPS_LW(REG_V0, ARCS_REG_RESULT, REG_T0));
 
     /* Return */
-    buf[8] = cpu_to_be32(MIPS_JR(REG_RA));
-    buf[9] = cpu_to_be32(MIPS_NOP);
+    buf[9] = cpu_to_be32(MIPS_JR(REG_RA));
+    buf[10] = cpu_to_be32(MIPS_NOP);
 }
 
 /* ------------------------------------------------------------------ */
@@ -981,8 +1197,10 @@ static void sgi_arcs_reset(DeviceState *dev)
     s->arg0 = 0;
     s->arg1 = 0;
     s->arg2 = 0;
+    s->arg3 = 0;
     s->result = 0;
     s->memdesc_index = 0;
+    memset(arcs_fds, 0, sizeof(arcs_fds));
 }
 
 static const Property sgi_arcs_properties[] = {
