@@ -380,7 +380,7 @@ static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
     const uint8_t *pt;
     int fd;
 
-    if (mode != 0 /* OpenReadOnly */) {
+    if (mode != 0 /* OpenReadOnly */ && mode != 7 /* OpenDirectory */) {
         return ARCS_EINVAL;
     }
 
@@ -958,8 +958,13 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
         memset(sash_args, 0, sizeof(sash_args));
         memcpy(&sash_args[ARCS_SASH_ARGS_STR_OFF], "dksc(0,1,0)/sash",
                sizeof("dksc(0,1,0)/sash"));
-        memcpy(&sash_args[ARCS_SASH_ARGS_STR1_OFF], "OSLoadOptions=auto",
-               sizeof("OSLoadOptions=auto"));
+        /* argv[1] selects autoboot vs sash command monitor. "OSLoadOptions=auto"
+         * autoboots; any other "OSLoadOptions=..." value falls through sash's
+         * main() to command_parser (the "sash: " prompt) — the C3/recovery and
+         * file-service test path. */
+        const char *osopts = getenv("SGI_MODE_C_SASH_CMD") ? "OSLoadOptions=cmd"
+                                                           : "OSLoadOptions=auto";
+        memcpy(&sash_args[ARCS_SASH_ARGS_STR1_OFF], osopts, strlen(osopts) + 1);
 
         /* environ: the same vars the ARCS GetEnvironmentVariable serves. */
         cursor = ARCS_SASH_ARGS_ENV_OFF;
