@@ -516,7 +516,7 @@ static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
 static int sgi_load_elf32_be_runtime(const uint8_t *img, size_t len,
                                      uint32_t *entry, uint32_t *high_phys);
 
-static void sgi_virtuix_execute(uint32_t path_va)
+static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va)
 {
     CPUState *cs = first_cpu;
     MIPSCPU *cpu = MIPS_CPU(cs);
@@ -604,6 +604,17 @@ static void sgi_virtuix_execute(uint32_t path_va)
         return;
     }
     qemu_log("ARCS Execute: entry 0x%08x, jumping to kernel\n", kentry);
+
+    /*
+     * sash setenv("kernname", <boot path>) right before Execute, but our
+     * firmware passes its own static environ (a2) to the kernel — which lacks
+     * kernname.  The kernel's getargs()/mload.c then logs "Kernname environment
+     * variable not set by sash" and refuses to load the runtime symbol table,
+     * so loadable modules (a2_dd audio) never register.  The Execute path IS
+     * the kernname value (sash sets them equal), so append it to the kernel
+     * environ before handing off.
+     */
+    sgi_arcs_set_kernel_env(arcs, "kernname", path);
 
     /*
      * The kernel entry (and the ARCS environ pointer) are 32-bit kseg0

@@ -58,9 +58,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIARCSState, SGI_ARCS)
  * Physical 0x2000+ aliases to 0x08002000+ where the kernel LOAD segment
  * starts, so any data there gets overwritten by the kernel image.
  */
-#define ARCS_ENVIRON_PHYS   0x00001E40  /* Kernel environ pointer array */
-#define ARCS_ENVSTRS_PHYS   0x00001E80  /* Kernel environ "key=value" strings */
-#define ARCS_ENVSTRS_SIZE   384         /* Max bytes for environ strings */
+#define ARCS_ENVIRON_PHYS   0x00001E40  /* Kernel environ pointer array (18 slots) */
+#define ARCS_ENVSTRS_PHYS   0x00001E88  /* Kernel environ "key=value" strings */
+#define ARCS_ENVSTRS_SIZE   376         /* Max bytes for environ strings */
 
 /*
  * RestartBlock (arcs/restart.h): the firmware's restart/crash-recovery block.
@@ -200,6 +200,11 @@ struct SGIARCSState {
     /* Memory descriptor iteration state */
     int memdesc_index;
 
+    /* Kernel environ (a2) state: how many "key=value" entries and string
+     * bytes are already placed, so Execute can append kernname. */
+    uint32_t kernel_env_count;
+    uint32_t kernel_env_str_off;
+
     /* Machine configuration */
     uint32_t ram_size;
     uint32_t kernel_end_phys;   /* Physical address after kernel image */
@@ -218,7 +223,19 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as);
  * Register the Execute() implementation (load + run /unix from the boot disk).
  * Lives in the machine (sgi_virtuix.c) because it needs the XFS reader and the
  * per-target MIPS CPU — neither is reachable from the system-target sgi_arcs.c.
+ * The callback receives the ARCS state (for kernname/args access) and the guest
+ * VA of the Execute path string.
  */
-void sgi_arcs_set_execute_cb(void (*cb)(uint32_t path_va));
+void sgi_arcs_set_execute_cb(void (*cb)(SGIARCSState *s, uint32_t path_va));
+
+/*
+ * Append a "name=value" entry to the kernel environ (the a2 envp handed to
+ * /unix on Execute). Used at Execute time to add "kernname=<boot path>" so the
+ * kernel can load its runtime symbol table and register loadable modules
+ * (a2_dd). Writes into guest RAM below physical 0x2000 (which survives the
+ * kernel's own LOAD segment at 0x08002000+).
+ */
+void sgi_arcs_set_kernel_env(SGIARCSState *s, const char *name,
+                             const char *value);
 
 #endif /* HW_MISC_SGI_ARCS_H */

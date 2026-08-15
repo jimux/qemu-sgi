@@ -339,11 +339,58 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
 static uint32_t arcs_relative_time;
 
 /* Execute() implementation, registered by the machine (sgi_virtuix.c). */
-static void (*arcs_execute_cb)(uint32_t path_va);
+static void (*arcs_execute_cb)(SGIARCSState *s, uint32_t path_va);
 
-void sgi_arcs_set_execute_cb(void (*cb)(uint32_t path_va))
+void sgi_arcs_set_execute_cb(void (*cb)(SGIARCSState *s, uint32_t path_va))
 {
     arcs_execute_cb = cb;
+}
+
+/*
+ * Append a "name=value" entry to the kernel environ. See the header decl.
+ * Writes into guest RAM (below phys 0x2000) so it survives the kernel's own
+ * LOAD segment; big-endian pointer array + NUL-terminated strings.
+ */
+void sgi_arcs_set_kernel_env(SGIARCSState *s, const char *name,
+                             const char *value)
+{
+    int name_len = strlen(name);
+    int value_len = strlen(value);
+    int entry_len = name_len + 1 + value_len + 1;  /* "name=value\0" */
+    uint8_t ptr[4];
+    char *str;
+
+    if (s->kernel_env_count + 1 >= 18) {
+        qemu_log("ARCS: kernel environ full, cannot add %s\n", name);
+        return;
+    }
+    if (s->kernel_env_str_off + entry_len > ARCS_ENVSTRS_SIZE) {
+        qemu_log("ARCS: kernel environ strings full, cannot add %s\n", name);
+        return;
+    }
+
+    /* Pointer (big-endian K0SEG VA of the string) at the next free slot. */
+    stl_be_p(ptr, MIPS_K0BASE + ARCS_ENVSTRS_PHYS + s->kernel_env_str_off);
+    address_space_write(&address_space_memory,
+                        ARCS_ENVIRON_PHYS + s->kernel_env_count * 4,
+                        MEMTXATTRS_UNSPECIFIED, ptr, 4);
+
+    /* "name=value\0" at the next free string byte. */
+    str = g_malloc(entry_len);
+    snprintf(str, entry_len, "%s=%s", name, value);
+    address_space_write(&address_space_memory,
+                        ARCS_ENVSTRS_PHYS + s->kernel_env_str_off,
+                        MEMTXATTRS_UNSPECIFIED, str, entry_len);
+    g_free(str);
+
+    s->kernel_env_count++;
+    s->kernel_env_str_off += entry_len;
+
+    /* NULL terminator after the new entry. */
+    stl_be_p(ptr, 0);
+    address_space_write(&address_space_memory,
+                        ARCS_ENVIRON_PHYS + s->kernel_env_count * 4,
+                        MEMTXATTRS_UNSPECIFIED, ptr, 4);
 }
 
 /* ------------------------------------------------------------------ */
@@ -637,7 +684,7 @@ static void arcs_hypercall(SGIARCSState *s)
         /* Load + run the named /unix (sash autoboot). The implementation lives
          * in the machine (sgi_virtuix.c) via the registered callback. */
         if (arcs_execute_cb) {
-            arcs_execute_cb(s->arg0);
+            arcs_execute_cb(s, s->arg0);
         }
         s->result = 0;  /* not reached if the jump succeeds */
         break;
@@ -1234,7 +1281,7 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
      */
     {
         uint8_t env_strs[ARCS_ENVSTRS_SIZE];
-        uint32_t env_ptrs[16];  /* max 15 environ entries + NULL */
+        uint32_t env_ptrs[18];  /* up to 17 environ entries + NULL (kernname) */
         int str_off = 0;
         int ptr_idx = 0;
 
@@ -1249,7 +1296,7 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
             if (str_off + entry_len > (int)sizeof(env_strs) - 1) {
                 break;
             }
-            if (ptr_idx >= 15) {
+            if (ptr_idx >= 17) {
                 break;
             }
 
@@ -1273,6 +1320,11 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
                            (ptr_idx + 1) * 4, ARCS_ENVIRON_PHYS);
         rom_add_blob_fixed("arcs-environ-strs", env_strs,
                            str_off, ARCS_ENVSTRS_PHYS);
+
+        /* Record the fill level so Execute can append kernname (the one env
+         * var sash adds via setenv before calling Execute). */
+        s->kernel_env_count = ptr_idx;
+        s->kernel_env_str_off = str_off;
 
         qemu_log("ARCS: %d environ entries for kernel getargs()\n", ptr_idx);
     }
