@@ -293,11 +293,16 @@ static uint32_t arcs_get_env_var(SGIARCSState *s, uint32_t arg0)
     return result;
 }
 
+/* Host-file env persistence (defined below). */
+static void arcs_env_persist(const char *name, const char *value);
+static void arcs_env_buf_override(char *buf, int *len, int cap,
+                                  const char *name, const char *value);
+static int arcs_env_apply_persisted(char *env_buf, int *env_len, int env_size);
+
 /*
  * SetEnvironmentVariable(name, value) — update the firmware environment in
  * guest memory (ARCS_ENVDATA_PHYS). Rebuilds the "key\0value\0..." blob so
- * GetEnvironmentVariable returns the new value. In-memory only (host-file
- * NVRAM persistence is a separate follow-up).
+ * GetEnvironmentVariable returns the new value, and persists to a host file.
  *
  * arg0 = guest VA of the variable name; arg1 = guest VA of the value.
  * Returns ESUCCESS (0) or ARCS_EINVAL.
@@ -368,6 +373,7 @@ static uint32_t arcs_set_env_var_impl(SGIARCSState *s, const char *name,
 
     qemu_log("ARCS: SetEnvironmentVariable(\"%s\") = \"%s\" (%s)\n",
              name, value, replaced ? "replaced" : "appended");
+    arcs_env_persist(name, value);  /* survive reboot (host-file NVRAM) */
     g_free(blob);
     g_free(out);
     return ARCS_ESUCCESS;
@@ -388,6 +394,88 @@ static uint32_t arcs_set_env_var(SGIARCSState *s, uint32_t name_va,
     g_free(name);
     g_free(value);
     return rc;
+}
+
+/*
+ * Host-file persistence for SetEnvironmentVariable ("env set with NVRAM
+ * persistence", C1). Appends "name=value\n" to a host file (relative, like the
+ * virtuix NVRAM); on the NEXT boot sgi_arcs_setup_stubs() replays those lines
+ * over the static env. Last occurrence wins.
+ */
+#define ARCS_ENV_PERSIST_FILE "sgi_arcs_env.conf"
+
+static void arcs_env_persist(const char *name, const char *value)
+{
+    FILE *f = fopen(ARCS_ENV_PERSIST_FILE, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "%s=%s\n", name, value);
+    fclose(f);
+}
+
+/*
+ * Override/add a "key\0value\0" entry in a HOST "key\0value\0..." blob, in
+ * place. Same rebuild semantics as arcs_set_env_var_impl but on host memory,
+ * so persisted env can be replayed before the blob is written to guest RAM.
+ */
+static void arcs_env_buf_override(char *buf, int *len, int cap,
+                                  const char *name, const char *value)
+{
+    char out[ARCS_ENVDATA_SIZE];
+    int out_len = 0;
+    int i = 0;
+
+    while (i < *len && buf[i] != '\0') {
+        int klen = strlen(buf + i);
+        int vlen = strlen(buf + i + klen + 1);
+        if (strcasecmp(name, buf + i) != 0) {
+            memcpy(out + out_len, buf + i, klen + 1 + vlen + 1);
+            out_len += klen + 1 + vlen + 1;
+        }
+        i += klen + 1 + vlen + 1;
+    }
+    if (out_len + (int)strlen(name) + 1 + (int)strlen(value) + 1 < cap) {
+        memcpy(out + out_len, name, strlen(name));
+        out_len += strlen(name);
+        out[out_len++] = '\0';
+        memcpy(out + out_len, value, strlen(value));
+        out_len += strlen(value);
+        out[out_len++] = '\0';
+        memcpy(buf, out, out_len + 1);
+        *len = out_len;
+    }
+}
+
+/*
+ * Replay any persisted env lines (from a prior boot) over the host env blob
+ * before it is written to guest RAM. Returns the number of overrides applied.
+ */
+static int arcs_env_apply_persisted(char *env_buf, int *env_len, int env_size)
+{
+    FILE *f = fopen(ARCS_ENV_PERSIST_FILE, "r");
+    char line[256];
+    int applied = 0;
+
+    if (!f) {
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        char *nl;
+        if (!eq) {
+            continue;
+        }
+        nl = strchr(line, '\n');
+        if (nl) {
+            *nl = '\0';
+        }
+        *eq = '\0';
+        arcs_env_buf_override(env_buf, env_len, env_size, line, eq + 1);
+        applied++;
+    }
+    fclose(f);
+    return applied;
 }
 
 /*
@@ -1349,6 +1437,15 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
         env_offset += key_len + 1;
         memcpy(&env_buf[env_offset], arcs_env_vars[i].value, val_len + 1);
         env_offset += val_len + 1;
+    }
+
+    /* Replay env persisted by a prior boot's SetEnvironmentVariable. */
+    {
+        int overrides = arcs_env_apply_persisted((char *)env_buf, &env_offset,
+                                                 ARCS_ENVDATA_SIZE);
+        if (overrides) {
+            qemu_log("ARCS: applied %d persisted env override(s)\n", overrides);
+        }
     }
 
     rom_add_blob_fixed("arcs-env", env_buf, sizeof(env_buf),
