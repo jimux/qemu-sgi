@@ -490,12 +490,13 @@ static int arcs_env_apply_persisted(char *env_buf, int *env_len, int env_size)
  * later uses. Returns 0 (ESUCCESS).
  */
 static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
-                           uint32_t count)
+                           uint32_t count, uint32_t count_va)
 {
     char *buf;
+    uint32_t nwritten = 0;
 
     if (count == 0 || count > 4096) {
-        return 0;
+        goto out_count;
     }
 
     buf = g_malloc(count + 1);
@@ -503,7 +504,7 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
     if (cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_ptr), (uint8_t *)buf,
                             count, 0) != 0) {
         g_free(buf);
-        return 0;
+        goto out_count;
     }
     buf[count] = '\0';
 
@@ -514,6 +515,14 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
     }
 
     g_free(buf);
+    nwritten = count;
+
+out_count:
+    if (count_va) {
+        uint32_t count_be = cpu_to_be32(nwritten);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
+                            (uint8_t *)&count_be, 4, 1);
+    }
     return 0;  /* ESUCCESS */
 }
 
@@ -810,7 +819,7 @@ static void arcs_hypercall(SGIARCSState *s)
         break;
 
     case ARCS_FN_WRITE:
-        s->result = arcs_write(s, s->arg0, s->arg1, s->arg2);
+        s->result = arcs_write(s, s->arg0, s->arg1, s->arg2, s->arg3);
         break;
 
     case ARCS_FN_GETRELATIVETIME:
