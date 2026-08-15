@@ -834,6 +834,101 @@ static int sgi_sash_relocate(uint8_t *sash, size_t sash_size) {
 }
 
 /*
+ * Path I (install mini-kernel) — C3 first step. Load a standalone kseg1 ECOFF
+ * (the install CD's /stand/ide.IP22) from a HOST path (SGI_MODE_C_IDE, the
+ * virtualization-native "boot from host path") and jump to its entry.
+ *
+ * ide.IP22 is a FULLY-LINKED ECOFF: f_nscns=3, no symbol table (f_symptr=0),
+ * nreloc=0 on every section, linked in kseg1 at 0xa8400000 (entry 0x885025d0).
+ * So — unlike the relocatable disk sash — there are NO relocations and NO kuseg
+ * TLB mapping: place each section at PA = vaddr & 0x1fffffff, and reuse the Mode
+ * K kernel trampoline (jumps a kseg0 entry with argc=0/envp=ARCS environ).
+ * See progress_notes/ip55/prom_c3_install_scoping.md.
+ */
+static void sgi_virtuix_load_ide_ecoff(const char *path, MachineState *machine,
+                                       MemoryRegion *system_memory) {
+  gsize ide_len = 0;
+  uint8_t *ide = NULL;
+  GError *err = NULL;
+  uint16_t f_magic, f_nscns, a_magic;
+  uint32_t entry;
+  uint32_t kernel_end = 0;
+  int n;
+
+  if (!g_file_get_contents(path, (char **)&ide, &ide_len, &err) || !ide) {
+    error_report("Mode C IDE: cannot read %s: %s", path,
+                 err ? err->message : "unknown error");
+    if (err) {
+      g_error_free(err);
+    }
+    return;
+  }
+  if (ide_len < 76) {
+    error_report("Mode C IDE: %s too small for an ECOFF header", path);
+    g_free(ide);
+    return;
+  }
+  f_magic = sgi_be16(&ide[0]);
+  f_nscns = sgi_be16(&ide[2]);
+  a_magic = sgi_be16(&ide[20]);
+  entry = sgi_be32(&ide[36]);
+  if (f_magic != 0x0160 || a_magic != 0x0107) {
+    error_report("Mode C IDE: %s is not a standalone ECOFF "
+                 "(f_magic=0x%04x a_magic=0x%04x)", path, f_magic, a_magic);
+    g_free(ide);
+    return;
+  }
+  if (f_nscns > 16) {
+    error_report("Mode C IDE: %u sections (too many)", f_nscns);
+    g_free(ide);
+    return;
+  }
+
+  for (n = 0; n < f_nscns; n++) {
+    const uint8_t *sh = &ide[76 + n * 40];
+    char name[9];
+    uint32_t vaddr = sgi_be32(&sh[12]);
+    uint32_t size = sgi_be32(&sh[16]);
+    uint32_t scnptr = sgi_be32(&sh[20]);
+    uint32_t phys = vaddr & 0x1fffffff;
+    memcpy(name, sh, 8);
+    name[8] = '\0';
+
+    if (scnptr >= ide_len || scnptr + size > ide_len) {
+      /* .bss (no file data): zero-fill. */
+      void *zero = g_malloc0(size);
+      rom_add_blob_fixed("ide-bss", zero, size, phys);
+      g_free(zero);
+    } else {
+      rom_add_blob_fixed("ide-sec", ide + scnptr, size, phys);
+    }
+    if (phys + size > kernel_end) {
+      kernel_end = phys + size;
+    }
+    qemu_log("Mode C IDE: section %-8s vaddr=0x%08x -> phys 0x%08x (%u B)\n",
+             name, vaddr, phys, size);
+  }
+  g_free(ide);
+
+  qemu_log("Mode C IDE: loaded %s, entry 0x%08x\n", path, entry);
+  write_kernel_trampoline(entry);
+
+  /* ARCS firmware stubs (identical Mode K tail) so the mini-kernel finds the
+   * SPB/FV/env/memdesc. */
+  DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
+  qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+  qdev_prop_set_uint32(arcs_dev, "kernel-end", kernel_end);
+  if (serial_hd(1)) {
+    qdev_prop_set_chr(arcs_dev, "chardev", serial_hd(1));
+  }
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
+  memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
+                                      &SGI_ARCS(arcs_dev)->iomem, 10);
+  sgi_arcs_setup_stubs(SGI_ARCS(arcs_dev), &address_space_memory);
+  qemu_log("Mode C IDE: firmware ready; handing off to mini-kernel\n");
+}
+
+/*
  * Mode C boot (Path C — director decision 2026-07-07): our paravirtual ARCS
  * PROM reads the disk's /unix host-side from the XFS root partition, loads it,
  * and jumps — no guest sash, no -kernel, no borrowed Indy -bios. Reuses the
@@ -852,6 +947,14 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
   int i;
 
   qemu_log("Virtuix: Mode C (our IP55 PROM) — booting disk /unix host-side\n");
+
+  /* Path I (install mini-kernel from host path): env-gated; skips the disk
+   * boot chain entirely. */
+  const char *ide_path = getenv("SGI_MODE_C_IDE");
+  if (ide_path && *ide_path) {
+    sgi_virtuix_load_ide_ecoff(ide_path, machine, system_memory);
+    return;
+  }
 
   /* Boot disk is if=scsi,bus=0,unit=1 (the canonical golden convention). */
   dinfo = drive_get(IF_SCSI, 0, 1);
