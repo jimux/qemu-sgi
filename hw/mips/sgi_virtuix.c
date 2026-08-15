@@ -806,11 +806,40 @@ static int sgi_sash_relocate(uint8_t *sash, size_t sash_size) {
         *wp = cpu_to_be32((sgi_be32((uint8_t *)wp) & 0xFC000000u) |
                           ((disp >> 2) & 0x03FFFFFFu));
         break;
-      case 4: { /* R_REFHI — high 16 of a lui (peek the following addiu lo) */
+      case 4: { /* R_REFHI — high 16 of a lui */
         uint16_t hi = sgi_be16(&sash[file_off + 2]);
-        uint16_t lo = sgi_be16(&sash[file_off + 6]);
-        uint32_t tw = ((uint32_t)hi << 16) | lo;
+        uint16_t lo = 0;
+        uint32_t tw;
         uint16_t res;
+        /*
+         * The R_REFLO addend is NOT necessarily the immediately-following
+         * instruction: the IRIX compiler emits lui / addu(reg) / lbu for the
+         * ctype-table lookup in sash's isprint(), with the R_REFLO on the lbu
+         * two insns later. Peeking file_off+6 there read the addu's register
+         * fields (0xc821) as a garbage low-16, corrupting the table base and
+         * making isprint() return false for every ASCII char (the C4 input
+         * beep). Find the paired R_REFLO (same symbol, type 5) in the reloc
+         * table and use ITS instruction immediate as the addend instead.
+         */
+        for (int j = i + 1; j < (int)nreloc[n]; j++) {
+          uint32_t roff2 = relptr[n] + (uint32_t)j * 8;
+          uint32_t r_vaddr2, word2, r_symndx2, r_type2;
+          if (roff2 + 8 > sash_size) {
+            break;
+          }
+          r_vaddr2 = sgi_be32(&sash[roff2]);
+          word2 = sgi_be32(&sash[roff2 + 4]);
+          r_symndx2 = (word2 >> 8) & 0xFFFFFF;
+          r_type2 = (word2 >> 1) & 0x1F;
+          if (r_type2 == 5 && r_symndx2 == r_symndx) {
+            uint32_t lo_off = scnptr[n] + (r_vaddr2 - vaddr[n]);
+            if (lo_off + 4 <= sash_size) {
+              lo = sgi_be16(&sash[lo_off + 2]);
+            }
+            break;
+          }
+        }
+        tw = ((uint32_t)hi << 16) | lo;
         tw += disp;
         res = (uint16_t)(tw >> 16);
         if (tw & 0x8000) {
