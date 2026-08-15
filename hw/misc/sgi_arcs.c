@@ -115,6 +115,10 @@ static const struct {
 #define ARCS_ENODEV         13
 #define ARCS_ENOENT         14
 
+/* Sentinel the poll stub loops on: a blocking console Read() returns this and
+ * the stub executes a MIPS `wait` until the chardev input arrives. -1. */
+#define ARCS_RESULT_RETRY   0xFFFFFFFFu
+
 #define ARCS_MAX_FDS        20   /* ARCS_FOPEN_MAX */
 
 /* ------------------------------------------------------------------ */
@@ -442,15 +446,17 @@ static uint32_t arcs_read(SGIARCSState *s, uint32_t fd, uint32_t buf_va,
 
     if (fd == 0) {
         /* StandardIn: drain the console input FIFO (filled by the chardev
-         * receive callback). Non-blocking: report 0 bytes when idle. */
+         * receive callback). When idle, return ARCS_RESULT_RETRY so the poll
+         * stub executes a MIPS `wait` (yields to the main loop) and re-triggers. */
         got = MIN((uint32_t)cnt, s->console_rx_len);
-        if (got > 0) {
-            cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_va),
-                                s->console_rx, got, 1);
-            memmove(s->console_rx, s->console_rx + got,
-                    s->console_rx_len - got);
-            s->console_rx_len -= got;
+        if (got == 0) {
+            return ARCS_RESULT_RETRY;
         }
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_va),
+                            s->console_rx, got, 1);
+        memmove(s->console_rx, s->console_rx + got,
+                s->console_rx_len - got);
+        s->console_rx_len -= got;
         count_be = cpu_to_be32(got);
         cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
                             (uint8_t *)&count_be, 4, 1);
@@ -840,10 +846,14 @@ static const MemoryRegionOps sgi_arcs_ops = {
 /* MIPS instruction encoding helpers */
 #define MIPS_LUI(rt, imm)    (0x3C000000 | ((rt) << 16) | ((imm) & 0xFFFF))
 #define MIPS_ORI(rt, rs, imm) (0x34000000 | ((rs) << 21) | ((rt) << 16) | ((imm) & 0xFFFF))
+#define MIPS_ADDIU(rt, rs, imm) (0x24000000 | ((rs) << 21) | ((rt) << 16) | ((imm) & 0xFFFF))
+#define MIPS_BNE(rs, rt, off) (0x14000000 | ((rs) << 21) | ((rt) << 16) | ((off) & 0xFFFF))
+#define MIPS_B(off)           (0x10000000 | ((off) & 0xFFFF))
 #define MIPS_SW(rt, off, rs) (0xAC000000 | ((rs) << 21) | ((rt) << 16) | ((off) & 0xFFFF))
 #define MIPS_LW(rt, off, rs) (0x8C000000 | ((rs) << 21) | ((rt) << 16) | ((off) & 0xFFFF))
 #define MIPS_JR(rs)          (0x00000008 | ((rs) << 21))
 #define MIPS_NOP             0x00000000
+#define MIPS_WAIT            0x40800020
 
 /* Register numbers */
 #define REG_V0  2
@@ -853,6 +863,7 @@ static const MemoryRegionOps sgi_arcs_ops = {
 #define REG_A3  7
 #define REG_T0  8
 #define REG_T1  9
+#define REG_T2  10
 #define REG_RA  31
 
 static void generate_arcs_stub(uint32_t *buf, int func_id)
@@ -881,6 +892,37 @@ static void generate_arcs_stub(uint32_t *buf, int func_id)
     /* Return */
     buf[9] = cpu_to_be32(MIPS_JR(REG_RA));
     buf[10] = cpu_to_be32(MIPS_NOP);
+}
+
+/*
+ * Polling stub for Read/Write: like generate_arcs_stub, but on an
+ * ARCS_RESULT_RETRY result it executes a MIPS `wait` (halts the vCPU -> main
+ * loop delivers chardev input -> CP0 timer interrupt wakes us) then re-triggers
+ * the hypercall. This is the blocking console read.
+ */
+#define POLL_STUB_INSN_COUNT 17
+#define POLL_STUB_SIZE       (POLL_STUB_INSN_COUNT * 4)
+
+static void generate_arcs_stub_poll(uint32_t *buf, int func_id)
+{
+    buf[0] = cpu_to_be32(MIPS_LUI(REG_T0, 0xBF00));
+    buf[1] = cpu_to_be32(MIPS_ORI(REG_T0, REG_T0, 0x0100));
+    buf[2] = cpu_to_be32(MIPS_SW(REG_A0, ARCS_REG_ARG0, REG_T0));
+    buf[3] = cpu_to_be32(MIPS_SW(REG_A1, ARCS_REG_ARG1, REG_T0));
+    buf[4] = cpu_to_be32(MIPS_SW(REG_A2, ARCS_REG_ARG2, REG_T0));
+    buf[5] = cpu_to_be32(MIPS_SW(REG_A3, ARCS_REG_ARG3, REG_T0));
+    buf[6] = cpu_to_be32(MIPS_ORI(REG_T1, 0, func_id));
+    /* loop: */
+    buf[7] = cpu_to_be32(MIPS_SW(REG_T1, ARCS_REG_FUNC, REG_T0));
+    buf[8] = cpu_to_be32(MIPS_LW(REG_V0, ARCS_REG_RESULT, REG_T0));
+    buf[9] = cpu_to_be32(MIPS_ADDIU(REG_T2, 0, (uint16_t)ARCS_RESULT_RETRY));
+    buf[10] = cpu_to_be32(MIPS_BNE(REG_V0, REG_T2, 4));  /* != RETRY -> done */
+    buf[11] = cpu_to_be32(MIPS_NOP);                     /* delay slot */
+    buf[12] = cpu_to_be32(MIPS_WAIT);                    /* == RETRY: halt+yield */
+    buf[13] = cpu_to_be32(MIPS_B(-7));                   /* resume: back to loop */
+    buf[14] = cpu_to_be32(MIPS_NOP);                     /* delay slot */
+    buf[15] = cpu_to_be32(MIPS_JR(REG_RA));              /* done */
+    buf[16] = cpu_to_be32(MIPS_NOP);                     /* delay slot */
 }
 
 /* ------------------------------------------------------------------ */
@@ -927,10 +969,29 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     rom_add_blob_fixed("arcs-stubs", stub_code, sizeof(stub_code),
                        ARCS_STUBS_PHYS);
 
+    /* Read/Write get a POLLING stub (waits on ARCS_RESULT_RETRY via MIPS wait)
+     * for the blocking console read. Placed just past the uniform array; the
+     * FV slots for Read/Write are re-pointed at these after the table below. */
+    {
+        uint32_t poll_stub[2 * POLL_STUB_INSN_COUNT];
+        uint32_t poll_base = ARCS_STUBS_PHYS + ARCS_PFN_TOTAL_COUNT * STUB_SIZE;
+        generate_arcs_stub_poll(&poll_stub[0], ARCS_FN_READ);
+        generate_arcs_stub_poll(&poll_stub[POLL_STUB_INSN_COUNT], ARCS_FN_WRITE);
+        rom_add_blob_fixed("arcs-stubs-poll", poll_stub, sizeof(poll_stub),
+                           poll_base);
+    }
+
     /* ---- Build FirmwareVector (array of 35 K0SEG function pointers) ---- */
     for (i = 0; i < ARCS_FV_SLOTS; i++) {
         stub_offset = ARCS_STUBS_PHYS + i * STUB_SIZE;
         fv[i] = cpu_to_be32(MIPS_K0BASE + stub_offset);
+    }
+    /* Re-point Read/Write at the polling stubs (overrides the uniform slots). */
+    {
+        uint32_t poll_base = ARCS_STUBS_PHYS + ARCS_PFN_TOTAL_COUNT * STUB_SIZE;
+        fv[ARCS_FN_READ] = cpu_to_be32(MIPS_K0BASE + poll_base);
+        fv[ARCS_FN_WRITE] = cpu_to_be32(MIPS_K0BASE + poll_base +
+                                        POLL_STUB_SIZE);
     }
     rom_add_blob_fixed("arcs-fv", fv, sizeof(fv), ARCS_FV_PHYS);
 
