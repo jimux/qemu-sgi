@@ -498,6 +498,133 @@ static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
 }
 
 /*
+ * Apply the ECOFF relocations in a loaded sash image (host buffer, in place).
+ *
+ * The on-disk sash is a RELOCATABLE ECOFF (f_flags lacks F_RELFLG): its
+ * .text/.rdata/.data carry reloc records and the code/data has relocation
+ * placeholders (e.g. `LA sp,scstack` compiled to `lui sp,0; addiu sp,sp,0`).
+ * Since Path A loads the sash at exactly its linked vaddr (kuseg 0x10000000 ->
+ * phys 0x09000000), the "displacement" for internal (section) references is 0
+ * (no-op), and only EXTERNAL symbol references need the symbol value patched
+ * in. Only 4 reloc types occur in the real sash (REFWORD/REFHI/REFLO/JMPADDR)
+ * and the only external storage classes are Text/Bss/Data/RData (no gp-relative
+ * SData/SBss), so this is the minimal applier, ported from the PROM's
+ * stand/arcs/lib/libsk/lib/dload.c (doload_relocate). Returns 0 on success.
+ */
+static int sgi_sash_relocate(uint8_t *sash, size_t sash_size) {
+  uint16_t f_nscns = sgi_be16(&sash[2]);
+  uint32_t f_symptr = sgi_be32(&sash[8]);
+  uint32_t vaddr[16], scnptr[16], relptr[16];
+  uint32_t nreloc[16];
+  uint32_t iextMax, cbExtOffset;
+  uint32_t *sym_value;
+  int n, i;
+
+  if (f_nscns > 16) {
+    return -1;
+  }
+  /* Section headers at 20 (filehdr) + 56 (aouthdr) = 76, 40 bytes each. */
+  for (n = 0; n < f_nscns; n++) {
+    const uint8_t *sh = &sash[76 + n * 40];
+    vaddr[n] = sgi_be32(&sh[12]);
+    scnptr[n] = sgi_be32(&sh[20]);
+    relptr[n] = sgi_be32(&sh[24]);
+    nreloc[n] = sgi_be16(&sh[32]);
+  }
+
+  /* Symbolic header (HDRR) -> external symbol table. */
+  if (f_symptr == 0 || f_symptr + 96 > sash_size) {
+    return 0;  /* stripped / no external symbols — nothing to do */
+  }
+  iextMax = sgi_be32(&sash[f_symptr + 88]);
+  cbExtOffset = sgi_be32(&sash[f_symptr + 92]);
+  sym_value = g_malloc0(sizeof(uint32_t) * (iextMax ? iextMax : 1));
+  for (i = 0; i < (int)iextMax; i++) {
+    uint32_t off = cbExtOffset + (uint32_t)i * 16;
+    if (off + 16 > sash_size) {
+      g_free(sym_value);
+      return -2;
+    }
+    /* EXTR: word0(4) + asym.iss(4) + asym.value(4) + asym word(4). */
+    sym_value[i] = sgi_be32(&sash[off + 8]);
+  }
+
+  /* Apply each section's reloc records in place. */
+  for (n = 0; n < f_nscns; n++) {
+    for (i = 0; i < (int)nreloc[n]; i++) {
+      uint32_t roff = relptr[n] + (uint32_t)i * 8;
+      uint32_t r_vaddr, word, r_symndx, r_type, r_extern;
+      uint32_t disp, file_off;
+      uint32_t *wp;
+      if (roff + 8 > sash_size) {
+        g_free(sym_value);
+        return -3;
+      }
+      r_vaddr = sgi_be32(&sash[roff]);
+      word = sgi_be32(&sash[roff + 4]);
+      r_symndx = (word >> 8) & 0xFFFFFF;
+      r_type = (word >> 1) & 0x1F;
+      r_extern = word & 1;
+
+      if (!r_extern) {
+        continue;  /* internal (section) ref — loaded at vaddr, disp == 0 */
+      }
+      if (r_symndx >= iextMax) {
+        g_free(sym_value);
+        return -4;
+      }
+      disp = sym_value[r_symndx];
+      if (disp == 0) {
+        continue;
+      }
+      file_off = scnptr[n] + (r_vaddr - vaddr[n]);
+      if (file_off + 4 > sash_size) {
+        g_free(sym_value);
+        return -5;
+      }
+      wp = (uint32_t *)(sash + file_off);
+
+      switch (r_type) {
+      case 2: /* R_REFWORD — 32-bit absolute word */
+        *wp = cpu_to_be32(sgi_be32((uint8_t *)wp) + disp);
+        break;
+      case 3: /* R_JMPADDR — 26-bit jump target */
+        *wp = cpu_to_be32((sgi_be32((uint8_t *)wp) & 0xFC000000u) |
+                          ((disp >> 2) & 0x03FFFFFFu));
+        break;
+      case 4: { /* R_REFHI — high 16 of a lui (peek the following addiu lo) */
+        uint16_t hi = sgi_be16(&sash[file_off + 2]);
+        uint16_t lo = sgi_be16(&sash[file_off + 6]);
+        uint32_t tw = ((uint32_t)hi << 16) | lo;
+        uint16_t res;
+        tw += disp;
+        res = (uint16_t)(tw >> 16);
+        if (tw & 0x8000) {
+          res++;
+        }
+        sash[file_off + 2] = res >> 8;
+        sash[file_off + 3] = res & 0xFF;
+        break;
+      }
+      case 5: { /* R_REFLO — low 16 of an addiu */
+        uint16_t lo = sgi_be16(&sash[file_off + 2]);
+        uint16_t res = (uint16_t)(lo + disp);
+        sash[file_off + 2] = res >> 8;
+        sash[file_off + 3] = res & 0xFF;
+        break;
+      }
+      default:
+        g_free(sym_value);
+        return -6;  /* unexpected reloc type */
+      }
+    }
+  }
+
+  g_free(sym_value);
+  return 0;
+}
+
+/*
  * Mode C boot (Path C — director decision 2026-07-07): our paravirtual ARCS
  * PROM reads the disk's /unix host-side from the XFS root partition, loads it,
  * and jumps — no guest sash, no -kernel, no borrowed Indy -bios. Reuses the
@@ -589,6 +716,13 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
     uint32_t txoff = (20 + 56 + (uint32_t)f_nscns * 40 + 15) & ~15u;
     if ((uint64_t)txoff + tsize + dsize > sash_nbytes) {
       error_report("Mode C Path A: sash sections exceed file size");
+      g_free(sash);
+      return;
+    }
+
+    /* Apply ECOFF relocations (the on-disk sash is relocatable). */
+    if (sgi_sash_relocate(sash, sash_nbytes) < 0) {
+      error_report("Mode C Path A: sash relocation failed");
       g_free(sash);
       return;
     }
