@@ -121,6 +121,18 @@ static char *read_guest_string(hwaddr phys_addr, int max_len)
 }
 
 /*
+ * Sign-extend a guest pointer that arrived through the ARCS stub's `sw a0,4(t0)`.
+ * The stub stores only the low 32 bits of the 64-bit GPR, so a kseg0/kseg1
+ * pointer (e.g. the kernel's 0xffffffff882c652d) arrives here as 0x882c652d and
+ * must be sign-extended back to its 64-bit compat form before cpu_memory_rw_debug
+ * can translate it. Kuseg pointers (sash, < 0x80000000) are unchanged.
+ */
+static inline vaddr arcs_guest_va(uint32_t va32)
+{
+    return (vaddr)(int32_t)va32;
+}
+
+/*
  * Read a NUL-terminated string from a guest VIRTUAL address (handles kuseg ->
  * TLB -> physical, unlike the raw & 0x1FFFFFFF mask which only works for
  * kseg0/kseg1). Used for ARCS args that sash passes from its kuseg memory.
@@ -136,8 +148,8 @@ static char *read_guest_string_va(uint32_t va, int max_len)
         return buf;
     }
     for (i = 0; i < max_len; i++) {
-        if (cpu_memory_rw_debug(cs, (vaddr)va + i, (uint8_t *)&buf[i], 1, 0)
-            != 0) {
+        if (cpu_memory_rw_debug(cs, arcs_guest_va(va) + i, (uint8_t *)&buf[i],
+                                1, 0) != 0) {
             buf[i] = '\0';
             break;
         }
@@ -277,8 +289,8 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
 
     buf = g_malloc(count + 1);
     /* buf_ptr is a guest VA (kuseg for sash, kseg0 for the kernel). */
-    if (cpu_memory_rw_debug(first_cpu, (vaddr)buf_ptr, (uint8_t *)buf, count,
-                            0) != 0) {
+    if (cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_ptr), (uint8_t *)buf,
+                            count, 0) != 0) {
         g_free(buf);
         return 0;
     }
