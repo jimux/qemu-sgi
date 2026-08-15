@@ -441,17 +441,16 @@ static uint32_t arcs_read(SGIARCSState *s, uint32_t fd, uint32_t buf_va,
     uint32_t count_be;
 
     if (fd == 0) {
-        /* StandardIn: the serial console. Non-blocking read; report 0 bytes
-         * (not an error) when nothing is pending so sash's command loop
-         * doesn't spin. */
-        buf = g_malloc(cnt);
-        got = qemu_chr_fe_backend_connected(&s->chr)
-                  ? qemu_chr_fe_read_all(&s->chr, buf, cnt)
-                  : 0;
+        /* StandardIn: drain the console input FIFO (filled by the chardev
+         * receive callback). Non-blocking: report 0 bytes when idle. */
+        got = MIN((uint32_t)cnt, s->console_rx_len);
         if (got > 0) {
-            cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_va), buf, got, 1);
+            cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_va),
+                                s->console_rx, got, 1);
+            memmove(s->console_rx, s->console_rx + got,
+                    s->console_rx_len - got);
+            s->console_rx_len -= got;
         }
-        g_free(buf);
         count_be = cpu_to_be32(got);
         cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
                             (uint8_t *)&count_be, 4, 1);
@@ -534,6 +533,29 @@ static uint32_t arcs_get_read_status(SGIARCSState *s, uint32_t fd)
     }
     f = &arcs_fds[fd];
     return (f->offset < f->size) ? (uint32_t)(f->size - f->offset) : 0;
+}
+
+/* ---- console chardev receive callbacks (input FIFO for Read(StandardIn)) -- */
+
+static int arcs_chr_can_receive(void *opaque)
+{
+    SGIARCSState *s = SGI_ARCS(opaque);
+    return sizeof(s->console_rx) - s->console_rx_len;
+}
+
+static void arcs_chr_receive(void *opaque, const uint8_t *buf, int size)
+{
+    SGIARCSState *s = SGI_ARCS(opaque);
+    int room = sizeof(s->console_rx) - s->console_rx_len;
+    int n = MIN(size, room);
+
+    memcpy(s->console_rx + s->console_rx_len, buf, n);
+    s->console_rx_len += n;
+}
+
+static void arcs_chr_event(void *opaque, QEMUChrEvent ev)
+{
+    /* console open/close needs no special handling */
 }
 
 static void arcs_hypercall(SGIARCSState *s)
@@ -1241,6 +1263,19 @@ static void sgi_arcs_init(Object *obj)
      */
     s->iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    s->console_rx_len = 0;
+}
+
+static void sgi_arcs_realize(DeviceState *dev, Error **errp)
+{
+    SGIARCSState *s = SGI_ARCS(dev);
+
+    /* Bind the firmware console input FIFO to the chardev (if configured). */
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_set_handlers(&s->chr, arcs_chr_can_receive,
+                                 arcs_chr_receive, arcs_chr_event,
+                                 NULL, s, NULL, true);
+    }
 }
 
 static void sgi_arcs_reset(DeviceState *dev)
@@ -1267,6 +1302,7 @@ static void sgi_arcs_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    dc->realize = sgi_arcs_realize;
     device_class_set_legacy_reset(dc, sgi_arcs_reset);
     device_class_set_props(dc, sgi_arcs_properties);
 }

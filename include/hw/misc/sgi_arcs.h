@@ -185,6 +185,9 @@ struct SGIARCSState {
 
     /* Console chardev (serial) for the firmware's Read/Write on fds 0/1/2. */
     CharFrontend  chr;
+    /* Input FIFO filled by the chardev receive callback. */
+    uint8_t console_rx[512];
+    uint32_t console_rx_len;
 
     /* Hypercall registers */
     uint32_t func;
