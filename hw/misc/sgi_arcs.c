@@ -294,6 +294,103 @@ static uint32_t arcs_get_env_var(SGIARCSState *s, uint32_t arg0)
 }
 
 /*
+ * SetEnvironmentVariable(name, value) — update the firmware environment in
+ * guest memory (ARCS_ENVDATA_PHYS). Rebuilds the "key\0value\0..." blob so
+ * GetEnvironmentVariable returns the new value. In-memory only (host-file
+ * NVRAM persistence is a separate follow-up).
+ *
+ * arg0 = guest VA of the variable name; arg1 = guest VA of the value.
+ * Returns ESUCCESS (0) or ARCS_EINVAL.
+ */
+static uint32_t arcs_set_env_var_impl(SGIARCSState *s, const char *name,
+                                      const char *value)
+{
+    uint8_t *blob;
+    uint8_t *out;
+    size_t out_len = 0;
+    hwaddr scan_addr;
+    bool replaced = false;
+    int n;
+
+    if (name[0] == '\0') {
+        return ARCS_EINVAL;
+    }
+
+    /* Read the current env blob and rebuild it with this entry updated. */
+    blob = g_malloc0(ARCS_ENVDATA_SIZE);
+    for (n = 0; n < ARCS_ENVDATA_SIZE; n++) {
+        blob[n] = address_space_ldub(&address_space_memory,
+                                     ARCS_ENVDATA_PHYS + n,
+                                     MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    out = g_malloc0(ARCS_ENVDATA_SIZE);
+
+    /* Copy every existing entry except a same-named one. */
+    scan_addr = 0;
+    while (scan_addr < ARCS_ENVDATA_SIZE && blob[scan_addr] != '\0') {
+        size_t key_len = strlen((char *)&blob[scan_addr]);
+        size_t val_len;
+        hwaddr val_off;
+        if (key_len == 0) {
+            break;
+        }
+        val_off = scan_addr + key_len + 1;
+        val_len = strlen((char *)&blob[val_off]);
+
+        if (strcasecmp(name, (char *)&blob[scan_addr]) != 0) {
+            /* keep this entry */
+            memcpy(out + out_len, blob + scan_addr, key_len + 1 + val_len + 1);
+            out_len += key_len + 1 + val_len + 1;
+        } else {
+            replaced = true;
+        }
+        scan_addr = val_off + val_len + 1;
+    }
+
+    /* Append the (new or updated) entry. */
+    if (out_len + strlen(name) + 1 + strlen(value) + 1 < ARCS_ENVDATA_SIZE - 1) {
+        memcpy(out + out_len, name, strlen(name));
+        out_len += strlen(name);
+        out[out_len++] = '\0';
+        memcpy(out + out_len, value, strlen(value));
+        out_len += strlen(value);
+        out[out_len++] = '\0';
+    } else {
+        g_free(blob);
+        g_free(out);
+        return ARCS_EIO;  /* env area exhausted */
+    }
+
+    /* Write the rebuilt blob back (the double-NUL terminator comes from the
+     * zeroed buffer). */
+    address_space_write(&address_space_memory, ARCS_ENVDATA_PHYS,
+                        MEMTXATTRS_UNSPECIFIED, out, out_len + 1);
+
+    qemu_log("ARCS: SetEnvironmentVariable(\"%s\") = \"%s\" (%s)\n",
+             name, value, replaced ? "replaced" : "appended");
+    g_free(blob);
+    g_free(out);
+    return ARCS_ESUCCESS;
+}
+
+static uint32_t arcs_set_env_var(SGIARCSState *s, uint32_t name_va,
+                                 uint32_t value_va)
+{
+    char *name, *value;
+    uint32_t rc;
+
+    if (name_va == 0 || value_va == 0) {
+        return ARCS_EINVAL;
+    }
+    name = read_guest_string_va(name_va, 64);
+    value = read_guest_string_va(value_va, 256);
+    rc = arcs_set_env_var_impl(s, name, value);
+    g_free(name);
+    g_free(value);
+    return rc;
+}
+
+/*
  * Handle ARCS_FN_WRITE hypercall.
  *
  * arg0 = file descriptor (1 = stdout, 2 = stderr)
@@ -709,11 +806,14 @@ static void arcs_hypercall(SGIARCSState *s)
         s->result = arcs_seek(s, s->arg0, s->arg1, s->arg2);
         break;
 
+    case ARCS_FN_SETENVVAR:
+        s->result = arcs_set_env_var(s, s->arg0, s->arg1);
+        break;
+
     case ARCS_FN_MOUNT:
     case ARCS_FN_GETDIRENTRY:
     case ARCS_FN_GETFILEINFO:
     case ARCS_FN_SETFILEINFO:
-    case ARCS_FN_SETENVVAR:
     case ARCS_FN_SAVECONFIGURATION:
     case ARCS_FN_LOAD:
     case ARCS_FN_INVOKE:
