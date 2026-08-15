@@ -404,12 +404,22 @@ static void arcs_hypercall(SGIARCSState *s)
         break;
 
     case ARCS_PFN_IOCTL:
-    case ARCS_PFN_LOADABS:
-    case ARCS_PFN_INVOKEABS:
-    case ARCS_PFN_EXECABS:
     case ARCS_PFN_FSREG:
     case ARCS_PFN_FSUNREG:
     case ARCS_PFN_SIGNAL:
+        /*
+         * sash's startup calls FsReg (to register its EFS/XFS/volhdr parsers),
+         * Ioctl (console TIOCSETXOFF/TIOCINTRCHAR) and Signal. For Mode C we
+         * serve the file I/O host-side ourselves, so FsReg/FsUnReg are
+         * no-op-success; the console ioctls and Signal are no-ops too.
+         */
+        qemu_log("ARCS: PV function %d (no-op success)\n", s->func);
+        s->result = 0;  /* ESUCCESS */
+        break;
+
+    case ARCS_PFN_LOADABS:
+    case ARCS_PFN_INVOKEABS:
+    case ARCS_PFN_EXECABS:
         /* Unimplemented PV functions — return error */
         qemu_log_mask(LOG_UNIMP,
                       "ARCS: unimplemented PrivateVector function %d\n",
