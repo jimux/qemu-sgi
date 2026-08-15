@@ -421,9 +421,14 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
   }
 
   /* Resolve the boot device + filename from the ARCS environment (the same
-   * OSLoadPartition/OSLoadFilename the stock PROM/sash chain consults). */
+   * OSLoadPartition/OSLoadFilename the stock PROM/sash chain consults).
+   * SGI_MODE_C_OSLOAD overrides the kernel filename so a staged pv kernel
+   * (e.g. /unix.pv) can be booted without replacing the disk's stock /unix. */
   const char *osload_part = "dksc(0,1,0)";  /* matches arcs_env_vars */
-  const char *osload_file = "unix";
+  const char *osload_file = getenv("SGI_MODE_C_OSLOAD");
+  if (!osload_file || !*osload_file) {
+    osload_file = "unix";
+  }
   int unit = 1, part = 0;
   sgi_devpath_parse(osload_part, &unit, &part);
   if (part < 0 || part >= SGI_VH_NPARTAB) {
