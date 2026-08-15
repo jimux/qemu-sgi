@@ -17,6 +17,7 @@
 #ifndef HW_MISC_SGI_ARCS_H
 #define HW_MISC_SGI_ARCS_H
 
+#include "chardev/char-fe.h"
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 
@@ -181,6 +182,9 @@ struct SGIARCSState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+
+    /* Console chardev (serial) for the firmware's Read/Write on fds 0/1/2. */
+    CharFrontend  chr;
 
     /* Hypercall registers */
     uint32_t func;

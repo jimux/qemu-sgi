@@ -292,12 +292,13 @@ static uint32_t arcs_get_env_var(SGIARCSState *s, uint32_t arg0)
 /*
  * Handle ARCS_FN_WRITE hypercall.
  *
- * arg0 = file descriptor (1 = stdout)
+ * arg0 = file descriptor (1 = stdout, 2 = stderr)
  * arg1 = guest pointer to buffer
  * arg2 = byte count
  *
- * Copies data from guest memory and outputs to QEMU log.
- * Returns 0 (ESUCCESS).
+ * Copies data from guest memory and writes it to the serial console chardev
+ * (fds 1/2), so sash's banner/prompt appear on the same console the kernel
+ * later uses. Returns 0 (ESUCCESS).
  */
 static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
                            uint32_t count)
@@ -317,8 +318,11 @@ static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
     }
     buf[count] = '\0';
 
-    /* Output to QEMU log/stderr */
-    qemu_log("ARCS Write(fd=%u): %s", fd, buf);
+    if ((fd == 1 || fd == 2) && qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_write_all(&s->chr, (uint8_t *)buf, count);
+    } else {
+        qemu_log("ARCS Write(fd=%u): %s", fd, buf);
+    }
 
     g_free(buf);
     return 0;  /* ESUCCESS */
@@ -435,6 +439,24 @@ static uint32_t arcs_read(SGIARCSState *s, uint32_t fd, uint32_t buf_va,
     uint8_t *buf;
     uint32_t got = 0;
     uint32_t count_be;
+
+    if (fd == 0) {
+        /* StandardIn: the serial console. Non-blocking read; report 0 bytes
+         * (not an error) when nothing is pending so sash's command loop
+         * doesn't spin. */
+        buf = g_malloc(cnt);
+        got = qemu_chr_fe_backend_connected(&s->chr)
+                  ? qemu_chr_fe_read_all(&s->chr, buf, cnt)
+                  : 0;
+        if (got > 0) {
+            cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_va), buf, got, 1);
+        }
+        g_free(buf);
+        count_be = cpu_to_be32(got);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
+                            (uint8_t *)&count_be, 4, 1);
+        return ARCS_ESUCCESS;
+    }
 
     if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
         return ARCS_EINVAL;
@@ -1169,6 +1191,31 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
 
         qemu_log("ARCS: %d environ entries for kernel getargs()\n", ptr_idx);
     }
+
+    /* Host-side self-test of the raw-device file services (gated, no guest
+     * console needed): look up dksc(0,1,0) (the root XFS partition) in the
+     * volume header and read its first 16 bytes, expecting "XFSB". */
+    if (getenv("SGI_MODE_C_ARCS_SELFTEST")) {
+        BlockBackend *blk = arcs_scsi_backend(0, 1);
+        uint8_t vh[512];
+        if (!blk) {
+            qemu_log("ARCS SELFTEST: no scsi disk (bus0 unit1) -> FAIL\n");
+        } else if (blk_pread(blk, 0, 512, vh, 0) < 0 ||
+                   arcs_be32(&vh[0]) != SGI_VH_MAGIC) {
+            qemu_log("ARCS SELFTEST: bad volume header -> FAIL\n");
+        } else {
+            const uint8_t *pt = &vh[SGI_VH_PARTAB_OFF + 0 * SGI_VH_PT_ENTSZ];
+            uint32_t firstlbn = arcs_be32(pt + 4);
+            uint32_t nblks = arcs_be32(pt + 0);
+            uint8_t sb[16] = {0};
+            int r = blk_pread(blk, (uint64_t)firstlbn * 512, 16, sb, 0);
+            qemu_log("ARCS SELFTEST: dksc(0,1,0) firstlbn=%u nblks=%u "
+                     "read_rc=%d magic=\"%.4s\"\n", firstlbn, nblks, r, sb);
+            qemu_log("ARCS SELFTEST: %s\n",
+                     (r == 0 && sb[0] == 'X' && sb[1] == 'F' &&
+                      sb[2] == 'S' && sb[3] == 'B') ? "PASS" : "FAIL");
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1211,6 +1258,7 @@ static void sgi_arcs_reset(DeviceState *dev)
 static const Property sgi_arcs_properties[] = {
     DEFINE_PROP_UINT32("ram-size", SGIARCSState, ram_size, 64 * 1024 * 1024),
     DEFINE_PROP_UINT32("kernel-end", SGIARCSState, kernel_end_phys, 0),
+    DEFINE_PROP_CHR("chardev", SGIARCSState, chr),
 };
 
 static void sgi_arcs_class_init(ObjectClass *klass, const void *data)
