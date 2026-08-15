@@ -414,11 +414,23 @@ static uint32_t newport_get_host_color(SGINewportVirtuixState *s)
 /*
  * Get RGB color from current color slope accumulators.
  * Extracts 9-bit value from bits [19:11] of each color register,
- * clamps negative (>= 0x180 or sign bit set) to 0, overflow (> 0xff) to 0xff.
- * MAME ref: get_rgb_color() at newport.cpp:2548-2654
+ * clamps negative (>= 0x180 or sign bit set) to 0, overflow (> 0xff) to 0xff,
+ * then PACKS the result to the framebuffer format of the current plane depth
+ * (Bayer-dithered when DM1 bit 16 is set), so what lands in VRAM is a pixel
+ * the scanout unpack understands.  BL-82: the pre-fix version returned the
+ * raw 24-bit value (channel-swapped besides), so 8-bit RGB windows stored
+ * 24-bit words whose scanned-out byte decoded as "the red field replicated"
+ * — the measured 8-colour collapse (indigo_linux notes 117/119).
+ * MAME ref: get_rgb_color() at gio64/newport.cpp:2543-2686 (incl. the
+ * s_bayer dither table and both pack switches; channel order matches
+ * newport_rgb_unpack: R low, B high).  x/y feed the dither matrix.
  */
-static uint32_t newport_get_rgb_color(SGINewportVirtuixState *s)
+static uint32_t newport_get_rgb_color(SGINewportVirtuixState *s,
+                                      int16_t x, int16_t y)
 {
+    static const uint8_t bayer[4][4] = {
+        { 0, 12, 3, 15 }, { 8, 4, 11, 7 }, { 2, 14, 1, 13 }, { 10, 6, 9, 5 }
+    };
     uint32_t red   = (s->curr_color_red >> 11) & 0x1ff;
     uint32_t green = (s->curr_color_green >> 11) & 0x1ff;
     uint32_t blue  = (s->curr_color_blue >> 11) & 0x1ff;
@@ -442,11 +454,81 @@ static uint32_t newport_get_rgb_color(SGINewportVirtuixState *s)
     }
 
     if (!s->dm1_rgbmode) {
-        /* CI mode — fall back to default color */
+        /* CI mode — fall back to default color.  (MAME derives the CI value
+         * from the red iterator here; our color_i-based fallback predates
+         * this fix and is left as-is — divergence noted in the BL-82 log.) */
         return newport_get_default_color(s);
     }
 
-    return (red << 16) | (green << 8) | blue;
+    if (s->drawmode1 & (1 << 16)) { /* Dithering */
+        switch (s->dm1_drawdepth) {
+        case 0: { /* 4bpp 1-2-1 */
+            const uint8_t sr = (red >> 3) - (red >> 4);
+            const uint8_t sg = (green >> 2) - (green >> 4);
+            const uint8_t sb = (blue >> 3) - (blue >> 4);
+            uint8_t dr = (sr >> 4) & 1;
+            uint8_t dg = (sg >> 4) & 3;
+            uint8_t db = (sb >> 4) & 1;
+            if ((sr & 0xf) > bayer[x & 3][y & 3]) dr++;
+            if ((sg & 0xf) > bayer[x & 3][y & 3]) dg++;
+            if ((sb & 0xf) > bayer[x & 3][y & 3]) db++;
+            if (dr > 1) dr = 1;
+            if (dg > 3) dg = 3;
+            if (db > 1) db = 1;
+            uint32_t color = (db << 3) | (dg << 1) | dr;
+            return (color << 4) | color;
+        }
+        case 1: { /* 8bpp 3-3-2 */
+            const uint8_t sr = (red >> 1) - (red >> 4);
+            const uint8_t sg = (green >> 1) - (green >> 4);
+            const uint8_t sb = (blue >> 2) - (blue >> 4);
+            uint8_t dr = (sr >> 4) & 7;
+            uint8_t dg = (sg >> 4) & 7;
+            uint8_t db = (sb >> 4) & 3;
+            if ((sr & 0xf) > bayer[x & 3][y & 3]) dr++;
+            if ((sg & 0xf) > bayer[x & 3][y & 3]) dg++;
+            if ((sb & 0xf) > bayer[x & 3][y & 3]) db++;
+            if (dr > 7) dr = 7;
+            if (dg > 7) dg = 7;
+            if (db > 3) db = 3;
+            return (db << 6) | (dg << 3) | dr;
+        }
+        case 2: { /* 12bpp 4-4-4 */
+            const uint32_t sr = red - (red >> 4);
+            const uint32_t sg = green - (green >> 4);
+            const uint32_t sb = blue - (blue >> 4);
+            uint32_t dr = (sr >> 4) & 15;
+            uint32_t dg = (sg >> 4) & 15;
+            uint32_t db = (sb >> 4) & 15;
+            if ((sr & 0xf) > bayer[x & 3][y & 3]) dr++;
+            if ((sg & 0xf) > bayer[x & 3][y & 3]) dg++;
+            if ((sb & 0xf) > bayer[x & 3][y & 3]) db++;
+            if (dr > 15) dr = 15;
+            if (dg > 15) dg = 15;
+            if (db > 15) db = 15;
+            uint32_t color = (db << 8) | (dg << 4) | dr;
+            return (color << 12) | color;
+        }
+        case 3: /* 24bpp */
+            return (blue << 16) | (green << 8) | red;
+        default:
+            return 0;
+        }
+    } else {
+        switch (s->dm1_drawdepth) {
+        case 0: /* 4bpp 1-2-1 */
+            return (((blue >> 7) & 1) << 3) | ((green & 0xc0) >> 5) |
+                   ((red >> 7) & 1);
+        case 1: /* 8bpp 3-3-2 */
+            return (blue & 0xc0) | ((green & 0xe0) >> 2) | ((red & 0xe0) >> 5);
+        case 2: /* 12bpp 4-4-4 */
+            return ((blue & 0xf0) << 4) | (green & 0xf0) | ((red & 0xf0) >> 4);
+        case 3: /* 24bpp */
+            return (blue << 16) | (green << 8) | red;
+        default:
+            return 0;
+        }
+    }
 }
 
 /*
@@ -1405,7 +1487,7 @@ static void newport_draw_block(SGINewportVirtuixState *s)
                     }
                 } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
                     newport_output_pixel(s, sx, sy,
-                                         newport_get_rgb_color(s));
+                                         newport_get_rgb_color(s, sx, sy));
                 } else {
                     newport_output_pixel(s, sx, sy, color);
                 }
@@ -1544,7 +1626,7 @@ static void newport_draw_span(SGINewportVirtuixState *s)
                 newport_output_pixel(s, sx, y, newport_get_host_color(s));
                 if (hrw_tr) hrw_pixels++;
             } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
-                newport_output_pixel(s, sx, y, newport_get_rgb_color(s));
+                newport_output_pixel(s, sx, y, newport_get_rgb_color(s, sx, y));
             } else {
                 newport_output_pixel(s, sx, y, color);
             }
@@ -1618,7 +1700,7 @@ static void newport_draw_iline(SGINewportVirtuixState *s)
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, x0, y0, newport_get_host_color(s));
             } else if (shade && !s->dm1_fastclear) {
-                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s));
+                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s, x0, y0));
             } else {
                 newport_output_pixel(s, x0, y0, color);
             }
@@ -1678,7 +1760,7 @@ static void newport_draw_fline(SGINewportVirtuixState *s)
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, x0, y0, newport_get_host_color(s));
             } else if (shade && !s->dm1_fastclear) {
-                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s));
+                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s, x0, y0));
             } else {
                 newport_output_pixel(s, x0, y0, color);
             }
@@ -3274,6 +3356,23 @@ static void sgi_newport_virtuix_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case REX3_COLORI:
         s->color_i = val;
+        /*
+         * BL-82b: in RGB mode the packed-color write also loads the RGB
+         * iterators (packed layout: R low byte, G mid, B high; iterator
+         * integer part sits at bits [19:11]).  Xsgi programs stipple/pattern
+         * foregrounds through this register, so without the expansion
+         * every stippled fill on an RGB window drew with zeroed iterators
+         * (= black, regardless of fg).  MAME ref: gio64/newport.cpp
+         * case 0x0220/8 lower half.
+         */
+        if (s->dm1_rgbmode) {
+            s->color_red   = (val & 0xff) << 11;
+            s->color_green = (val & 0xff00) << 3;
+            s->color_blue  = (val & 0xff0000) >> 5;
+            s->curr_color_red   = s->color_red;
+            s->curr_color_green = s->color_green;
+            s->curr_color_blue  = s->color_blue;
+        }
         break;
     case REX3_ZEROOVERFLOW:
         s->zero_overflow = val;
