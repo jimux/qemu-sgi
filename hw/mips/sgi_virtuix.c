@@ -227,6 +227,148 @@ static void write_kernel_trampoline(uint32_t kernel_entry_32) {
 #undef CP0_STATUS
 }
 
+/*
+ * Write a MIPS boot trampoline for Track-C Path A (run the on-disk sash).
+ *
+ * sash is an ECOFF/OMAGIC binary linked in kuseg at 0x10000000 (entry
+ * 0x100208e0), which needs a TLB mapping before it can execute — kseg0 direct
+ * mapping cannot reach kuseg. This trampoline (a) clears BEV/ERL, (b) programs
+ * 16 TLB entries (16 KB pages) mapping kuseg 0x10000000-0x10080000 to physical
+ * 0x09000000-0x09080000, (c) sets ARCS args (argc/argv/envp) + sp at the top of
+ * the mapped window, and (d) jumps to the sash entry (kuseg, now TLB-mapped).
+ * See progress_notes/ip55/prom_c3_path_a_scoping.md for the sash header facts.
+ */
+static void write_sash_trampoline(uint32_t sash_entry, uint32_t gp_value) {
+#define MIPS_MFC0(rt, rd) (0x40000000 | ((rt) << 16) | ((rd) << 11))
+#define MIPS_MTC0(rt, rd) (0x40800000 | ((rt) << 16) | ((rd) << 11))
+#define MIPS_AND(rd, rs, rt)                                                   \
+  (0x00000024 | ((rs) << 21) | ((rt) << 16) | ((rd) << 11))
+#define MIPS_LUI(rt, imm) (0x3C000000 | ((rt) << 16) | ((imm) & 0xFFFF))
+#define MIPS_ORI(rt, rs, im)                                                   \
+  (0x34000000 | ((rs) << 21) | ((rt) << 16) | ((im) & 0xFFFF))
+#define MIPS_ADDIU(rt, rs, im)                                                 \
+  (0x24000000 | ((rs) << 21) | ((rt) << 16) | ((im) & 0xFFFF))
+#define MIPS_ADDU(rd, rs, rt)                                                  \
+  (0x00000021 | ((rs) << 21) | ((rt) << 16) | ((rd) << 11))
+#define MIPS_BNE(rs, rt, off)                                                  \
+  (0x14000000 | ((rs) << 21) | ((rt) << 16) | ((off) & 0xFFFF))
+#define MIPS_JR(rs) (0x00000008 | ((rs) << 21))
+#define MIPS_MOVE(rd, rs) (0x00000025 | ((rs) << 21) | ((rd) << 11))
+#define MIPS_NOP 0x00000000
+#define MIPS_TLBWI 0x42000002
+#define ZERO 0
+#define A0 4
+#define A1 5
+#define A2 6
+#define T0 8
+#define T1 9
+#define T2 10
+#define T3 11
+#define T4 12
+#define T5 13
+#define SP 29
+#define GP 28
+#define CP0_INDEX 0
+#define CP0_ENTRYLO0 2
+#define CP0_ENTRYLO1 3
+#define CP0_PAGEMASK 5
+#define CP0_ENTRYHI 10
+#define CP0_STATUS 12
+
+  uint32_t tramp[40];
+  int i = 0;
+  int loop = -1;
+
+  /* Clear BEV (bit 22) + ERL (bit 2) + EXL (bit 1): mask ~((1<<22)|(1<<2)|(1<<1))
+   * = 0xFFBFFFF9. EXL must be clear too, or sash's first exception would be a
+   * double-fault (the real PROM clears all three before Execute). */
+  tramp[i++] = cpu_to_be32(MIPS_MFC0(T0, CP0_STATUS));
+  tramp[i++] = cpu_to_be32(MIPS_LUI(T1, 0xFFBF));
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T1, T1, 0xFFF9));
+  tramp[i++] = cpu_to_be32(MIPS_AND(T0, T0, T1));
+  tramp[i++] = cpu_to_be32(MIPS_MTC0(T0, CP0_STATUS));
+
+  /* TLB: 16 entries x 16 KB pages, kuseg 0x10000000 -> phys 0x09000000. */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T0, ZERO, 0));       /* t0 = index 0 */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T4, ZERO, 16));      /* t4 = 16 (bound) */
+  tramp[i++] = cpu_to_be32(MIPS_LUI(T1, 0x1000));        /* t1 = EntryHi 0x10000000 */
+  tramp[i++] = cpu_to_be32(MIPS_LUI(T2, 0x0024));        /* t2 = EntryLo0 base */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T2, T2, 0x001E));    /*   = PFN 0x09000 (0x24001E) */
+  tramp[i++] = cpu_to_be32(MIPS_LUI(T3, 0x0024));        /* t3 = EntryLo1 base */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T3, T3, 0x011E));    /*   = PFN 0x09004 (0x24011E) */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T5, ZERO, 0x6000));  /* t5 = PageMask 16 KB */
+  tramp[i++] = cpu_to_be32(MIPS_MTC0(T5, CP0_PAGEMASK)); /* PageMask = 16 KB */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T5, ZERO, 0x8000));  /* t5 = EntryHi step (+32 KB) */
+
+  loop = i;
+  tramp[i++] = cpu_to_be32(MIPS_MTC0(T1, CP0_ENTRYHI));  /* EntryHi */
+  tramp[i++] = cpu_to_be32(MIPS_MTC0(T2, CP0_ENTRYLO0)); /* EntryLo0 */
+  tramp[i++] = cpu_to_be32(MIPS_MTC0(T3, CP0_ENTRYLO1)); /* EntryLo1 */
+  tramp[i++] = cpu_to_be32(MIPS_MTC0(T0, CP0_INDEX));    /* Index */
+  tramp[i++] = cpu_to_be32(MIPS_TLBWI);                  /* write entry */
+  tramp[i++] = cpu_to_be32(MIPS_ADDIU(T0, T0, 1));       /* index++ */
+  tramp[i++] = cpu_to_be32(MIPS_ADDU(T1, T1, T5));       /* EntryHi += 32 KB */
+  tramp[i++] = cpu_to_be32(MIPS_ADDIU(T2, T2, 0x0200));  /* EntryLo0 += PFN 8 */
+  tramp[i++] = cpu_to_be32(MIPS_ADDIU(T3, T3, 0x0200));  /* EntryLo1 += PFN 8 */
+  /* bne t0,t4,loop — offset relative to the delay slot (i), loop is back 10. */
+  int bne_off = loop - (i + 1);
+  tramp[i++] = cpu_to_be32(MIPS_BNE(T0, T4, bne_off));
+  tramp[i++] = cpu_to_be32(MIPS_NOP);
+
+  /* ARCS args (argc=0, argv=0, envp=0) + stack at top of the mapped window. */
+  tramp[i++] = cpu_to_be32(MIPS_MOVE(A0, ZERO));
+  tramp[i++] = cpu_to_be32(MIPS_MOVE(A1, ZERO));
+  tramp[i++] = cpu_to_be32(MIPS_MOVE(A2, ZERO));
+  tramp[i++] = cpu_to_be32(MIPS_LUI(SP, 0x1008));        /* sp = 0x10080000 */
+
+  /* gp = aouthdr gp_value (sash uses gp-relative BSS/data addressing). */
+  tramp[i++] = cpu_to_be32(MIPS_LUI(GP, gp_value >> 16));
+  tramp[i++] = cpu_to_be32(MIPS_ORI(GP, GP, gp_value & 0xFFFF));
+
+  /* Jump to sash entry (kuseg). */
+  tramp[i++] = cpu_to_be32(MIPS_LUI(T5, sash_entry >> 16));
+  tramp[i++] = cpu_to_be32(MIPS_ORI(T5, T5, sash_entry & 0xFFFF));
+  tramp[i++] = cpu_to_be32(MIPS_JR(T5));
+  tramp[i++] = cpu_to_be32(MIPS_NOP);
+
+  rom_add_blob_fixed("sash-trampoline", tramp, i * 4, SGI_PROM_BASE);
+
+  qemu_log("Virtuix: Wrote sash trampoline at 0x%08x -> entry 0x%08x "
+           "(TLB kuseg 0x10000000 -> phys 0x09000000, 16 x 16 KB)\n",
+           (unsigned)SGI_PROM_BASE, sash_entry);
+
+#undef MIPS_MFC0
+#undef MIPS_MTC0
+#undef MIPS_AND
+#undef MIPS_LUI
+#undef MIPS_ORI
+#undef MIPS_ADDIU
+#undef MIPS_ADDU
+#undef MIPS_BNE
+#undef MIPS_JR
+#undef MIPS_MOVE
+#undef MIPS_NOP
+#undef MIPS_TLBWI
+#undef ZERO
+#undef A0
+#undef A1
+#undef A2
+#undef T0
+#undef T1
+#undef T2
+#undef T3
+#undef T4
+#undef T5
+#undef SP
+#undef GP
+#undef CP0_INDEX
+#undef CP0_ENTRYLO0
+#undef CP0_ENTRYLO1
+#undef CP0_PAGEMASK
+#undef CP0_ENTRYHI
+#undef CP0_STATUS
+}
+
 /* ------------------------------------------------------------------ */
 /* Mode C — our own IP55 PROM (paravirtual ARCS firmware) bootstrap    */
 /* ------------------------------------------------------------------ */
@@ -396,28 +538,90 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
   }
 
   /*
-   * Path-A prep (cheap, non-gating): locate the volume-header `sash` (the
-   * ECOFF the real PROM chain would load + run) and parse its a.out header.
-   * This proves the raw-voldir Open/Read + ECOFF-parse chain works; actually
-   * *running* it (Path A) still needs an ECOFF loader + a kuseg-0x10000000 TLB
-   * map, which Mode C (Path C) deliberately skips. See prom_c1_c2.md.
+   * Path A: locate the volume-header `sash` (the ECOFF the real PROM chain
+   * loads + runs). When SGI_MODE_C_PATH_A=1 we actually load it (ECOFF loader)
+   * and transfer control via the kuseg-TLB trampoline; without the env gate this
+   * stays a cheap header parse, and Mode C (Path C) proceeds to boot /unix
+   * host-side. See prom_c1_c2.md + prom_c3_path_a_scoping.md.
    */
+  uint32_t sash_lbn = 0, sash_nbytes = 0;
+  bool have_sash = false;
   for (i = 0; i < SGI_VH_NVDIR; i++) {
     const uint8_t *vd = &vh[SGI_VH_VOLDIR_OFF + i * SGI_VH_VD_ENTSZ];
     if (memcmp(vd, "sash\0\0\0\0", SGI_VH_VDNAMESIZE) != 0) {
       continue;
     }
-    uint32_t lbn = sgi_be32(vd + 8);
-    uint8_t hdr[SGI_VH_SECTOR];
-    if (blk_pread(blk, (uint64_t)lbn * SGI_VH_SECTOR, SGI_VH_SECTOR, hdr, 0)
-        == 0) {
-      uint16_t coff = sgi_be16(&hdr[0]);
-      const uint8_t *ao = &hdr[20];
-      qemu_log("Mode C: [Path-A prep] volhdr sash lbn=%u coff_magic=0x%04x "
-               "aout_magic=0%o entry=0x%08x (ECOFF loader+kuseg TLB = future)\n",
-               lbn, coff, sgi_be16(ao), sgi_be32(ao + 16));
-    }
+    sash_lbn = sgi_be32(vd + 8);
+    sash_nbytes = sgi_be32(vd + 12);
+    have_sash = true;
     break;
+  }
+
+  if (getenv("SGI_MODE_C_PATH_A") && have_sash) {
+    uint8_t *sash = g_malloc(sash_nbytes);
+    if (blk_pread(blk, (uint64_t)sash_lbn * SGI_VH_SECTOR, sash_nbytes, sash,
+                  0) < 0) {
+      error_report("Mode C Path A: could not read sash (%u B at lbn %u)",
+                   sash_nbytes, sash_lbn);
+      g_free(sash);
+      return;
+    }
+
+    /* ECOFF filehdr (20 B) + aouthdr (56 B), big-endian. */
+    uint16_t f_magic = sgi_be16(&sash[0]);
+    uint16_t f_nscns = sgi_be16(&sash[2]);
+    uint16_t a_magic = sgi_be16(&sash[20]);
+    uint32_t tsize = sgi_be32(&sash[24]);
+    uint32_t dsize = sgi_be32(&sash[28]);
+    uint32_t bsize = sgi_be32(&sash[32]);
+    uint32_t entry = sgi_be32(&sash[36]);
+    uint32_t text_start = sgi_be32(&sash[40]);
+    uint32_t data_start = sgi_be32(&sash[44]);
+    uint32_t bss_start = sgi_be32(&sash[48]);
+    uint32_t gp_value = sgi_be32(&sash[72]);  /* aouthdr +52 gp_value */
+    if (f_magic != 0x0163 || a_magic != 0x0107) {
+      error_report("Mode C Path A: unexpected sash header (f_magic=0x%04x "
+                   "a_magic=0x%04x)", f_magic, a_magic);
+      g_free(sash);
+      return;
+    }
+    /* N_TXTOFF = round_up(FILHSZ + AOUTHSZ + nscns*SCNHSZ, 16). */
+    uint32_t txoff = (20 + 56 + (uint32_t)f_nscns * 40 + 15) & ~15u;
+    if ((uint64_t)txoff + tsize + dsize > sash_nbytes) {
+      error_report("Mode C Path A: sash sections exceed file size");
+      g_free(sash);
+      return;
+    }
+
+    /* kuseg 0x10000000 -> phys 0x09000000 (PA = VA - 0x07000000). */
+    uint32_t phys_text = text_start - 0x07000000u;
+    uint32_t phys_data = data_start - 0x07000000u;
+    uint32_t phys_bss = bss_start - 0x07000000u;
+    rom_add_blob_fixed("sash-text", sash + txoff, tsize, phys_text);
+    rom_add_blob_fixed("sash-data", sash + txoff + tsize, dsize, phys_data);
+    if (bsize > 0) {
+      void *zero = g_malloc0(bsize);
+      rom_add_blob_fixed("sash-bss", zero, bsize, phys_bss);
+      g_free(zero);
+    }
+    g_free(sash);
+    qemu_log("Mode C Path A: loaded sash text=%u@0x%08x data=%u@0x%08x "
+             "bss=%u@0x%08x entry=0x%08x gp=0x%08x\n",
+             tsize, phys_text, dsize, phys_data, bsize, phys_bss, entry,
+             gp_value);
+
+    write_sash_trampoline(entry, gp_value);
+
+    /* ARCS firmware stubs (identical Mode K tail) so sash finds the SPB/FV. */
+    DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
+    qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+    qdev_prop_set_uint32(arcs_dev, "kernel-end", phys_bss + bsize);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
+    memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
+                                        &SGI_ARCS(arcs_dev)->iomem, 10);
+    sgi_arcs_setup_stubs(SGI_ARCS(arcs_dev), &address_space_memory);
+    qemu_log("Mode C Path A: firmware ready; handing off to disk sash\n");
+    return;
   }
 
   /* Resolve the boot device + filename from the ARCS environment (the same
