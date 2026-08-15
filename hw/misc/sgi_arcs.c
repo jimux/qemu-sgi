@@ -1464,10 +1464,10 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     /*
      * SystemID at scratch+0 (16 bytes):
      *   +0: VendorId[8] = "SGI\0\0\0\0\0"
-     *   +8: ProductId[8] = "IP24\0\0\0\0"
+     *   +8: ProductId[8] = "IP55\0\0\0\0"  (IP55 branding, C4)
      */
     memcpy(&scratch[0], "SGI\0\0\0\0\0", 8);
-    memcpy(&scratch[8], "IP24\0\0\0\0", 8);
+    memcpy(&scratch[8], "IP55\0\0\0\0", 8);
 
     /* TimeInfo at scratch+0x10 (all zeros = epoch) */
 
