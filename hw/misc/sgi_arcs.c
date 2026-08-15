@@ -948,6 +948,16 @@ static void sgi_arcs_init(Object *obj)
 
     memory_region_init_io(&s->iomem, obj, &sgi_arcs_ops, s,
                           "sgi-arcs", ARCS_REG_SIZE);
+    /*
+     * The Execute hypercall (registered by sgi_virtuix.c) swaps the CPU PC and
+     * calls cpu_loop_exit() from inside this region's write handler, which
+     * longjmps out before access_with_adjusted_size can clear the device's
+     * mem_reentrancy_guard. Disable the guard: the handler is re-entrancy-safe
+     * (it only sets scalar state + does host-side XFS/ELF work), and leaving the
+     * guard engaged would reject the guest kernel's own subsequent hypercalls as
+     * "Blocked re-entrant IO".
+     */
+    s->iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
 }
 

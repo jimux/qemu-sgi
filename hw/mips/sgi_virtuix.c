@@ -605,11 +605,24 @@ static void sgi_virtuix_execute(uint32_t path_va)
     }
     qemu_log("ARCS Execute: entry 0x%08x, jumping to kernel\n", kentry);
 
-    env->active_tc.PC = kentry;
+    /*
+     * The kernel entry (and the ARCS environ pointer) are 32-bit kseg0
+     * addresses.  On a 64-bit MIPS CPU they must be SIGN-EXTENDED into the
+     * 64-bit PC/GPR: a zero-extended value (e.g. 0x0000000088003c30) lands in
+     * xuseg and raises EXCP_AdEL on the first fetch instead of mapping to the
+     * kernel's compat-kseg0 physical address.
+     *
+     * cpu_loop_exit() longjmps out of the sgi-arcs MMIO write handler here; the
+     * sgi-arcs region sets disable_reentrancy_guard so that leaving the handler
+     * mid-flight does not leave mem_reentrancy_guard.engaged_in_io stuck (which
+     * would reject the kernel's own first ARCS hypercall as "re-entrant IO").
+     */
+    env->active_tc.PC = (target_ulong)(int32_t)kentry;
     env->active_tc.gpr[4] = 0;                            /* a0 = argc */
     env->active_tc.gpr[5] = 0;                            /* a1 = argv */
-    env->active_tc.gpr[6] = MIPS_K0BASE + ARCS_ENVIRON_PHYS;  /* a2 = environ */
-    env->CP0_Status = 0;      /* clear BEV/ERL/EXL, KSU=kernel */
+    env->active_tc.gpr[6] =
+        (target_ulong)(int32_t)(MIPS_K0BASE + ARCS_ENVIRON_PHYS);  /* a2 = environ */
+    env->CP0_Status = 0;      /* clear BEV/ERL/EXL, KSU=kernel, KX=0 (32-bit entry) */
     env->CP0_EPC = 0;
     env->CP0_Cause = 0;
     env->active_tc.HI[0] = 0;
