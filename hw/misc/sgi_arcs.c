@@ -1359,13 +1359,14 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
      * The kernel was loaded by our loader (not by ARCS Load()), and it
      * doesn't check its own memory descriptor type.
      */
+    uint32_t kernel_start_page = s->kernel_start_phys / ARCS_PAGE_SIZE;
     uint32_t kernel_end_page = (s->kernel_end_phys + ARCS_PAGE_SIZE - 1)
-                               / ARCS_PAGE_SIZE;
+                                / ARCS_PAGE_SIZE;
     uint32_t ram_pages = s->ram_size / ARCS_PAGE_SIZE;
-    uint32_t free_start;
+    uint32_t firmware_end_page = 8;  /* pages 0-7 are firmware-owned */
     int desc_idx = 0;
 
-    /* Descriptor 0: ExceptionBlock — first 2 pages */
+    /* Descriptor 0: ExceptionBlock - first page (vectors) */
     put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 0,
              ARCS_MEM_EXCEPTION_BLOCK);
     put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4, 0);
@@ -1379,37 +1380,43 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 8, 1);
     desc_idx++;
 
-    /* Descriptor 2: FirmwarePermanent — our stubs area (pages 1-7) */
+    /* Descriptor 2: FirmwarePermanent - pages 2-7 */
     put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 0,
              ARCS_MEM_FIRMWARE_PERMANENT);
     put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4, 2);
     put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 8, 6);
     desc_idx++;
 
-    /*
-     * Descriptor 3: FreeContiguous — from after stubs to kernel start.
-     * Kernel loads at physical 0x59c0 (page 5), so this may be small.
-     * If kernel starts right after stubs, skip this descriptor.
-     */
-    free_start = 8;  /* After our firmware area (page 8 = 0x8000) */
-    if (kernel_end_page > free_start) {
-        /* Descriptor: LoadedProgram for the kernel */
-        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 0,
-                 ARCS_MEM_LOADED_PROGRAM);
-        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4, free_start);
-        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 8,
-                 kernel_end_page - free_start);
-        desc_idx++;
-        free_start = kernel_end_page;
-    }
-
-    /* Descriptor: FreeContiguous — rest of RAM */
-    if (free_start < ram_pages) {
+    /* FreeContiguous between firmware and the kernel (if any). */
+    if (kernel_start_page > firmware_end_page) {
         put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 0,
                  ARCS_MEM_FREE_CONTIGUOUS);
-        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4, free_start);
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4,
+                 firmware_end_page);
         put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 8,
-                 ram_pages - free_start);
+                 kernel_start_page - firmware_end_page);
+        desc_idx++;
+    }
+
+    /* LoadedProgram - the kernel image. */
+    if (kernel_end_page > kernel_start_page) {
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 0,
+                 ARCS_MEM_LOADED_PROGRAM);
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4,
+                 kernel_start_page);
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 8,
+                 kernel_end_page - kernel_start_page);
+        desc_idx++;
+    }
+
+    /* FreeContiguous after the kernel. */
+    if (kernel_end_page < ram_pages) {
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 0,
+                 ARCS_MEM_FREE_CONTIGUOUS);
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 4,
+                 kernel_end_page);
+        put_be32(memdesc_buf, desc_idx * MEMDESC_STRUCT_SIZE + 8,
+                 ram_pages - kernel_end_page);
         desc_idx++;
     }
 
@@ -1418,8 +1425,8 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     rom_add_blob_fixed("arcs-memdesc", memdesc_buf, sizeof(memdesc_buf),
                        ARCS_MEMDESC_PHYS);
 
-    qemu_log("ARCS: %d memory descriptors, free starts at page %u\n",
-             desc_idx, free_start);
+    qemu_log("ARCS: %d memory descriptors, kernel pages %u..%u\n",
+             desc_idx, kernel_start_page, kernel_end_page);
 
     /* ---- Build environment variable data ---- */
     memset(env_buf, 0, sizeof(env_buf));
@@ -1606,6 +1613,7 @@ static void sgi_arcs_reset(DeviceState *dev)
 
 static const Property sgi_arcs_properties[] = {
     DEFINE_PROP_UINT32("ram-size", SGIARCSState, ram_size, 64 * 1024 * 1024),
+    DEFINE_PROP_UINT32("kernel-start", SGIARCSState, kernel_start_phys, 0),
     DEFINE_PROP_UINT32("kernel-end", SGIARCSState, kernel_end_phys, 0),
     DEFINE_PROP_CHR("chardev", SGIARCSState, chr),
 };

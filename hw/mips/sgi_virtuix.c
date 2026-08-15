@@ -453,7 +453,7 @@ static void sgi_devpath_parse(const char *dp, int *unit, int *part) {
  * Sets *entry (virtual) and *high_phys (end-of-image physical). Returns 0 ok.
  */
 static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
-                             uint32_t *high_phys) {
+                             uint32_t *low_phys, uint32_t *high_phys) {
   if (len < 52 || memcmp(img, "\x7f" "ELF", 4) != 0) {
     return -1;
   }
@@ -468,6 +468,7 @@ static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
   uint32_t e_phoff = sgi_be32(&img[28]);
   uint16_t e_phentsize = sgi_be16(&img[42]);
   uint16_t e_phnum = sgi_be16(&img[44]);
+  uint32_t low = 0xFFFFFFFFu;
   uint32_t high = 0;
   int loaded = 0;
 
@@ -497,12 +498,16 @@ static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
     if (seg_end > high) {
       high = seg_end;
     }
+    if (phys < low) {
+      low = phys;
+    }
     loaded++;
   }
   if (!loaded) {
     return -6;
   }
   *entry = e_entry;
+  *low_phys = low;
   *high_phys = high;
   return 0;
 }
@@ -852,6 +857,7 @@ static void sgi_virtuix_load_ide_ecoff(const char *path, MachineState *machine,
   GError *err = NULL;
   uint16_t f_magic, f_nscns, a_magic;
   uint32_t entry;
+  uint32_t kernel_start = 0xFFFFFFFFu;
   uint32_t kernel_end = 0;
   int n;
 
@@ -905,6 +911,9 @@ static void sgi_virtuix_load_ide_ecoff(const char *path, MachineState *machine,
     if (phys + size > kernel_end) {
       kernel_end = phys + size;
     }
+    if (phys < kernel_start) {
+      kernel_start = phys;
+    }
     qemu_log("Mode C IDE: section %-8s vaddr=0x%08x -> phys 0x%08x (%u B)\n",
              name, vaddr, phys, size);
   }
@@ -917,6 +926,7 @@ static void sgi_virtuix_load_ide_ecoff(const char *path, MachineState *machine,
    * SPB/FV/env/memdesc. */
   DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
   qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+  qdev_prop_set_uint32(arcs_dev, "kernel-start", kernel_start);
   qdev_prop_set_uint32(arcs_dev, "kernel-end", kernel_end);
   if (serial_hd(1)) {
     qdev_prop_set_chr(arcs_dev, "chardev", serial_hd(1));
@@ -1061,6 +1071,7 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
     /* ARCS firmware stubs (identical Mode K tail) so sash finds the SPB/FV. */
     DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
     qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+    qdev_prop_set_uint32(arcs_dev, "kernel-start", phys_text);
     qdev_prop_set_uint32(arcs_dev, "kernel-end", phys_bss + bsize);
     /* Firmware console: bind to a SECOND -serial if one was provided (the
      * first is the SCC/kernel console); else sash's console falls back to
@@ -1131,22 +1142,23 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
   qemu_log("Mode C: read %s (%" PRIu64 " bytes) from XFS root\n", path, ksize);
 
   /* Load the ELF into guest RAM (Execute). */
-  uint32_t kentry = 0, khigh_phys = 0;
-  int rc = sgi_load_elf32_be(kbuf, ksize, &kentry, &khigh_phys);
+  uint32_t kentry = 0, klow_phys = 0, khigh_phys = 0;
+  int rc = sgi_load_elf32_be(kbuf, ksize, &kentry, &klow_phys, &khigh_phys);
   g_free(kbuf);
   if (rc < 0) {
     error_report("Mode C: %s is not a loadable ELF32-MSB MIPS kernel (rc=%d)",
                  path, rc);
     return;
   }
-  qemu_log("Mode C: loaded kernel, entry 0x%08x, high phys 0x%08x\n", kentry,
-           khigh_phys);
+  qemu_log("Mode C: loaded kernel, entry 0x%08x, low phys 0x%08x, "
+           "high phys 0x%08x\n", kentry, klow_phys, khigh_phys);
 
   /* Mode K tail: trampoline + ARCS firmware stubs (identical firmware ABI). */
   write_kernel_trampoline(kentry);
 
   DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
   qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+  qdev_prop_set_uint32(arcs_dev, "kernel-start", klow_phys);
   qdev_prop_set_uint32(arcs_dev, "kernel-end", khigh_phys);
   if (serial_hd(1)) {
       qdev_prop_set_chr(arcs_dev, "chardev", serial_hd(1));
@@ -1420,32 +1432,39 @@ static void sgi_virtuix_init(MachineState *machine) {
    */
   if (machine->kernel_filename) {
     uint64_t kernel_entry;
+    uint64_t kernel_low = 0xFFFFFFFFULL;
     uint64_t kernel_high = 0;
     long kernel_size;
     DeviceState *arcs_dev;
     SGIARCSState *arcs;
 
     kernel_size = load_elf(machine->kernel_filename, NULL,
-                           cpu_mips_kseg0_to_phys, NULL, &kernel_entry, NULL,
-                           &kernel_high, NULL, ELFDATA2MSB, EM_MIPS, 1, 0);
+                           cpu_mips_kseg0_to_phys, NULL, &kernel_entry,
+                           &kernel_low, &kernel_high, NULL, ELFDATA2MSB,
+                           EM_MIPS, 1, 0);
     if (kernel_size < 0) {
       error_report("could not load kernel '%s': %s", machine->kernel_filename,
                    load_elf_strerror(kernel_size));
       exit(1);
     }
 
+    uint64_t kernel_low_phys = kernel_low & 0x1FFFFFFF;
     uint64_t kernel_high_phys = kernel_high & 0x1FFFFFFF;
 
     qemu_log("Virtuix: Loaded kernel '%s' (%ld bytes)\n",
              machine->kernel_filename, kernel_size);
-    qemu_log("Virtuix: Kernel entry: 0x%016" PRIx64 ", highest addr: 0x%016"
+    qemu_log("Virtuix: Kernel entry: 0x%016" PRIx64 ", lowest addr: 0x%016"
+             PRIx64 " (phys 0x%08" PRIx64 "), highest addr: 0x%016"
              PRIx64 " (phys 0x%08" PRIx64 ")\n",
-             kernel_entry, kernel_high, kernel_high_phys);
+             kernel_entry, kernel_low, kernel_low_phys,
+             kernel_high, kernel_high_phys);
 
     write_kernel_trampoline((uint32_t)kernel_entry);
 
     arcs_dev = qdev_new(TYPE_SGI_ARCS);
     qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+    qdev_prop_set_uint32(arcs_dev, "kernel-start",
+                         (uint32_t)kernel_low_phys);
     qdev_prop_set_uint32(arcs_dev, "kernel-end", (uint32_t)kernel_high_phys);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
     memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
