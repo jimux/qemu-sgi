@@ -315,10 +315,16 @@ static void write_sash_trampoline(uint32_t sash_entry, uint32_t gp_value) {
   tramp[i++] = cpu_to_be32(MIPS_BNE(T0, T4, bne_off));
   tramp[i++] = cpu_to_be32(MIPS_NOP);
 
-  /* ARCS args (argc=0, argv=0, envp=0) + stack at top of the mapped window. */
-  tramp[i++] = cpu_to_be32(MIPS_MOVE(A0, ZERO));
-  tramp[i++] = cpu_to_be32(MIPS_MOVE(A1, ZERO));
-  tramp[i++] = cpu_to_be32(MIPS_MOVE(A2, ZERO));
+  /* ARCS args: argc=1, argv=["dksc(0,1,0)/unix"], envp=[NULL] + stack. */
+  tramp[i++] = cpu_to_be32(MIPS_ORI(A0, ZERO, 1));       /* argc = 1 */
+  tramp[i++] = cpu_to_be32(MIPS_LUI(A1,
+      (MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_ARGV_OFF) >> 16));
+  tramp[i++] = cpu_to_be32(MIPS_ORI(A1, A1,
+      (MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_ARGV_OFF) & 0xFFFF));
+  tramp[i++] = cpu_to_be32(MIPS_LUI(A2,
+      (MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_ENVP_OFF) >> 16));
+  tramp[i++] = cpu_to_be32(MIPS_ORI(A2, A2,
+      (MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_ENVP_OFF) & 0xFFFF));
   tramp[i++] = cpu_to_be32(MIPS_LUI(SP, 0x1008));        /* sp = 0x10080000 */
 
   /* gp = aouthdr gp_value (sash uses gp-relative BSS/data addressing). */

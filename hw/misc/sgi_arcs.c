@@ -633,7 +633,7 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     put_be32(spb, 0x04, 0x44);  /* Length: 68 bytes (17 x uint32) */
     put_be16(spb, 0x08, ARCS_VERSION);
     put_be16(spb, 0x0A, ARCS_REVISION);
-    put_be32(spb, 0x0C, 0);     /* RestartBlock */
+    put_be32(spb, 0x0C, MIPS_K1BASE + ARCS_RESTARTBLOCK_PHYS);  /* RestartBlock */
     put_be32(spb, 0x10, 0);     /* DebugBlock */
     put_be32(spb, 0x14, 0);     /* GEVector */
     put_be32(spb, 0x18, 0);     /* UTLBMissVector */
@@ -644,6 +644,36 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     put_be32(spb, 0x2C, 0);     /* AdapterCount */
 
     rom_add_blob_fixed("arcs-spb", spb, sizeof(spb), ARCS_SPB_PHYS);
+
+    /* ---- Build RestartBlock (sash's rbclrbs dereferences it) ---- */
+    {
+        uint8_t rb[ARCS_RESTARTBLOCK_SIZE];
+        memset(rb, 0, sizeof(rb));
+        put_be32(rb, 0x00, ARCS_RB_SIGNATURE);  /* Signature */
+        put_be32(rb, 0x04, sizeof(rb));          /* Length */
+        put_be16(rb, 0x08, ARCS_VERSION);        /* Version */
+        put_be16(rb, 0x0A, ARCS_REVISION);       /* Revision */
+        /* Next/RestartAddress/BootMasterID/ProcessorID/BootStatus/Checksum
+         * all 0 (Checksum is recomputed by sash's checksum_rb — which sums to
+         * 0 due to its sizeof(rb) quirk). SSALength: */
+        put_be32(rb, 0x24, 512);                  /* SSALength = SSA_WORDS*4 */
+        rom_add_blob_fixed("arcs-restart", rb, sizeof(rb),
+                           ARCS_RESTARTBLOCK_PHYS);
+    }
+
+    /* ---- Build sash argv/envp (argv[0] = boot path) ---- */
+    {
+        uint8_t sash_args[0x20];
+        static const char bootpath[] = "dksc(0,1,0)/unix";
+        memset(sash_args, 0, sizeof(sash_args));
+        memcpy(&sash_args[ARCS_SASH_ARGS_STR_OFF], bootpath,
+               sizeof(bootpath));
+        put_be32(sash_args, ARCS_SASH_ARGS_ARGV_OFF,
+                 MIPS_K0BASE + ARCS_SASH_ARGS_PHYS + ARCS_SASH_ARGS_STR_OFF);
+        /* argv[1] = NULL (already 0); envp[0] = NULL (already 0). */
+        rom_add_blob_fixed("arcs-sash-args", sash_args, sizeof(sash_args),
+                           ARCS_SASH_ARGS_PHYS);
+    }
 
     /* ---- Build memory descriptors ---- */
     memset(memdesc_buf, 0xFF, sizeof(memdesc_buf));  /* Fill with sentinel */

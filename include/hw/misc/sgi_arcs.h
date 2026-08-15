@@ -61,6 +61,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIARCSState, SGI_ARCS)
 #define ARCS_ENVSTRS_SIZE   384         /* Max bytes for environ strings */
 
 /*
+ * RestartBlock (arcs/restart.h): the firmware's restart/crash-recovery block.
+ * sash's rbclrbs() dereferences SPB->RestartBlock, so it must be non-NULL.
+ * Placed just past the environ strings in the FirmwarePermanent pages; the
+ * kernel overwrites it only after sash hands off (alias 0x2000 -> 0x08002000),
+ * which is fine.
+ */
+#define ARCS_RESTARTBLOCK_PHYS   0x00002000
+#define ARCS_RESTARTBLOCK_SIZE   552   /* sizeof(RestartBlock) */
+#define ARCS_RB_SIGNATURE        0x42545352  /* "RBTS" — RB_SIGNATURE */
+
+/*
+ * sash's main(argc, argv, envp): argv[0] must be a valid boot path (it calls
+ * rindex/Execute on it). Provide a minimal argc=1 argv=["dksc(0,1,0)/unix"]
+ * envp=[NULL] in the FirmwarePermanent pages, after the RestartBlock.
+ */
+#define ARCS_SASH_ARGS_PHYS      0x00002230
+#define ARCS_SASH_ARGS_STR_OFF   0x00  /* argv[0] string */
+#define ARCS_SASH_ARGS_ARGV_OFF  0x10  /* argv pointer array (2 words) */
+#define ARCS_SASH_ARGS_ENVP_OFF  0x18  /* envp pointer array (1 word, NULL) */
+
+/*
  * ARCS function IDs for the hypercall interface.
  * These match the FirmwareVector slot indices.
  */
