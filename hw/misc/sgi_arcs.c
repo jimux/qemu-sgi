@@ -1194,7 +1194,9 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
 
     /* Host-side self-test of the raw-device file services (gated, no guest
      * console needed): look up dksc(0,1,0) (the root XFS partition) in the
-     * volume header and read its first 16 bytes, expecting "XFSB". */
+     * volume header and read its first 16 bytes, expecting "XFSB". (The full
+     * arcs_open/arcs_read FV path is already exercised by sash's own startup
+     * Open/Close on dksc(0,1,8) during sdvh_install.) */
     if (getenv("SGI_MODE_C_ARCS_SELFTEST")) {
         BlockBackend *blk = arcs_scsi_backend(0, 1);
         uint8_t vh[512];
