@@ -528,6 +528,13 @@ static uint64_t mc_dma_seq;
 static uint32_t sgi_mc_virtuix_dma_translate(SGIMCVirtuixState *s, uint32_t address)
 {
     for (int entry = 0; entry < 4; entry++) {
+        /* Skip empty uTLB slots (DTLB_VALID bit 1 clear).  A zeroed slot is
+         * the power-on "VDMA Clear" state, not a real mapping: treating it as
+         * a hit would read a zero PTE and raise a spurious PAGEFAULT that
+         * regresses the -M virtuix Mode-P PROM boot. */
+        if (!(s->dma_tlb_lo[entry] & 0x2)) {
+            continue;
+        }
         if ((address & 0xffc00000) == (s->dma_tlb_hi[entry] & 0xffc00000)) {
             uint32_t vpn_lo = (address & 0x003ff000) >> 12;
             /*
@@ -597,11 +604,13 @@ static uint32_t sgi_mc_virtuix_dma_translate(SGIMCVirtuixState *s, uint32_t addr
                     s->dma_tlb_hi[2], s->dma_tlb_hi[3]);
         }
     }
-    /* BL-44 defense-in-depth: a genuine uTLB miss raises VDMA_R_UTLBMISS and
-     * halts (vdma_wait() → vdma_fault() reports it) instead of silently
-     * translating to physical page 0. */
-    s->dma_run |= MC_DMA_R_UTLBMISS;
-    return MC_DMA_TRANSLATE_FAULT;
+    /* Genuine uTLB miss (no *valid* slot matches): keep the historical silent
+     * return of 0.  The PROM's power-on "VDMA Clear" diagnostic relies on this
+     * — its uTLB is empty at that point and the clear must complete, not fault
+     * — so raising UTLBMISS here regressed the -M virtuix Mode-P boot.  A real
+     * data transfer's non-resident page is still caught above by the PG_VR
+     * check (PAGEFAULT), which is the BL-44 class. */
+    return 0;
 }
 
 static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
