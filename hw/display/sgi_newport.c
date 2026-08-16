@@ -386,11 +386,15 @@ static uint32_t newport_get_host_color(SGINewportState *s)
 /*
  * Get RGB color from current color slope accumulators.
  * Extracts 9-bit value from bits [19:11] of each color register,
- * clamps negative (>= 0x180 or sign bit set) to 0, overflow (> 0xff) to 0xff.
- * MAME ref: get_rgb_color() at newport.cpp:2548-2654
+ * clamps negative (>= 0x180 or sign bit set) to 0, overflow (> 0xff) to 0xff,
+ * then PACKS to the plane depth (Bayer-dithered when DM1 bit 16 is set);
+ * x/y feed the dither matrix.  MAME ref: get_rgb_color() at newport.cpp:2548-2654
  */
-static uint32_t newport_get_rgb_color(SGINewportState *s)
+static uint32_t newport_get_rgb_color(SGINewportState *s, int16_t x, int16_t y)
 {
+    static const uint8_t bayer[4][4] = {
+        { 0, 12, 3, 15 }, { 8, 4, 11, 7 }, { 2, 14, 1, 13 }, { 10, 6, 9, 5 }
+    };
     uint32_t red   = (s->curr_color_red >> 11) & 0x1ff;
     uint32_t green = (s->curr_color_green >> 11) & 0x1ff;
     uint32_t blue  = (s->curr_color_blue >> 11) & 0x1ff;
@@ -418,7 +422,80 @@ static uint32_t newport_get_rgb_color(SGINewportState *s)
         return newport_get_default_color(s);
     }
 
-    return (red << 16) | (green << 8) | blue;
+    /* BL-82b: pack to the plane depth so what lands in VRAM is a pixel the
+     * scanout unpack (newport_rgb_unpack) understands, instead of a raw
+     * 24-bit word stored into 8-bit planes.  Channel order is BGR (B high,
+     * R low), matching this file's convert_*_to_8bpp and newport_rgb_unpack.
+     * Ported from the d082be1abe fix in sgi_newport_virtuix.c. */
+    if (s->drawmode1 & (1 << 16)) { /* Dithering */
+        switch (s->dm1_drawdepth) {
+        case 0: { /* 4bpp 1-2-1 */
+            const uint8_t sr = (red >> 3) - (red >> 4);
+            const uint8_t sg = (green >> 2) - (green >> 4);
+            const uint8_t sb = (blue >> 3) - (blue >> 4);
+            uint8_t dr = (sr >> 4) & 1;
+            uint8_t dg = (sg >> 4) & 3;
+            uint8_t db = (sb >> 4) & 1;
+            if ((sr & 0xf) > bayer[x & 3][y & 3]) dr++;
+            if ((sg & 0xf) > bayer[x & 3][y & 3]) dg++;
+            if ((sb & 0xf) > bayer[x & 3][y & 3]) db++;
+            if (dr > 1) dr = 1;
+            if (dg > 3) dg = 3;
+            if (db > 1) db = 1;
+            uint32_t color = (db << 3) | (dg << 1) | dr;
+            return (color << 4) | color;
+        }
+        case 1: { /* 8bpp 3-3-2 */
+            const uint8_t sr = (red >> 1) - (red >> 4);
+            const uint8_t sg = (green >> 1) - (green >> 4);
+            const uint8_t sb = (blue >> 2) - (blue >> 4);
+            uint8_t dr = (sr >> 4) & 7;
+            uint8_t dg = (sg >> 4) & 7;
+            uint8_t db = (sb >> 4) & 3;
+            if ((sr & 0xf) > bayer[x & 3][y & 3]) dr++;
+            if ((sg & 0xf) > bayer[x & 3][y & 3]) dg++;
+            if ((sb & 0xf) > bayer[x & 3][y & 3]) db++;
+            if (dr > 7) dr = 7;
+            if (dg > 7) dg = 7;
+            if (db > 3) db = 3;
+            return (db << 6) | (dg << 3) | dr;
+        }
+        case 2: { /* 12bpp 4-4-4 */
+            const uint32_t sr = red - (red >> 4);
+            const uint32_t sg = green - (green >> 4);
+            const uint32_t sb = blue - (blue >> 4);
+            uint32_t dr = (sr >> 4) & 15;
+            uint32_t dg = (sg >> 4) & 15;
+            uint32_t db = (sb >> 4) & 15;
+            if ((sr & 0xf) > bayer[x & 3][y & 3]) dr++;
+            if ((sg & 0xf) > bayer[x & 3][y & 3]) dg++;
+            if ((sb & 0xf) > bayer[x & 3][y & 3]) db++;
+            if (dr > 15) dr = 15;
+            if (dg > 15) dg = 15;
+            if (db > 15) db = 15;
+            uint32_t color = (db << 8) | (dg << 4) | dr;
+            return (color << 12) | color;
+        }
+        case 3: /* 24bpp */
+            return (blue << 16) | (green << 8) | red;
+        default:
+            return 0;
+        }
+    } else {
+        switch (s->dm1_drawdepth) {
+        case 0: /* 4bpp 1-2-1 */
+            return (((blue >> 7) & 1) << 3) | ((green & 0xc0) >> 5) |
+                   ((red >> 7) & 1);
+        case 1: /* 8bpp 3-3-2 */
+            return (blue & 0xc0) | ((green & 0xe0) >> 2) | ((red & 0xe0) >> 5);
+        case 2: /* 12bpp 4-4-4 */
+            return ((blue & 0xf0) << 4) | (green & 0xf0) | ((red & 0xf0) >> 4);
+        case 3: /* 24bpp */
+            return (blue << 16) | (green << 8) | red;
+        default:
+            return 0;
+        }
+    }
 }
 
 /*
@@ -839,7 +916,7 @@ static void newport_draw_block(SGINewportState *s)
                                          newport_get_host_color(s));
                 } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
                     newport_output_pixel(s, sx, sy,
-                                         newport_get_rgb_color(s));
+                                         newport_get_rgb_color(s, sx, sy));
                 } else {
                     newport_output_pixel(s, sx, sy, color);
                 }
@@ -946,7 +1023,7 @@ static void newport_draw_span(SGINewportState *s)
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, sx, y, newport_get_host_color(s));
             } else if ((shade || s->dm1_rgbmode) && !s->dm1_fastclear) {
-                newport_output_pixel(s, sx, y, newport_get_rgb_color(s));
+                newport_output_pixel(s, sx, y, newport_get_rgb_color(s, sx, y));
             } else {
                 newport_output_pixel(s, sx, y, color);
             }
@@ -1006,7 +1083,7 @@ static void newport_draw_iline(SGINewportState *s)
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, x0, y0, newport_get_host_color(s));
             } else if (shade && !s->dm1_fastclear) {
-                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s));
+                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s, x0, y0));
             } else {
                 newport_output_pixel(s, x0, y0, color);
             }
@@ -1066,7 +1143,7 @@ static void newport_draw_fline(SGINewportState *s)
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, x0, y0, newport_get_host_color(s));
             } else if (shade && !s->dm1_fastclear) {
-                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s));
+                newport_output_pixel(s, x0, y0, newport_get_rgb_color(s, x0, y0));
             } else {
                 newport_output_pixel(s, x0, y0, color);
             }
@@ -2330,6 +2407,24 @@ static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case REX3_COLORI:
         s->color_i = val;
+        /*
+         * BL-82b: in RGB mode the packed-color write also loads the RGB
+         * iterators (packed layout: R low byte, G mid, B high; iterator
+         * integer part sits at bits [19:11]).  Xsgi programs stipple/pattern
+         * foregrounds through this register, so without the expansion every
+         * stippled fill on an RGB window draws with zeroed iterators (= black,
+         * regardless of fg).  Ported from the d082be1abe fix in
+         * sgi_newport_virtuix.c; MAME ref: gio64/newport.cpp case 0x0220/8
+         * lower half.
+         */
+        if (s->dm1_rgbmode) {
+            s->color_red   = (val & 0xff) << 11;
+            s->color_green = (val & 0xff00) << 3;
+            s->color_blue  = (val & 0xff0000) >> 5;
+            s->curr_color_red   = s->color_red;
+            s->curr_color_green = s->color_green;
+            s->curr_color_blue  = s->color_blue;
+        }
         break;
     case REX3_ZEROOVERFLOW:
         s->zero_overflow = val;
@@ -2472,6 +2567,27 @@ static const MemoryRegionOps sgi_newport_ops = {
     },
 };
 
+/* BL-83: the visible scanout window in VRAM is offset by the XYWIN window
+ * origin (winx - 0x1000).  Xsgi programs winx = 0x1000 + bt445_xbias (2 for
+ * the BT445 Rev A "extra black pixels" workaround, see ng1_init.c
+ * Ng1DacInit), leaving that many black bias columns at the start of each VRAM
+ * scanline that the real scanout skips.  Reading VRAM from x=0 shifted the
+ * whole desktop +2px right and clipped 2 columns off the right edge.
+ * (Y is not biased: the timing tables fold bt445_xbias into winx only, winy
+ * stays 0x1000.) */
+static inline int newport_scanout_xoff(const SGINewportState *s)
+{
+    int xoff = (int16_t)(s->xy_window >> 16) - 0x1000;
+    /* Guard the pre-init state: xy_window resets to 0 (winx=0), giving -4096,
+     * far outside the VRAM window.  Only a small bias is ever valid — the
+     * bt445_xbias is at most the VRAM/screen width delta (64) — so anything
+     * outside [0, VRAM_W - SCREEN_W) falls back to the un-biased origin. */
+    if (xoff < 0 || xoff >= NEWPORT_VRAM_W - NEWPORT_SCREEN_W) {
+        return 0;
+    }
+    return xoff;
+}
+
 /*
  * ============================================================
  * Framebuffer dump (debugging / OCR)
@@ -2510,9 +2626,10 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
     use_did = (s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS)
               && did_entry_ptr != 0;
 
+    int xoff = newport_scanout_xoff(s);
     for (y = 0; y < NEWPORT_SCREEN_H; y++) {
-        const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W];
-        const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W];
+        const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W + xoff];
+        const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W + xoff];
         uint8_t pix_mode = 0;
         uint8_t pix_size = 1;
         uint16_t ci_msb = 0;
@@ -2539,6 +2656,22 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
             }
             did_line_ptr++;
             next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+            /* BL-83: skip DID transitions in the pre-window bias columns */
+            while ((uint16_t)(next_did_entry >> 5) <= (uint16_t)xoff) {
+                mode_entry = s->xmap_mode_table[next_did_entry & 0x1f];
+                pix_mode = (mode_entry >> 8) & 3;
+                pix_size = (mode_entry >> 10) & 3;
+                aux_pix_mode = (mode_entry >> 16) & 7;
+                aux_msb = (mode_entry >> 11) & 0x1f00;
+                switch (pix_mode) {
+                case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
+                case 1: ci_msb = 0x1d00; break;
+                case 2: ci_msb = 0x1e00; break;
+                case 3: ci_msb = 0x1f00; break;
+                }
+                did_line_ptr++;
+                next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+            }
         }
 
         for (x = 0; x < NEWPORT_SCREEN_W; x++) {
@@ -2547,7 +2680,7 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
             uint32_t rgb;
             uint8_t r, g, b;
 
-            if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
+            if (use_did && (uint16_t)(x + xoff) == (next_did_entry >> 5)) {
                 mode_entry =
                     s->xmap_mode_table[next_did_entry & 0x1f];
                 pix_mode = (mode_entry >> 8) & 3;
@@ -2880,9 +3013,10 @@ static void newport_update_display(void *opaque)
     use_did = (s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS)
               && did_entry_ptr != 0;
 
+    int xoff = newport_scanout_xoff(s);
     for (y = 0; y < NEWPORT_SCREEN_H; y++) {
-        const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W];
-        const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W];
+        const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W + xoff];
+        const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W + xoff];
         uint8_t pix_mode = 0;   /* 0=CI, 1=RGB Map0, 2=Map1, 3=Map2 */
         uint8_t pix_size = 1;   /* 0=4bpp, 1=8bpp, 2=12bpp, 3=24bpp */
         uint16_t ci_msb = 0;
@@ -2916,6 +3050,22 @@ static void newport_update_display(void *opaque)
             /* Prepare next DID entry — MAME ref: next_did_line_entry() */
             did_line_ptr++;
             next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+            /* BL-83: skip DID transitions in the pre-window bias columns */
+            while ((uint16_t)(next_did_entry >> 5) <= (uint16_t)xoff) {
+                mode_entry = s->xmap_mode_table[next_did_entry & 0x1f];
+                pix_mode = (mode_entry >> 8) & 3;
+                pix_size = (mode_entry >> 10) & 3;
+                aux_pix_mode = (mode_entry >> 16) & 7;
+                aux_msb = (mode_entry >> 11) & 0x1f00;
+                switch (pix_mode) {
+                case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
+                case 1: ci_msb = 0x1d00; break;
+                case 2: ci_msb = 0x1e00; break;
+                case 3: ci_msb = 0x1f00; break;
+                }
+                did_line_ptr++;
+                next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+            }
         }
 
         for (x = 0; x < NEWPORT_SCREEN_W; x++) {
@@ -2928,7 +3078,7 @@ static void newport_update_display(void *opaque)
              * Check for DID mode change at this X position.
              * MAME ref: screen_update() at newport.cpp:1298-1312
              */
-            if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
+            if (use_did && (uint16_t)(x + xoff) == (next_did_entry >> 5)) {
                 mode_entry =
                     s->xmap_mode_table[next_did_entry & 0x1f];
                 pix_mode = (mode_entry >> 8) & 3;

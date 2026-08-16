@@ -1297,8 +1297,9 @@ static void newport_fast_fill_rect(SGINewportVirtuixState *s,
     }
 
     if (fx0 <= fx1 && fy0 <= fy1) {
-        newport_dirty_rect(s, fx0 + winx - 0x1000, fy0 + winy - 0x1000,
-                           fx1 - fx0 + 1, fy1 - fy0 + 1);
+        /* dirty rects are in scanout/dst (screen) space; the window offset only
+         * relocates the VRAM write, which the scanout applies on read (BL-83) */
+        newport_dirty_rect(s, fx0, fy0, fx1 - fx0 + 1, fy1 - fy0 + 1);
     }
 }
 
@@ -2009,8 +2010,7 @@ static void newport_draw_scr2scr(SGINewportVirtuixState *s)
                             }
                         }
                     }
-                    newport_dirty_rect(s, dst_x0, Dyl + winy - 0x1000,
-                                       row_w, Dyh - Dyl + 1);
+                    newport_dirty_rect(s, Dxl, Dyl, row_w, Dyh - Dyl + 1);
                 }
                 if (vmode && sf_fast && vry0 <= vry1) {
                     /* capture fast result, restore VRAM, fall through to slow
@@ -2237,8 +2237,6 @@ static void newport_do_rex3_command(SGINewportVirtuixState *s)
     int cap_ex = s->x_end_int,   cap_ey = s->y_end_int;
     int cap_mx = (int16_t)((s->xy_move >> 16) & 0xffff);
     int cap_my = (int16_t)(s->xy_move & 0xffff);
-    int cap_winx = (int16_t)((s->xy_window >> 16) & 0xffff);
-    int cap_winy = (int16_t)(s->xy_window & 0xffff);
     uint32_t touch_before = s->dirty_touch;
 
     trace_sgi_newport_rex3_cmd(s->drawmode0, s->drawmode1);
@@ -2301,9 +2299,10 @@ static void newport_do_rex3_command(SGINewportVirtuixState *s)
             x0 += cap_mx; x1 += cap_mx;
             y0 += cap_my; y1 += cap_my;
         }
-        /* raw draw coords → post-window-offset scanout space */
-        newport_dirty_rect(s, x0 + cap_winx - 0x1000, y0 + cap_winy - 0x1000,
-                           x1 - x0 + 1, y1 - y0 + 1);
+        /* raw draw coords are already scanout/dst (screen) space; the window
+         * offset only relocates the VRAM write, which the scanout applies on
+         * read (BL-83) */
+        newport_dirty_rect(s, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
     }
 }
 
@@ -3593,6 +3592,27 @@ static const MemoryRegionOps sgi_newport_virtuix_ops = {
     },
 };
 
+/* BL-83: the visible scanout window in VRAM is offset by the XYWIN window
+ * origin (winx - 0x1000).  Xsgi programs winx = 0x1000 + bt445_xbias (2 for
+ * the BT445 Rev A "extra black pixels" workaround, see ng1_init.c
+ * Ng1DacInit), leaving that many black bias columns at the start of each VRAM
+ * scanline that the real scanout skips.  Reading VRAM from x=0 shifted the
+ * whole desktop +2px right and clipped 2 columns off the right edge.
+ * (Y is not biased: the timing tables fold bt445_xbias into winx only, winy
+ * stays 0x1000.) */
+static inline int newport_scanout_xoff(const SGINewportVirtuixState *s)
+{
+    int xoff = (int16_t)(s->xy_window >> 16) - 0x1000;
+    /* Guard the pre-init state: xy_window resets to 0 (winx=0), giving -4096,
+     * far outside the VRAM window.  Only a small bias is ever valid — the
+     * bt445_xbias is at most the VRAM/screen width delta (64) — so anything
+     * outside [0, VRAM_W - SCREEN_W) falls back to the un-biased origin. */
+    if (xoff < 0 || xoff >= NEWPORT_VRAM_W - NEWPORT_SCREEN_W) {
+        return 0;
+    }
+    return xoff;
+}
+
 /*
  * ============================================================
  * Framebuffer dump (debugging / OCR)
@@ -3631,9 +3651,10 @@ static void newport_dump_vram_ppm(SGINewportVirtuixState *s, const char *path)
     use_did = (s->vc2_reg[VC2_DC_CONTROL] & VC2_DC_ENA_DIDS)
               && did_entry_ptr != 0;
 
+    int xoff = newport_scanout_xoff(s);
     for (y = 0; y < NEWPORT_SCREEN_H; y++) {
-        const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W];
-        const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W];
+        const uint32_t *src_rgbci = &s->vram_rgbci[y * NEWPORT_VRAM_W + xoff];
+        const uint32_t *src_cidaux = &s->vram_cidaux[y * NEWPORT_VRAM_W + xoff];
         uint8_t pix_mode = 0;
         uint8_t pix_size = 1;
         uint16_t ci_msb = 0;
@@ -3660,6 +3681,22 @@ static void newport_dump_vram_ppm(SGINewportVirtuixState *s, const char *path)
             }
             did_line_ptr++;
             next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+            /* BL-83: skip DID transitions in the pre-window bias columns */
+            while ((uint16_t)(next_did_entry >> 5) <= (uint16_t)xoff) {
+                mode_entry = s->xmap_mode_table[next_did_entry & 0x1f];
+                pix_mode = (mode_entry >> 8) & 3;
+                pix_size = (mode_entry >> 10) & 3;
+                aux_pix_mode = (mode_entry >> 16) & 7;
+                aux_msb = (mode_entry >> 11) & 0x1f00;
+                switch (pix_mode) {
+                case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
+                case 1: ci_msb = 0x1d00; break;
+                case 2: ci_msb = 0x1e00; break;
+                case 3: ci_msb = 0x1f00; break;
+                }
+                did_line_ptr++;
+                next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+            }
         }
 
         for (x = 0; x < NEWPORT_SCREEN_W; x++) {
@@ -3668,7 +3705,7 @@ static void newport_dump_vram_ppm(SGINewportVirtuixState *s, const char *path)
             uint32_t rgb;
             uint8_t r, g, b;
 
-            if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
+            if (use_did && (uint16_t)(x + xoff) == (next_did_entry >> 5)) {
                 mode_entry =
                     s->xmap_mode_table[next_did_entry & 0x1f];
                 pix_mode = (mode_entry >> 8) & 3;
@@ -4671,7 +4708,7 @@ static void newport_pal_resolve(SGINewportVirtuixState *s)
  * src_rgbci/src_cidaux row pointers and is the ONLY coupling to where the pixels
  * live: VRAM today, a shadowfb-derived CI row for Stage 2 (do not hardcode). */
 static void newport_convert_row(SGINewportVirtuixState *s, uint32_t *dst, int w,
-                                int y, int x_begin, int x_end,
+                                int y, int x_begin, int x_end, int xoff,
                                 const uint32_t *src_rgbci,
                                 const uint32_t *src_cidaux,
                                 uint16_t did_entry_ptr, bool use_did,
@@ -4704,6 +4741,24 @@ static void newport_convert_row(SGINewportVirtuixState *s, uint32_t *dst, int w,
         }
         did_line_ptr++;
         next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+        /* BL-83: the visible window begins at scanline pixel xoff (the
+         * bt445_xbias extra columns Xsgi leaves black).  Skip DID transitions
+         * before it so the mode at screen x=0 is the mode at scanline xoff. */
+        while ((uint16_t)(next_did_entry >> 5) <= (uint16_t)xoff) {
+            mode_entry = s->xmap_mode_table[next_did_entry & 0x1f];
+            pix_mode = (mode_entry >> 8) & 3;
+            pix_size = (mode_entry >> 10) & 3;
+            aux_pix_mode = (mode_entry >> 16) & 7;
+            aux_msb = (mode_entry >> 11) & 0x1f00;
+            switch (pix_mode) {
+            case 0: ci_msb = (mode_entry & 0xf8) << 5; break;
+            case 1: ci_msb = 0x1d00; break;
+            case 2: ci_msb = 0x1e00; break;
+            case 3: ci_msb = 0x1f00; break;
+            }
+            did_line_ptr++;
+            next_did_entry = s->vc2_ram[did_line_ptr & 0x7fff];
+        }
     }
 
     for (x = 0; x < x_end; x++) {
@@ -4712,8 +4767,10 @@ static void newport_convert_row(SGINewportVirtuixState *s, uint32_t *dst, int w,
 
         /* DID-segment boundary: advance the visual mode (must run for EVERY x
          * from 0 so the mode at x_begin is correct — this is the whole reason
-         * the walk starts at 0 even when only a sub-span is written). */
-        if (use_did && (uint16_t)x == (next_did_entry >> 5)) {
+         * the walk starts at 0 even when only a sub-span is written).
+         * Scanline pixel = x + xoff (the visible window is offset by the
+         * bt445_xbias). */
+        if (use_did && (uint16_t)(x + xoff) == (next_did_entry >> 5)) {
             mode_entry = s->xmap_mode_table[next_did_entry & 0x1f];
             pix_mode = (mode_entry >> 8) & 3;
             pix_size = (mode_entry >> 10) & 3;
@@ -4954,9 +5011,10 @@ static void newport_set_scanout(void *opaque, uint64_t base, uint32_t w,
     if (fmt == 0 && s->vram_rgbci && !newport_scanout_noseed()) {
         uint32_t cols = MIN(w, (uint32_t)NEWPORT_SCREEN_W);
         uint32_t rows = MIN(h, (uint32_t)NEWPORT_SCREEN_H);
+        int xoff = newport_scanout_xoff(s);
         uint32_t yy, xx;
         for (yy = 0; yy < rows; yy++) {
-            const uint32_t *vrow = &s->vram_rgbci[(size_t)yy * NEWPORT_VRAM_W];
+            const uint32_t *vrow = &s->vram_rgbci[(size_t)yy * NEWPORT_VRAM_W + xoff];
             for (xx = 0; xx < cols; xx++) {
                 s->scanout_rowbytes[xx] = (uint8_t)(vrow[xx] & 0xff);
             }
@@ -5063,7 +5121,8 @@ static void newport_scanout_ab_check(SGINewportVirtuixState *s,
     static uint32_t *scratch;       /* full frame: convert_row indexes dst[y*w+x] */
     static uint32_t n_rows, n_bad;
     uint32_t saved[NEWPORT_SCREEN_W];
-    uint32_t *vrow = &s->vram_rgbci[y * NEWPORT_VRAM_W];
+    int xoff = newport_scanout_xoff(s);
+    uint32_t *vrow = &s->vram_rgbci[y * NEWPORT_VRAM_W + xoff];
     int x;
     bool ok = true;
 
@@ -5072,8 +5131,8 @@ static void newport_scanout_ab_check(SGINewportVirtuixState *s,
     }
     memcpy(saved, vrow, sizeof(saved));
     memcpy(vrow, shadow_row, sizeof(saved));   /* same CI values, now in VRAM */
-    newport_convert_row(s, scratch, w, y, x_begin, x_end,
-                        vrow, &s->vram_cidaux[y * NEWPORT_VRAM_W],
+    newport_convert_row(s, scratch, w, y, x_begin, x_end, xoff,
+                        vrow, &s->vram_cidaux[y * NEWPORT_VRAM_W + xoff],
                         did_entry_ptr, use_did, popup_msb);
     memcpy(vrow, saved, sizeof(saved));
 
@@ -5197,6 +5256,7 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
     bool shadow_ci8   = s->scanout_active && s->scanout_format == 0;
     bool shadow_xrgb  = s->scanout_active && s->scanout_format == 1;
 
+    int xoff = newport_scanout_xoff(s);
     if (do_full) {
         for (y = 0; y < NEWPORT_SCREEN_H; y++) {
             if (shadow_xrgb) {
@@ -5204,10 +5264,10 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
             } else {
                 const uint32_t *src = shadow_ci8
                     ? newport_scanout_ci_row(s, y)
-                    : &s->vram_rgbci[y * NEWPORT_VRAM_W];
-                newport_convert_row(s, dst, w, y, 0, NEWPORT_SCREEN_W,
+                    : &s->vram_rgbci[y * NEWPORT_VRAM_W + xoff];
+                newport_convert_row(s, dst, w, y, 0, NEWPORT_SCREEN_W, xoff,
                                     src,
-                                    &s->vram_cidaux[y * NEWPORT_VRAM_W],
+                                    &s->vram_cidaux[y * NEWPORT_VRAM_W + xoff],
                                     did_entry_ptr, use_did, popup_msb);
                 if (shadow_ci8 && newport_scanout_ab()) {
                     newport_scanout_ab_check(s, dst, w, y, 0, NEWPORT_SCREEN_W,
@@ -5228,10 +5288,10 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
                 } else {
                     const uint32_t *src = shadow_ci8
                         ? newport_scanout_ci_row(s, y)
-                        : &s->vram_rgbci[y * NEWPORT_VRAM_W];
-                    newport_convert_row(s, dst, w, y, rx, xe,
+                        : &s->vram_rgbci[y * NEWPORT_VRAM_W + xoff];
+                    newport_convert_row(s, dst, w, y, rx, xe, xoff,
                                         src,
-                                        &s->vram_cidaux[y * NEWPORT_VRAM_W],
+                                        &s->vram_cidaux[y * NEWPORT_VRAM_W + xoff],
                                         did_entry_ptr, use_did, popup_msb);
                     if (shadow_ci8 && newport_scanout_ab()) {
                         newport_scanout_ab_check(s, dst, w, y, rx, xe,
@@ -5769,11 +5829,14 @@ static char *newport_get_diag_rex3(Object *obj, Error **errp)
         "Colors: red=0x%08x green=0x%08x blue=0x%08x alpha=0x%08x\n"
         "  color_i=0x%08x color_back=0x%08x\n"
         "Write_mask=0x%08x global_mask=0x%08x\n"
-        "Clip_mode=0x%08x status=0x%08x config=0x%08x\n",
+        "Clip_mode=0x%08x status=0x%08x config=0x%08x\n"
+        "XYWIN=0x%08x (winx=0x%04x winy=0x%04x scanout_xoff=%d)\n",
         s->color_red, s->color_green, s->color_blue, s->color_alpha,
         s->color_i, s->color_back,
         s->write_mask, s->global_mask,
-        s->clip_mode, s->status, s->config);
+        s->clip_mode, s->status, s->config,
+        s->xy_window, (uint16_t)(s->xy_window >> 16),
+        (uint16_t)s->xy_window, newport_scanout_xoff(s));
 
     return g_string_free(buf, FALSE);
 }
