@@ -779,6 +779,11 @@ static uint16_t sgi_be16(const uint8_t *p) {
   return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
 }
 
+/* Clear the SCSI unit-attention after a reset (see the realize-site comment). */
+static void sgi_virtuix_clear_scsi_ua(void *opaque) {
+  scsi_bus_clear_unit_attention((SCSIBus *)opaque);
+}
+
 /*
  * Parse an ARCS device path ("dksc(c,u,p)" or the canonical
  * "scsi(c)disk(u)rdisk(0)partition(p)") into a SCSI unit + partition index.
@@ -1851,6 +1856,16 @@ static void sgi_virtuix_init(MachineState *machine) {
   {
     SGIHPC3VirtuixState *hpc3 = SGI_HPC3_VIRTUIX(hpc3_dev);
     scsi_bus_legacy_handle_cmdline(&hpc3->scsi[0]->bus);
+    /* SGI install CDs are 512-byte-sector EFS images; force the CD sector
+     * size (QEMU defaults TYPE_ROM to 2048) so the guest wd93 driver's READ
+     * transfers the right amount. */
+    scsi_bus_force_cd_sector_size(&hpc3->scsi[0]->bus, 512);
+    /* Clear the post-reset SCSI unit-attention so the guest's first command
+     * (e.g. the miniroot's READ CAPACITY on the install CD) succeeds instead
+     * of returning power-on/reset sense 6/29 that the wd93 driver doesn't
+     * retry. The legacy reset handler runs in the exit-reset phase, i.e. AFTER
+     * the scsi-disk reset that set the unit attention. */
+    qemu_register_reset(sgi_virtuix_clear_scsi_ua, &hpc3->scsi[0]->bus);
   }
 
   /*

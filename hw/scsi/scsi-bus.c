@@ -1775,6 +1775,41 @@ void scsi_device_set_ua(SCSIDevice *sdev, SCSISense sense)
     }
 }
 
+/* Clear any pending unit-attention on the bus and its devices (used after a
+ * reset so the guest's first command doesn't get a spurious power-on/reset
+ * unit attention — e.g. the SGI install CD's READ CAPACITY under Mode C). */
+void scsi_bus_clear_unit_attention(SCSIBus *bus)
+{
+    BusChild *kid;
+
+    bus->unit_attention = SENSE_CODE(NO_SENSE);
+    QTAILQ_FOREACH(kid, &bus->qbus.children, sibling) {
+        SCSIDevice *dev = SCSI_DEVICE(kid->child);
+        dev->unit_attention = SENSE_CODE(NO_SENSE);
+    }
+}
+
+/* Force a sector size on CD-ROM devices on the bus and recompute their
+ * capacity. SGI install CDs are 512-byte-sector EFS images (not 2048-byte
+ * ISO9660), but QEMU's scsi-cd defaults TYPE_ROM to 2048 — which makes the
+ * guest's wd93 driver's READ transfer 4x more data than its DMA buffer. */
+void scsi_bus_force_cd_sector_size(SCSIBus *bus, int bytes)
+{
+    BusChild *kid;
+
+    QTAILQ_FOREACH(kid, &bus->qbus.children, sibling) {
+        SCSIDevice *dev = SCSI_DEVICE(kid->child);
+        uint64_t nb;
+        if (dev->type != TYPE_ROM) {
+            continue;
+        }
+        dev->blocksize = bytes;
+        blk_get_geometry(dev->conf.blk, &nb);
+        nb /= bytes / BDRV_SECTOR_SIZE;
+        dev->max_lba = nb ? nb - 1 : 0;
+    }
+}
+
 static void scsi_device_purge_one_req(SCSIRequest *req, void *opaque)
 {
     scsi_req_cancel_async(req, NULL);
