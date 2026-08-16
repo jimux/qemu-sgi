@@ -54,6 +54,19 @@ static QEMUClockType mc_timebase_clock(void)
 #define MC_DMA_MODE_FILL      (1 << 3)
 #define MC_DMA_MODE_DIR       (1 << 4)   /* memory address increments */
 
+/* VDMA status register (MC_DMA_RUN) bits — IRIX kern/sys/vdma.h.  RUNNING is
+ * bit 6, COMPLETE is bit 3; the error bits below are what real hardware raises
+ * when a transfer aborts instead of completing (vdma_wait() reads them, calls
+ * vdma_fault(), and retries for PAGEFAULT). */
+#define MC_DMA_R_PAGEFAULT    (1 << 0)   /* accessed non-resident page */
+#define MC_DMA_R_UTLBMISS     (1 << 1)   /* VDMA uTLB miss */
+#define MC_DMA_R_COMPLETE     (1 << 3)   /* last DMA completed */
+#define MC_DMA_R_RUNNING      (1 << 6)   /* DMA in progress */
+
+/* sentinel: a translate() fault (never a valid translated physical address —
+ * IP22 RAM + GIO device space all live far below 0xffffffff). */
+#define MC_DMA_TRANSLATE_FAULT  0xffffffffu
+
 /* SEG0 base address for 512KB alias */
 #define SEG0_BASE         0x08000000
 #define SEG0_ALIAS_BASE   0x00000000
@@ -542,6 +555,18 @@ static uint32_t sgi_mc_virtuix_dma_translate(SGIMCVirtuixState *s, uint32_t addr
             uint32_t pte = address_space_ldl_be(&address_space_memory,
                 pte_addr, MEMTXATTRS_UNSPECIFIED, NULL);
             uint32_t offset = address & 0xfff;
+            /*
+             * BL-44 defense-in-depth (note 22 §5): a non-resident PTE (the
+             * IP22 PG_VR "valid+referenced" bit clear — kern/sys/immu.h, the
+             * IP20/IP22/IP28 branch) must raise VDMA_R_PAGEFAULT and halt, so
+             * IRIX's vdma_wait()→vdma_fault() can set PG_VR and retry instead
+             * of the transfer silently streaming physical page 0 (the BL-44
+             * class of silent desktop corruption).
+             */
+            if (!(pte & 0x02)) {
+                s->dma_run |= MC_DMA_R_PAGEFAULT;
+                return MC_DMA_TRANSLATE_FAULT;
+            }
             uint32_t phys = ((pte & 0x03ffffc0) << 6) + offset;
             if (sgi_mc_dma_trace()) {
                 mc_xl_total++;
@@ -572,7 +597,11 @@ static uint32_t sgi_mc_virtuix_dma_translate(SGIMCVirtuixState *s, uint32_t addr
                     s->dma_tlb_hi[2], s->dma_tlb_hi[3]);
         }
     }
-    return 0;
+    /* BL-44 defense-in-depth: a genuine uTLB miss raises VDMA_R_UTLBMISS and
+     * halts (vdma_wait() → vdma_fault() reports it) instead of silently
+     * translating to physical page 0. */
+    s->dma_run |= MC_DMA_R_UTLBMISS;
+    return MC_DMA_TRANSLATE_FAULT;
 }
 
 static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
@@ -613,8 +642,12 @@ static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
             while (bytecount > 0) {
                 if (s->dma_mode & MC_DMA_MODE_TO_HOST) {
                     if (s->dma_mode & MC_DMA_MODE_FILL) {
+                        uint32_t phys = sgi_mc_virtuix_dma_translate(s, memory_addr);
+                        if (phys == MC_DMA_TRANSLATE_FAULT) {
+                            goto dma_fault;
+                        }
                         address_space_stl_be(&address_space_memory,
-                            sgi_mc_virtuix_dma_translate(s, memory_addr), s->dma_gio_addr,
+                            phys, s->dma_gio_addr,
                             MEMTXATTRS_UNSPECIFIED, NULL);
                         memory_addr += (s->dma_mode & MC_DMA_MODE_DIR) ? 4 : -4;
                         bytecount -= 4;
@@ -624,9 +657,12 @@ static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
                         uint64_t data = address_space_ldq_be(&address_space_memory,
                             gio_addr, MEMTXATTRS_UNSPECIFIED, NULL);
                         for (uint32_t i = 0; i < length; i++) {
+                            uint32_t phys = sgi_mc_virtuix_dma_translate(s, memory_addr);
+                            if (phys == MC_DMA_TRANSLATE_FAULT) {
+                                goto dma_fault;
+                            }
                             address_space_stb(&address_space_memory,
-                                sgi_mc_virtuix_dma_translate(s, memory_addr),
-                                (uint8_t)(data >> shift),
+                                phys, (uint8_t)(data >> shift),
                                 MEMTXATTRS_UNSPECIFIED, NULL);
                             memory_addr += (s->dma_mode & MC_DMA_MODE_DIR) ? 1 : -1;
                             shift -= 8;
@@ -638,9 +674,12 @@ static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
                     uint64_t shift = 56;
                     uint64_t data = 0;
                     for (uint32_t i = 0; i < length; i++) {
+                        uint32_t phys = sgi_mc_virtuix_dma_translate(s, memory_addr);
+                        if (phys == MC_DMA_TRANSLATE_FAULT) {
+                            goto dma_fault;
+                        }
                         data |= (uint64_t)address_space_ldub(&address_space_memory,
-                            sgi_mc_virtuix_dma_translate(s, memory_addr),
-                            MEMTXATTRS_UNSPECIFIED, NULL) << shift;
+                            phys, MEMTXATTRS_UNSPECIFIED, NULL) << shift;
                         memory_addr += (s->dma_mode & MC_DMA_MODE_DIR) ? 1 : -1;
                         shift -= 8;
                     }
@@ -672,17 +711,35 @@ static void sgi_mc_virtuix_perform_dma(SGIMCVirtuixState *s)
         memory_addr += stride;
     }
 
+    /* Fall through to finalize on both normal completion and a mid-transfer
+     * translation fault (the goto target from the inner loops above). */
+dma_fault:
     if (sgi_mc_dma_trace()) {
         fprintf(stderr, "MC_DMA END   #%llu xl_total=%u xl_miss=%u "
-                "xl_badpte=%u end_mem=0x%08x\n",
+                "xl_badpte=%u end_mem=0x%08x run=0x%02x\n",
                 (unsigned long long)dma_id, mc_xl_total, mc_xl_miss,
-                mc_xl_badpte, memory_addr);
+                mc_xl_badpte, memory_addr, s->dma_run & 0xff);
     }
 
+    /* On a fault this is the faulting address, which vdma_fault() reads back
+     * from DMA_MEMADR to locate and repair the PTE. */
     s->dma_mem_addr = memory_addr;
-    s->dma_run |= (1 << 3);     /* COMPLETE (0x08) */
+
+    if (s->dma_run & (MC_DMA_R_PAGEFAULT | MC_DMA_R_UTLBMISS)) {
+        /*
+         * BL-44 defense-in-depth (note 22 §5): a translation fault halts the
+         * transfer — clear RUNNING, keep the error bit, and do NOT set
+         * COMPLETE — so IRIX's vdma_wait() observes the error and calls
+         * vdma_fault() (which for PAGEFAULT sets PG_VR and retries) instead
+         * of the transfer silently streaming physical page 0.
+         */
+        s->dma_run &= ~MC_DMA_R_RUNNING;
+        return;
+    }
+
+    s->dma_run |= MC_DMA_R_COMPLETE;
     /*
-     * Keep RUNNING (0x40) set here. The transfer is synchronous, but consumers
+     * Keep RUNNING set here. The transfer is synchronous, but consumers
      * expect to observe RUNNING at least once after a start before it clears:
      * the indy PROM's "VDMA Clear" polls DMA_RUN and aborts ("VDMA Clear failed
      * to start") if it never sees RUNNING — which crashed machine=indy boot.
