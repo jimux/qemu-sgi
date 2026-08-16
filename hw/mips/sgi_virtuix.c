@@ -726,6 +726,13 @@ static void sgi_execute_copy_args(uint32_t argc, uint32_t argv_va,
     address_space_write(&address_space_memory, SGI_EXEC_ARGS_PHYS,
                         MEMTXATTRS_UNSPECIFIED, blob, sizeof(blob));
 
+    qemu_log("ARCS Execute: argv[%d] = {", nargv);
+    for (i = 0; i < nargv; i++) {
+        qemu_log(" \"%s\"", blob + SGI_EXEC_ARGS_STR_OFF +
+                 (argv_ptrs[i] - SGI_EXEC_ARGS_STR_OFF));
+    }
+    qemu_log(" }\n");
+
     *out_argc = nargv;
     *out_argv_va = nargv ? MIPS_K0BASE + SGI_EXEC_ARGS_PHYS +
                                SGI_EXEC_ARGS_ARGV_OFF : 0;
@@ -1473,16 +1480,20 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
     return;
   }
 
-  /* Boot disk is if=scsi,bus=0,unit=1 (the canonical golden convention). */
-  dinfo = drive_get(IF_SCSI, 0, 1);
+  /* Boot disk is if=scsi,bus=0,unit=1 (the canonical golden convention).
+   * SGI_MODE_C_SASH_UNIT overrides the unit the volume-header sash is read
+   * from — the C3 install layout loads sashARCS from the CD at unit 4. */
+  const char *sash_unit_str = getenv("SGI_MODE_C_SASH_UNIT");
+  int sash_unit = sash_unit_str ? atoi(sash_unit_str) : 1;
+  dinfo = drive_get(IF_SCSI, 0, sash_unit);
   if (!dinfo || !(blk = blk_by_legacy_dinfo(dinfo))) {
-    error_report("Mode C: no boot disk at scsi bus=0 unit=1");
+    error_report("Mode C: no sash source at scsi bus=0 unit=%d", sash_unit);
     return;
   }
 
   if (blk_pread(blk, 0, SGI_VH_SECTOR, vh, 0) < 0 ||
       sgi_be32(&vh[0]) != SGI_VH_MAGIC) {
-    error_report("Mode C: bad/absent SGI volume header on boot disk");
+    error_report("Mode C: bad/absent SGI volume header on sash source");
     return;
   }
 
@@ -1502,15 +1513,17 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
    */
   uint32_t sash_lbn = 0, sash_nbytes = 0;
   bool have_sash = false;
+  /* Prefer the CD's relocatable `sashARCS` (C3 install), then the boot disk's
+   * NUL-padded `sash`; `sash64` is the 64-bit variant and not for IP22. */
   for (i = 0; i < SGI_VH_NVDIR; i++) {
     const uint8_t *vd = &vh[SGI_VH_VOLDIR_OFF + i * SGI_VH_VD_ENTSZ];
-    if (memcmp(vd, "sash\0\0\0\0", SGI_VH_VDNAMESIZE) != 0) {
-      continue;
+    if (memcmp(vd, "sashARCS", 8) == 0 ||
+        memcmp(vd, "sash\0\0\0\0", SGI_VH_VDNAMESIZE) == 0) {
+      sash_lbn = sgi_be32(vd + 8);
+      sash_nbytes = sgi_be32(vd + 12);
+      have_sash = true;
+      break;
     }
-    sash_lbn = sgi_be32(vd + 8);
-    sash_nbytes = sgi_be32(vd + 12);
-    have_sash = true;
-    break;
   }
 
   if (getenv("SGI_MODE_C_PATH_A") && have_sash) {
