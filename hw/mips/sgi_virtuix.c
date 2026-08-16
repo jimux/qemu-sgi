@@ -925,7 +925,9 @@ static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va,
     }
     qemu_log("ARCS Execute: path=%s -> file=%s\n", path, fname);
 
-    /* Parse "dksc(bus,unit,part)name"; part selects the filesystem. */
+    /* Parse "dksc(bus,unit,part)name" or the canonical
+     * "scsi(c)disk(u)partition(p)name" / "scsi(c)cdrom(u)partition(p)name"
+     * (mrboot's miniroot path). `part` selects the filesystem. */
     if (sscanf(path, "dksc(%d,%d,%d)", &bus, &unit, &part) == 3) {
         char *rp = strchr(path, ')');
         rest = rp ? rp + 1 : path;
@@ -933,7 +935,28 @@ static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va,
             rest++;
         }
     } else {
-        rest = fname;
+        /* New-style: scsi(c)[cdrom|disk](u)[rdisk(r)]partition(p)rest */
+        const char *q = strstr(path, "scsi(");
+        const char *rp = NULL;
+        if (q) {
+            bus = atoi(q + 5);
+        }
+        if ((q = strstr(path, "disk(")) != NULL) {
+            unit = atoi(q + 5);
+        } else if ((q = strstr(path, "cdrom(")) != NULL) {
+            unit = atoi(q + 6);
+        }
+        if ((q = strstr(path, "partition(")) != NULL) {
+            part = atoi(q + 10);
+            rp = strchr(q, ')');
+        } else if ((q = strstr(path, "part(")) != NULL) {
+            part = atoi(q + 5);
+            rp = strchr(q, ')');
+        }
+        rest = rp ? rp + 1 : fname;
+        while (*rest == '/') {
+            rest++;
+        }
     }
 
     dinfo = drive_get(IF_SCSI, bus, unit);

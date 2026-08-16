@@ -106,7 +106,16 @@ static const struct {
 #define SGI_VH_PARTAB_OFF   0x138
 #define SGI_VH_NPARTAB      16
 #define SGI_VH_PT_ENTSZ     12   /* int nblks + int firstlbn + int type */
+#define SGI_VH_VOLDIR_OFF   0x48
+#define SGI_VH_NVDIR        15
+#define SGI_VH_VD_ENTSZ     16   /* char[8] name + int lbn + int nbytes */
 #define SGI_VH_PTYPE_XFS    10
+
+/* Minimal ARCS component tree: a single root component "SGI-IP22" so
+ * GetChild(NULL) (mrboot's inv_findcpu) can name the CPU for the miniroot
+ * kernel path. Placed in high RAM above sash/fx/kernel. */
+#define ARCS_COMPONENT_PHYS     0x09403000ULL
+#define ARCS_COMPONENT_ID_PHYS  0x09403040ULL
 
 /* ARCS errno (arcs/errno.h) */
 #define ARCS_ESUCCESS       0
@@ -679,10 +688,13 @@ static int arcs_devpath_parse(const char *name, int *bus, int *unit, int *part)
     if ((q = strstr(name, "scsi(")) != NULL) {
         c = atoi(q + 5);
     }
-    if ((q = strstr(name, "disk(")) == NULL) {
+    if ((q = strstr(name, "disk(")) != NULL) {
+        u = atoi(q + 5);
+    } else if ((q = strstr(name, "cdrom(")) != NULL) {
+        u = atoi(q + 6);
+    } else {
         return -1;
     }
-    u = atoi(q + 5);
     if ((q = strstr(name, "partition(")) != NULL) {
         p = atoi(q + 10);
     } else if ((q = strstr(name, "part(")) != NULL) {
@@ -721,6 +733,19 @@ static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
     if (arcs_devpath_parse(name, &bus, &unit, &part) != 0) {
         g_free(name);
         return ARCS_ENODEV;
+    }
+    /* A volume-directory entry suffix "(name)" (e.g. mrboot's
+     * "scsi(0)cdrom(4)partition(8)(mr)") selects a file within the volume
+     * header: parse it from the dvh voldir and override base/size. */
+    char vdname[9] = {0};
+    const char *suffix = strstr(name, ")(");
+    if (suffix && suffix[2] != '\0') {
+        const char *end = strchr(suffix + 2, ')');
+        int n = end ? (int)(end - (suffix + 2)) : (int)strlen(suffix + 2);
+        if (n > 8) {
+            n = 8;
+        }
+        memcpy(vdname, suffix + 2, n);
     }
     g_free(name);
 
@@ -763,6 +788,27 @@ static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
         firstlbn = arcs_be32(pt + 4);
         arcs_fds[fd].base = (uint64_t)firstlbn * 512;
         arcs_fds[fd].size = (uint64_t)nblks * 512;
+
+        /* Resolve a volume-directory entry by name. */
+        if (vdname[0]) {
+            int v = 0, found = 0;
+            for (v = 0; v < SGI_VH_NVDIR; v++) {
+                const uint8_t *vd = &vh[SGI_VH_VOLDIR_OFF + v * SGI_VH_VD_ENTSZ];
+                if (memcmp(vd, vdname, strlen(vdname)) == 0) {
+                    uint32_t lbn = arcs_be32(vd + 8);
+                    uint32_t nbytes = arcs_be32(vd + 12);
+                    arcs_fds[fd].base = (uint64_t)lbn * 512;
+                    arcs_fds[fd].size = nbytes;
+                    firstlbn = lbn;
+                    nblks = nbytes / 512;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                return ARCS_ENOENT;
+            }
+        }
     }
 
     arcs_fds[fd].in_use = true;
@@ -886,12 +932,30 @@ static uint32_t arcs_close(SGIARCSState *s, uint32_t fd)
 #define SGI_DIOCSENSE           SGI_DIOC_(11)
 #define SGI_DIOCREADCAPACITY    SGI_DIOC_(13)
 #define SGI_DIOCDRIVETYPE       SGI_DIOC_(24)
+#define SGI_TIOCISGRAPHIC       (('t' << 8) | 9)
+#define SGI_TIOCISATTY          (('t' << 8) | 12)
 
 static uint32_t arcs_ioctl(SGIARCSState *s, uint32_t fd, uint32_t cmd,
                            uint32_t arg_va)
 {
     ARCSFd *f;
     uint8_t buf[512];
+
+    /* Console/tty ioctls (isgraphic/isatty) — answered for any fd. A serial
+     * console is never a graphics device, so isgraphic() = 0 (keeps mrboot in
+     * text/panel mode instead of trying to draw a GUI dialog). */
+    if (cmd == SGI_TIOCISGRAPHIC) {
+        uint32_t v = cpu_to_be32(0);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(arg_va), (uint8_t *)&v,
+                            4, 1);
+        return ARCS_ESUCCESS;
+    }
+    if (cmd == SGI_TIOCISATTY) {
+        uint32_t v = cpu_to_be32(fd <= 2 ? 1 : 0);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(arg_va), (uint8_t *)&v,
+                            4, 1);
+        return ARCS_ESUCCESS;
+    }
 
     if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
         return ARCS_EINVAL;
@@ -1087,8 +1151,15 @@ static void arcs_hypercall(SGIARCSState *s)
         s->result = ARCS_EIO;  /* not implemented */
         break;
 
-    case ARCS_FN_GETPEER:
     case ARCS_FN_GETCHILD:
+        /* Return our minimal root component "SGI-IP22" only for the root
+         * (GetChild(NULL)); the component itself has no children. */
+        qemu_log("ARCS: GetChild(parent=0x%08x) -> %s\n", s->arg0,
+                 s->arg0 == 0 ? "0x89403000" : "NULL");
+        s->result = (s->arg0 == 0) ? MIPS_K0BASE + ARCS_COMPONENT_PHYS : 0;
+        break;
+
+    case ARCS_FN_GETPEER:
     case ARCS_FN_GETPARENT:
     case ARCS_FN_ADDCHILD:
     case ARCS_FN_DELETECOMPONENT:
@@ -1518,6 +1589,25 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
 
         rom_add_blob_fixed("arcs-sash-args", sash_args, sizeof(sash_args),
                            ARCS_SASH_ARGS_PHYS);
+    }
+
+    /* ---- Build a minimal component tree (GetChild(NULL) -> "SGI-IP22") ---- */
+    {
+        uint8_t comp[0x60];
+        uint32_t idptr = MIPS_K0BASE + ARCS_COMPONENT_ID_PHYS;
+        memset(comp, 0, sizeof(comp));
+        /* Identifier string "SGI-IP22" at +0x40. */
+        memcpy(comp + 0x40, "SGI-IP22", 8);
+        /* COMPONENT struct at +0 (arcs/hinv.h: Class/Type/Flags/Version/
+         * Revision/Key/AffinityMask/ConfigurationDataSize/IdentifierLength/
+         * Identifier — 36 bytes, big-endian). */
+        comp[31] = 8;                       /* IdentifierLength = 8 */
+        comp[32] = idptr >> 24;             /* Identifier pointer */
+        comp[33] = idptr >> 16;
+        comp[34] = idptr >> 8;
+        comp[35] = idptr;
+        rom_add_blob_fixed("arcs-component", comp, sizeof(comp),
+                           ARCS_COMPONENT_PHYS);
     }
 
     /* ---- Build memory descriptors ---- */

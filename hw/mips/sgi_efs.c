@@ -158,8 +158,12 @@ static int efs_read_inode(SGIEFS *fs, uint64_t ino, SGIEFSInode *out)
         int j;
         uint64_t got;
 
-        /* First direct extent's offset holds the indirect-block count. */
-        num_indirect = (raw[32 + 5] << 8) | raw[32 + 6]; /* offset field, 2 BE bytes */
+        /* First direct extent's offset field holds the indirect-block count. */
+        {
+            SGIEFSExtent first;
+            parse_extent(raw + 32, &first);
+            num_indirect = (int)first.offset;
+        }
         if (num_indirect <= 0 || num_indirect > EFS_MAX_EXTENTS) {
             error_report("sgi_efs: inode %" PRIu64 " bad indirect count %d",
                          ino, num_indirect);
