@@ -478,6 +478,18 @@ static int arcs_env_apply_persisted(char *env_buf, int *env_len, int env_size)
     return applied;
 }
 
+/* Raw block-device file descriptor table (shared by Open/Read/Write/Seek). */
+typedef struct ARCSFd {
+    bool in_use;
+    bool writable;
+    BlockBackend *blk;
+    uint64_t base;      /* partition start, in bytes (512*firstlbn) */
+    uint64_t offset;    /* byte offset within the partition */
+    uint64_t size;      /* partition size, in bytes */
+} ARCSFd;
+
+static ARCSFd arcs_fds[ARCS_MAX_FDS];
+
 /*
  * Handle ARCS_FN_WRITE hypercall.
  *
@@ -492,30 +504,64 @@ static int arcs_env_apply_persisted(char *env_buf, int *env_len, int env_size)
 static uint32_t arcs_write(SGIARCSState *s, uint32_t fd, uint32_t buf_ptr,
                            uint32_t count, uint32_t count_va)
 {
-    char *buf;
     uint32_t nwritten = 0;
+    uint32_t rc = ARCS_ESUCCESS;
 
-    if (count == 0 || count > 4096) {
+    if (count == 0) {
         goto out_count;
     }
 
-    buf = g_malloc(count + 1);
-    /* buf_ptr is a guest VA (kuseg for sash, kseg0 for the kernel). */
-    if (cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_ptr), (uint8_t *)buf,
-                            count, 0) != 0) {
+    if (fd >= 3 && fd < ARCS_MAX_FDS && arcs_fds[fd].in_use) {
+        /* Raw block write to a SCSI partition slice (fx / mrboot mr_copy). */
+        ARCSFd *f = &arcs_fds[fd];
+        uint8_t *buf;
+        uint32_t avail;
+
+        if (!f->writable) {
+            return ARCS_EINVAL;
+        }
+        if (count > 1024 * 1024) {
+            goto out_count;
+        }
+        buf = g_malloc(count);
+        if (cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_ptr), buf, count,
+                                0) != 0) {
+            g_free(buf);
+            goto out_count;
+        }
+        if (f->offset >= f->size) {
+            g_free(buf);
+            goto out_count;  /* past end of partition: 0 bytes written */
+        }
+        avail = MIN((uint64_t)count, f->size - f->offset);
+        if (blk_pwrite(f->blk, f->base + f->offset, avail, buf, 0) < 0) {
+            g_free(buf);
+            return ARCS_EIO;
+        }
+        f->offset += avail;
+        nwritten = avail;
         g_free(buf);
+        qemu_log("ARCS: Write(fd=%u, %u) -> %u bytes\n", fd, count, nwritten);
         goto out_count;
     }
-    buf[count] = '\0';
 
-    if ((fd == 1 || fd == 2) && qemu_chr_fe_backend_connected(&s->chr)) {
-        qemu_chr_fe_write_all(&s->chr, (uint8_t *)buf, count);
-    } else {
-        qemu_log("ARCS Write(fd=%u): %s", fd, buf);
+    /* Console write (fd 1/2). */
+    if (count <= 4096) {
+        char *buf = g_malloc(count + 1);
+        if (cpu_memory_rw_debug(first_cpu, arcs_guest_va(buf_ptr),
+                                (uint8_t *)buf, count, 0) != 0) {
+            g_free(buf);
+            goto out_count;
+        }
+        buf[count] = '\0';
+        if ((fd == 1 || fd == 2) && qemu_chr_fe_backend_connected(&s->chr)) {
+            qemu_chr_fe_write_all(&s->chr, (uint8_t *)buf, count);
+        } else {
+            qemu_log("ARCS Write(fd=%u): %s", fd, buf);
+        }
+        g_free(buf);
+        nwritten = count;
     }
-
-    g_free(buf);
-    nwritten = count;
 
 out_count:
     if (count_va) {
@@ -523,7 +569,7 @@ out_count:
         cpu_memory_rw_debug(first_cpu, arcs_guest_va(count_va),
                             (uint8_t *)&count_be, 4, 1);
     }
-    return 0;  /* ESUCCESS */
+    return rc;
 }
 
 /*
@@ -533,9 +579,13 @@ out_count:
 static uint32_t arcs_relative_time;
 
 /* Execute() implementation, registered by the machine (sgi_virtuix.c). */
-static void (*arcs_execute_cb)(SGIARCSState *s, uint32_t path_va);
+static void (*arcs_execute_cb)(SGIARCSState *s, uint32_t path_va,
+                               uint32_t argc, uint32_t argv_va,
+                               uint32_t envp_va);
 
-void sgi_arcs_set_execute_cb(void (*cb)(SGIARCSState *s, uint32_t path_va))
+void sgi_arcs_set_execute_cb(void (*cb)(SGIARCSState *s, uint32_t path_va,
+                                        uint32_t argc, uint32_t argv_va,
+                                        uint32_t envp_va))
 {
     arcs_execute_cb = cb;
 }
@@ -597,16 +647,6 @@ void sgi_arcs_set_kernel_env(SGIARCSState *s, const char *name,
  * (sdvh/xfs/efs install) build on these to read the volume header + XFS/EFS.
  */
 
-typedef struct ARCSFd {
-    bool in_use;
-    BlockBackend *blk;
-    uint64_t base;      /* partition start, in bytes (512*firstlbn) */
-    uint64_t offset;    /* byte offset within the partition */
-    uint64_t size;      /* partition size, in bytes */
-} ARCSFd;
-
-static ARCSFd arcs_fds[ARCS_MAX_FDS];
-
 static uint32_t arcs_be32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -619,6 +659,41 @@ static BlockBackend *arcs_scsi_backend(int bus, int unit)
     return dinfo ? blk_by_legacy_dinfo(dinfo) : NULL;
 }
 
+/*
+ * Parse an ARCS device path into (bus, unit, part). Accepts both the old
+ * "dksc(bus,unit,part)" form and the canonical "scsi(c)disk(u)[rdisk(r)]
+ * partition(p)" form (plus the short "scsi(c)disk(u)part(p)" fx emits).
+ * Returns 0 on success, -1 if no disk specifier is found.
+ */
+static int arcs_devpath_parse(const char *name, int *bus, int *unit, int *part)
+{
+    int c = 0, u = 1, p = 0;
+    const char *q;
+
+    if (sscanf(name, "dksc(%d,%d,%d)", &c, &u, &p) == 3) {
+        *bus = c;
+        *unit = u;
+        *part = p;
+        return 0;
+    }
+    if ((q = strstr(name, "scsi(")) != NULL) {
+        c = atoi(q + 5);
+    }
+    if ((q = strstr(name, "disk(")) == NULL) {
+        return -1;
+    }
+    u = atoi(q + 5);
+    if ((q = strstr(name, "partition(")) != NULL) {
+        p = atoi(q + 10);
+    } else if ((q = strstr(name, "part(")) != NULL) {
+        p = atoi(q + 5);
+    }
+    *bus = c;
+    *unit = u;
+    *part = p;
+    return 0;
+}
+
 static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
                           uint32_t fd_va)
 {
@@ -627,14 +702,23 @@ static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
     BlockBackend *blk;
     uint8_t vh[512];
     const uint8_t *pt;
+    uint32_t nblks = 0, firstlbn = 0;
     int fd;
+    bool writable;
 
-    if (mode != 0 /* OpenReadOnly */ && mode != 7 /* OpenDirectory */) {
+    /* OpenReadOnly=0, OpenWriteOnly=1, OpenReadWrite=2, OpenDirectory=7. */
+    if (mode == 0) {
+        writable = false;
+    } else if (mode == 1 || mode == 2) {
+        writable = true;
+    } else if (mode == 7) {
+        writable = false;
+    } else {
         return ARCS_EINVAL;
     }
 
     name = read_guest_string_va(path_va, 128);
-    if (sscanf(name, "dksc(%d,%d,%d)", &bus, &unit, &part) != 3) {
+    if (arcs_devpath_parse(name, &bus, &unit, &part) != 0) {
         g_free(name);
         return ARCS_ENODEV;
     }
@@ -655,27 +739,44 @@ static uint32_t arcs_open(SGIARCSState *s, uint32_t path_va, uint32_t mode,
     }
 
     if (blk_pread(blk, 0, 512, vh, 0) < 0 || arcs_be32(&vh[0]) != SGI_VH_MAGIC) {
-        return ARCS_EIO;
+        /* Blank disk (no volume header yet, e.g. the C3 install target): allow
+         * whole-disk access via the volume (10) / volhdr (8) / root (0) names
+         * so fx can write the initial dvh + partition table. */
+        int64_t len;
+        if (part != 0 && part != 8 && part != 10) {
+            return ARCS_EIO;
+        }
+        len = blk_getlength(blk);
+        if (len <= 0) {
+            return ARCS_EIO;
+        }
+        arcs_fds[fd].base = 0;
+        arcs_fds[fd].size = (uint64_t)len;
+        nblks = len / 512;
+        firstlbn = 0;
+    } else {
+        if (part < 0 || part >= SGI_VH_NPARTAB) {
+            return ARCS_EINVAL;
+        }
+        pt = &vh[SGI_VH_PARTAB_OFF + part * SGI_VH_PT_ENTSZ];
+        nblks = arcs_be32(pt + 0);
+        firstlbn = arcs_be32(pt + 4);
+        arcs_fds[fd].base = (uint64_t)firstlbn * 512;
+        arcs_fds[fd].size = (uint64_t)nblks * 512;
     }
-    if (part < 0 || part >= SGI_VH_NPARTAB) {
-        return ARCS_EINVAL;
-    }
-    pt = &vh[SGI_VH_PARTAB_OFF + part * SGI_VH_PT_ENTSZ];
-    uint32_t nblks = arcs_be32(pt + 0);
-    uint32_t firstlbn = arcs_be32(pt + 4);
 
     arcs_fds[fd].in_use = true;
+    arcs_fds[fd].writable = writable;
     arcs_fds[fd].blk = blk;
-    arcs_fds[fd].base = (uint64_t)firstlbn * 512;
     arcs_fds[fd].offset = 0;
-    arcs_fds[fd].size = (uint64_t)nblks * 512;
 
     /* Write the fd back to the guest's output pointer. */
     uint32_t fd_be = cpu_to_be32(fd);
     cpu_memory_rw_debug(first_cpu, arcs_guest_va(fd_va), (uint8_t *)&fd_be,
                         4, 1);
-    qemu_log("ARCS: Open(\"dksc(%d,%d,%d)\") -> fd %d (lbn %u, %u blks)\n",
-             bus, unit, part, fd, firstlbn, nblks);
+    qemu_log("ARCS: Open(bus=%d unit=%d part=%d) -> fd %d (lbn %u, %u blks, "
+             "%s)\n", bus, unit, part, fd, firstlbn, nblks,
+             writable ? "rw" : "ro");
     return ARCS_ESUCCESS;
 }
 
@@ -771,6 +872,75 @@ static uint32_t arcs_close(SGIARCSState *s, uint32_t fd)
     arcs_fds[fd].in_use = false;
     qemu_log("ARCS: Close(fd=%u)\n", fd);
     return ARCS_ESUCCESS;
+}
+
+/*
+ * SGI PrivateVector Ioctl: the raw-disk ioctl service fx / mrboot use for
+ * volume-header get/set and drive capacity. arg0=fd, arg1=cmd (DIOC_*),
+ * arg2=guest pointer to the data. Serves the DIOC commands the install chain
+ * needs (capacity + dvh get/set + drive type); everything else fails EINVAL.
+ */
+#define SGI_DIOC_(x)            (('d' << 8) | (x))
+#define SGI_DIOCGETVH           SGI_DIOC_(6)
+#define SGI_DIOCSETVH           SGI_DIOC_(7)
+#define SGI_DIOCSENSE           SGI_DIOC_(11)
+#define SGI_DIOCREADCAPACITY    SGI_DIOC_(13)
+#define SGI_DIOCDRIVETYPE       SGI_DIOC_(24)
+
+static uint32_t arcs_ioctl(SGIARCSState *s, uint32_t fd, uint32_t cmd,
+                           uint32_t arg_va)
+{
+    ARCSFd *f;
+    uint8_t buf[512];
+
+    if (fd >= ARCS_MAX_FDS || !arcs_fds[fd].in_use) {
+        return ARCS_EINVAL;
+    }
+    f = &arcs_fds[fd];
+
+    switch (cmd) {
+    case SGI_DIOCREADCAPACITY: {
+        int64_t len = blk_getlength(f->blk);
+        uint32_t cap;
+        if (len <= 0) {
+            return ARCS_EIO;
+        }
+        cap = cpu_to_be32((uint32_t)(len / 512));
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(arg_va), (uint8_t *)&cap,
+                            4, 1);
+        qemu_log("ARCS: Ioctl(DIOCREADCAPACITY) -> %u blocks\n",
+                 (uint32_t)(len / 512));
+        return ARCS_ESUCCESS;
+    }
+    case SGI_DIOCGETVH:
+        /* Read the on-disk volume header (sector 0) into the guest buffer.
+         * A blank disk reads as zeros, which fx treats as "no volume header". */
+        memset(buf, 0, sizeof(buf));
+        blk_pread(f->blk, 0, sizeof(buf), buf, 0);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(arg_va), buf, sizeof(buf),
+                            1);
+        qemu_log("ARCS: Ioctl(DIOCGETVH)\n");
+        return ARCS_ESUCCESS;
+    case SGI_DIOCSETVH:
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(arg_va), buf, sizeof(buf),
+                            0);
+        if (blk_pwrite(f->blk, 0, sizeof(buf), buf, 0) < 0) {
+            return ARCS_EIO;
+        }
+        qemu_log("ARCS: Ioctl(DIOCSETVH)\n");
+        return ARCS_ESUCCESS;
+    case SGI_DIOCDRIVETYPE: {
+        /* struct { char name[28]; ... } — a minimal SCSI drive type name. */
+        uint8_t dt[28] = {0};
+        memcpy(dt, "scsi", 4);
+        cpu_memory_rw_debug(first_cpu, arcs_guest_va(arg_va), dt, sizeof(dt),
+                            1);
+        return ARCS_ESUCCESS;
+    }
+    default:
+        qemu_log_mask(LOG_UNIMP, "ARCS: Ioctl(cmd=0x%x) unimplemented\n", cmd);
+        return ARCS_EINVAL;
+    }
 }
 
 static uint32_t arcs_get_read_status(SGIARCSState *s, uint32_t fd)
@@ -878,7 +1048,7 @@ static void arcs_hypercall(SGIARCSState *s)
         /* Load + run the named /unix (sash autoboot). The implementation lives
          * in the machine (sgi_virtuix.c) via the registered callback. */
         if (arcs_execute_cb) {
-            arcs_execute_cb(s, s->arg0);
+            arcs_execute_cb(s, s->arg0, s->arg1, s->arg2, s->arg3);
         }
         s->result = 0;  /* not reached if the jump succeeds */
         break;
@@ -969,14 +1139,16 @@ static void arcs_hypercall(SGIARCSState *s)
         break;
 
     case ARCS_PFN_IOCTL:
+        s->result = arcs_ioctl(s, s->arg0, s->arg1, s->arg2);
+        break;
+
     case ARCS_PFN_FSREG:
     case ARCS_PFN_FSUNREG:
     case ARCS_PFN_SIGNAL:
         /*
          * sash's startup calls FsReg (to register its EFS/XFS/volhdr parsers),
-         * Ioctl (console TIOCSETXOFF/TIOCINTRCHAR) and Signal. For Mode C we
-         * serve the file I/O host-side ourselves, so FsReg/FsUnReg are
-         * no-op-success; the console ioctls and Signal are no-ops too.
+         * and Signal. For Mode C we serve the file I/O host-side ourselves, so
+         * FsReg/FsUnReg are no-op-success; Signal is a no-op too.
          */
         qemu_log("ARCS: PV function %d (no-op success)\n", s->func);
         s->result = 0;  /* ESUCCESS */

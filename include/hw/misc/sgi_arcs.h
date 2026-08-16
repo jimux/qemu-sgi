@@ -227,7 +227,9 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as);
  * The callback receives the ARCS state (for kernname/args access) and the guest
  * VA of the Execute path string.
  */
-void sgi_arcs_set_execute_cb(void (*cb)(SGIARCSState *s, uint32_t path_va));
+void sgi_arcs_set_execute_cb(void (*cb)(SGIARCSState *s, uint32_t path_va,
+                                        uint32_t argc, uint32_t argv_va,
+                                        uint32_t envp_va));
 
 /*
  * Append a "name=value" entry to the kernel environ (the a2 envp handed to

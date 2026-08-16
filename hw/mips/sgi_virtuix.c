@@ -50,6 +50,7 @@
 #include "hw/misc/sgi_hpc3_virtuix.h"
 #include "hw/misc/sgi_mc_virtuix.h"
 #include "hw/mips/sgi_xfs.h"
+#include "hw/mips/sgi_efs.h"
 #include "hw/misc/sgi_pvaudio.h"
 #include "hw/misc/sgi_pvchan.h"
 #include "hw/misc/sgi_smp.h"
@@ -379,6 +380,359 @@ static void write_sash_trampoline(uint32_t sash_entry, uint32_t gp_value) {
 #undef CP0_STATUS
 }
 
+/*
+ * ARCS Execute argv/envp scratch. High RAM (phys 0x09400000) — above the
+ * standalone programs loaded at kuseg 0x10000000 -> phys 0x09000000 (fx.ARCS)
+ * AND above the kernel LOAD at 0x08002000 — so the copied guest argv/envp
+ * survive whichever program we hand off to. kseg0 VA = MIPS_K0BASE + phys.
+ */
+#define SGI_EXEC_ARGS_PHYS       0x09400000ULL
+#define SGI_EXEC_ARGS_STR_OFF    0x0000    /* argv/envp strings (8 KB) */
+#define SGI_EXEC_ARGS_ARGV_OFF   0x2000    /* argv pointer array (32 x 4) */
+#define SGI_EXEC_ARGS_ENVP_OFF   0x2100    /* envp pointer array (32 x 4) */
+
+/* Runtime trampoline: RAM (not the read-only PROM ROM) — rom_add_blob_fixed
+ * aborts at runtime ("ROM images must be loaded at startup"), so the Execute
+ * trampoline is written with address_space_write into high RAM above every
+ * program we load (fx.ARCS ~0x09000000, kernel ~0x08002000). */
+#define SGI_EXEC_TRAMP_PHYS      0x10000000ULL
+#define SGI_EXEC_TRAMP_K1        0xB0000000ULL   /* kseg1 VA of the trampoline */
+
+/* Forward declarations (definitions follow later in this file). */
+static uint32_t sgi_be32(const uint8_t *p);
+static uint16_t sgi_be16(const uint8_t *p);
+static int sgi_sash_relocate(uint8_t *sash, size_t sash_size);
+
+/*
+ * Runtime ECOFF loader for the ARCS Execute path (fx.ARCS + friends).
+ *
+ * The SGI standalone programs in /stand (fx.ARCS) use the same on-disk format
+ * as the disk sash: a relocatable kuseg ECOFF (f_magic 0x0162/0x0163, a_magic
+ * 0x0107), linked at kuseg 0x10000000 with external-symbol relocations. Relocate
+ * the host buffer in place (sgi_sash_relocate), write .text/.data to phys
+ * (kuseg VA -> PA = VA - 0x07000000) and zero .bss, then return entry + gp.
+ * Unlike the boot-time sash loader this runs at RUNTIME (inside the Execute
+ * hypercall), so it uses address_space_write, not rom_add_blob_fixed.
+ */
+static int sgi_load_ecoff_runtime(uint8_t *img, size_t len, uint32_t *entry,
+                                  uint32_t *gp_value, uint32_t *high_phys)
+{
+    uint16_t f_magic, f_nscns, a_magic;
+    uint32_t tsize, dsize, bsize, text_start, data_start, bss_start;
+    uint32_t txoff, phys_text, phys_data, phys_bss;
+
+    if (len < 76) {
+        return -1;
+    }
+    f_magic = sgi_be16(&img[0]);
+    f_nscns = sgi_be16(&img[2]);
+    a_magic = sgi_be16(&img[20]);
+    if (f_magic != 0x0162 && f_magic != 0x0163) {
+        return -2;
+    }
+    if (a_magic != 0x0107) {
+        return -3;
+    }
+    if (f_nscns > 16) {
+        return -4;
+    }
+    tsize = sgi_be32(&img[24]);
+    dsize = sgi_be32(&img[28]);
+    bsize = sgi_be32(&img[32]);
+    *entry = sgi_be32(&img[36]);
+    text_start = sgi_be32(&img[40]);
+    data_start = sgi_be32(&img[44]);
+    bss_start = sgi_be32(&img[48]);
+    *gp_value = sgi_be32(&img[72]);
+
+    /* Apply the ECOFF relocations (external refs only; internal section refs
+     * resolve at the linked vaddr, so their displacement is 0). */
+    if (sgi_sash_relocate(img, len) < 0) {
+        return -5;
+    }
+
+    /* N_TXTOFF = round_up(FILHSZ + AOUTHSZ + nscns*SCNHSZ, 16). */
+    txoff = (20 + 56 + (uint32_t)f_nscns * 40 + 15) & ~15u;
+    if ((uint64_t)txoff + tsize + dsize > len) {
+        return -6;
+    }
+
+    /* kuseg 0x10000000 -> phys 0x09000000 (PA = VA - 0x07000000). */
+    phys_text = text_start - 0x07000000u;
+    phys_data = data_start - 0x07000000u;
+    phys_bss = bss_start - 0x07000000u;
+
+    address_space_write(&address_space_memory, phys_text,
+                        MEMTXATTRS_UNSPECIFIED, img + txoff, tsize);
+    address_space_write(&address_space_memory, phys_data,
+                        MEMTXATTRS_UNSPECIFIED, img + txoff + tsize, dsize);
+    if (bsize > 0) {
+        address_space_set(&address_space_memory, phys_bss, 0, bsize,
+                          MEMTXATTRS_UNSPECIFIED);
+    }
+    *high_phys = phys_bss + bsize;
+    qemu_log("ARCS Execute: loaded ECOFF text=%u@0x%08x data=%u@0x%08x "
+             "bss=%u@0x%08x entry=0x%08x gp=0x%08x\n",
+             tsize, phys_text, dsize, phys_data, bsize, phys_bss, *entry,
+             *gp_value);
+    return 0;
+}
+
+/*
+ * Write a generalized kuseg program trampoline (ARCS Execute for standalone
+ * ECOFF programs like fx.ARCS). Like write_sash_trampoline but the TLB window
+ * is sized to the loaded program's span (variable page size so a 2.9 MB fx
+ * image fits the R5000's 48 entries), and argc/argv/envp/sp are taken from the
+ * caller. The trampoline (a) clears BEV/ERL/EXL, (b) programs N TLB entries
+ * mapping kuseg 0x10000000 -> phys 0x09000000, (c) sets a0=argc/a1=argv/
+ * a2=envp + sp at the top of the mapped window, (d) sets gp, (e) jumps to the
+ * kuseg entry. Returns 0 on success.
+ */
+static int write_execute_trampoline(uint32_t entry, uint32_t gp_value,
+                                    uint32_t argc, uint32_t argv_va,
+                                    uint32_t envp_va, uint32_t span)
+{
+#define MIPS_MFC0(rt, rd) (0x40000000 | ((rt) << 16) | ((rd) << 11))
+#define MIPS_MTC0(rt, rd) (0x40800000 | ((rt) << 16) | ((rd) << 11))
+#define MIPS_AND(rd, rs, rt)                                                   \
+  (0x00000024 | ((rs) << 21) | ((rt) << 16) | ((rd) << 11))
+#define MIPS_LUI(rt, imm) (0x3C000000 | ((rt) << 16) | ((imm) & 0xFFFF))
+#define MIPS_ORI(rt, rs, im)                                                   \
+  (0x34000000 | ((rs) << 21) | ((rt) << 16) | ((im) & 0xFFFF))
+#define MIPS_JR(rs) (0x00000008 | ((rs) << 21))
+#define MIPS_NOP 0x00000000
+#define MIPS_TLBWI 0x42000002
+#define ZERO 0
+#define A0 4
+#define A1 5
+#define A2 6
+#define T0 8
+#define T1 9
+#define T2 10
+#define T3 11
+#define T4 12
+#define T5 13
+#define SP 29
+#define GP 28
+#define CP0_INDEX 0
+#define CP0_ENTRYLO0 2
+#define CP0_ENTRYLO1 3
+#define CP0_PAGEMASK 5
+#define CP0_ENTRYHI 10
+#define CP0_STATUS 12
+
+    uint32_t page = 0x4000;          /* start at 16 KB */
+    uint32_t headroom = 0x80000;     /* 512 KB stack headroom */
+    uint32_t need = span + headroom;
+    uint32_t entries, pfn_step, pfn0, pagemask;
+    uint32_t kuseg_base = 0x10000000u;
+    uint32_t phys_base = 0x09000000u;
+    uint32_t *tramp;
+    uint32_t stack_top;
+    int i, n;
+
+    /* Smallest power-of-4 page (16KB..16MB) covering need with <= 48 entries. */
+    while (page < 0x1000000 &&
+           ((need + 2 * page - 1) / (2 * page)) > 48) {
+        page <<= 2;
+    }
+    entries = (need + 2 * page - 1) / (2 * page);
+    if (entries > 48) {
+        return -1;
+    }
+    pfn_step = page >> 12;           /* 4 KB pages per page */
+    pfn0 = phys_base >> 12;          /* 0x9000 */
+    pagemask = (pfn_step - 1) << 13; /* mask bits -> PageMask register */
+    stack_top = kuseg_base + entries * 2 * page;
+
+    tramp = g_malloc0((16 + entries * 12 + 20) * 4);
+    i = 0;
+
+    /* Clear BEV (bit 22) + ERL (bit 2) + EXL (bit 1). */
+    tramp[i++] = cpu_to_be32(MIPS_MFC0(T0, CP0_STATUS));
+    tramp[i++] = cpu_to_be32(MIPS_LUI(T1, 0xFFBF));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(T1, T1, 0xFFF9));
+    tramp[i++] = cpu_to_be32(MIPS_AND(T0, T0, T1));
+    tramp[i++] = cpu_to_be32(MIPS_MTC0(T0, CP0_STATUS));
+
+    /* PageMask (once, applies to every tlbwi). */
+    tramp[i++] = cpu_to_be32(MIPS_LUI(T4, pagemask >> 16));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(T4, T4, pagemask & 0xFFFF));
+    tramp[i++] = cpu_to_be32(MIPS_MTC0(T4, CP0_PAGEMASK));
+
+    /* One TLB entry per iteration (EntryLo0 + EntryLo1 = 2 pages). */
+    for (n = 0; n < (int)entries; n++) {
+        uint32_t vaddr = kuseg_base + n * 2 * page;
+        uint32_t pfn = pfn0 + n * 2 * pfn_step;
+        uint32_t lo0 = (pfn << 6) | 0x1E;           /* V=1 D=1 C=3 */
+        uint32_t lo1 = ((pfn + pfn_step) << 6) | 0x1E;
+
+        tramp[i++] = cpu_to_be32(MIPS_LUI(T0, vaddr >> 16));
+        tramp[i++] = cpu_to_be32(MIPS_ORI(T0, T0, vaddr & 0xFFFF));
+        tramp[i++] = cpu_to_be32(MIPS_MTC0(T0, CP0_ENTRYHI));
+
+        tramp[i++] = cpu_to_be32(MIPS_LUI(T1, lo0 >> 16));
+        tramp[i++] = cpu_to_be32(MIPS_ORI(T1, T1, lo0 & 0xFFFF));
+        tramp[i++] = cpu_to_be32(MIPS_MTC0(T1, CP0_ENTRYLO0));
+
+        tramp[i++] = cpu_to_be32(MIPS_LUI(T2, lo1 >> 16));
+        tramp[i++] = cpu_to_be32(MIPS_ORI(T2, T2, lo1 & 0xFFFF));
+        tramp[i++] = cpu_to_be32(MIPS_MTC0(T2, CP0_ENTRYLO1));
+
+        tramp[i++] = cpu_to_be32(MIPS_ORI(T3, ZERO, n));  /* Index = n */
+        tramp[i++] = cpu_to_be32(MIPS_MTC0(T3, CP0_INDEX));
+        tramp[i++] = cpu_to_be32(MIPS_TLBWI);
+    }
+
+    /* a0 = argc, a1 = argv (kseg0), a2 = envp (kseg0). */
+    tramp[i++] = cpu_to_be32(MIPS_ORI(A0, ZERO, argc & 0xFFFF));
+    tramp[i++] = cpu_to_be32(MIPS_LUI(A1, argv_va >> 16));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(A1, A1, argv_va & 0xFFFF));
+    tramp[i++] = cpu_to_be32(MIPS_LUI(A2, envp_va >> 16));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(A2, A2, envp_va & 0xFFFF));
+
+    /* sp = top of the mapped kuseg window. */
+    tramp[i++] = cpu_to_be32(MIPS_LUI(SP, stack_top >> 16));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(SP, SP, stack_top & 0xFFFF));
+
+    /* gp = aouthdr gp_value. */
+    tramp[i++] = cpu_to_be32(MIPS_LUI(GP, gp_value >> 16));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(GP, GP, gp_value & 0xFFFF));
+
+    /* Jump to the kuseg entry (now TLB-mapped). */
+    tramp[i++] = cpu_to_be32(MIPS_LUI(T5, entry >> 16));
+    tramp[i++] = cpu_to_be32(MIPS_ORI(T5, T5, entry & 0xFFFF));
+    tramp[i++] = cpu_to_be32(MIPS_JR(T5));
+    tramp[i++] = cpu_to_be32(MIPS_NOP);
+
+    address_space_write(&address_space_memory, SGI_EXEC_TRAMP_PHYS,
+                        MEMTXATTRS_UNSPECIFIED, tramp, i * 4);
+    g_free(tramp);
+
+    qemu_log("ARCS Execute: wrote kuseg trampoline (%u x %u KB, %u entries) "
+             "-> entry 0x%08x\n", entries, page >> 10, entries, entry);
+    return 0;
+
+#undef MIPS_MFC0
+#undef MIPS_MTC0
+#undef MIPS_AND
+#undef MIPS_LUI
+#undef MIPS_ORI
+#undef MIPS_JR
+#undef MIPS_NOP
+#undef MIPS_TLBWI
+#undef ZERO
+#undef A0
+#undef A1
+#undef A2
+#undef T0
+#undef T1
+#undef T2
+#undef T3
+#undef T4
+#undef T5
+#undef SP
+#undef GP
+#undef CP0_INDEX
+#undef CP0_ENTRYLO0
+#undef CP0_ENTRYLO1
+#undef CP0_PAGEMASK
+#undef CP0_ENTRYHI
+#undef CP0_STATUS
+}
+
+/*
+ * Copy the guest's Execute argv/envp (sash's pointers, in sash's memory) into
+ * the high-RAM scratch blob (SGI_EXEC_ARGS_PHYS) so they survive the newly
+ * loaded program overwriting sash's memory — what the real PROM's Execute does.
+ * Returns the new kseg0 argv/envp pointers and the copied argc.
+ */
+static void sgi_execute_copy_args(uint32_t argc, uint32_t argv_va,
+                                  uint32_t envp_va, uint32_t *out_argc,
+                                  uint32_t *out_argv_va, uint32_t *out_envp_va)
+{
+    CPUState *cs = first_cpu;
+    uint8_t blob[0x2200];
+    uint32_t str_off = 0;
+    uint32_t argv_ptrs[32], envp_ptrs[32];
+    int nargv = 0, nenvp = 0, i;
+
+    memset(blob, 0, sizeof(blob));
+
+    if (argc > 31) {
+        argc = 31;
+    }
+    for (i = 0; argv_va && i < (int)argc && nargv < 31; i++) {
+        uint8_t pb[4];
+        char s[256];
+        uint32_t p;
+        int n;
+        if (cpu_memory_rw_debug(cs, argv_va + i * 4, pb, 4, 0) != 0) {
+            break;
+        }
+        p = sgi_be32(pb);
+        if (!p) {
+            break;
+        }
+        if (cpu_memory_rw_debug(cs, p, (uint8_t *)s, sizeof(s) - 1, 0) != 0) {
+            break;
+        }
+        s[sizeof(s) - 1] = '\0';
+        n = strlen(s);
+        if (str_off + n + 1 >= SGI_EXEC_ARGS_ARGV_OFF) {
+            break;
+        }
+        memcpy(blob + str_off, s, n + 1);
+        argv_ptrs[nargv++] = SGI_EXEC_ARGS_STR_OFF + str_off;
+        str_off += n + 1;
+    }
+    for (i = 0; envp_va && nenvp < 31; i++) {
+        uint8_t pb[4];
+        char s[256];
+        uint32_t p;
+        int n;
+        if (cpu_memory_rw_debug(cs, envp_va + i * 4, pb, 4, 0) != 0) {
+            break;
+        }
+        p = sgi_be32(pb);
+        if (!p) {
+            break;
+        }
+        if (cpu_memory_rw_debug(cs, p, (uint8_t *)s, sizeof(s) - 1, 0) != 0) {
+            break;
+        }
+        s[sizeof(s) - 1] = '\0';
+        n = strlen(s);
+        if (str_off + n + 1 >= SGI_EXEC_ARGS_ARGV_OFF) {
+            break;
+        }
+        memcpy(blob + str_off, s, n + 1);
+        envp_ptrs[nenvp++] = SGI_EXEC_ARGS_STR_OFF + str_off;
+        str_off += n + 1;
+    }
+
+    /* Big-endian pointer arrays at the fixed offsets. */
+    for (i = 0; i < nargv; i++) {
+        uint32_t va = MIPS_K0BASE + SGI_EXEC_ARGS_PHYS + argv_ptrs[i];
+        uint8_t *dst = blob + SGI_EXEC_ARGS_ARGV_OFF + i * 4;
+        dst[0] = va >> 24; dst[1] = va >> 16; dst[2] = va >> 8; dst[3] = va;
+    }
+    for (i = 0; i < nenvp; i++) {
+        uint32_t va = MIPS_K0BASE + SGI_EXEC_ARGS_PHYS + envp_ptrs[i];
+        uint8_t *dst = blob + SGI_EXEC_ARGS_ENVP_OFF + i * 4;
+        dst[0] = va >> 24; dst[1] = va >> 16; dst[2] = va >> 8; dst[3] = va;
+    }
+
+    address_space_write(&address_space_memory, SGI_EXEC_ARGS_PHYS,
+                        MEMTXATTRS_UNSPECIFIED, blob, sizeof(blob));
+
+    *out_argc = nargv;
+    *out_argv_va = nargv ? MIPS_K0BASE + SGI_EXEC_ARGS_PHYS +
+                               SGI_EXEC_ARGS_ARGV_OFF : 0;
+    *out_envp_va = nenvp ? MIPS_K0BASE + SGI_EXEC_ARGS_PHYS +
+                               SGI_EXEC_ARGS_ENVP_OFF : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Mode C — our own IP55 PROM (paravirtual ARCS firmware) bootstrap    */
 /* ------------------------------------------------------------------ */
@@ -521,12 +875,14 @@ static int sgi_load_elf32_be(const uint8_t *img, size_t len, uint32_t *entry,
 static int sgi_load_elf32_be_runtime(const uint8_t *img, size_t len,
                                      uint32_t *entry, uint32_t *high_phys);
 
-static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va)
+static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va,
+                                uint32_t argc, uint32_t argv_va,
+                                uint32_t envp_va)
 {
     CPUState *cs = first_cpu;
     MIPSCPU *cpu = MIPS_CPU(cs);
     CPUMIPSState *env = &cpu->env;
-    DriveInfo *dinfo = drive_get(IF_SCSI, 0, 1);
+    DriveInfo *dinfo;
     BlockBackend *blk;
     uint8_t vh[512];
     uint32_t part_firstlbn = 0;
@@ -535,20 +891,29 @@ static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va)
     char *slash, *paren;
     SGIXfs fs;
     SGIXfsInode kino;
+    SGIEFS efs;
+    SGIEFSInode eino;
     uint8_t *kbuf;
     uint64_t ksize, got;
-    uint32_t kentry, khigh;
+    uint32_t kentry, khigh, kgp;
+    uint32_t exec_argc, exec_argv_va, exec_envp_va;
     int i, rc;
+    int bus = 0, unit = 1, part = 0;
+    const char *rest;
+    char fpath[160];
 
-    if (!dinfo || !(blk = blk_by_legacy_dinfo(dinfo))) {
-        error_report("ARCS Execute: no boot disk at scsi bus=0 unit=1");
-        return;
-    }
     if (cpu_memory_rw_debug(cs, path_va, path, sizeof(path) - 1, 0) < 0) {
         error_report("ARCS Execute: cannot read path at 0x%08x", path_va);
         return;
     }
     path[sizeof(path) - 1] = '\0';
+    /* Copy sash's argv/envp out of sash's memory BEFORE the new program loads
+     * (ECOFF standalone programs load over sash at phys 0x09000000). */
+    sgi_execute_copy_args(argc, argv_va, envp_va, &exec_argc, &exec_argv_va,
+                          &exec_envp_va);
+    if (!exec_envp_va) {
+        exec_envp_va = MIPS_K0BASE + ARCS_ENVIRON_PHYS;  /* firmware environ */
+    }
     /* sash's kernel_name() yields "dksc(c,u,p)name" (no slash); take the name
      * after the last '/' or ')'. */
     slash = strrchr(path, '/');
@@ -560,85 +925,175 @@ static void sgi_virtuix_execute(SGIARCSState *arcs, uint32_t path_va)
     }
     qemu_log("ARCS Execute: path=%s -> file=%s\n", path, fname);
 
-    if (blk_pread(blk, 0, 512, vh, 0) < 0 ||
-        sgi_be32(&vh[0]) != 0x0be5a941u) {
-        error_report("ARCS Execute: bad volume header");
-        return;
-    }
-    for (i = 0; i < SGI_VH_NPARTAB; i++) {
-        const uint8_t *pt = &vh[SGI_VH_PARTAB_OFF + i * SGI_VH_PT_ENTSZ];
-        if (sgi_be32(pt + 8) == SGI_VH_PTYPE_XFS) {
-            part_firstlbn = sgi_be32(pt + 4);
-            break;
+    /* Parse "dksc(bus,unit,part)name"; part selects the filesystem. */
+    if (sscanf(path, "dksc(%d,%d,%d)", &bus, &unit, &part) == 3) {
+        char *rp = strchr(path, ')');
+        rest = rp ? rp + 1 : path;
+        while (*rest == '/') {
+            rest++;
         }
+    } else {
+        rest = fname;
     }
-    if (!part_firstlbn) {
-        error_report("ARCS Execute: no XFS root partition");
-        return;
-    }
-    if (sgi_xfs_mount(blk, part_firstlbn, &fs) < 0) {
-        error_report("ARCS Execute: xfs mount failed");
-        return;
-    }
-    char kpath[160];
-    snprintf(kpath, sizeof(kpath), "/%s", fname);
-    if (sgi_xfs_lookup(&fs, kpath, &kino) < 0) {
-        error_report("ARCS Execute: '%s' not found", kpath);
-        return;
-    }
-    ksize = kino.size;
-    if (ksize == 0 || ksize > 64 * MiB) {
-        error_report("ARCS Execute: implausible size %" PRIu64, ksize);
-        sgi_xfs_inode_put(&kino);
-        return;
-    }
-    kbuf = g_malloc(ksize);
-    if (sgi_xfs_read(&fs, &kino, 0, ksize, kbuf, &got) < 0 || got != ksize) {
-        error_report("ARCS Execute: read failed");
-        g_free(kbuf);
-        sgi_xfs_inode_put(&kino);
-        return;
-    }
-    sgi_xfs_inode_put(&kino);
-    qemu_log("ARCS Execute: read %s (%" PRIu64 " bytes)\n", kpath, ksize);
 
-    rc = sgi_load_elf32_be_runtime(kbuf, ksize, &kentry, &khigh);
+    dinfo = drive_get(IF_SCSI, bus, unit);
+    if (!dinfo || !(blk = blk_by_legacy_dinfo(dinfo))) {
+        error_report("ARCS Execute: no disk at scsi bus=%d unit=%d", bus, unit);
+        return;
+    }
+
+    if (part == 7) {
+        /* Install CD: partition 7 is the EFS (labeled "sysv"/ptype 5 on the
+         * real media). Read the file at its FULL path from that partition.
+         * The partition NUMBER (not the ptype) indexes the dvh table. */
+        if (blk_pread(blk, 0, 512, vh, 0) < 0 ||
+            sgi_be32(&vh[0]) != 0x0be5a941u) {
+            error_report("ARCS Execute: bad volume header");
+            return;
+        }
+        if (part >= SGI_VH_NPARTAB) {
+            error_report("ARCS Execute: partition %d out of range", part);
+            return;
+        }
+        part_firstlbn = sgi_be32(&vh[SGI_VH_PARTAB_OFF +
+                                   part * SGI_VH_PT_ENTSZ + 4]);
+        if (!part_firstlbn) {
+            error_report("ARCS Execute: empty partition %d", part);
+            return;
+        }
+        if (sgi_efs_mount(blk, part_firstlbn, &efs) < 0) {
+            error_report("ARCS Execute: efs mount failed");
+            return;
+        }
+        snprintf(fpath, sizeof(fpath), "/%s", rest);
+        if (sgi_efs_lookup(&efs, fpath, &eino) < 0) {
+            error_report("ARCS Execute: '%s' not found on EFS", fpath);
+            return;
+        }
+        ksize = eino.size;
+        if (ksize == 0 || ksize > 64 * MiB) {
+            error_report("ARCS Execute: implausible size %" PRIu64, ksize);
+            sgi_efs_inode_put(&eino);
+            return;
+        }
+        kbuf = g_malloc(ksize);
+        if (sgi_efs_read(&efs, &eino, 0, ksize, kbuf, &got) < 0 ||
+            got != ksize) {
+            error_report("ARCS Execute: efs read failed");
+            g_free(kbuf);
+            sgi_efs_inode_put(&eino);
+            return;
+        }
+        sgi_efs_inode_put(&eino);
+        qemu_log("ARCS Execute: read EFS %s (%" PRIu64 " bytes)\n", fpath, ksize);
+    } else {
+        /* Boot disk: XFS root, look up just the filename. */
+        if (blk_pread(blk, 0, 512, vh, 0) < 0 ||
+            sgi_be32(&vh[0]) != 0x0be5a941u) {
+            error_report("ARCS Execute: bad volume header");
+            return;
+        }
+        part_firstlbn = 0;
+        for (i = 0; i < SGI_VH_NPARTAB; i++) {
+            const uint8_t *pt = &vh[SGI_VH_PARTAB_OFF + i * SGI_VH_PT_ENTSZ];
+            if (sgi_be32(pt + 8) == SGI_VH_PTYPE_XFS) {
+                part_firstlbn = sgi_be32(pt + 4);
+                break;
+            }
+        }
+        if (!part_firstlbn) {
+            error_report("ARCS Execute: no XFS root partition");
+            return;
+        }
+        if (sgi_xfs_mount(blk, part_firstlbn, &fs) < 0) {
+            error_report("ARCS Execute: xfs mount failed");
+            return;
+        }
+        snprintf(fpath, sizeof(fpath), "/%s", fname);
+        if (sgi_xfs_lookup(&fs, fpath, &kino) < 0) {
+            error_report("ARCS Execute: '%s' not found", fpath);
+            return;
+        }
+        ksize = kino.size;
+        if (ksize == 0 || ksize > 64 * MiB) {
+            error_report("ARCS Execute: implausible size %" PRIu64, ksize);
+            sgi_xfs_inode_put(&kino);
+            return;
+        }
+        kbuf = g_malloc(ksize);
+        if (sgi_xfs_read(&fs, &kino, 0, ksize, kbuf, &got) < 0 || got != ksize) {
+            error_report("ARCS Execute: read failed");
+            g_free(kbuf);
+            sgi_xfs_inode_put(&kino);
+            return;
+        }
+        sgi_xfs_inode_put(&kino);
+        qemu_log("ARCS Execute: read %s (%" PRIu64 " bytes)\n", fpath, ksize);
+    }
+
+    /*
+     * The loaded program is either an ELF32 (the /unix and miniroot kernels)
+     * or a relocatable kuseg ECOFF (the fx.ARCS standalone). Branch on magic.
+     */
+    if (memcmp(kbuf, "\x7f" "ELF", 4) == 0) {
+        rc = sgi_load_elf32_be_runtime(kbuf, ksize, &kentry, &khigh);
+        g_free(kbuf);
+        if (rc < 0) {
+            error_report("ARCS Execute: not a loadable ELF (rc=%d)", rc);
+            return;
+        }
+        qemu_log("ARCS Execute: entry 0x%08x, jumping to kernel\n", kentry);
+
+        /*
+         * sash setenv("kernname", <boot path>) right before Execute; our copy
+         * of sash's environ (a2) already carries it, but append it to the
+         * firmware environ as well for the cases where we fall back to it.
+         */
+        sgi_arcs_set_kernel_env(arcs, "kernname", path);
+
+        /*
+         * The kernel entry (and the ARCS environ pointer) are 32-bit kseg0
+         * addresses.  On a 64-bit MIPS CPU they must be SIGN-EXTENDED into the
+         * 64-bit PC/GPR: a zero-extended value (e.g. 0x0000000088003c30) lands
+         * in xuseg and raises EXCP_AdEL on the first fetch instead of mapping
+         * to the kernel's compat-kseg0 physical address.
+         *
+         * cpu_loop_exit() longjmps out of the sgi-arcs MMIO write handler
+         * here; the sgi-arcs region sets disable_reentrancy_guard so leaving
+         * the handler mid-flight does not leave the guard engaged.
+         */
+        env->active_tc.PC = (target_ulong)(int32_t)kentry;
+        env->active_tc.gpr[4] = (target_ulong)(int32_t)exec_argc;  /* argc */
+        env->active_tc.gpr[5] = (target_ulong)(int32_t)exec_argv_va; /* argv */
+        env->active_tc.gpr[6] = (target_ulong)(int32_t)exec_envp_va; /* envp */
+        env->CP0_Status = 0;   /* clear BEV/ERL/EXL, KSU=kernel, 32-bit entry */
+        env->CP0_EPC = 0;
+        env->CP0_Cause = 0;
+        env->active_tc.HI[0] = 0;
+        env->active_tc.LO[0] = 0;
+        tlb_flush(cs);
+        cpu_loop_exit(cs);
+        return;
+    }
+
+    /* ECOFF standalone (fx.ARCS): relocate, load at kuseg 0x10000000 ->
+     * phys 0x09000000, then run through the kuseg TLB trampoline. */
+    rc = sgi_load_ecoff_runtime(kbuf, ksize, &kentry, &kgp, &khigh);
     g_free(kbuf);
     if (rc < 0) {
-        error_report("ARCS Execute: not a loadable ELF (rc=%d)", rc);
+        error_report("ARCS Execute: not a loadable ECOFF (rc=%d)", rc);
         return;
     }
-    qemu_log("ARCS Execute: entry 0x%08x, jumping to kernel\n", kentry);
+    if (write_execute_trampoline(kentry, kgp, exec_argc, exec_argv_va,
+                                 exec_envp_va, khigh - 0x09000000u) < 0) {
+        error_report("ARCS Execute: program span too large for TLB");
+        return;
+    }
 
-    /*
-     * sash setenv("kernname", <boot path>) right before Execute, but our
-     * firmware passes its own static environ (a2) to the kernel — which lacks
-     * kernname.  The kernel's getargs()/mload.c then logs "Kernname environment
-     * variable not set by sash" and refuses to load the runtime symbol table,
-     * so loadable modules (a2_dd audio) never register.  The Execute path IS
-     * the kernname value (sash sets them equal), so append it to the kernel
-     * environ before handing off.
-     */
-    sgi_arcs_set_kernel_env(arcs, "kernname", path);
-
-    /*
-     * The kernel entry (and the ARCS environ pointer) are 32-bit kseg0
-     * addresses.  On a 64-bit MIPS CPU they must be SIGN-EXTENDED into the
-     * 64-bit PC/GPR: a zero-extended value (e.g. 0x0000000088003c30) lands in
-     * xuseg and raises EXCP_AdEL on the first fetch instead of mapping to the
-     * kernel's compat-kseg0 physical address.
-     *
-     * cpu_loop_exit() longjmps out of the sgi-arcs MMIO write handler here; the
-     * sgi-arcs region sets disable_reentrancy_guard so that leaving the handler
-     * mid-flight does not leave mem_reentrancy_guard.engaged_in_io stuck (which
-     * would reject the kernel's own first ARCS hypercall as "re-entrant IO").
-     */
-    env->active_tc.PC = (target_ulong)(int32_t)kentry;
-    env->active_tc.gpr[4] = 0;                            /* a0 = argc */
-    env->active_tc.gpr[5] = 0;                            /* a1 = argv */
-    env->active_tc.gpr[6] =
-        (target_ulong)(int32_t)(MIPS_K0BASE + ARCS_ENVIRON_PHYS);  /* a2 = environ */
-    env->CP0_Status = 0;      /* clear BEV/ERL/EXL, KSU=kernel, KX=0 (32-bit entry) */
+    /* Jump to the trampoline (kseg1 RAM), which maps kuseg TLB and enters the
+     * program. */
+    env->active_tc.PC = (target_ulong)(int32_t)SGI_EXEC_TRAMP_K1;
+    env->CP0_Status = 0;
     env->CP0_EPC = 0;
     env->CP0_Cause = 0;
     env->active_tc.HI[0] = 0;
