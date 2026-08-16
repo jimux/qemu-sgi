@@ -113,9 +113,16 @@ static const struct {
 
 /* Minimal ARCS component tree: a single root component "SGI-IP22" so
  * GetChild(NULL) (mrboot's inv_findcpu) can name the CPU for the miniroot
- * kernel path. Placed in high RAM above sash/fx/kernel. */
-#define ARCS_COMPONENT_PHYS     0x09403000ULL
-#define ARCS_COMPONENT_ID_PHYS  0x09403040ULL
+ * kernel path. Placed in high RAM above sash/fx/kernel.
+ *
+ * NOTE: must sit ABOVE the Mode K daily-driver kernel's load range.  unix.pv.g
+ * loads 0x08070000..0x097c4a60, so 0x09403000 (the original address) overlapped
+ * it and made `-kernel unix.pv.g` abort with "Some ROM regions are overlapping".
+ * 0x09F00000 clears the kernel top with ~7 MB of headroom, stays inside the
+ * 256 MB RAM window (0x08000000..0x17ffffff), and is still above the Mode C
+ * miniroot kernel/fx/sash which load lower. */
+#define ARCS_COMPONENT_PHYS     0x09F00000ULL
+#define ARCS_COMPONENT_ID_PHYS  0x09F00040ULL
 
 /* ARCS errno (arcs/errno.h) */
 #define ARCS_ESUCCESS       0
