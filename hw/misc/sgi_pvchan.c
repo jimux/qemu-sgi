@@ -257,12 +257,15 @@ static void pvchan_process_g2h(SGIPvChanState *s)
         if (n == PVCHAN_NOMSG || n < 0) {
             break;  /* nothing more ready (or a desync we already skipped past) */
         }
-        /* guest clipboard grab: consume internally, never forward to a client */
+        /* guest clipboard grab: with the clipboard peer enabled it goes to the
+         * host clipboard; otherwise (clipboard=off) forward it to the chardev
+         * client so a host CLI can read the guest selection (BL-51 clipget). */
         if (op == PVCHAN_OP_CLIP_GRAB) {
             if (s->clip_enabled) {
                 pvchan_clip_from_guest(s, payload, (uint32_t)n);
+                continue;
             }
-            continue;
+            /* fall through to the chardev-forwarding path below */
         }
         /* clipboard mode may drain the startup ANNOUNCE before any client is
          * attached; stash it so CHR_EVENT_OPENED can re-emit it (wait_announce). */
