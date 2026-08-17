@@ -118,6 +118,95 @@ static void sgi_pvaudio_open_voice(SGIPVAudioState *s)
                              s, sgi_pvaudio_out_cb, &as);
 }
 
+/* Captured-but-unread bytes in the input ring (head - tail, mod size). */
+static uint32_t pvaudio_cap_avail(SGIPVAudioState *s)
+{
+    if (s->cap_size == 0) {
+        return 0;
+    }
+    return (s->cap_head - s->cap_tail) % s->cap_size;
+}
+
+/* Bytes of free space left in the capture ring. */
+static uint32_t pvaudio_cap_free(SGIPVAudioState *s)
+{
+    if (s->cap_size == 0) {
+        return 0;
+    }
+    return s->cap_size - pvaudio_cap_avail(s) - 1;  /* keep 1 byte guard */
+}
+
+/*
+ * Audio input callback: the host backend has `avail` bytes of captured audio
+ * for us.  Copy them into the capture ring at CAP_HEAD; if the ring is full,
+ * drop the excess and flag an overrun (real capture hardware clips rather
+ * than blocking).
+ */
+static void sgi_pvaudio_in_cb(void *opaque, int avail)
+{
+    SGIPVAudioState *s = opaque;
+    uint8_t buf[4096];
+    size_t n;
+
+    if (!(s->ctrl & PVAUDIO_CTRL_RECORD) || s->cap_size == 0) {
+        return;
+    }
+
+    n = AUD_read(s->voice_in, buf, sizeof(buf));
+
+    while (n > 0) {
+        uint32_t free_b = pvaudio_cap_free(s);
+        uint32_t chunk = MIN((uint32_t)n, free_b);
+
+        if (chunk == 0) {
+            s->status |= PVAUDIO_STATUS_OVERRUN;
+            break;  /* drop the rest; the ring is full */
+        }
+
+        uint32_t head_offset = s->cap_head % s->cap_size;
+        uint32_t first = MIN(chunk, s->cap_size - head_offset);
+        dma_memory_write(&address_space_memory,
+                         s->cap_base + head_offset,
+                         buf, first, MEMTXATTRS_UNSPECIFIED);
+        if (chunk > first) {
+            dma_memory_write(&address_space_memory, s->cap_base,
+                             buf + first, chunk - first, MEMTXATTRS_UNSPECIFIED);
+        }
+        s->cap_head = (s->cap_head + chunk) % s->cap_size;
+        n -= chunk;
+    }
+
+    if (pvaudio_cap_avail(s) > 0) {
+        s->intr_stat |= PVAUDIO_INTR_CAP_READY;
+        sgi_pvaudio_update_irq(s);
+    }
+}
+
+/*
+ * (Re)open the capture voice with current parameters.
+ */
+static void sgi_pvaudio_open_capture_voice(SGIPVAudioState *s)
+{
+    struct audsettings as;
+
+    if (!s->audio_be) {
+        return;
+    }
+
+    if (s->voice_in) {
+        AUD_close_in(s->audio_be, s->voice_in);
+        s->voice_in = NULL;
+    }
+
+    as.freq = s->sample_rate ? s->sample_rate : 44100;
+    as.nchannels = s->channels ? (int)s->channels : 2;
+    as.fmt = (s->bits == 8) ? AUDIO_FORMAT_U8 : AUDIO_FORMAT_S16;
+    as.endianness = 1; /* big-endian (MIPS) */
+
+    s->voice_in = AUD_open_in(s->audio_be, NULL, "sgi-pvaudio-in",
+                               s, sgi_pvaudio_in_cb, &as);
+}
+
 static uint64_t sgi_pvaudio_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIPVAudioState *s = opaque;
@@ -145,6 +234,14 @@ static uint64_t sgi_pvaudio_read(void *opaque, hwaddr addr, unsigned size)
         return s->channels;
     case PVAUDIO_BITS:
         return s->bits;
+    case PVAUDIO_CAP_BASE:
+        return s->cap_base;
+    case PVAUDIO_CAP_SIZE:
+        return s->cap_size;
+    case PVAUDIO_CAP_HEAD:
+        return s->cap_head;
+    case PVAUDIO_CAP_TAIL:
+        return s->cap_tail;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad register offset 0x%" HWADDR_PRIx "\n",
@@ -166,8 +263,13 @@ static void sgi_pvaudio_write(void *opaque, hwaddr addr, uint64_t val,
             s->intr_stat = 0;
             s->buf_head = 0;
             s->buf_tail = 0;
+            s->cap_head = 0;
+            s->cap_tail = 0;
             if (s->voice) {
                 AUD_set_active_out(s->voice, 0);
+            }
+            if (s->voice_in) {
+                AUD_set_active_in(s->voice_in, 0);
             }
             sgi_pvaudio_update_irq(s);
             return;
@@ -181,6 +283,12 @@ static void sgi_pvaudio_write(void *opaque, hwaddr addr, uint64_t val,
             } else {
                 s->status &= ~PVAUDIO_STATUS_PLAYING;
                 AUD_set_active_out(s->voice, 0);
+            }
+        }
+        if (s->voice_in) {
+            AUD_set_active_in(s->voice_in, (val & PVAUDIO_CTRL_RECORD) != 0);
+            if (!(val & PVAUDIO_CTRL_RECORD)) {
+                s->status &= ~PVAUDIO_STATUS_OVERRUN;
             }
         }
         break;
@@ -210,12 +318,33 @@ static void sgi_pvaudio_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Write to read-only BUF_TAIL\n", __func__);
         break;
+    case PVAUDIO_CAP_BASE:
+        s->cap_base = val;
+        break;
+    case PVAUDIO_CAP_SIZE:
+        s->cap_size = val;
+        s->cap_head = 0;
+        s->cap_tail = 0;
+        break;
+    case PVAUDIO_CAP_HEAD:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: Write to read-only CAP_HEAD\n", __func__);
+        break;
+    case PVAUDIO_CAP_TAIL:
+        s->cap_tail = val;
+        break;
     case PVAUDIO_SAMPLE_RATE:
         s->sample_rate = val;
         if (s->ctrl & PVAUDIO_CTRL_PLAY) {
             sgi_pvaudio_open_voice(s);
             if (s->voice) {
                 AUD_set_active_out(s->voice, 1);
+            }
+        }
+        if (s->ctrl & PVAUDIO_CTRL_RECORD) {
+            sgi_pvaudio_open_capture_voice(s);
+            if (s->voice_in) {
+                AUD_set_active_in(s->voice_in, 1);
             }
         }
         break;
@@ -227,6 +356,12 @@ static void sgi_pvaudio_write(void *opaque, hwaddr addr, uint64_t val,
                 AUD_set_active_out(s->voice, 1);
             }
         }
+        if (s->ctrl & PVAUDIO_CTRL_RECORD) {
+            sgi_pvaudio_open_capture_voice(s);
+            if (s->voice_in) {
+                AUD_set_active_in(s->voice_in, 1);
+            }
+        }
         break;
     case PVAUDIO_BITS:
         s->bits = val;
@@ -234,6 +369,12 @@ static void sgi_pvaudio_write(void *opaque, hwaddr addr, uint64_t val,
             sgi_pvaudio_open_voice(s);
             if (s->voice) {
                 AUD_set_active_out(s->voice, 1);
+            }
+        }
+        if (s->ctrl & PVAUDIO_CTRL_RECORD) {
+            sgi_pvaudio_open_capture_voice(s);
+            if (s->voice_in) {
+                AUD_set_active_in(s->voice_in, 1);
             }
         }
         break;

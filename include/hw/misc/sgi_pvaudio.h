@@ -35,17 +35,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIPVAudioState, SGI_PVAUDIO)
 #define PVAUDIO_SAMPLE_RATE     0x20
 #define PVAUDIO_CHANNELS        0x24
 #define PVAUDIO_BITS            0x28
+/* Capture (input) ring — mirror of the play ring: the DEVICE writes captured
+ * PCM at CAP_HEAD, the guest reads at CAP_TAIL and advances it. */
+#define PVAUDIO_CAP_BASE        0x30
+#define PVAUDIO_CAP_SIZE        0x34
+#define PVAUDIO_CAP_HEAD        0x38   /* QEMU write pointer (read-only) */
+#define PVAUDIO_CAP_TAIL        0x3C   /* Guest read pointer */
 
 /* CTRL bits */
 #define PVAUDIO_CTRL_PLAY       (1 << 0)
 #define PVAUDIO_CTRL_RESET      (1 << 1)
+#define PVAUDIO_CTRL_RECORD     (1 << 2)
 
 /* STATUS bits */
 #define PVAUDIO_STATUS_UNDERRUN (1 << 0)
 #define PVAUDIO_STATUS_PLAYING  (1 << 1)
+#define PVAUDIO_STATUS_OVERRUN  (1 << 2)  /* capture ring full (host dropped) */
 
 /* Interrupt bits */
 #define PVAUDIO_INTR_BUF_DONE  (1 << 0)
+#define PVAUDIO_INTR_CAP_READY (1 << 1)   /* captured data available */
 
 struct SGIPVAudioState {
     SysBusDevice parent_obj;
@@ -56,6 +65,7 @@ struct SGIPVAudioState {
     /* Audio backend (configured via -audiodev / DEFINE_AUDIO_PROPERTIES) */
     AudioBackend *audio_be;
     SWVoiceOut *voice;
+    SWVoiceIn *voice_in;
 
     /* Registers */
     uint32_t ctrl;
@@ -69,6 +79,10 @@ struct SGIPVAudioState {
     uint32_t sample_rate;
     uint32_t channels;
     uint32_t bits;
+    uint32_t cap_base;
+    uint32_t cap_size;
+    uint32_t cap_head;
+    uint32_t cap_tail;
 };
 
 #endif /* HW_MISC_SGI_PVAUDIO_H */
