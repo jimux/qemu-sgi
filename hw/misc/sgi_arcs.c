@@ -80,6 +80,26 @@ static const struct {
 };
 
 /*
+ * SGI_MODE_C_CONSOLE=g overrides the console routing for a Mode C Path A
+ * desktop boot: console="g" routes the stock kernel's console to the Newport
+ * framebuffer (and re-enables the graphics keyboard), instead of the serial
+ * console ("d") the firmware defaults to.  Defaults are unchanged.
+ */
+static const char *arcs_env_value(const char *key, const char *dflt)
+{
+    const char *mode = getenv("SGI_MODE_C_CONSOLE");
+    if (mode && !strcmp(mode, "g")) {
+        if (!strcmp(key, "console")) {
+            return "g";
+        }
+        if (!strcmp(key, "nogfxkbd")) {
+            return "0";
+        }
+    }
+    return dflt;
+}
+
+/*
  * ARCS memory descriptor table.
  * Built dynamically during setup based on actual RAM size and kernel placement.
  * The kernel iterates this via GetMemoryDescriptor(prev) returning next,
@@ -1572,7 +1592,9 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
         for (j = 0; arcs_env_vars[j].key != NULL && nenv < 15; j++) {
             int n = snprintf((char *)&sash_args[cursor],
                              sizeof(sash_args) - cursor, "%s=%s",
-                             arcs_env_vars[j].key, arcs_env_vars[j].value);
+                             arcs_env_vars[j].key,
+                             arcs_env_value(arcs_env_vars[j].key,
+                                            arcs_env_vars[j].value));
             if (n < 0 || cursor + n + 1 > ARCS_SASH_ARGS_ARGV_OFF) {
                 break;
             }
@@ -1711,8 +1733,10 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     env_offset = 0;
 
     for (i = 0; arcs_env_vars[i].key != NULL; i++) {
+        const char *val = arcs_env_value(arcs_env_vars[i].key,
+                                         arcs_env_vars[i].value);
         int key_len = strlen(arcs_env_vars[i].key);
-        int val_len = strlen(arcs_env_vars[i].value);
+        int val_len = strlen(val);
 
         if (env_offset + key_len + 1 + val_len + 1 > ARCS_ENVDATA_SIZE - 1) {
             break;  /* Out of space */
@@ -1720,7 +1744,7 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
 
         memcpy(&env_buf[env_offset], arcs_env_vars[i].key, key_len + 1);
         env_offset += key_len + 1;
-        memcpy(&env_buf[env_offset], arcs_env_vars[i].value, val_len + 1);
+        memcpy(&env_buf[env_offset], val, val_len + 1);
         env_offset += val_len + 1;
     }
 
