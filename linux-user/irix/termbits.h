@@ -266,3 +266,47 @@ struct target_termios {
 #define TARGET_TIOCGICOUNT     0x5492 /* read serial port inline interrupt counts */
 #define TARGET_TIOCGHAYESESP	0x5493 /* Get Hayes ESP configuration */
 #define TARGET_TIOCSHAYESESP	0x5494 /* Set Hayes ESP configuration */
+
+/*
+ * IRIX BSD-encoded file and socket ioctls.
+ *
+ * The TARGET_FIO / TARGET_TIOC block above was inherited when this target was
+ * cloned from linux-user/mips/termbits.h, so it carries the Linux/MIPS
+ * numbering. IRIX keeps the SysV "TIOC" group at ('T'<<8)|n (so TCGETA 0x5401
+ * etc. above are right), but its file ('f') and socket ('s') groups use the
+ * 4.3BSD _IOR/_IOW encoding from <sys/ioccom.h>. Those numbers are different,
+ * and real IRIX binaries issue them, so they need their own table entries.
+ * These are additive: the Linux-numbered constants above are left in place.
+ *
+ * Transcribed from the IRIX 6.5.5 kernel headers in
+ * software_library/irix-655-source/f/irix/kern/:
+ *
+ *   sys/ioccom.h:44-52   IOC_OUT 0x40000000, IOC_IN 0x80000000,
+ *                        _IOC(f,n,x,y) = f | ((n & 0xff) << 16)
+ *                                          | (x << 8) | y
+ *                        _IOR(x,y,t)  = _IOC(IOC_OUT, sizeof(t), x, y)
+ *                        _IOW(x,y,t)  = _IOC(IOC_IN,  sizeof(t), x, y)
+ *   sys/filio.h:47-48    FIONREAD  _IOR('f', 127, int)   == 0x4004667f
+ *                        FIONBIO   _IOW('f', 126, int)   == 0x8004667e
+ *   bsd/net/soioctl.h:33 SIOCNREAD _IOR('s',  10, int)   == 0x4004730a
+ *
+ * SIOCNREAD is soioctl.h's socket counterpart of FIONREAD ("Like FIONREAD
+ * except if the socket can't receive more data or the transport layer detected
+ * an error, ioctl returns -1 & sets errno"); mapping it to the host FIONREAD
+ * gives exactly the byte count Xlib's XPending path is asking for, and the
+ * host returns the same errors on a broken socket.
+ *
+ * Which of the 's' group's siblings matter was settled empirically rather than
+ * guessed: a disassembly sweep of all 1619 ELF files in a staged IRIX 6.5.5
+ * root (reconstructing lui/ori constant pairs) found SIOCNREAD in 9 binaries
+ * -- including libX11.so.1 and libXt.so -- and found NO other 's'-group ioctl
+ * in use at all. SIOCATMARK/SIOCSPGRP/SIOCGPGRP appear in no binary, and are
+ * in any case already covered by the generic TARGET_MIPS definitions in
+ * syscall_defs.h, which happen to match IRIX's encoding exactly. The same
+ * sweep found the BSD-encoded FIONREAD in libcurses.so, showfont, icrash and
+ * libdps.so, and the BSD-encoded FIONBIO in libc.so.1 itself (inside
+ * _clntudp_bufcreate, i.e. every RPC client), which is why those two are here.
+ */
+#define TARGET_IRIX_FIONREAD	TARGET_IOR('f', 127, abi_int)	/* 0x4004667f */
+#define TARGET_IRIX_FIONBIO	TARGET_IOW('f', 126, abi_int)	/* 0x8004667e */
+#define TARGET_SIOCNREAD	TARGET_IOR('s',  10, abi_int)	/* 0x4004730a */
