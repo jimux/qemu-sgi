@@ -310,3 +310,18 @@ struct target_termios {
 #define TARGET_IRIX_FIONREAD	TARGET_IOR('f', 127, abi_int)	/* 0x4004667f */
 #define TARGET_IRIX_FIONBIO	TARGET_IOW('f', 126, abi_int)	/* 0x8004667e */
 #define TARGET_SIOCNREAD	TARGET_IOR('s',  10, abi_int)	/* 0x4004730a */
+
+/*
+ * The STREAMS 'S' group. IRIX's pty, tty and network plumbing is STREAMS, and
+ * libc reaches it through these; see linux-user/irix/target_pty.h for what we
+ * do with them and why. Plain ('S'<<8)|n, no BSD size/direction encoding.
+ *
+ * Transcribed from software_library/irix-655-source/f/root/usr/include/
+ * sys/stropts.h:147-161.
+ */
+#define TARGET_IRIX_I_NREAD	0x5301		/* stropts.h:149 (STR|01)  */
+#define TARGET_IRIX_I_PUSH	0x5302		/* stropts.h:150 (STR|02)  */
+#define TARGET_IRIX_I_POP	0x5303		/* stropts.h:151 (STR|03)  */
+#define TARGET_IRIX_I_LOOK	0x5304		/* stropts.h:152 (STR|04)  */
+#define TARGET_IRIX_I_STR	0x5308		/* stropts.h:156 (STR|010) */
+#define TARGET_IRIX_I_FIND	0x530b		/* stropts.h:159 (STR|013) */
