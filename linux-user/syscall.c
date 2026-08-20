@@ -5634,6 +5634,13 @@ static abi_long do_ioctl_TUNSETTXFILTER(const IOCTLEntry *ie, uint8_t *buf_temp,
     return get_errno(safe_ioctl(fd, ie->host_cmd, filter));
 }
 
+#ifdef TARGET_ABI_IRIX
+/* IRIX pty translation: /dev/ptc, the ttyq/pts slave names, STREAMS I_STR. */
+#include "irix/target_pty.h"
+/* IRIX 'i'-group network ioctls: ifr_flags width, IFF_ values, ifr_enaddr. */
+#include "irix/target_ifreq.h"
+#endif
+
 IOCTLEntry ioctl_entries[] = {
 #define IOCTL(cmd, access, ...) \
     { TARGET_ ## cmd, cmd, #cmd, access, 0, {  __VA_ARGS__ } },
@@ -8847,6 +8854,18 @@ int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *pathname,
         return fd;
     }
 
+#ifdef TARGET_ABI_IRIX
+    /*
+     * IRIX pty nodes: /dev/ptc is a clone device with no host equivalent, and
+     * the /dev/ttyq* slave names have to be redirected onto host devpts.
+     * See linux-user/irix/target_pty.h.
+     */
+    fd = irix_pty_open(pathname, flags, mode);
+    if (fd > -2) {
+        return fd;
+    }
+#endif
+
     if (safe) {
         return safe_openat(dirfd, path(pathname), flags, mode);
     } else {
@@ -10035,6 +10054,8 @@ static abi_long host_to_target_irix_stat64(abi_ulong target_addr,
 
 /* syssgi(SGI_INVENT) -- the synthesised hardware inventory table. */
 #include "target_invent.h"
+/* statfs(path, buf, len, fstyp) -- IRIX's own struct, not Linux's. */
+#include "target_statfs.h"
 #endif /* TARGET_ABI_IRIX */
 
 /* This is an internal helper for do_syscall so that it is easier
@@ -10064,6 +10085,9 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     || defined(TARGET_NR_fstatvfs64))
     /* IRIX statvfs-family marshalling buffer. Ported from qemu-irix, GPLv2. */
     struct statvfs stvfs;
+#endif
+#ifdef TARGET_ABI_IRIX
+    int pty_res;    /* raw host return from the IRIX pty stat hook */
 #endif
     void *p;
 
@@ -10433,6 +10457,18 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_chmod:
         if (!(p = lock_user_string(arg1)))
             return -TARGET_EFAULT;
+#ifdef TARGET_ABI_IRIX
+        /*
+         * chmod/chown of a pty slave: the host's devpts has already made the
+         * node private to this user, which is the whole point of the sequence
+         * in getpty.c:300-325, so report success and change nothing. See
+         * linux-user/irix/target_pty.h.
+         */
+        if (irix_pty_is_slave_path(p)) {
+            unlock_user(p, arg1, 0);
+            return 0;
+        }
+#endif
         ret = get_errno(chmod(p, arg2));
         unlock_user(p, arg1, 0);
         return ret;
@@ -11682,6 +11718,19 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
+#ifdef TARGET_ABI_IRIX
+        /*
+         * IRIX statfs(path, buf, len, fstyp): a different struct from Linux's,
+         * and fed from statvfs because that is what the IRIX VFS layer feeds
+         * into it. See linux-user/irix/target_statfs.h.
+         */
+        ret = get_errno(statvfs(path(p), &stvfs));
+        unlock_user(p, arg1, 0);
+        if (!is_error(ret)) {
+            ret = host_to_target_irix_statfs(arg2, arg3, &stvfs);
+        }
+        return ret;
+#endif
         ret = get_errno(statfs(path(p), &stfs));
         unlock_user(p, arg1, 0);
     convert_statfs:
@@ -11713,6 +11762,13 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_fstatfs
     case TARGET_NR_fstatfs:
+#ifdef TARGET_ABI_IRIX
+        ret = get_errno(fstatvfs(arg1, &stvfs));   /* see TARGET_NR_statfs */
+        if (!is_error(ret)) {
+            ret = host_to_target_irix_statfs(arg2, arg3, &stvfs);
+        }
+        return ret;
+#endif
         ret = get_errno(fstatfs(arg1, &stfs));
         goto convert_statfs;
 #endif
@@ -13058,6 +13114,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     case TARGET_NR_chown:
         if (!(p = lock_user_string(arg1)))
             return -TARGET_EFAULT;
+#ifdef TARGET_ABI_IRIX
+        if (irix_pty_is_slave_path(p)) {    /* see chmod above */
+            unlock_user(p, arg1, 0);
+            return 0;
+        }
+#endif
         ret = get_errno(chown(p, low2highuid(arg2), low2highgid(arg3)));
         unlock_user(p, arg1, 0);
 #ifdef TARGET_ABI_IRIX
@@ -15032,6 +15094,8 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (ret >= 0) {
             memset(&st, 0, sizeof(st));
             st.st_ino = ret;
+        } else if (irix_pty_stat(p, &st, &pty_res)) {
+            ret = get_errno(pty_res);
         } else {
             ret = get_errno(stat(path(p), &st));
         }
@@ -15041,11 +15105,18 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg2))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(lstat(path(p), &st));
+        if (irix_pty_stat(p, &st, &pty_res)) {
+            ret = get_errno(pty_res);
+        } else {
+            ret = get_errno(lstat(path(p), &st));
+        }
         unlock_user(p, arg2, 0);
         goto do_irix_xstat;
     case TARGET_NR_fxstat:  /* fxstat(ver, fd, statbuf) */
         ret = get_errno(fstat(arg2, &st));
+        if (!is_error(ret)) {
+            irix_pty_fstat_fixup(arg2, &st);
+        }
         goto do_irix_xstat;
     do_irix_xstat:
         /*
@@ -15072,7 +15143,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(stat(path(p), &st));
+        if (irix_pty_stat(p, &st, &pty_res)) {
+            ret = get_errno(pty_res);
+        } else {
+            ret = get_errno(stat(path(p), &st));
+        }
         unlock_user(p, arg1, 0);
         if (!is_error(ret)) {
             ret = host_to_target_irix_stat(arg2, &st);

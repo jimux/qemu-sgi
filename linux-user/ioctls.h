@@ -28,6 +28,79 @@
        IOC_R, 0, { MK_PTR(TYPE_INT) } },
      { TARGET_IRIX_FIONBIO, FIONBIO, "FIONBIO",
        IOC_W, 0, { MK_PTR(TYPE_INT) } },
+     /*
+      * The STREAMS ioctls IRIX's pty allocation rides on. There is no host
+      * command for any of them -- they are handled entirely in
+      * linux-user/irix/target_pty.h, which translates them onto the host's
+      * Unix98 pty machinery -- so host_cmd is 0 and do_ioctl does the work.
+      */
+     /*
+      * arg_type is only consulted by -strace here (do_ioctl short-circuits to
+      * do_ioctl as soon as it is set), so I_STR declares MK_PTR(TYPE_INT):
+      * ic_cmd is the first word of struct strioctl and the only interesting
+      * one, so a trace line reads "I_STR,20482" == UNLKPT.
+      */
+     { TARGET_IRIX_I_STR, 0, "I_STR",
+       IOC_RW, do_ioctl_irix_i_str, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_I_PUSH, 0, "I_PUSH",
+       IOC_W, do_ioctl_irix_i_push, { TYPE_PTRVOID } },
+     { TARGET_IRIX_I_POP, 0, "I_POP",
+       IOC_W, do_ioctl_irix_i_push, { TYPE_NULL } },
+     /*
+      * The IRIX 'i' (network interface) group. Every entry here is one a real
+      * binary in a staged 6.5.22 root actually issues -- see the sweep result
+      * recorded in linux-user/irix/termbits.h -- and the marshalling rationale
+      * (why SIOCGIFCONF reuses the generic handler, why the flags pair and
+      * SIOCGENADDR cannot) is in linux-user/irix/target_ifreq.h.
+      *
+      * STRUCT_ifconf is 8 bytes and STRUCT_sockaddr_ifreq is 32 on n32, which
+      * is exactly sizeof(struct ifconf) and sizeof(struct ifreq) on IRIX, so
+      * do_ioctl_ifconf() and the sockaddr thunk apply unchanged.
+      */
+     { TARGET_IRIX_SIOCGIFCONF, SIOCGIFCONF, "SIOCGIFCONF",
+       IOC_RW, do_ioctl_ifconf, { MK_PTR(MK_STRUCT(STRUCT_ifconf)) } },
+     { TARGET_IRIX_SIOCGIFFLAGS, 0, "SIOCGIFFLAGS",
+       IOC_RW, do_ioctl_irix_ifflags, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_SIOCSIFFLAGS, 0, "SIOCSIFFLAGS",
+       IOC_W, do_ioctl_irix_ifflags, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_OSIOCGIFFLAGS, 0, "OSIOCGIFFLAGS",
+       IOC_RW, do_ioctl_irix_ifflags, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_OSIOCSIFFLAGS, 0, "OSIOCSIFFLAGS",
+       IOC_W, do_ioctl_irix_ifflags, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_SIOCGENADDR, 0, "SIOCGENADDR",
+       IOC_W, do_ioctl_irix_genaddr, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_SIOCGIFMTU, SIOCGIFMTU, "SIOCGIFMTU",
+       IOC_RW, 0, { MK_PTR(MK_STRUCT(STRUCT_int_ifreq)) } },
+     { TARGET_IRIX_SIOCSIFMTU, SIOCSIFMTU, "SIOCSIFMTU",
+       IOC_W, 0, { MK_PTR(MK_STRUCT(STRUCT_int_ifreq)) } },
+     { TARGET_IRIX_SIOCSIFMETRIC, SIOCSIFMETRIC, "SIOCSIFMETRIC",
+       IOC_W, 0, { MK_PTR(MK_STRUCT(STRUCT_int_ifreq)) } },
+     { TARGET_IRIX_SIOCSIFDSTADDR, SIOCSIFDSTADDR, "SIOCSIFDSTADDR",
+       IOC_W, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCGIFADDR, SIOCGIFADDR, "SIOCGIFADDR",
+       IOC_RW, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCGIFDSTADDR, SIOCGIFDSTADDR, "SIOCGIFDSTADDR",
+       IOC_RW, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCGIFBRDADDR, SIOCGIFBRDADDR, "SIOCGIFBRDADDR",
+       IOC_RW, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCGIFNETMASK, SIOCGIFNETMASK, "SIOCGIFNETMASK",
+       IOC_RW, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCGIFMETRIC, SIOCGIFMETRIC, "SIOCGIFMETRIC",
+       IOC_RW, 0, { MK_PTR(MK_STRUCT(STRUCT_int_ifreq)) } },
+     { TARGET_IRIX_SIOCSIFADDR, SIOCSIFADDR, "SIOCSIFADDR",
+       IOC_W, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCSIFBRDADDR, SIOCSIFBRDADDR, "SIOCSIFBRDADDR",
+       IOC_W, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     { TARGET_IRIX_SIOCSIFNETMASK, SIOCSIFNETMASK, "SIOCSIFNETMASK",
+       IOC_W, 0, { MK_PTR(MK_STRUCT(STRUCT_sockaddr_ifreq)) } },
+     /*
+      * Trusted IRIX MAC labels. host_cmd 0 makes do_ioctl return ENOTTY, which
+      * is what an IRIX kernel without the MAC option returns and what libc's
+      * _tsix_get_solabel is written to cope with; naming them here only keeps
+      * them out of the "Unsupported ioctl" log.
+      */
+     { TARGET_IRIX_SIOCGETLABEL, 0, "SIOCGETLABEL", 0, 0, { TYPE_NULL } },
+     { TARGET_IRIX_SIOCSETLABEL, 0, "SIOCSETLABEL", 0, 0, { TYPE_NULL } },
 #endif
      IOCTL(TCGETA, IOC_R, MK_PTR(TYPE_INT))
      IOCTL(TCSETA, IOC_W, MK_PTR(TYPE_INT))
