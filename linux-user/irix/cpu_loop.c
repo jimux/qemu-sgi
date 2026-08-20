@@ -315,6 +315,55 @@ static void get_args_n32(target_ulong *regs, int arg64, int num, abi_ulong args[
     }
 }
 
+/*
+ * IRIX register-pair syscall returns (the 4.3BSD "second return register").
+ *
+ * A handful of IRIX syscalls hand back two values: the primary in v0 (gpr[2])
+ * and a second in v1 (gpr[3]). libc exposes each half as its own function --
+ * the "e"/"p" variants are literally the same syscall stub with one extra
+ * `move v0,v1`. Transcribed from the staged IRIX userland's own
+ * lib32/libc.so.1 (IRIX 6.5.5, n32):
+ *
+ *   _getuid  @0x0fa4e168:  li v0,1024; syscall; bnez a3,err;  jr ra
+ *   _geteuid @0x0fa4a800:  li v0,1024; syscall; bnez a3,err;  move v0,v1; jr ra
+ *   _getgid  @0x0fa4d47c:  li v0,1047; syscall; ...            jr ra
+ *   _getegid @0x0fa43fd0:  li v0,1047; syscall; ...            move v0,v1
+ *   _getpid  @0x0fa3864c:  li v0,1020; syscall; ...            jr ra
+ *   _getppid @0x0fa6044c:  li v0,1020; syscall; ...            move v0,v1
+ *
+ * A disassembly sweep of every ELF in a staged IRIX 6.5.5 root (1619 files)
+ * found exactly four syscalls whose result is read out of v1: getpid (1020),
+ * getuid (1024), pipe (1042) and getgid (1047) -- pipe is already handled by
+ * do_pipe(), the other three are handled here. rld's _getreuid/_getregid
+ * (`sw v1,0(a1)`) confirm the same pairing from a second, independent binary.
+ *
+ * Every OTHER syscall must leave v1 strictly alone, because IRIX libc relies
+ * on the kernel preserving it across a trap. The concrete example is
+ * __sbrk @0x0fa37540: it loads the cached old break into v1, issues brk
+ * (1017), and *then* returns it with `move v0,v1`. Clobbering v1 there would
+ * break sbrk() and hence malloc(). Hence the narrow switch below rather than
+ * a blanket write.
+ */
+static void irix_syscall_ret_pair(CPUMIPSState *env, unsigned int num)
+{
+    if (env->active_tc.gpr[7]) {
+        return;                 /* error return: v0 = errno, v1 untouched */
+    }
+    switch (num) {
+    case TARGET_NR_getpid:      /* (pid, ppid) */
+        env->active_tc.gpr[3] = (abi_int)getppid();
+        break;
+    case TARGET_NR_getuid:      /* (uid, euid) */
+        env->active_tc.gpr[3] = (abi_int)geteuid();
+        break;
+    case TARGET_NR_getgid:      /* (gid, egid) */
+        env->active_tc.gpr[3] = (abi_int)getegid();
+        break;
+    default:
+        break;
+    }
+}
+
 void cpu_loop(CPUMIPSState *env)
 {
     CPUState *cs = env_cpu(env);
@@ -394,6 +443,7 @@ void cpu_loop(CPUMIPSState *env)
                 env->active_tc.gpr[7] = ((abi_ulong)ret >= (abi_ulong)-1700);
                 env->active_tc.gpr[2] =
                     (env->active_tc.gpr[7] ? -ret : ret);
+                irix_syscall_ret_pair(env, syscall_num + TARGET_NR_Linux);
             }
             break;
         case EXCP_TLBL:
