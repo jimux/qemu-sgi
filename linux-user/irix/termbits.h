@@ -325,3 +325,105 @@ struct target_termios {
 #define TARGET_IRIX_I_LOOK	0x5304		/* stropts.h:152 (STR|04)  */
 #define TARGET_IRIX_I_STR	0x5308		/* stropts.h:156 (STR|010) */
 #define TARGET_IRIX_I_FIND	0x530b		/* stropts.h:159 (STR|013) */
+
+/*
+ * The 'i' (network interface) group.
+ *
+ * BSD-encoded like 'f' and 's' above, but the structs carried by them differ
+ * from Linux's in layout as well as the command number, so these need real
+ * marshalling; see linux-user/irix/target_ifreq.h.
+ *
+ * Definitions transcribed from
+ * software_library/irix-655-source/f/irix/kern/bsd/net/soioctl.h (identical to
+ * f/root/usr/include/net/soioctl.h; sys/sockio.h:27 is just an #include of it),
+ * with the sizes taken from f/irix/kern/bsd/net/if.h:513-585 --
+ * sizeof(struct ifreq) == 32 (16-byte ifr_name + a union whose widest member is
+ * the 16-byte struct sockaddr) and sizeof(struct ifconf) == 8 (int + 4-byte
+ * pointer under n32).
+ *
+ * Those two sizes are not asserted from the headers alone: they are also what
+ * SGI's own compiler baked into the constants, and a disassembly sweep of all
+ * 1619 ELF files in a staged 6.5.22 root reads back exactly 8B for
+ * SIOCGIFCONF and 32B for every ifreq command (tmp/legT2/sweep_i.out).
+ *
+ * WHICH ONES ARE HERE was decided by that sweep and nothing else -- the same
+ * discipline leg-T1 applied to the 's' group. All 16 'i'-group constants any
+ * binary in the tree actually issues are listed; nothing was added on
+ * speculation. The "used by" column is the sweep's own output.
+ */
+#define TARGET_IRIX_IFREQ_SIZE		32	/* net/if.h:513-553 */
+#define TARGET_IRIX_IFCONF_SIZE		8	/* net/if.h:577-585 */
+#define TARGET_IRIX_IOWRN(g, n, sz) \
+	TARGET_IOC(TARGET_IOC_READ | TARGET_IOC_WRITE, (g), (n), (sz))
+#define TARGET_IRIX_IOWN(g, n, sz) \
+	TARGET_IOC(TARGET_IOC_WRITE, (g), (n), (sz))
+
+/* soioctl.h:53  -- libc _get_myaddress, xdm, chooser, osview, gr_osview,
+ *                  libpf_ogl, libimdModel, libsaNetwork, testmcast (10 files) */
+#define TARGET_IRIX_SIOCGIFCONF \
+	TARGET_IRIX_IOWRN('i', 20, TARGET_IRIX_IFCONF_SIZE)	/* 0xc0086914 */
+/* soioctl.h:149 -- libc _get_myaddress, chooser, libsaNetwork, testmcast */
+#define TARGET_IRIX_SIOCGIFFLAGS \
+	TARGET_IRIX_IOWRN('i', 123, TARGET_IRIX_IFREQ_SIZE)	/* 0xc020697b */
+/* soioctl.h:148 -- libsaNetwork SaSetInterfaceState */
+#define TARGET_IRIX_SIOCSIFFLAGS \
+	TARGET_IRIX_IOWN('i', 122, TARGET_IRIX_IFREQ_SIZE)	/* 0x8020697a */
+/* soioctl.h:74  -- chooser, libsaNetwork SaGetBroadcastAddr */
+#define TARGET_IRIX_SIOCGIFBRDADDR \
+	TARGET_IRIX_IOWRN('i', 23, TARGET_IRIX_IFREQ_SIZE)	/* 0xc0206917 */
+/* soioctl.h:48  -- libsaNetwork SaGetInterfaceAddr */
+#define TARGET_IRIX_SIOCGIFADDR \
+	TARGET_IRIX_IOWRN('i', 13, TARGET_IRIX_IFREQ_SIZE)	/* 0xc020690d */
+/* soioctl.h:50  -- libsaNetwork */
+#define TARGET_IRIX_SIOCGIFDSTADDR \
+	TARGET_IRIX_IOWRN('i', 15, TARGET_IRIX_IFREQ_SIZE)	/* 0xc020690f */
+/* soioctl.h:76  -- libsaNetwork SaGetSubnetmask */
+#define TARGET_IRIX_SIOCGIFNETMASK \
+	TARGET_IRIX_IOWRN('i', 25, TARGET_IRIX_IFREQ_SIZE)	/* 0xc0206919 */
+/* soioctl.h:51-52 -- the legacy 16-bit flags pair, still issued by ifconfig,
+ *                    arrayd, bootpc and appletalk/atconfig. The value lives in
+ *                    the first two bytes of ifr_flags; see the kernel side at
+ *                    bsd/net/if.c:1617-1619 and :1655-1661. */
+#define TARGET_IRIX_OSIOCSIFFLAGS \
+	TARGET_IRIX_IOWN('i', 16, TARGET_IRIX_IFREQ_SIZE)	/* 0x80206910 */
+#define TARGET_IRIX_OSIOCGIFFLAGS \
+	TARGET_IRIX_IOWRN('i', 17, TARGET_IRIX_IFREQ_SIZE)	/* 0xc0206911 */
+/* soioctl.h:78-79 -- ifconfig, routed, libsaNetwork */
+#define TARGET_IRIX_SIOCGIFMETRIC \
+	TARGET_IRIX_IOWRN('i', 27, TARGET_IRIX_IFREQ_SIZE)	/* 0xc020691b */
+#define TARGET_IRIX_SIOCSIFMETRIC \
+	TARGET_IRIX_IOWN('i', 28, TARGET_IRIX_IFREQ_SIZE)	/* 0x8020691c */
+/* soioctl.h:93-94 -- mtrconfig */
+#define TARGET_IRIX_SIOCSIFMTU \
+	TARGET_IRIX_IOWN('i', 21, TARGET_IRIX_IFREQ_SIZE)	/* 0x80206915 */
+#define TARGET_IRIX_SIOCGIFMTU \
+	TARGET_IRIX_IOWRN('i', 22, TARGET_IRIX_IFREQ_SIZE)	/* 0xc0206916 */
+/* soioctl.h:49  -- ifconfig, snetd */
+#define TARGET_IRIX_SIOCSIFDSTADDR \
+	TARGET_IRIX_IOWN('i', 14, TARGET_IRIX_IFREQ_SIZE)	/* 0x8020690e */
+/* soioctl.h:120 -- libsaNetwork; returns 6 raw bytes in ifr_enaddr, NOT a
+ *                  sockaddr like Linux's SIOCGIFHWADDR (net/if.h:524) */
+#define TARGET_IRIX_SIOCGENADDR \
+	TARGET_IRIX_IOWRN('i', 85, TARGET_IRIX_IFREQ_SIZE)	/* 0xc0206955 */
+/* soioctl.h:47,75,77 -- libsaNetwork SaSetInterface / SaSetPrimaryInterface */
+#define TARGET_IRIX_SIOCSIFADDR \
+	TARGET_IRIX_IOWN('i', 12, TARGET_IRIX_IFREQ_SIZE)	/* 0x8020690c */
+#define TARGET_IRIX_SIOCSIFBRDADDR \
+	TARGET_IRIX_IOWN('i', 24, TARGET_IRIX_IFREQ_SIZE)	/* 0x80206918 */
+#define TARGET_IRIX_SIOCSIFNETMASK \
+	TARGET_IRIX_IOWN('i', 26, TARGET_IRIX_IFREQ_SIZE)	/* 0x8020691a */
+/* soioctl.h:84  -- osview, gr_osview. Returns struct ifstats inside the ifreq
+ *                  union (net/if.h:471-477); the host has no ioctl that
+ *                  produces it, so this one stays unmapped (ledgered). */
+#define TARGET_IRIX_SIOCGIFSTATS \
+	TARGET_IRIX_IOWRN('i', 101, TARGET_IRIX_IFREQ_SIZE)	/* 0xc0206965 */
+/* soioctl.h:85  -- libsaNetwork. No host equivalent; ledgered. */
+#define TARGET_IRIX_SIOCSIFHEAD \
+	TARGET_IRIX_IOWN('i', 102, TARGET_IRIX_IFREQ_SIZE)	/* 0x80206966 */
+/* soioctl.h:88-89 -- libc _tsix_{get,set}_solabel, sbin/sh. Trusted IRIX MAC
+ *                    labels: there is no host equivalent and no host state to
+ *                    describe, and an IRIX kernel without the MAC option fails
+ *                    them too, so ENOTTY is the right answer -- named here only
+ *                    so the trace says so instead of "Unsupported ioctl". */
+#define TARGET_IRIX_SIOCGETLABEL	TARGET_IO('i', 103)	/* 0x20006967 */
+#define TARGET_IRIX_SIOCSETLABEL	TARGET_IO('i', 104)	/* 0x20006968 */
