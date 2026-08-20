@@ -13,6 +13,22 @@
      IOCTL(TIOCGWINSZ, IOC_R, MK_PTR(MK_STRUCT(STRUCT_winsize)))
      IOCTL(TIOCSWINSZ, IOC_W, MK_PTR(MK_STRUCT(STRUCT_winsize)))
      IOCTL(FIONREAD, IOC_R, MK_PTR(TYPE_INT))
+#ifdef TARGET_ABI_IRIX
+     /*
+      * IRIX numbers its 'f' (file) and 's' (socket) ioctl groups with the
+      * 4.3BSD _IOR/_IOW encoding, not the Linux/MIPS one the entries above
+      * use. These are the same three operations under their real IRIX command
+      * numbers; see the derivation in linux-user/irix/termbits.h. Spelled out
+      * rather than written with IOCTL() because the target and host command
+      * names differ (there is no host SIOCNREAD).
+      */
+     { TARGET_SIOCNREAD, FIONREAD, "SIOCNREAD",
+       IOC_R, 0, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_FIONREAD, FIONREAD, "FIONREAD",
+       IOC_R, 0, { MK_PTR(TYPE_INT) } },
+     { TARGET_IRIX_FIONBIO, FIONBIO, "FIONBIO",
+       IOC_W, 0, { MK_PTR(TYPE_INT) } },
+#endif
      IOCTL(TCGETA, IOC_R, MK_PTR(TYPE_INT))
      IOCTL(TCSETA, IOC_W, MK_PTR(TYPE_INT))
      IOCTL(TCSETAW, IOC_W, MK_PTR(TYPE_INT))

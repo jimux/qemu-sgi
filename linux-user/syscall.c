@@ -10032,6 +10032,9 @@ static abi_long host_to_target_irix_stat64(abi_ulong target_addr,
     unlock_user_struct(target_st, target_addr, 1);
     return 0;
 }
+
+/* syssgi(SGI_INVENT) -- the synthesised hardware inventory table. */
+#include "target_invent.h"
 #endif /* TARGET_ABI_IRIX */
 
 /* This is an internal helper for do_syscall so that it is easier
@@ -15443,6 +15446,9 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
             unlock_user(target_phdr, arg3, 0);
             break;
         }
+        case TARGET_NR_syssgi_invent: /* hardware inventory (hinv) */
+            ret = do_syssgi_invent(arg2, arg3, arg4);
+            break;
         case TARGET_NR_syssgi_sigaltstack:
             ret = do_sigaltstack(arg2, arg3, cpu_env);
             break;
@@ -15476,7 +15482,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
                 ret = TARGET_PAGE_SIZE;
                 break;
             case TARGET_NR_sysconf_nprocs:
-                ret = 1;
+                ret = irix_host_nprocs();
                 break;
             case TARGET_NR_sysconf_acl:
             case TARGET_NR_sysconf_cap:
@@ -15602,7 +15608,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         switch (arg1) {
         case TARGET_NR_sysmp_nprocs:  /* #physical processors */
         case TARGET_NR_sysmp_naprocs: /* #processors without process limit */
-            ret = 1;
+            /*
+             * Host truth: hinv prints this count next to the CPUBOARD record
+             * synthesised in target_invent.h, so the two must agree.
+             */
+            ret = irix_host_nprocs();
             break;
         case TARGET_NR_sysmp_pgsize:
             ret = TARGET_PAGE_SIZE;
