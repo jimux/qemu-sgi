@@ -257,6 +257,7 @@
 #define TARGET_NR_syssgi_getsid		(65)
 /* SGI specific syssgi calls */
 #define TARGET_NR_syssgi_sysid		(1)
+#define TARGET_NR_syssgi_invent		(5)	/* sys/syssgi.h: SGI_INVENT */
 #define TARGET_NR_syssgi_elfmap		(68)
 #define TARGET_NR_syssgi_getprocattr    (85)
 #define TARGET_NR_syssgi_rldenv         (92)
