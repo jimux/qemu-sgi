@@ -1224,7 +1224,22 @@ static inline abi_long target_to_host_timespec(struct timespec *host_ts,
     defined(TARGET_NR_utimensat) || \
     defined(TARGET_NR_utimensat_time64) || \
     defined(TARGET_NR_semtimedop_time64) || \
-    defined(TARGET_NR_pselect6_time64) || defined(TARGET_NR_ppoll_time64)
+    defined(TARGET_NR_pselect6_time64) || defined(TARGET_NR_ppoll_time64) || \
+    defined(TARGET_NR_poll) || defined(TARGET_NR_ppoll) || \
+    defined(TARGET_NR_pselect6)
+/*
+ * The three non-time64 cases above are not decoration. do_ppoll() is compiled
+ * whenever poll/ppoll/ppoll_time64 exists (see its guard below) and
+ * do_pselect6() whenever pselect6/pselect6_time64 does, and both call this
+ * helper unconditionally -- the time64-ness is a runtime argument, not a
+ * compile-time one. A target that has plain ppoll and no *_time64 syscall at
+ * all (the IRIX N32 ABI is one: syscall_nr.h defines poll and ppoll, neither
+ * pselect6 nor any _time64) therefore got an implicit declaration here. That
+ * was a silent warning until GCC 15 / C23 made implicit declarations a hard
+ * error, at which point the target stopped building; it was worked around with
+ * --extra-cflags=-Wno-error=implicit-function-declaration at configure time,
+ * which this fix removes the need for. Nothing target-specific about the bug.
+ */
 static inline abi_long target_to_host_timespec64(struct timespec *host_ts,
                                                  abi_ulong target_addr)
 {
