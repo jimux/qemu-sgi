@@ -287,6 +287,7 @@ static const uint32_t mips_syscall_args[] = { /* see IRIX:/usr/include/sys.s */
 	SYSCALL_ARGS(2, _, _, _),                   /* 234: linkfollow */
 };
 
+#ifndef TARGET_ABI_MIPSO32
 /*
  * split the arg64'th arg, which is a 64 bit arg in a 64 bit register, into an
  * even/odd 32 bit register pair, moving the other args up as necessary. This is
@@ -314,6 +315,7 @@ static void get_args_n32(target_ulong *regs, int arg64, int num, abi_ulong args[
         }
     }
 }
+#endif /* !TARGET_ABI_MIPSO32 */
 
 /*
  * IRIX register-pair syscall returns (the 4.3BSD "second return register").
@@ -402,6 +404,66 @@ void cpu_loop(CPUMIPSState *env)
                                      env->active_tc.gpr[5 + offset]);
             } else if (syscall_num >= ARRAY_SIZE(mips_syscall_args)) {
                 ret = -TARGET_ENOSYS;
+#ifdef TARGET_ABI_MIPSO32
+            } else {
+                /*
+                 * IRIX O32 syscall convention (ported from qemu-irix
+                 * linux-user/main.c): args 1-4 in a0-a3, args 5-8 in the
+                 * caller's stack argument area at sp+16..28. No SYSCALL_MAP
+                 * (o32 libc calls the *64 syscalls explicitly when it means
+                 * them; a 64-bit argument arrives as an even/odd 32-bit
+                 * register pair already, which regpairs_aligned() reassembles
+                 * in do_syscall) and no RET64 repacking (a 64-bit result is
+                 * returned as a v0=high/v1=low pair, and the *64 handlers
+                 * write gpr[3] themselves).
+                 * For the indirect form (SYS_syscall), everything shifts by
+                 * one register and arg4 moves to the stack at sp+12.
+                 */
+                int nb_args;
+                abi_ulong sp_reg;
+                abi_ulong arg4 = 0, arg5 = 0, arg6 = 0, arg7 = 0, arg8 = 0;
+
+                nb_args = SYSCALL_NARGS(mips_syscall_args[syscall_num]);
+                sp_reg = env->active_tc.gpr[29] + 4 * offset;
+                switch (nb_args) {
+                /* these arguments are taken from the stack */
+                case 8:
+                    if ((ret = get_user_ual(arg8, sp_reg + 28)) != 0) {
+                        goto done_syscall;
+                    }
+                    /* fall through */
+                case 7:
+                    if ((ret = get_user_ual(arg7, sp_reg + 24)) != 0) {
+                        goto done_syscall;
+                    }
+                    /* fall through */
+                case 6:
+                    if ((ret = get_user_ual(arg6, sp_reg + 20)) != 0) {
+                        goto done_syscall;
+                    }
+                    /* fall through */
+                case 5:
+                    if ((ret = get_user_ual(arg5, sp_reg + 16)) != 0) {
+                        goto done_syscall;
+                    }
+                    /* fall through */
+                case 4:
+                    if (offset && (ret = get_user_ual(arg4, sp_reg + 12)) != 0) {
+                        goto done_syscall;
+                    }
+                    break;
+                default:
+                    break;
+                }
+                ret = do_syscall(env, syscall_num + TARGET_NR_Linux,
+                                 env->active_tc.gpr[4 + offset],
+                                 env->active_tc.gpr[5 + offset],
+                                 env->active_tc.gpr[6 + offset],
+                                 offset ? arg4 : env->active_tc.gpr[7],
+                                 arg5, arg6, arg7, arg8);
+done_syscall:   ;
+            }
+#else /* N32 */
             } else {
                 int nb_args;
                 int arg64;
@@ -421,6 +483,7 @@ void cpu_loop(CPUMIPSState *env)
                                  args[0], args[1], args[2], args[3],
                                  args[4], args[5], args[6], args[7]);
             }
+#endif /* TARGET_ABI_MIPSO32 */
             if (ret == -QEMU_ERESTARTSYS) {
                 env->active_tc.PC -= 4;
                 break;
@@ -431,6 +494,7 @@ void cpu_loop(CPUMIPSState *env)
                 break;
             }
             /* on return: gpr7 = error flag, gpr2/3 = value(s) or error code */
+#ifndef TARGET_ABI_MIPSO32
             if (syscall_num < ARRAY_SIZE(mips_syscall_args) &&
                 SYSCALL_RET64(mips_syscall_args[syscall_num])) {
                 /* restore a 64 bit retval for N32 */
@@ -439,7 +503,16 @@ void cpu_loop(CPUMIPSState *env)
                 env->active_tc.gpr[7] = (tret >= (target_ulong)-1700);
                 env->active_tc.gpr[2] =
                     (env->active_tc.gpr[7] ? -tret : tret);
-            } else {
+            } else
+#endif
+            {
+                /*
+                 * O32 takes this path for every syscall, including RET64
+                 * ones: a 64-bit result is v0=high/v1=low, the *64 handlers
+                 * already wrote the low word into gpr[3], and ret is the
+                 * high word (ported from qemu-irix, whose o32 epilogue is
+                 * exactly this).
+                 */
                 env->active_tc.gpr[7] = ((abi_ulong)ret >= (abi_ulong)-1700);
                 env->active_tc.gpr[2] =
                     (env->active_tc.gpr[7] ? -ret : ret);

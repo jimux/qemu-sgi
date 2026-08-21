@@ -21,7 +21,17 @@
 #define ELF_MACHINE             EM_MIPS
 #define EXSTACK_DEFAULT         true
 
+/*
+ * EF_MIPS_ABI2 is the o32/n32 discriminator (the same bit the binfmt_misc
+ * registration masks on): n32 carries it, o32 does not. Each target accepts
+ * exactly its own ABI so an o32 binary handed to qemu-irixn32 (or vice versa)
+ * is refused with "Invalid ELF image", never mis-run.
+ */
+#ifdef TARGET_ABI_MIPSO32
+#define elf_check_abi(x)        (!((x) & EF_MIPS_ABI2))
+#else
 #define elf_check_abi(x)        ((x) & EF_MIPS_ABI2)
+#endif
 
 #define HAVE_ELF_HWCAP          1
 #define HAVE_ELF_BASE_PLATFORM  1
