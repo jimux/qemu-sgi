@@ -1683,6 +1683,45 @@ static void load_elf_image(const char *image_name, const ImageSource *src,
         info->end_data = info->end_code;
     }
 
+#if defined(TARGET_ABI_IRIX) && defined(TARGET_ABI_MIPSO32)
+    /*
+     * IRIX O32 executables put text at 0x00400000 and data at 0x10000000,
+     * and the ~250MB hole between the two segments is exactly where the
+     * quickstarted o32 shared libraries live (libc.so.1 at 0x0fa40000, the
+     * X/GL/Motif stack below it). The whole-image PROT_NONE reservation
+     * made above therefore swallows the home addresses of every library,
+     * the interpreter (libc, per PT_INTERP) gets rebased away from its
+     * quickstart base, and its prelinked GOT sends the first indirect call
+     * into the reservation (measured: SIGSEGV SEGV_ACCERR at 0x0fa7f480
+     * before the first syscall). The IRIX kernel does not reserve this
+     * hole; neither do we: punch out the gaps between PT_LOAD segments so
+     * rld and libraries can map at their stated vaddrs. O32-only -- N32
+     * binaries sit wholly above 0x10000000 and their reservation never
+     * covers library space.
+     */
+    if (ehdr->e_type == ET_EXEC) {
+        abi_ulong prev_end = load_addr;
+
+        for (i = 0; i < ehdr->e_phnum; i++) {
+            struct elf_phdr *eppnt = phdr + i;
+            abi_ulong seg_start, seg_end;
+
+            if (eppnt->p_type != PT_LOAD) {
+                continue;
+            }
+            seg_start = (load_bias + eppnt->p_vaddr) & TARGET_PAGE_MASK;
+            seg_end = TARGET_PAGE_ALIGN(load_bias + eppnt->p_vaddr
+                                        + eppnt->p_memsz);
+            if (seg_start > prev_end) {
+                target_munmap(prev_end, seg_start - prev_end);
+            }
+            if (seg_end > prev_end) {
+                prev_end = seg_end;
+            }
+        }
+    }
+#endif
+
     if (qemu_log_enabled()) {
         load_symbols(ehdr, src, load_bias);
     }
