@@ -847,10 +847,25 @@ static void sgi_pvchan_realize(DeviceState *dev, Error **errp)
      * REL mouse wins that lookup, so GTK/VNC send RELATIVE motion (to the PS/2
      * mouse) instead of absolute position (to us) for REAL display input — the
      * D5 gate only ever passed because QMP input-send-event abs events route to
-     * this handler by event-type, bypassing is_absolute.  Buttons still reach
-     * the PS/2 mouse (routed by BTN event-type, independent of head order), so
-     * guest-local clicking is unchanged.  Headless/CI boots have no display and
-     * are unaffected. */
+     * this handler by event-type, bypassing is_absolute.
+     *
+     * MEASURED 2026-08-22 (leg-PTR): buttons DO still reach the PS/2 mouse
+     * (routed by BTN event-type, independent of head order) — an in-guest
+     * XQueryPointer probe shows Button1 held in the X server's state for real
+     * and HMP-injected presses alike.  But that alone does NOT keep clicking
+     * working: because this handler now owns ALL real-display motion, the
+     * guest X pointer only ever moves if the OP_ABSPTR -> resident-irixga ->
+     * XWarpPointer half is alive end to end.  A guest agent that predates D5
+     * (the A4-era golden's /usr/etc/irixga) consumes the ring and silently
+     * discards op 7 — the pointer stays frozen, every PS/2 button lands at
+     * the frozen position, and "no click ever registers" on a real display
+     * while every monitor/QMP synthetic passes.  The cursor the user still
+     * sees moving is the HOST cursor; virtuix screendumps do not composite
+     * the guest cursor, so pixel diffs are blind to the frozen pointer.
+     * Gate: sgi-irix-re/tests/test_display_pointer_gate.py boots a real GTK
+     * display and asserts the GUEST pointer tracks host motion (in-guest
+     * XQueryPointer) and that a click posts the Toolchest menu.  Details:
+     * progress_notes/ip55/leg_ptr_real_display_clicks.md. */
     s->input_handler = qemu_input_handler_register(dev, &pvchan_ptr_handler);
     qemu_input_handler_activate(s->input_handler);
 
