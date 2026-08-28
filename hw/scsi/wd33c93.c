@@ -260,9 +260,6 @@ static void wd33c93_do_select_xfer(WD33C93State *s, bool with_atn)
         if ((s->regs[WD_CONTROL] & CONTROL_DM_MASK) != CONTROL_DM_POLLED) {
             wd33c93_set_drq(s, true);
         }
-        qemu_log_mask(LOG_UNIMP, "wd33c93: SELECT_XFER resume multi-pass: "
-                      "TC=%u async_len=%u pending_len=%u\n",
-                      s->transfer_count, s->async_len, s->pending_len);
         return;
     }
 
@@ -318,7 +315,14 @@ static void wd33c93_do_select_xfer(WD33C93State *s, bool with_atn)
     /* Get transfer count */
     s->transfer_count = wd33c93_get_transfer_count(s);
 
-    /* Log SCSI command details */
+    /*
+     * Log SCSI command details. NOTE: this line (plus "SCSI response
+     * datalen" below and "SCSI CMD FAILED" in command_complete) is the
+     * parse interface for sgi-irix-re/sgi_mcp/scsi_parser.py — the
+     * qemu_scsi_trace / scsi_log_parse tools and
+     * tests/test_scsi_prom_irix.py capture with `-d unimp` and regex these
+     * exact formats. Keep the wording and the LOG_UNIMP channel.
+     */
     {
         char cdb_str[64];
         int pos = 0;
@@ -336,6 +340,7 @@ static void wd33c93_do_select_xfer(WD33C93State *s, bool with_atn)
     s->current_req = scsi_req_new(s->current_dev, 0, lun, cdb, cdb_len, s);
     datalen = scsi_req_enqueue(s->current_req);
 
+    /* Parse interface for scsi_parser.py (see SELECT_XFER note above). */
     qemu_log_mask(LOG_UNIMP, "wd33c93: SCSI response datalen=%d\n", datalen);
 
     if (datalen != 0) {
@@ -402,13 +407,6 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
     }
 
     WD_DPRINTF("Command 0x%02x\n", cmd);
-
-    qemu_log_mask(LOG_UNIMP, "wd33c93: CMD 0x%02x asr=0x%02x ctrl=0x%02x "
-                  "tgt=%d tc=%d\n", cmd, s->aux_status,
-                  s->regs[WD_CONTROL],
-                  s->regs[WD_DESTINATION_ID] & 0x07,
-                  wd33c93_get_transfer_count(s));
-
 
     /* Check if last command was ignored */
     if (s->aux_status & ASR_CIP) {
@@ -499,9 +497,6 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
             if ((s->regs[WD_CONTROL] & CONTROL_DM_MASK) != CONTROL_DM_POLLED) {
                 wd33c93_set_drq(s, true);
             }
-            qemu_log_mask(LOG_UNIMP, "wd33c93: TRANSFER_INFO resume: "
-                          "new TC=%u async_len=%u\n",
-                          s->transfer_count, s->async_len);
         } else if (!s->current_req && s->current_dev) {
             /*
              * Path 2: SELECT was done but no request yet. Build CDB and
@@ -511,9 +506,6 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
             uint8_t cdb_len_ti;
             uint8_t cdb_ti[12];
             int32_t datalen_ti;
-
-            qemu_log_mask(LOG_UNIMP, "wd33c93: TRANSFER_INFO building SCSI "
-                          "request (SELECT+XFER path)\n");
 
             /* Determine CDB length */
             if (s->regs[WD_OWN_ID] & OWN_ID_EAF) {
@@ -763,9 +755,6 @@ static void wd33c93_transfer_data(SCSIRequest *req, uint32_t len)
      * Reference: IRIX wd93.c:2936 — ST_UNEX_SDATA/RDATA handler
      */
     if (s->transfer_count == 0) {
-        qemu_log_mask(LOG_UNIMP, "wd33c93: transfer_data: TC=0, "
-                      "raising unexpected-phase IRQ (device offered %u bytes)\n",
-                      len);
         s->pending_len = len;
         s->pending_buf = scsi_req_get_buf(req);
         s->async_len = 0;
@@ -793,9 +782,6 @@ static void wd33c93_transfer_data(SCSIRequest *req, uint32_t len)
 
     /* Cap the transfer to the remaining TC */
     if (len > s->transfer_count) {
-        qemu_log_mask(LOG_UNIMP, "wd33c93: transfer_data: capping len %u "
-                      "to TC %u (pending %u for multi-pass)\n",
-                      len, s->transfer_count, len - s->transfer_count);
         /* Save remainder for multi-pass DMA resume after TC reaches 0 */
         s->pending_len = len - s->transfer_count;
         s->pending_buf = s->async_buf + s->transfer_count;
@@ -839,7 +825,10 @@ static void wd33c93_command_complete(SCSIRequest *req, size_t residual)
     WD_DPRINTF("command_complete: status=%d residual=%zu\n",
                scsi_status, residual);
 
-    /* Log CDB details when SCSI command fails (CHECK_CONDITION etc.) */
+    /*
+     * Log CDB details when a command fails (CHECK_CONDITION etc.) — parse
+     * interface for scsi_parser.py's RE_CMD_FAILED (see SELECT_XFER note).
+     */
     if (scsi_status != 0) {
         uint8_t target_id = s->regs[WD_DESTINATION_ID] & DEST_ID_MASK;
         uint8_t cmd_byte = s->regs[WD_CDB_1];

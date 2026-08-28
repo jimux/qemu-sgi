@@ -386,10 +386,6 @@ static void sgi_hpc3_pit_timer0_cb(void *opaque)
     SGIHPC3State *s = SGI_HPC3(opaque);
 
     trace_sgi_hpc3_pit(0, s->pit_count[0]);
-    qemu_log_mask(LOG_UNIMP, "sgi_hpc3: Timer0 fired, map_status=0x%02x, "
-                  "map_mask0=0x%02x, local0_stat=0x%02x, local0_mask=0x%02x\n",
-                  s->int3_map_status, s->int3_map_mask0,
-                  s->int3_local0_stat, s->int3_local0_mask);
 
     /*
      * Set timer pending and update CPU IRQ output.
@@ -424,10 +420,6 @@ static void sgi_hpc3_pit_timer1_cb(void *opaque)
     SGIHPC3State *s = SGI_HPC3(opaque);
 
     trace_sgi_hpc3_pit(1, s->pit_count[1]);
-    qemu_log_mask(LOG_UNIMP, "sgi_hpc3: Timer1 fired, map_status=0x%02x, "
-                  "map_mask1=0x%02x, local1_stat=0x%02x, local1_mask=0x%02x\n",
-                  s->int3_map_status, s->int3_map_mask1,
-                  s->int3_local1_stat, s->int3_local1_mask);
 
     /* Direct to CPU IP5, bypass INT3 cascade (see timer0 comment above) */
     s->timer_pending[1] = true;
@@ -459,9 +451,6 @@ static void sgi_hpc3_pit_arm_timer(SGIHPC3State *s, int channel)
     s->pit_load_time[channel] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     uint64_t period_ns = (uint64_t)count * PIT_NS_PER_TICK;
-
-    qemu_log_mask(LOG_UNIMP, "sgi_hpc3: Arming timer%d, count=%d, "
-                  "period=%" PRIu64 " ns\n", channel, count, period_ns);
 
     timer_mod(s->pit_timer[channel],
               s->pit_load_time[channel] + period_ns);
@@ -546,10 +535,6 @@ static void sgi_hpc3_pit_write(SGIHPC3State *s, int channel, uint8_t val)
 static void sgi_hpc3_pit_control_write(SGIHPC3State *s, uint8_t val)
 {
     int channel = (val >> 6) & 0x03;
-
-    qemu_log_mask(LOG_UNIMP, "sgi_hpc3: PIT control write 0x%02x "
-                  "(ch=%d rw=%d mode=%d)\n",
-                  val, channel, (val >> 4) & 3, (val >> 1) & 7);
 
     if (channel == 3) {
         /* Read-back command - not implemented */
@@ -1013,14 +998,6 @@ static void sgi_hpc3_nvram_init_defaults(SGIHPC3State *s)
 
     /* Compute and set checksum */
     table[NVOFF_CHECKSUM] = sgi_hpc3_nvram_checksum(table, NVRAM_TABLE_SIZE);
-
-    qemu_log_mask(LOG_UNIMP, "sgi_hpc3: initialized NVRAM defaults "
-                  "(rev=%d, autoload=%c, eaddr=%02x:%02x:%02x:%02x:%02x:%02x)\n",
-                  table[NVOFF_REVISION],
-                  table[NVOFF_AUTOLOAD],
-                  table[NVOFF_ENET], table[NVOFF_ENET + 1],
-                  table[NVOFF_ENET + 2], table[NVOFF_ENET + 3],
-                  table[NVOFF_ENET + 4], table[NVOFF_ENET + 5]);
 }
 
 /*
@@ -1092,14 +1069,6 @@ static void sgi_hpc3_eeprom_init_defaults(SGIHPC3State *s)
     for (int i = 0; i < 128; i++) {
         data[i] = (table[i * 2] << 8) | table[i * 2 + 1];
     }
-
-    qemu_log_mask(LOG_UNIMP, "sgi_hpc3: initialized serial EEPROM defaults "
-                  "(rev=%d, autoload=%c, eaddr=%02x:%02x:%02x:%02x:%02x:%02x)\n",
-                  table[NVOFF_REVISION],
-                  table[NVOFF_AUTOLOAD],
-                  table[NVOFF_ENET], table[NVOFF_ENET + 1],
-                  table[NVOFF_ENET + 2], table[NVOFF_ENET + 3],
-                  table[NVOFF_ENET + 4], table[NVOFF_ENET + 5]);
 }
 
 /*
@@ -1399,17 +1368,6 @@ static void sgi_hpc3_scc_update_irq(SGIHPC3State *s)
         s->int3_map_status |= LIO_DUART_BIT;
     } else {
         s->int3_map_status &= ~LIO_DUART_BIT;
-    }
-
-    /* Debug: trace SCC interrupt state changes involving TX */
-    if (s->scc_rr3 & 0x12) {  /* Any TX_IP bit set */
-        qemu_log_mask(LOG_UNIMP,
-            "sgi_hpc3: SCC IRQ update: rr3=0x%02x wr9=0x%02x "
-            "map_status=0x%02x map_mask0=0x%02x local0_stat=0x%02x "
-            "local0_mask=0x%02x\n",
-            s->scc_rr3, s->scc_wr9,
-            s->int3_map_status, s->int3_map_mask0,
-            s->int3_local0_stat, s->int3_local0_mask);
     }
 
     sgi_hpc3_update_irq(s);
@@ -2032,10 +1990,6 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
             break;
         case 3: /* RR3: Interrupt pending (ONLY valid on channel A) */
             val = s->scc_rr3;
-            if (val) {
-                qemu_log_mask(LOG_UNIMP,
-                    "sgi_hpc3: ChA RR3 read = 0x%02x\n", val);
-            }
             break;
         case 8: /* RR8: Receive data */
             if (s->serial_rx_fifo_count[0] > 0) {
@@ -2560,9 +2514,6 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 sgi_hpc3_scc_update_irq(s);
                 break;
             case 5: /* Reset TX Interrupt Pending */
-                qemu_log_mask(LOG_UNIMP,
-                    "sgi_hpc3: ChB WR0 cmd5 Reset TX IP (rr3 0x%02x→0x%02x)\n",
-                    s->scc_rr3, s->scc_rr3 & ~0x02);
                 s->scc_rr3 &= ~0x02;  /* Clear Ch B TX IP */
                 sgi_hpc3_scc_update_irq(s);
                 break;
@@ -2592,12 +2543,6 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
                 {
                     uint8_t old_wr1 = s->scc_wr1[1];
                     s->scc_wr1[1] = val;
-                    qemu_log_mask(LOG_UNIMP,
-                        "sgi_hpc3: ChB WR1 0x%02x→0x%02x (TX_INT %s→%s)\n",
-                        old_wr1, (uint8_t)val,
-                        (old_wr1 & 0x02) ? "ON" : "OFF",
-                        (val & 0x02) ? "ON" : "OFF");
-                    /* Debug: log WR1 TX_INT transitions (remove after debugging) */
                     /*
                      * Per Z85C30 datasheet: "when the WR1 D1 bit [Tx Int
                      * Enable] is first set after initialization, the Tx IP
@@ -3248,9 +3193,6 @@ static void sgi_hpc3_realize(DeviceState *dev, Error **errp)
         if (f) {
             if (fread(s->bbram, sizeof(s->bbram), 1, f) == 1) {
                 s->nvram_loaded = true;
-                qemu_log_mask(LOG_UNIMP,
-                              "sgi_hpc3: loaded NVRAM from %s\n",
-                              s->nvram_filename);
             }
             fclose(f);
         }

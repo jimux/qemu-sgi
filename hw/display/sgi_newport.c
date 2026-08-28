@@ -29,6 +29,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/display/sgi_newport.h"
@@ -3403,9 +3404,8 @@ static void sgi_newport_realize(DeviceState *dev, Error **errp)
     if (s->newview_log_path && s->newview_log_path[0] != '\0') {
         s->newview_log_file = fopen(s->newview_log_path, "wb");
         if (!s->newview_log_file) {
-            qemu_log_mask(LOG_UNIMP,
-                          "newport: failed to open NewView log '%s'\n",
-                          s->newview_log_path);
+            warn_report("newport: failed to open NewView log '%s'",
+                        s->newview_log_path);
         }
     }
 

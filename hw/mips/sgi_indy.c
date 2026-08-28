@@ -61,7 +61,6 @@
 
 /* Memory map addresses (shared across IP2x platforms) */
 #define SGI_RAM_LOW_BASE 0x08000000ULL
-#define SGI_RAM_LOW_ALIAS 0x00000000ULL
 #define SGI_RAM_HIGH_BASE 0x20000000ULL
 #define SGI_GIO_GFX_BASE 0x1f000000ULL
 #define SGI_GIO_EXP0_BASE 0x1f400000ULL
@@ -606,15 +605,6 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   create_unimplemented_device("low-mem-probe", SGI_RAM_LOW_BASE, 256 * MiB);
   create_unimplemented_device("high-mem-probe", SGI_RAM_HIGH_BASE, 256 * MiB);
   create_unimplemented_device("zero-mem-probe", 0x00000000, 512 * KiB);
-
-  /* Map high RAM natively if > 256MB */
-  if (machine->ram_size > 256 * MiB) {
-    MemoryRegion *high_ram = g_new(MemoryRegion, 1);
-    memory_region_init_alias(high_ram, NULL, "high-ram", machine->ram,
-                             256 * MiB, machine->ram_size - 256 * MiB);
-    /* PV-MEM advertises high_base = 0x20000000, map it there. */
-    memory_region_add_subregion(system_memory, 0x20000000, high_ram);
-  }
 
   /*
    * Extended probe areas for MIPS64 XKPHYS memory probing.

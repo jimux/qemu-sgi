@@ -96,9 +96,6 @@ static void sgi_mc_unmap_bank(SGIMCState *s, int bank_idx)
     SGIMCBankState *bank = &s->banks[bank_idx];
 
     if (bank->mapped && bank->region) {
-        qemu_log_mask(LOG_UNIMP,
-                      "sgi_mc: unmapping bank %d RAM at 0x%08x\n",
-                      bank_idx, bank->mapped_base);
         memory_region_del_subregion(s->system_memory, bank->region);
         object_unparent(OBJECT(bank->region));
         g_free(bank->region);
@@ -106,9 +103,6 @@ static void sgi_mc_unmap_bank(SGIMCState *s, int bank_idx)
     }
 
     if (bank->low_alias) {
-        qemu_log_mask(LOG_UNIMP,
-                      "sgi_mc: unmapping bank %d low alias at 0x0\n",
-                      bank_idx);
         memory_region_del_subregion(s->system_memory, bank->low_alias);
         object_unparent(OBJECT(bank->low_alias));
         g_free(bank->low_alias);
@@ -220,8 +214,6 @@ static void sgi_mc_update_ram_mapping(SGIMCState *s)
             memory_region_add_subregion_overlap(s->system_memory,
                                                 SEG0_ALIAS_BASE,
                                                 bank->low_alias, 1);
-            qemu_log_mask(LOG_UNIMP,
-                          "sgi_mc: bank %d: 512KB alias at 0x0\n", i);
         }
 
         /*
@@ -260,12 +252,6 @@ static void sgi_mc_update_ram_mapping(SGIMCState *s)
                                                     base + wrap_offset,
                                                     bank->wrap_aliases[w], 1);
             }
-            qemu_log_mask(LOG_UNIMP,
-                          "sgi_mc: bank %d: %d wrap aliases "
-                          "(cfg=%u MB, physical=%u MB)\n",
-                          i, num_wraps,
-                          cfg_size / (1024 * 1024),
-                          map_size / (1024 * 1024));
         }
     }
 }
@@ -918,8 +904,6 @@ static void sgi_mc_reset(DeviceState *dev)
     /* Apply the initial mapping */
     sgi_mc_update_ram_mapping(s);
 
-    qemu_log_mask(LOG_UNIMP,
-                  "sgi_mc: reset with ram_size=%u\n", s->ram_size);
     s->cpu_mem_access = 0;
     s->gio_mem_access = 0;
     s->cpu_err_addr = 0;
