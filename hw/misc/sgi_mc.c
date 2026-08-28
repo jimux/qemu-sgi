@@ -752,12 +752,27 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         s->dma_count = val;
         break;
     case MC_DMA_RUN:
-        s->dma_run = val;
-        /* TODO: Actually perform DMA when enabled */
+        /*
+         * Read-only status register (RUNNING 0x40 | COMPLETE 0x08). The SGI
+         * MC spec lists "DMA RUN 0x1fa02048/4 R" and IRIX sys/mc.h documents
+         * it "(w, ro)". Transfers are kicked via GIO_ADRS (0x2028), STDMA
+         * (0x2040) or MEMADRDS (0x2070); a trace of a full PROM+IRIX boot
+         * shows zero RUN writes, so ignore writes rather than invent a
+         * DMA-on-write that the hardware does not have.
+         */
         break;
     case MC_DMA_MEM_ADDR_DEF:
+        /*
+         * "DMA memory address and set default parameters" — SGI MC spec
+         * register MEMADRD (R/W); IRIX sys/mc.h DMA_MEMADRD. Loads the same
+         * default descriptor as MEMADRDS (0x2070, MAME-derived values: 1
+         * line x 12 bytes, zoom 1, stride 0, fill mode) but does NOT start.
+         */
         s->dma_mem_addr = val;
-        /* TODO: Also set default parameters */
+        s->dma_size = 0x0001000c;
+        s->dma_stride = 0x00010000;
+        s->dma_count = 0x0001000c;
+        s->dma_mode = 0x00000028;
         break;
     case MC_DMA_GIO_ADDR_START:
         s->dma_gio_addr = val;
@@ -775,7 +790,15 @@ static void sgi_mc_write(void *opaque, hwaddr addr, uint64_t val,
         }
         break;
     case MC_DMA_GIO_ADDR_DEF_START:
-        /* GIO addr + default descriptor + start — MAME mc.cpp 0x2070. */
+        /*
+         * GIO addr + default descriptor + start — MAME mc.cpp 0x2070.
+         * NOTE: the SGI MC spec and IRIX sys/mc.h name this register
+         * DMA_MEMADRDS ("DMA memory address, set defaults, and start") — on
+         * real hardware the written value is a MEMORY address, not a GIO
+         * address. Latent only: the Indy PROM and IRIX vdma.c both kick via
+         * GIO_ADRS (0x2028), never 0x2070 (verified by boot trace). Fix in
+         * lockstep with sgi_mc_virtuix.c's twin handler.
+         */
         s->dma_gio_addr = val;
         s->dma_size = 0x0001000c;
         s->dma_stride = 0x00010000;
