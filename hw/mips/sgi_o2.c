@@ -1,24 +1,17 @@
 /*
- * ============================ DIRTY / KNOWN-WRONG ============================
- * DO NOT TRUST THIS FILE AS A REAL O2 (IP32) HARDWARE REFERENCE.
+ * SGI O2 (IP32, "Moosehead") — authentic CRIME/MACE/GBE model (disentangled
+ * from the IP54 paravirtual machine 2026-09; IP54 now lives in
+ * hw/mips/sgi_ip54pv.c, machine "sgi-ip54").
  *
- * The "sgi-o2" machine defined here was HIJACKED to run the project's invented
- * IP54 paravirtual platform. By default it loads ip54.bin (NOT a real O2/IP32
- * PROM) and unconditionally instantiates IP54 paravirtual devices that do not
- * exist on real O2 hardware: SGI_SMP, SGI_PVMEM, SGI_PVNET, SGI_GLACCEL,
- * SGI_BOOTDISK, plus a 64 GB PVMEM RAM ceiling. It is NOT a faithful O2 model.
+ * Uniprocessor (max_cpus=1), UMA SDRAM (1 GB cap, 8 × 128 MB CRIME banks).
+ * Real IP32 PROM is loaded via -bios (e.g.
+ * PROM_library/bins/cpu/ip32/O2_ip32prom.rev4.18.bin); there is no bundled
+ * default firmware. Do NOT re-introduce paravirtual devices here.
  *
- * Consequently, comments/constants below describe that IP54 hybrid, not stock
- * O2 (e.g. the "2GB"/64GB RAM notes are wrong -- real O2 caps at 1 GB). Treat
- * every hardware claim in this file as suspect. Authoritative real-O2 facts
- * live in the project wiki / resolved-notes (platform/ip32-o2, o2-crime,
- * o2-mace, o2-gbe, o2-vice), sourced from the SGI CRIME/MACE/GBE/VICE ASIC
- * specs -- NOT from this file.
+ * Authoritative facts: resolved-notes/platform/ip32-o2.md and the wiki
+ * o2-{crime,mace,gbe,vice} pages (SGI CRIME/MACE/GBE/VICE ASIC specs).
  *
- * TODO (separate cleanup, intentionally NOT done here): disentangle a faithful
- * sgi-o2 (real IP32 PROM; CRIME/MACE/GBE only; 1 GB cap) from the IP54
- * paravirtual machine (which belongs in hw/mips/sgi_ip54pv.c).
- * ===========================================================================
+ * The original QEMU O2 header follows (memory map + interrupt routing).
  *
  * QEMU SGI O2 (IP32) machine emulation
  *
@@ -30,7 +23,7 @@
  *   0x14000000-0x140002FF  CRIME base (CPU, memory, interrupts, timer)
  *   0x15000000-0x15004FFF  CRIME RE (rendering engine, TLBs, pixel pipe)
  *   0x16000000-0x160FFFFF  GBE (graphics framebuffer)
- *   0x17000000-0x170003FF  Virtual boot disk
+ *   0x17000000-0x17FFFFFF  VICE (video/image compression; stubbed)
  *   0x1F000000-0x1FFFFFFF  MACE (peripherals)
  *   0x1FC00000-0x1FC7FFFF  PROM (512KB, overlaps MACE region)
  *
@@ -60,17 +53,11 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/sgi_gbe.h"
-#include "hw/display/sgi_glaccel.h"
 #include "hw/mips/mips.h"
-#include "hw/misc/sgi_bootdisk.h"
 #include "hw/misc/sgi_crime.h"
 #include "hw/misc/sgi_crime_re.h"
 #include "hw/misc/sgi_mace.h"
-#include "hw/misc/sgi_pvmem.h"
-#include "hw/misc/sgi_pvnet.h"
-#include "hw/misc/sgi_smp.h"
 #include "hw/misc/unimp.h"
-#include "net/net.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
@@ -85,17 +72,13 @@
 #define O2_RAM_BASE 0x00000000ULL
 #define O2_CRIME_BASE 0x14000000ULL
 #define O2_CRIME_RE_BASE 0x15000000ULL
-#define O2_BOOTDISK_BASE 0x17000000ULL
 #define O2_GBE_BASE 0x16000000ULL
 #define O2_MACE_BASE 0x1F000000ULL
 #define O2_PROM_BASE 0x1FC00000ULL
 
 #define O2_PROM_SIZE (512 * KiB)
-/*
- * IP54 supports up to 64GB via the PVMEM paravirtual memory controller.
- * Real O2 hardware maxed at 2GB (8 × 256MB DIMMs).
- */
-#define O2_RAM_MAX (64ULL * GiB)
+/* Real O2: 8 CRIME banks × 128 MB = 1 GB max. */
+#define O2_RAM_MAX (1ULL * GiB)
 
 /*
  * High-RAM alias base: physical 0x40000000.
@@ -347,39 +330,6 @@ static void sgi_o2_init(MachineState *machine) {
     }
   }
 
-  /* Create SMP controller */
-  DeviceState *smp = qdev_new(TYPE_SGI_SMP);
-  qdev_prop_set_uint32(smp, "num-cpus", ncpus);
-  sysbus_realize_and_unref(SYS_BUS_DEVICE(smp), &error_fatal);
-  sysbus_mmio_map(SYS_BUS_DEVICE(smp), 0, SGI_SMP_BASE_ADDR);
-
-  SGISMPState *smp_state = SGI_SMP(smp);
-  for (int i = 0; i < ncpus; i++) {
-    smp_state->cpus[i] = CPU(cpus[i]);
-    /* Use env.irq[4] for SMP IPIs */
-    sysbus_connect_irq(SYS_BUS_DEVICE(smp), i, cpus[i]->env.irq[4]);
-  }
-
-  /* Create PVMEM Controller */
-  DeviceState *pvmem = qdev_new(TYPE_SGI_PVMEM);
-  sysbus_realize_and_unref(SYS_BUS_DEVICE(pvmem), &error_fatal);
-  sysbus_mmio_map(SYS_BUS_DEVICE(pvmem), 0, SGI_PVMEM_BASE_ADDR);
-
-  /* Create PVNET Controller */
-  DeviceState *pvnet = qdev_new(TYPE_SGI_PVNET);
-  qemu_configure_nic_device(pvnet, true, NULL);
-  sysbus_realize_and_unref(SYS_BUS_DEVICE(pvnet), &error_fatal);
-  sysbus_mmio_map(SYS_BUS_DEVICE(pvnet), 0, SGI_PVNET_BASE_ADDR);
-  /* PVNET to irq 6 */
-  sysbus_connect_irq(SYS_BUS_DEVICE(pvnet), 0, cpus[0]->env.irq[6]);
-
-  /* Create GLACCEL Controller */
-  DeviceState *glaccel = qdev_new(TYPE_SGI_GLACCEL);
-  sysbus_realize_and_unref(SYS_BUS_DEVICE(glaccel), &error_fatal);
-  sysbus_mmio_map(SYS_BUS_DEVICE(glaccel), 0, SGI_GLACCEL_BASE_ADDR);
-  /* GLACCEL to irq 5 */
-  sysbus_connect_irq(SYS_BUS_DEVICE(glaccel), 0, cpus[0]->env.irq[5]);
-
   /*
    * RAM at physical 0x00000000 (SEG0).
    * IP32 has RAM starting at address 0 (unlike IP24 which starts at
@@ -435,11 +385,8 @@ static void sgi_o2_init(MachineState *machine) {
       exit(EXIT_FAILURE);
     }
   } else {
-    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, "ip54.bin");
-    if (!filename) {
-      warn_report("No firmware specified, use -bios to specify IP32 PROM");
-      filename = NULL;
-    }
+    warn_report("No firmware specified; use -bios with a real IP32 PROM image");
+    filename = NULL;
   }
 
   if (filename) {
@@ -510,33 +457,6 @@ static void sgi_o2_init(MachineState *machine) {
     }
   }
 
-  /*
-   * Virtual Boot Disk at 0x15000000.
-   * Simple MMIO block device for PROM to load kernels without SCSI.
-   * Attach via: -drive file=disk.img,if=mtd,format=raw
-   */
-  {
-    DeviceState *bootdisk_dev;
-    DriveInfo *dinfo;
-
-    bootdisk_dev = qdev_new(TYPE_SGI_BOOTDISK);
-    /* Try multiple interfaces: mtd, pflash, then scsi bus=0 unit=1 */
-    dinfo = drive_get(IF_MTD, 0, 0);
-    if (!dinfo) {
-      dinfo = drive_get(IF_PFLASH, 0, 0);
-    }
-    if (!dinfo) {
-      /* MCP tool uses -drive if=scsi,bus=0,unit=1 for first disk */
-      dinfo = drive_get(IF_SCSI, 0, 1);
-    }
-    if (dinfo) {
-      qdev_prop_set_drive_err(bootdisk_dev, "drive", blk_by_legacy_dinfo(dinfo),
-                              &error_fatal);
-    }
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(bootdisk_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(bootdisk_dev), 0, O2_BOOTDISK_BASE);
-  }
-
   /* GBE at 0x16000000 */
   gbe_dev = qdev_new(TYPE_SGI_GBE);
   sysbus_realize_and_unref(SYS_BUS_DEVICE(gbe_dev), &error_fatal);
@@ -564,10 +484,10 @@ static void sgi_o2_init(MachineState *machine) {
   create_unimplemented_device("gap-crime-re", 0x14000280, 0x00FFFD80);
   /* Gap between CRIME RE and GBE */
   create_unimplemented_device("gap-re-gbe", 0x15005000, 0x00FFB000);
-  /* Gap between GBE and bootdisk */
-  create_unimplemented_device("gap-gbe-bootdisk", 0x16100000, 0x00F00000);
-  /* Gap between bootdisk and MACE */
-  create_unimplemented_device("gap-bootdisk-mace", 0x17000400, 0x07FFFC00);
+  /* Gap between GBE and VICE (VICE stubbed) */
+  create_unimplemented_device("gap-gbe-vice", 0x16100000, 0x00F00000);
+  /* VICE + gap between VICE and MACE (VICE stubbed) */
+  create_unimplemented_device("gap-vice-mace", 0x17000000, 0x08000000);
 
   /*
    * Cover the gap after MACE (0x1F400000-0x1FFFFFFF).
@@ -587,7 +507,7 @@ static void sgi_o2_class_init(ObjectClass *oc, const void *data) {
   mc->default_ram_size = 64 * MiB;
   mc->default_ram_id = "sgi-o2.ram";
   mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R5000");
-  mc->max_cpus = SGI_SMP_MAXCPU;
+  mc->max_cpus = 1;
   mc->no_floppy = 1;
   mc->no_cdrom = 1;
   mc->no_parallel = 1;
