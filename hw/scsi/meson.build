@@ -17,6 +17,7 @@ scsi_ss.add(when: 'CONFIG_MEGASAS_SCSI_PCI', if_true: files('megasas.c'))
 scsi_ss.add(when: 'CONFIG_MPTSAS_SCSI_PCI', if_true: files('mptsas.c', 'mptconfig.c', 'mptendian.c'))
 scsi_ss.add(when: 'CONFIG_VMW_PVSCSI_SCSI_PCI', if_true: files('vmw_pvscsi.c'))
 scsi_ss.add(when: 'CONFIG_WD33C93', if_true: files('wd33c93.c'))
+scsi_ss.add(when: 'CONFIG_SGI_AIC7880', if_true: files('sgi_aic7880.c'))
 
 virtio_scsi_ss.add(files('virtio-scsi-dataplane.c'))
 virtio_scsi_ss.add(when: 'CONFIG_VHOST_SCSI', if_true: files('vhost-scsi.c'))

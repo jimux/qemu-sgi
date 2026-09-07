@@ -390,3 +390,6 @@ scsi_generic_realize_blocksize(int blocksize) "block size %d"
 scsi_generic_aio_sgio_command(uint32_t tag, uint8_t cmd, uint32_t timeout) "generic aio sgio: tag=0x%x cmd=0x%x timeout=%u"
 scsi_generic_ioctl_sgio_command(uint8_t cmd, uint32_t timeout) "generic ioctl sgio: cmd=0x%x timeout=%u"
 scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_status) "generic ioctl sgio: cmd=0x%x ret=%d status=0x%x host_status=0x%x"
+
+# sgi_aic7880.c
+sgi_aic7880_mode_sense_page0_synth(uint8_t bus, uint8_t target, uint8_t lun, bool dbd, uint8_t page_control, uint32_t alloc_len, int blocksize, uint64_t nblocks) "bus %u target %u lun %u dbd %d pc %u xfer %u blksz %d nblocks %"PRIu64

@@ -73,3 +73,9 @@ config VHOST_USER_SCSI
 config WD33C93
     bool
     select SCSI
+
+config SGI_AIC7880
+    bool
+    # Placeholder AIC-7880 PCI SCSI controller for -M sgi-o2 (IP32);
+    # sits on the MACE PCI host bridge (SGI_MACE) with a QEMU SCSI bus.
+    select SCSI
