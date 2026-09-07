@@ -191,6 +191,99 @@ static int sgi_o2_strip_prom_container(int bios_size) {
 }
 
 /*
+ * Validate every flash segment's checksums after loading (and after the
+ * memtest patch has repaired what it breaks).
+ *
+ * The O2 PROM flash is segmented by 64-byte SHDR headers on 256-byte
+ * pages: reserved(8) | 'SHDR'@+8 | segLen@+0xc | nameLen/vsnLen/segType
+ * @+0x10 | name[32]@+0x14 | version[8]@+0x34 | header-checksum word@+0x3c
+ * | body@+0x40.  Both checksums are negated 32-bit big-endian word sums:
+ * the header checksum covers the 15 words before it, the body checksum
+ * (the segment's last word) covers the body up to it — each covered range
+ * sums to zero.  (irix-657m IP32prom flash.h / libsk flash.c validHdr /
+ * validBody, builders buildFlash.c / futil.c.)
+ *
+ * The PROM itself validates these at boot: sloader gates post1/firmware,
+ * and the firmware's init_env() drops EVERY environment variable (falling
+ * back to compiled-in defaults) when the env segment's checksums are
+ * wrong — a patched console=g NVRAM env with a bad checksum silently
+ * boots with console=d instead, with no diagnostic anywhere.  QEMU
+ * validating at load time turns that silent failure into a loud,
+ * immediate, actionable error naming the segment and offset.
+ *
+ * Only segments that checksum to zero pass; a nonzero sum is reported
+ * with error_report and the load is aborted (the PROM would reject or
+ * silently degrade the segment anyway — booting a known-bad image only
+ * wastes the user's time producing mysterious behavior).
+ */
+static bool sgi_o2_validate_prom_checksums(uint8_t *rom, int bios_size) {
+  bool ok = true;
+  int seg_off;
+
+  for (seg_off = 0; seg_off + 64 <= bios_size; seg_off += 256) {
+    char name[33];
+    uint32_t magic = ldl_be_p(rom + seg_off + 8);
+    uint32_t seg_len;
+    uint32_t sum, w;
+    int body_end, last_off, off;
+
+    if (magic != 0x53484452) { /* 'SHDR' */
+      continue;
+    }
+
+    seg_len = ldl_be_p(rom + seg_off + 12);
+    if (seg_len < 64 || (int)seg_len > bios_size - seg_off) {
+      continue;
+    }
+
+    /* Segment name (NUL-terminated within name[32]) for diagnostics */
+    memcpy(name, rom + seg_off + 0x14, 32);
+    name[32] = '\0';
+    for (int i = 0; i < 32 && name[i]; i++) {
+      if (!g_ascii_isprint(name[i])) {
+        name[i] = '\0';
+        break;
+      }
+    }
+
+    /* Header checksum: words [seg_off, seg_off+0x3c) + the checksum word
+     * at +0x3c must sum to zero. */
+    sum = ldl_be_p(rom + seg_off + 0x3c);
+    for (off = seg_off; off < seg_off + 0x3c; off += 4) {
+      sum += ldl_be_p(rom + off);
+    }
+    if (sum != 0) {
+      error_report("PROM segment '%s' @0x%06x: header checksum mismatch "
+                   "(sum 0x%08" PRIx32 ", expected 0)",
+                   name[0] ? name : "?", seg_off, sum);
+      ok = false;
+      continue;
+    }
+
+    /* Body checksum: body words [seg_off+0x40, last) + the checksum word
+     * at the segment's last aligned word must sum to zero. */
+    body_end = seg_off + (int)seg_len;
+    last_off = ((body_end + 3) & ~3) - 4;
+    if (last_off < seg_off + 0x40 + 4 || last_off + 4 > bios_size) {
+      continue; /* degenerate/empty body — nothing to check */
+    }
+    sum = ldl_be_p(rom + last_off);
+    for (off = seg_off + 0x40; off < last_off; off += 4) {
+      w = ldl_be_p(rom + off);
+      sum += w;
+    }
+    if (sum != 0) {
+      error_report("PROM segment '%s' @0x%06x: body checksum mismatch "
+                   "(sum 0x%08" PRIx32 ", expected 0)",
+                   name[0] ? name : "?", seg_off, sum);
+      ok = false;
+    }
+  }
+
+  return ok;
+}
+
+/*
  * Patch PROM SimpleMEMtst to skip the destructive memory test.
  *
  * The PROM's DupSLStack() saves registers on the stack via kseg0 (cached
@@ -860,6 +953,12 @@ static void sgi_o2_init(MachineState *machine) {
       }
       bios_size = sgi_o2_strip_prom_container(bios_size);
       sgi_o2_patch_prom_memtest(bios_size);
+      if (!sgi_o2_validate_prom_checksums(
+              rom_ptr(O2_PROM_BASE, bios_size), bios_size)) {
+        error_report("PROM image failed flash-segment checksum validation — "
+                     "refusing to boot a corrupted image");
+        exit(EXIT_FAILURE);
+      }
     }
   }
 
