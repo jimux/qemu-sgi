@@ -947,6 +947,21 @@ static void sgi_o2_init(MachineState *machine) {
   sysbus_mmio_map(SYS_BUS_DEVICE(gbe_dev), 0, O2_GBE_BASE);
 
   /*
+   * Wire GBE interrupt outputs to CRIME sources 16-19 (GBE0 = vertical
+   * retrace -> crimeRetraceHandler, GBE1 = pre-blank ->
+   * crimePreblankHandler [contract note §3.3 / sys/IP32.h GBE_INTR]).
+   * Plumbing only — GBE does not raise these yet.
+   */
+  {
+    int i;
+    for (i = 0; i < 4; i++) {
+      qdev_connect_gpio_out_named(gbe_dev, "crime-irq", i,
+                                  qdev_get_gpio_in(crime_dev,
+                                                   CRM_IRQ_GBE0 + i));
+    }
+  }
+
+  /*
    * Unimplemented device stubs for memory probing.
    * The PROM probes memory by writing patterns and reading back.
    * Unmapped regions need to return 0 (pattern mismatch) instead

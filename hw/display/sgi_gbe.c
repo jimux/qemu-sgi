@@ -306,6 +306,14 @@ static void sgi_gbe_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &sgi_gbe_ops, s,
                           "sgi-gbe", GBE_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    /*
+     * Interrupt outputs to CRIME, sysbus irqs 0-3 = GBE0-3
+     * (GBE0 = vertical retrace, GBE1 = pre-blank [sys/IP32.h GBE_INTR]).
+     * Nothing raises them yet — the raster/timing model that drives them
+     * is a later milestone; this is the plumbing only.
+     */
+    qdev_init_gpio_out_named(dev, s->crime_irq, "crime-irq", 4);
 }
 
 static void sgi_gbe_class_init(ObjectClass *klass, const void *data)

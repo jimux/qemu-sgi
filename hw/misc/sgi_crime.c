@@ -23,6 +23,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "system/runstate.h"
 #include "hw/misc/sgi_crime.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
@@ -35,8 +36,18 @@
 #define CRIME_DPRINTF(fmt, ...) \
     fprintf(stderr, "CRIME: " fmt, ## __VA_ARGS__)
 #else
-#define CRIME_DPRINTF(fmt, ...) do {} while (0)
+#define CRIME_DPRINTF(fmt, ...) do {} while ( 0)
 #endif
+
+/*
+ * CRM_HARDINT readable view mask [sys/crime.h CRM_HARDINT_MSK 0xf0ffffff]:
+ * the 16 MACE sources (bits 15:0) are ganged — the kernel never reads them
+ * from HARDINT (it reads MACE's own per-source status instead) — and bits
+ * 23:16 of the mask disambiguate the ganged view. Hardware sources visible
+ * here are GBE0-3 (16-19), CRMERR (20), MEMERR (21), RE0-5 (22-27).
+ * SOFT (28-30) and VICE (31) are outside the readable mask.
+ */
+#define CRM_HARDINT_VIEW_MASK 0xf0ffffffULL
 
 static void sgi_crime_update_irq(SGICRIMEState *s)
 {
@@ -45,8 +56,16 @@ static void sgi_crime_update_irq(SGICRIMEState *s)
      * SOFTINT bits are kept separate from INTSTAT (not OR'd in).
      * The kernel clears soft interrupts by reading CRM_SOFTINT,
      * clearing the desired bit, and writing it back.
+     *
+     * The mask is 64-bit as written by the kernel (high 32 bits carry the
+     * interrupt delivery level in ef_crmmsk); only the low 32 bits gate
+     * delivery (INTSTAT/INTMASK are 32-bit registers [sys/crime.h]).
+     *
+     * HARDINT mirrors the pending hardware sources (see the HARDINT read
+     * below); keep it in sync whenever intstat changes.
      */
-    uint64_t pending = (s->intstat | s->softint) & s->intmask;
+    uint64_t pending = (s->intstat | s->softint) & s->intmask & 0xffffffffULL;
+    s->hardint = s->intstat & CRM_HARDINT_VIEW_MASK;
     qemu_set_irq(s->cpu_irq, pending ? 1 : 0);
 }
 
@@ -97,9 +116,63 @@ static uint64_t sgi_crime_get_time(SGICRIMEState *s)
     return val;
 }
 
+/*
+ * McGriff watchdog (CRM_DOG) [sys/crime.h].
+ *
+ * The register is a 21-bit down-counter at CRM_MASTER_FREQ (66.67 MHz,
+ * 15 ns/tick) with two sticky status bits (POWER_ON_RESET 0x100000 /
+ * WARM_RESET 0x080000) that record the cause of the last reset. The
+ * kernel's non-USE_McGriff build clears DOG_ENA in CRM_CONTROL and
+ * writes 0 to CRM_DOG at init (IP32init.c "clear CRIME watchdog
+ * timer"), so a faithful inert-by-default watchdog cannot perturb the
+ * stock boot path; it only bites when software explicitly arms it.
+ *
+ * On expiry with DOG_ENA set, real hardware resets the machine. We
+ * record WARM_RESET in the sticky bits and request a system reset.
+ */
+static void sgi_crime_dog_expired(void *opaque)
+{
+    SGICRIMEState *s = SGI_CRIME(opaque);
+
+    if (!s->dog_enabled) {
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "sgi_crime: McGriff watchdog expired "
+                  "- hardware reset\n");
+    /* Sticky status bits survive the reset to report the cause. */
+    s->watchdog = (s->watchdog & ~(CRM_DOG_POWER_ON_RESET | CRM_DOG_WARM_RESET |
+                                   CRM_DOG_VALUE))
+                  | CRM_DOG_WARM_RESET;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static void sgi_crime_dog_rearm(SGICRIMEState *s)
+{
+    uint64_t count;
+
+    if (s->dog_timer) {
+        timer_del(s->dog_timer);
+    }
+    if (!s->dog_enabled) {
+        return;
+    }
+
+    count = s->watchdog & CRM_DOG_VALUE;
+    if (count == 0) {
+        /* Count 0 with the dog enabled: expires immediately. */
+        timer_mod_ns(s->dog_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        return;
+    }
+    /* count ticks at 15 ns each; +1 so a count of N runs N ticks. */
+    timer_mod_ns(s->dog_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                 (int64_t)(count + 1) * CRIME_NS_PER_TICK);
+}
+
 static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGICRIMEState *s = SGI_CRIME(opaque);
+    hwaddr raw_offset = offset;
 
     /*
      * SGI uses 64-bit bus with 32-bit registers. The PROM accesses
@@ -141,7 +214,15 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
         return val;
 
     case CRM_HARDINT:
-        val = s->hardint;
+        /*
+         * CRM_HARDINT is a live (not latched) view of the currently-asserted
+         * hardware sources, masked to 0xf0ffffff [sys/crime.h]. Refresh
+         * from intstat so it never reports stale state. The kernel's
+         * addrprobe.s reads it to sample CRMERR (bit 20, CAUSE_BERRINTR)
+         * during bus-error probing.
+         */
+        val = s->intstat & CRM_HARDINT_VIEW_MASK;
+        s->hardint = val;
         CRIME_DPRINTF("read  CRM_HARDINT = 0x%" PRIx64 "\n", val);
         return val;
 
@@ -231,9 +312,12 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
 
     default:
         CRIME_DPRINTF("read  UNKNOWN offset 0x%03" HWADDR_PRIx "\n", offset);
+        /* Log the raw offset so stray BE/LE sub-word accesses inside the
+         * CRIME page are distinguishable from genuinely missing regs. */
         qemu_log_mask(LOG_UNIMP,
                       "sgi_crime: unimplemented read at offset 0x%03"
-                      HWADDR_PRIx "\n", offset);
+                      HWADDR_PRIx " (aligned 0x%03" HWADDR_PRIx ", size %u)\n",
+                      raw_offset, offset, size);
         return 0;
     }
 }
@@ -242,6 +326,7 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
                              uint64_t value, unsigned size)
 {
     SGICRIMEState *s = SGI_CRIME(opaque);
+    hwaddr raw_offset = offset;
 
     /* Normalize BE/LE offset to 64-bit aligned */
     offset &= ~7ULL;
@@ -250,6 +335,36 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
     case CRM_CONTROL:
         CRIME_DPRINTF("write CRM_CONTROL = 0x%" PRIx64 "\n", value);
         s->control = value & 0x3fffULL;
+        /*
+         * Watchdog enable (CRM_CONTROL_DOG_ENA [sys/crime.h]). The stock
+         * IRIX kernel clears this bit (IP32init.c, non-USE_McGriff build),
+         * so the dog stays inert unless software explicitly arms it.
+         */
+        {
+            bool enable = (s->control & CRM_CONTROL_DOG_ENA) != 0;
+            if (enable != s->dog_enabled) {
+                s->dog_enabled = enable;
+                sgi_crime_dog_rearm(s);
+            }
+        }
+        /*
+         * HARD_RESET / SOFT_RESET [sys/crime.h]: reset strobes. The PROM's
+         * reset path writes SOFT_RESET (IP32asm.s _coldstart / sl_csu.s)
+         * or HARD_RESET ("reboot"); gxemul treats HARD_RESET as a machine
+         * reboot. Self-clearing strobes: drop them from the stored value
+         * after firing.
+         */
+        if (value & (CRM_CONTROL_HARD_RESET | CRM_CONTROL_SOFT_RESET)) {
+            bool hard = (value & CRM_CONTROL_HARD_RESET) != 0;
+            s->control &= ~(CRM_CONTROL_HARD_RESET | CRM_CONTROL_SOFT_RESET);
+            if (hard) {
+                qemu_log_mask(LOG_GUEST_ERROR, "sgi_crime: HARD_RESET\n");
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR, "sgi_crime: SOFT_RESET\n");
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            }
+        }
         break;
 
     case CRM_INTSTAT:
@@ -285,12 +400,21 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
 
     case CRM_HARDINT:
         CRIME_DPRINTF("write CRM_HARDINT (clear) = 0x%" PRIx64 "\n", value);
-        s->hardint &= ~value;
+        /*
+         * HARDINT is a read-only view of live hardware sources; accept
+         * the write (sources clear themselves by deasserting their gpio
+         * line) but do not let it clear intstat behind a live source's
+         * back. Only allow clearing bits that are no longer asserted.
+         */
         break;
 
     case CRM_DOG:
         CRIME_DPRINTF("write CRM_DOG = 0x%" PRIx64 "\n", value);
-        s->watchdog = value & 0x1fffffULL;
+        /* Counter field is writable; the reset-cause bits are sticky. */
+        s->watchdog = (s->watchdog & (CRM_DOG_POWER_ON_RESET |
+                                      CRM_DOG_WARM_RESET))
+                      | (value & CRM_DOG_VALUE);
+        sgi_crime_dog_rearm(s);
         break;
 
     case CRM_TIME:
@@ -386,8 +510,9 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
                       " = 0x%" PRIx64 "\n", offset, value);
         qemu_log_mask(LOG_UNIMP,
                       "sgi_crime: unimplemented write at offset 0x%03"
-                      HWADDR_PRIx " value 0x%016" PRIx64 "\n",
-                      offset, value);
+                      HWADDR_PRIx " (aligned 0x%03" HWADDR_PRIx
+                      ", size %u) value 0x%016" PRIx64 "\n",
+                      raw_offset, offset, size, value);
         break;
     }
 }
@@ -416,7 +541,17 @@ static void sgi_crime_reset(DeviceState *dev)
     s->intmask = 0;
     s->softint = 0;
     s->hardint = 0;
-    s->watchdog = 0;
+    /*
+     * Power-on: the McGriff records POWER_ON_RESET [sys/crime.h], and the
+     * dog starts disabled (CRM_CONTROL has no DOG_ENA at reset). The
+     * counter loads its max value (CRM_DOG_VALUE) per the kernel's
+     * McGriff kick idiom (IP32intr.c writes 0x7fff under USE_McGriff).
+     */
+    s->watchdog = CRM_DOG_POWER_ON_RESET | CRM_DOG_VALUE;
+    s->dog_enabled = false;
+    if (s->dog_timer) {
+        timer_del(s->dog_timer);
+    }
     s->time_offset = 0;
     s->last_time_read = 0;
     s->cpu_error_addr = 0;
@@ -475,12 +610,22 @@ static void sgi_crime_reset(DeviceState *dev)
 }
 
 /*
- * Set a MACE interrupt bit in CRIME's INTSTAT.
- * Called by the MACE device when a peripheral interrupt fires.
+ * Set/clear one of the 32 CRIME interrupt sources.
+ *
+ * Line number == INTSTAT bit position [sys/IP32.h]: 0-15 = MACE (ganged,
+ * driven by the MACE device), 16-19 = GBE0-3, 20 = CRMERR, 21 = MEMERR,
+ * 22-27 = RE0-5, 31 = VICE. Level-triggered: the source holds the bit
+ * asserted until it deasserts its line (matches the MACE model and the
+ * kernel's RE3/RE5 "level trigger" comments in IP32intr.c is_thd()).
+ *
+ * Called by the MACE device for lines 0-15 and by GBE/RE devices for
+ * their own lines in later milestones.
  */
-static void sgi_crime_set_mace_irq(void *opaque, int irq, int level)
+static void sgi_crime_set_irq(void *opaque, int irq, int level)
 {
     SGICRIMEState *s = SGI_CRIME(opaque);
+
+    assert(irq >= 0 && irq < CRM_NUM_IRQS);
 
     if (level) {
         s->intstat |= (1ULL << irq);
@@ -501,8 +646,16 @@ static void sgi_crime_realize(DeviceState *dev, Error **errp)
     /* Output IRQ to CPU (IP2) */
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cpu_irq);
 
-    /* Input IRQs from MACE (16 lines) */
-    qdev_init_gpio_in(dev, sgi_crime_set_mace_irq, 16);
+    /*
+     * Input IRQs: all 32 CRIME interrupt sources. Lines 0-15 are the
+     * ganged MACE sources (unchanged wiring from the MACE device);
+     * 16-19 = GBE0-3 (retrace/preblank), 20 = CRMERR, 21 = MEMERR,
+     * 22-27 = RE0-5 (FIFO watermarks), 31 = VICE. SOFT0-2 (28-30) are
+     * generated by software writes to CRM_SOFTINT and have no line.
+     */
+    qdev_init_gpio_in(dev, sgi_crime_set_irq, CRM_NUM_IRQS);
+
+    s->dog_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_crime_dog_expired, s);
 }
 
 static const Property sgi_crime_properties[] = {
@@ -521,6 +674,7 @@ static const VMStateDescription vmstate_sgi_crime = {
         VMSTATE_UINT64(softint, SGICRIMEState),
         VMSTATE_UINT64(hardint, SGICRIMEState),
         VMSTATE_UINT64(watchdog, SGICRIMEState),
+        VMSTATE_BOOL(dog_enabled, SGICRIMEState),
         VMSTATE_INT64(time_offset, SGICRIMEState),
         VMSTATE_UINT64(last_time_read, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_addr, SGICRIMEState),

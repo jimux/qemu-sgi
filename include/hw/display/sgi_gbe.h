@@ -138,6 +138,12 @@ struct SGIGBEState {
 
     MemoryRegion iomem;
 
+    /*
+     * Interrupt outputs to CRIME (GBE0 = retrace, GBE1 = preblank,
+     * GBE2/GBE3). Plumbed but not yet driven — see realize().
+     */
+    qemu_irq crime_irq[4];
+
     /* DMA channel control registers */
     uint32_t frm_control;
     uint32_t ovr_control;

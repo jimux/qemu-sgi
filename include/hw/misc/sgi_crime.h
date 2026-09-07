@@ -6,10 +6,10 @@
  * - Interrupt routing (MACE, GBE, RE, VICE, software)
  * - Free-running 66.67MHz timer (CRM_TIME)
  * - CPU/memory error reporting
- * - Watchdog timer
+ * - Watchdog timer (McGriff)
  *
  * Physical base: 0x14000000
- * Reference: IRIX sys/crime.h, MAME src/mame/sgi/crime.cpp
+ * Reference: IRIX sys/crime.h, sys/IP32.h, MAME src/mame/sgi/crime.cpp
  *
  * Copyright (c) 2024 the QEMU project
  *
@@ -71,20 +71,77 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEState, SGI_CRIME)
 /* CRIME ID value: ID bits = 0xa0, revision = 0x02 */
 #define CRIME_ID_VALUE          0xa2
 
-/* CRIME control register bits */
+/* CRIME control register bits [sys/crime.h] */
 #define CRM_CONTROL_ENDIAN_BIG  0x0100
+#define CRM_CONTROL_DOG_ENA     0x0200
+#define CRM_CONTROL_SOFT_RESET  0x0400
+#define CRM_CONTROL_HARD_RESET  0x0800
 
 /* CRIME master frequency: 66.67 MHz */
 #define CRIME_MASTER_FREQ       66666500
 /* Nanoseconds per CRIME tick */
 #define CRIME_NS_PER_TICK       15
 
-/* Interrupt bits */
-#define CRM_INT_VICE            0x80000000ULL
-#define CRM_INT_SOFT2           0x40000000ULL
-#define CRM_INT_SOFT1           0x20000000ULL
+/*
+ * CRIME interrupt source numbering, 32 sources [sys/IP32.h]:
+ *   0-15  = MACE (CRM_INT_MACE(i) = 1<<i)
+ *   16-19 = GBE0..GBE3 (retrace, preblank, GBE2, GBE3)
+ *   20    = CRMERR
+ *   21    = MEMERR
+ *   22-27 = RE0..RE5 (RE3 = FIFO empty watermark, RE4 = FIFO full)
+ *   28-30 = SOFT0..SOFT2
+ *   31    = VICE
+ * Bit masks [sys/crime.h]: GBE0 0x10000 .. GBE3 0x80000, CRMERR 0x100000,
+ * MEMERR 0x200000, RE0 0x400000 .. RE5 0x8000000, SOFT0 0x10000000, VICE
+ * 0x80000000.
+ */
+#define CRM_INT_GBE0            0x00010000ULL
+#define CRM_INT_GBE1            0x00020000ULL
+#define CRM_INT_GBE2            0x00040000ULL
+#define CRM_INT_GBE3            0x00080000ULL
+#define CRM_INT_CRMERR          0x00100000ULL
+#define CRM_INT_MEMERR          0x00200000ULL
+#define CRM_INT_RE0             0x00400000ULL
+#define CRM_INT_RE1             0x00800000ULL
+#define CRM_INT_RE2             0x01000000ULL
+#define CRM_INT_RE3             0x02000000ULL
+#define CRM_INT_RE4             0x04000000ULL
+#define CRM_INT_RE5             0x08000000ULL
 #define CRM_INT_SOFT0           0x10000000ULL
+#define CRM_INT_SOFT1           0x20000000ULL
+#define CRM_INT_SOFT2           0x40000000ULL
+#define CRM_INT_VICE            0x80000000ULL
 #define CRM_INT_MACE_MASK       0x0000ffffULL
+
+/* Index (line number) of each gpio-in source; == bit position [sys/IP32.h] */
+#define CRM_IRQ_GBE0            16
+#define CRM_IRQ_GBE1            17
+#define CRM_IRQ_GBE2            18
+#define CRM_IRQ_GBE3            19
+#define CRM_IRQ_CRMERR          20
+#define CRM_IRQ_MEMERR          21
+#define CRM_IRQ_RE0             22
+#define CRM_IRQ_RE1             23
+#define CRM_IRQ_RE2             24
+#define CRM_IRQ_RE3             25
+#define CRM_IRQ_RE4             26
+#define CRM_IRQ_RE5             27
+#define CRM_IRQ_SOFT0           28
+#define CRM_IRQ_SOFT1           29
+#define CRM_IRQ_SOFT2           30
+#define CRM_IRQ_VICE            31
+
+/* Number of gpio-in interrupt source lines (MACE 0-15 + the 16 above) */
+#define CRM_NUM_IRQS            32
+
+/*
+ * McGriff watchdog [sys/crime.h]: 21-bit down-counter.
+ * CRM_DOG_POWER_ON_RESET / WARM_RESET are sticky status bits that
+ * report why the last reset happened; the counter field is 0x7fff.
+ */
+#define CRM_DOG_POWER_ON_RESET  0x100000ULL
+#define CRM_DOG_WARM_RESET      0x080000ULL
+#define CRM_DOG_VALUE           0x7fffULL
 
 /*
  * Memory bank control register format:
@@ -101,6 +158,10 @@ struct SGICRIMEState {
 
     /* CPU interrupt output (CRIME -> CPU IP2) */
     qemu_irq cpu_irq;
+
+    /* Watchdog timer (McGriff), NULL until enabled */
+    QEMUTimer *dog_timer;
+    bool dog_enabled;
 
     /* Configuration */
     uint32_t ram_size;
