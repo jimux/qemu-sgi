@@ -251,3 +251,13 @@ sgi_pvrex3_dcb_write(uint32_t slave, uint32_t reg, uint32_t dw, uint32_t val) "d
 sgi_pvrex3_dcb_read(uint32_t slave, uint32_t reg, uint32_t dw, uint32_t val) "dcb slave=%u crs=%u dw=%u val=0x%08x"
 sgi_pvrex3_vc2(uint32_t reg, uint32_t val, int write) "vc2 reg=0x%02x val=0x%04x write=%d"
 
+
+# sgi_gbe.c (O2 GBE raster/timing + tile scanout)
+sgi_gbe_vt_xy_read(uint32_t xy) "vt_xy read -> 0x%08x"
+sgi_gbe_xymax(uint32_t xymax) "vt_xymax = 0x%08x"
+sgi_gbe_latch(uint32_t ovr, uint32_t frm, uint32_t did) "vsync latch ovr=0x%08x frm=0x%08x did=0x%08x"
+sgi_gbe_irq_raise(void) "GBE0/GBE1 raise (retrace/preblank)"
+sgi_gbe_irq_lower(void) "GBE0/GBE1 lower"
+sgi_gbe_frm_ctrl(uint32_t val) "frm_ctrl = 0x%08x"
+sgi_gbe_frame_tick(uint32_t htotal, uint32_t vtotal, uint32_t refresh) "frame tick htotal=%u vtotal=%u refresh=%u"
+sgi_gbe_scanout(int width, int height, int width_tiles, uint64_t list) "scanout %dx%d tiles=%d list=0x%"PRIx64

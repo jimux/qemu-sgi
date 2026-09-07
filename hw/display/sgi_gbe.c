@@ -1,18 +1,27 @@
 /*
  * SGI GBE (Graphics Back End) emulation
  *
- * Minimal register handling to support IRIX kernel boot.
+ * Full raster/timing + tile-scanout model for the O2 (IP32) graphics
+ * back end. The raster is derived from real (virtual-clock) time: a
+ * periodic QEMUTimer at the frame rate sweeps the full total extent
+ * (active + blanking), so the PROM's waitForBlanking() poll and the
+ * turnOnGbe() freeze-poll both exit naturally.
  *
- * Each DMA channel has two registers:
- *   CTRL (write): software sets the new value
- *   INHWCTRL (read): returns the value active in hardware
- * On real hardware, CTRL propagates to INHWCTRL at VSync.
- * We reflect writes immediately (instant VSync).
+ * Register contract (crm_init.c bring-up order):
+ *   gbeSetTimingRegs writes vsync/hsync/vblank/hblank/hcmap/vcmap,
+ *   fp_de/fp_hdrv/fp_vdrv, did/crs/vc_start_xy, frm_size_tile,
+ *   frm_size_pixel, dotclock, 11ms delay, vpixen/hpixen, vt_xymax
+ *   ((vtotal<<12)|htotal), frm_size_tile toggle, ovr_width_tile toggle,
+ *   frm_control (list ptr | enable), did_control, then spins on
+ *   frm_inhwctrl bit 0 until set. Our VSync latch (frame timer) copies
+ *   ctrl->inhwctrl (enable bit INCLUDED) once per frame, so the spin
+ *   exits within one frame period.
  *
- * The i2cfp register returns 0 so that the kernel's I2C bit-bang
- * reads inverted values (SDA=1, SCL=1 = bus idle, no panel).
- *
- * Physical base: 0x16000000 (kseg1: 0xB6000000)
+ * Tile scanout: frm_ctrl = descriptor-list pointer | enable bit.
+ * The list is guest RAM (UMA), big-endian uint16 tile numbers
+ * (physical address = tilenum << 16, 64KB tiles; 0x8000 = valid).
+ * Tiles are walked per gxemul: width-tiles across, 128 lines per tile
+ * row, 512/256/128 contiguous pixels per tile line at 8/16/32bpp.
  *
  * Copyright (c) 2024 the QEMU project
  *
@@ -21,52 +30,314 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
 #include "hw/display/sgi_gbe.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "ui/pixel_ops.h"
+#include "system/address-spaces.h"
+#include "trace.h"
+#include "framebuffer.h"
 
 /*
- * Simulate the GBE video timing raster position.
- *
- * VT_XY format: bit[31] = freeze, bits[23:12] = Y, bits[11:0] = X
- * Standard 1024x768@60Hz timing (total including blanking):
- *   H total = 1344 pixels, V total = 806 lines
- *   H blank starts at 1024, V blank starts at 768
- *
- * Each read advances the simulated position so that polling loops
- * (like waitForBlanking) see the raster sweep through the frame.
+ * Update the derived raster geometry from the programmed timing regs.
+ * vt_xymax = (vtotal << 12) | htotal (written last by gbeSetTimingRegs).
  */
-#define GBE_HTOTAL  1344
-#define GBE_VTOTAL  806
-
-static uint32_t sgi_gbe_get_vt_xy(SGIGBEState *s)
+static void sgi_gbe_update_geometry(SGIGBEState *s)
 {
-    uint32_t x, y;
+    uint32_t xmax = s->vt_xymax & 0xfff;
+    uint32_t ymax = (s->vt_xymax >> 12) & 0xfff;
 
-    if (s->vt_frozen) {
-        return s->vt_xy | 0x80000000;
+    if (xmax == 0 || ymax == 0) {
+        /* not programmed yet: keep defaults */
+        xmax = GBE_DEF_HTOTAL;
+        ymax = GBE_DEF_VTOTAL;
     }
+    s->htotal = xmax;
+    s->vtotal = ymax;
+
+    /* hblank: on = bits [23:12], off = bits [11:0] (gbeSetTimingRegs) */
+    uint32_t hb = s->vt_regs[GBE_VT_IDX(GBE_VT_HBLANK)];
+    s->hblank_start = (hb >> 12) & 0xfff;
+    s->hblank_end = hb & 0xfff;
+
+    uint32_t vb = s->vt_regs[GBE_VT_IDX(GBE_VT_VBLANK)];
+    s->vblank_start = (vb >> 12) & 0xfff;
+    s->vblank_end = vb & 0xfff;
 
     /*
-     * Advance the simulated raster position. Increment Y by a few
-     * lines per read to sweep through the frame quickly. This ensures
-     * waitForBlanking() sees the raster enter the blanking region
-     * within a reasonable number of reads.
+     * Frame period: nominal 60Hz. Refine against the dotclock if it
+     * looks sane (run bit 0x100000 set) using the simple PLL reading
+     * dotclock = base * m / (n * pdiv) — do NOT chase exactness.
      */
-    s->vt_read_count += 7;  /* ~7 lines per read */
-    x = (s->vt_read_count * 37) % GBE_HTOTAL;  /* pseudo-random X */
-    y = s->vt_read_count % GBE_VTOTAL;
+    s->refresh_hz = GBE_DEF_REFRESH;
+    uint32_t dot = s->dotclock;
+    if ((dot & 0x100000) && (dot & 0xff)) {
+        uint32_t m = (dot & 0xff) + 1;
+        uint32_t n = ((dot >> 8) & 0x3f) + 1;
+        uint32_t pdiv = 1u << ((dot >> 14) & 3);
+        /* base ~ 66.67MHz/8 ≈ 8.33MHz per unit */
+        double khz = 8333.0 * m / n / pdiv;
+        if (khz > 1000.0 && khz < 400000.0) {
+            double hz = khz * 1000.0 / ((double)s->htotal * s->vtotal);
+            if (hz > 40.0 && hz < 160.0) {
+                s->refresh_hz = (uint32_t)(hz + 0.5);
+            }
+        }
+    }
+}
 
+/*
+ * Current raster position from real time. The sweep starts at
+ * frame_start_ns and covers htotal*vtotal dots in 1/refresh seconds.
+ * X bits [11:0], Y bits [23:12]; bit 31 = freeze flag (NetBSD
+ * crmfbreg.h CRMFB_VT_XY_X/Y_MASK — the same layout the PROM's
+ * waitForBlanking decodes).
+ */
+static uint32_t sgi_gbe_current_xy(SGIGBEState *s, int64_t now)
+{
+    int64_t frame_ns = NANOSECONDS_PER_SECOND / (int64_t)s->refresh_hz;
+    int64_t sweep = ((int64_t)s->htotal * s->vtotal);
+    int64_t off = now - s->frame_start_ns;
+    uint64_t dot;
+
+    if (off < 0) {
+        off = 0;
+    }
+    if (off >= frame_ns) {
+        off = frame_ns - 1;
+    }
+    dot = ((uint64_t)off * sweep) / frame_ns;
+    if (dot >= sweep) {
+        dot = sweep - 1;
+    }
+    uint32_t x = dot % s->htotal;
+    uint32_t y = dot / s->htotal;
+    /*
+     * Layout per NetBSD crmfbreg.h (via gxemul thirdparty) and the
+     * PROM's decoders: X = bits [11:0], Y = bits [23:12], bit 31 =
+     * freeze. crm_init.c waitForBlanking reads tempY = (val &
+     * 0x00fff000) >> 12 and compares against the vblank window; the
+     * turnOnGbe freeze-poll only looks at bit 31. (vt_xymax keeps its
+     * own separate encoding (vtotal<<12)|htotal.)
+     */
     return (y << 12) | x;
 }
+
+/* ---------------- frame timer: raster tick + vsync latch -------------- */
+
+static void sgi_gbe_invalidate(void *opaque);
+static void sgi_gbe_update(void *opaque);
+
+/*
+ * Called at each frame boundary (VSync edge):
+ *  1. latch ovr/frm/did ctrl -> inhwctrl (enable bits kept)
+ *  2. raise GBE0 (retrace) and GBE1 (preblank) as brief level pulses
+ *  3. run the tile scanout into the QEMU console
+ *  4. re-arm the timer for the next frame
+ */
+static void sgi_gbe_frame_tick(void *opaque)
+{
+    SGIGBEState *s = SGI_GBE(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t frame_ns = NANOSECONDS_PER_SECOND / (int64_t)s->refresh_hz;
+
+    trace_sgi_gbe_frame_tick(s->htotal, s->vtotal, s->refresh_hz);
+
+    /* VSync edge: latch the ctrl values into the in-hardware copies */
+    s->ovr_inhwctrl = s->ovr_ctrl;
+    s->frm_inhwctrl = s->frm_ctrl;
+    s->did_inhwctrl = s->did_ctrl;
+    trace_sgi_gbe_latch(s->ovr_ctrl, s->frm_ctrl, s->did_ctrl);
+
+    /* GBE0 retrace / GBE1 preblank pulses to CRIME (level, brief) */
+    qemu_irq_raise(s->crime_irq[0]);
+    qemu_irq_raise(s->crime_irq[1]);
+    trace_sgi_gbe_irq_raise();
+
+    /* Scanout + display update while the beam is in blanking */
+    if (s->con) {
+        sgi_gbe_update(s);
+    }
+
+    s->frame_start_ns = now;
+    timer_mod(s->frame_timer, now + frame_ns);
+
+    /* Deassert shortly after: model the pulse width as one scanline-ish.
+     * Simplest correct approach for the level-triggered CRIME model:
+     * raise at vsync (above), drop before the next frame tick. We
+     * deassert immediately after the scanout so intstat stays clean
+     * unless the guest deliberately holds the source. */
+    qemu_irq_lower(s->crime_irq[0]);
+    qemu_irq_lower(s->crime_irq[1]);
+    trace_sgi_gbe_irq_lower();
+}
+
+/* -------------------- tile scanout into the console ------------------- */
+
+/*
+ * Decode one pixel through the FRM channel. The PROM programs all 32
+ * WIDs to I8/CM0 (initFramebuffer), so 8bpp cmap lookups are the gate
+ * path; 16bpp RGB5 and 32bpp direct are supported for the kernel.
+ */
+static void sgi_gbe_scanout(SGIGBEState *s)
+{
+    DisplaySurface *surface = qemu_console_surface(s->con);
+    if (!surface) {
+        return;
+    }
+
+    int depth = (s->frm_size_tile >> 13) & 3;   /* 0=8 1=16 2=32bpp */
+    int bpp = (depth == 0) ? 1 : (depth == 1) ? 2 : 4;
+    int width_tiles = (s->frm_size_tile >> 5) & 0xff;
+    int rhs_pixels = (s->frm_size_tile & 0x1f) * 32 / bpp;
+    int height = s->frm_size_pixel >> 16;
+
+    /* tile width in pixels: 512@8bpp, 256@16bpp, 128@32bpp */
+    int pix_per_tile = (bpp == 1) ? 512 : (bpp == 2) ? 256 : 128;
+    int width = width_tiles * pix_per_tile + rhs_pixels;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    width = MIN(width, 2048);
+    height = MIN(height, 2048);
+
+    if (s->scan_width != width || s->scan_height != height) {
+        qemu_console_resize(s->con, width, height);
+        s->scan_width = width;
+        s->scan_height = height;
+        surface = qemu_console_surface(s->con);
+        if (!surface) {
+            return;
+        }
+    }
+
+    hwaddr list_ptr = s->frm_ctrl & 0xffffffc0;
+    if (!(s->frm_ctrl & 1) || list_ptr == 0) {
+        return;     /* DMA not enabled */
+    }
+    trace_sgi_gbe_scanout(width, height, width_tiles, list_ptr);
+
+    int w = width_tiles + (rhs_pixels > 0 ? 1 : 0);
+    int stride = surface_stride(surface) / sizeof(uint32_t);
+    uint32_t *dst = (uint32_t *)surface_data(surface);
+
+    /*
+     * Walk tile ROWS, not pixel columns: one tile row covers 128 LINES
+     * (each tile is 64KB = 128 lines x 512 bytes; a "row" of width_tiles
+     * tiles spans the full screen width at any bpp). The loop bound is
+     * therefore over HEIGHT: row * 128 < height, i.e. 1024 lines = 8 rows
+     * of 16 tiles at 1280x1024@8bpp (gxemul dev_sgi_gbe.c dev_sgi_gbe_tick
+     * walks tiley = 0..255, aborting once the screen is filled; we size
+     * the walk from frm_size_pixel directly).
+     */
+    int tile_rows = (height + 127) / 128;
+    for (int row = 0; row * 128 < height && row < tile_rows; row++) {
+        /* tile row y range: lines 0..127 within the tile */
+        for (int line = 0; line < 128; line++) {
+            int y = row * 128 + line;
+            if (y >= height) {
+                break;
+            }
+            int x = 0;
+            for (int tx = 0; tx < w; tx++) {
+                int tilenr = tx + row * w;
+                if (tilenr >= 256) {
+                    break;
+                }
+                /* descriptor: big-endian u16 at list_ptr + 2*tilenr.
+                 * PROM initFramebuffer writes plain tile numbers
+                 * (phys>>16) with NO valid bit; an empty slot is 0.
+                 * (The 0x8000 valid marker is an RE-TLB-entry-only
+                 * convention; a stray flagged entry still decodes as a
+                 * tile number through the 0x7fff mask.) */
+                uint16_t desc;
+                address_space_read(&address_space_memory,
+                                   list_ptr + 2 * tilenr, MEMTXATTRS_UNSPECIFIED,
+                                   &desc, 2);
+                desc = be16_to_cpu(desc);
+                if (desc == 0) {
+                    x += pix_per_tile;
+                    continue;
+                }
+                hwaddr tile_base = (hwaddr)(desc & 0x7fff) << 16;
+
+                int pix_here = pix_per_tile;
+                if (tx == width_tiles && rhs_pixels > 0) {
+                    pix_here = rhs_pixels;
+                }
+                uint8_t buf[512 * 4];
+                int nbytes = pix_here * bpp;
+                address_space_read(&address_space_memory, tile_base + 512 * line,
+                                   MEMTXATTRS_UNSPECIFIED, buf, MIN(nbytes, 512 * 4));
+
+                for (int i = 0; i < pix_here && x < width; i++, x++) {
+                    uint32_t r, g, b;
+                    if (bpp == 1) {
+                        uint32_t idx = buf[i];
+                        uint32_t ent = s->cmap[idx];
+                        r = (ent >> 24) & 0xff;
+                        g = (ent >> 16) & 0xff;
+                        b = (ent >> 8) & 0xff;
+                    } else if (bpp == 2) {
+                        uint16_t p = (buf[2 * i] << 8) | buf[2 * i + 1];
+                        r = ((p >> 10) & 0x1f) << 3;
+                        g = ((p >> 5) & 0x1f) << 3;
+                        b = (p & 0x1f) << 3;
+                    } else {
+                        r = buf[4 * i];
+                        g = buf[4 * i + 1];
+                        b = buf[4 * i + 2];
+                    }
+                    if (x >= 0 && x < surface_width(surface) &&
+                        y < surface_height(surface)) {
+                        dst[y * stride + x] = rgb_to_pixel32(r, g, b);
+                    }
+                }
+            }
+        }
+    }
+    s->scan_dirty = false;
+}
+
+static void sgi_gbe_invalidate(void *opaque)
+{
+    SGIGBEState *s = opaque;
+    if (s->con) {
+        sgi_gbe_scanout(s);
+        dpy_gfx_update(s->con, 0, 0, surface_width(qemu_console_surface(s->con)),
+                       surface_height(qemu_console_surface(s->con)));
+    }
+}
+
+static void sgi_gbe_update(void *opaque)
+{
+    SGIGBEState *s = opaque;
+    if (s->con && (s->frm_ctrl & 1)) {
+        sgi_gbe_scanout(s);
+        dpy_gfx_update(s->con, 0, 0,
+                       surface_width(qemu_console_surface(s->con)),
+                       surface_height(qemu_console_surface(s->con)));
+    }
+}
+
+static const GraphicHwOps sgi_gbe_gfx_ops = {
+    .invalidate = sgi_gbe_invalidate,
+    .gfx_update = sgi_gbe_update,
+};
+
+
+
 
 static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGBEState *s = SGI_GBE(opaque);
 
-    /* Control block (0x00000-0x0001F) */
     switch (offset) {
     case GBE_CTRLSTAT:
-        return s->ctrlstat;
+        /* chip ID in the low nibble; we emulate pre-Arsenic GBE (1) */
+        return (s->ctrlstat & ~GBE_CTRLSTAT_CHIPID_MASK) | GBE_CHIPID;
 
     case GBE_DOTCLOCK:
         return s->dotclock;
@@ -75,50 +346,54 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
         return GBE_ID_VALUE;
 
     case GBE_I2C:
+        /* open-drain lines idle-high, no DDC device: invert low 2 bits
+         * of the last written value (crm_i2c.c I2C_READ semantics) */
+        return (~s->i2c) & 3;
+
     case GBE_I2CFP:
-        return 0;
+        return (~s->i2cfp) & 3;
 
     case GBE_SYSCLK:
         return 0;
 
-    case GBE_VT_XY:
-        return sgi_gbe_get_vt_xy(s);
+    case GBE_VT_XY: {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint32_t xy = sgi_gbe_current_xy(s, now);
+        if (s->vt_frozen) {
+            xy = s->vt_xy_frozen;
+        }
+        trace_sgi_gbe_vt_xy_read(xy);
+        return s->vt_frozen ? (xy | 0x80000000u) : xy;
+    }
 
     case GBE_VT_XYMAX:
         return s->vt_xymax;
 
-    /* OVR channel */
     case GBE_OVR_WIDTH_TILE:
-        return 0;
+        return s->ovr_width_tile;
     case GBE_OVR_INHWCTRL:
-        /* Return control value with DMA enable (bit 0) cleared.
-         * No real DMA engine, so DMA is always "complete". */
-        return s->ovr_control & ~1u;
+        return s->ovr_inhwctrl;
     case GBE_OVR_CTRL:
-        return s->ovr_control;
+        return s->ovr_ctrl;
 
-    /* FRM channel */
     case GBE_FRM_SIZE_TILE:
+        return s->frm_size_tile;
     case GBE_FRM_SIZE_PIXEL:
-        return 0;
+        return s->frm_size_pixel;
     case GBE_FRM_INHWCTRL:
-        /* DMA enable is bit 0 for FRM too */
-        return s->frm_control & ~1u;
+        return s->frm_inhwctrl;
     case GBE_FRM_CTRL:
-        return s->frm_control;
+        return s->frm_ctrl;
 
-    /* DID channel */
     case GBE_DID_INHWCTRL:
-        /* DID DMA enable is bit 16 */
-        return s->did_control & ~(1u << 16);
+        return s->did_inhwctrl;
     case GBE_DID_CTRL:
-        return s->did_control;
+        return s->did_ctrl;
 
-    /* CMAP FIFO status: return 0x3F = FIFO has space for 63 entries */
+    /* CMAP FIFO: pre-Arsenic GBE — 0x0 means "full OR empty" = ready */
     case GBE_CM_FIFO:
-        return 0x3F;
+        return 0x0;
 
-    /* Cursor registers */
     case GBE_CRS_POS:
         return s->crs_pos;
     case GBE_CRS_CTRL:
@@ -135,32 +410,35 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
     }
 
     /* Video timing registers (0x10008-0x1004C) */
-    if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VPIXENF) {
-        int idx = (offset - GBE_VT_VSYNC) / 4;
-        if (idx < GBE_VT_REG_COUNT) {
+    if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VCSTARTXY) {
+        int idx = GBE_VT_IDX(offset);
+        if (idx >= 0 && idx < GBE_VT_REG_COUNT) {
             return s->vt_regs[idx];
         }
     }
 
-    /* Mode registers (0x48000-0x4807F) */
+    /* WID mode registers (0x48000) */
     if (offset >= GBE_MODE_REGS_BASE &&
         offset < GBE_MODE_REGS_BASE + GBE_MODE_REGS_SIZE * 4) {
-        int idx = (offset - GBE_MODE_REGS_BASE) / 4;
-        return s->mode_regs[idx];
+        return s->mode_regs[(offset - GBE_MODE_REGS_BASE) / 4];
     }
 
-    /* CMAP entries (0x50000-0x54800) */
+    /* CMAP (0x50000) */
     if (offset >= GBE_CMAP_BASE &&
         offset < GBE_CMAP_BASE + GBE_CMAP_SIZE * 4) {
-        int idx = (offset - GBE_CMAP_BASE) / 4;
-        return s->cmap[idx];
+        return s->cmap[(offset - GBE_CMAP_BASE) / 4];
     }
 
-    /* GMAP entries (0x60000-0x603FF) */
+    /* GMAP (0x60000) */
     if (offset >= GBE_GMAP_BASE &&
         offset < GBE_GMAP_BASE + GBE_GMAP_SIZE * 4) {
-        int idx = (offset - GBE_GMAP_BASE) / 4;
-        return s->gmap[idx];
+        return s->gmap[(offset - GBE_GMAP_BASE) / 4];
+    }
+
+    /* Cursor glyphs (0x78000) */
+    if (offset >= GBE_CRS_GLYPH_BASE &&
+        offset < GBE_CRS_GLYPH_BASE + GBE_CRS_GLYPH_COUNT * 4) {
+        return s->crs_glyph[(offset - GBE_CRS_GLYPH_BASE) / 4];
     }
 
     qemu_log_mask(LOG_UNIMP,
@@ -170,112 +448,149 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
 }
 
 static void sgi_gbe_write(void *opaque, hwaddr offset,
-                            uint64_t value, unsigned size)
+                          uint64_t value, unsigned size)
 {
     SGIGBEState *s = SGI_GBE(opaque);
+    uint32_t v = (uint32_t)value;
 
     switch (offset) {
     case GBE_CTRLSTAT:
-        s->ctrlstat = (uint32_t)value;
+        /* keep the chip ID bits ours; store the rest verbatim so the
+         * PROM's (val & 0x020aa000) == 0x020aa000 test round-trips */
+        s->ctrlstat = (v & ~GBE_CTRLSTAT_CHIPID_MASK) | GBE_CHIPID;
         return;
 
     case GBE_DOTCLOCK:
-        s->dotclock = (uint32_t)value;
-        return;
-
-    case GBE_VT_XY:
-        s->vt_frozen = (value & 0x80000000) != 0;
-        if (!s->vt_frozen) {
-            s->vt_read_count = 0;
-        }
-        s->vt_xy = (uint32_t)value;
-        return;
-
-    case GBE_VT_XYMAX:
-        s->vt_xymax = (uint32_t)value;
-        return;
-
-    /* OVR channel: both CTRL and INHWCTRL writes accepted */
-    case GBE_OVR_CTRL:
-    case GBE_OVR_INHWCTRL:
-        s->ovr_control = (uint32_t)value;
-        return;
-
-    /* FRM channel: both CTRL and INHWCTRL writes accepted */
-    case GBE_FRM_CTRL:
-    case GBE_FRM_INHWCTRL:
-        s->frm_control = (uint32_t)value;
-        return;
-
-    /* DID channel: both CTRL and INHWCTRL writes accepted */
-    case GBE_DID_CTRL:
-    case GBE_DID_INHWCTRL:
-        s->did_control = (uint32_t)value;
+        s->dotclock = v;
+        sgi_gbe_update_geometry(s);
         return;
 
     case GBE_SYSCLK:
+        return;     /* write-only PLL, no model needed */
+
     case GBE_I2C:
+        s->i2c = v & 3;
+        return;
     case GBE_I2CFP:
-    case GBE_FRM_SIZE_TILE:
-    case GBE_FRM_SIZE_PIXEL:
-    case GBE_OVR_WIDTH_TILE:
+        s->i2cfp = v & 3;
         return;
 
-    /* Cursor registers */
+    case GBE_VT_XY:
+        /* bit 31 = freeze; the PROM writes 0x80000000 to freeze and
+         * 0 to unfreeze (turnOnGbe polls bit 31 read-back) */
+        s->vt_frozen = (v & 0x80000000u) != 0;
+        if (s->vt_frozen) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->vt_xy_frozen = sgi_gbe_current_xy(s, now) & 0x7fffffff;
+        }
+        return;
+
+    case GBE_VT_XYMAX:
+        s->vt_xymax = v;
+        sgi_gbe_update_geometry(s);
+        trace_sgi_gbe_xymax(v);
+        return;
+
+    case GBE_VT_INTR01:
+        s->vt_intr01 = v;
+        return;
+    case GBE_VT_INTR23:
+        s->vt_intr23 = v;
+        return;
+
+    case GBE_OVR_WIDTH_TILE:
+        s->ovr_width_tile = v;
+        return;
+    case GBE_OVR_CTRL:
+        s->ovr_ctrl = v;
+        return;
+    case GBE_OVR_INHWCTRL:
+        /* inhwctrl is a read-only hardware view; accept the write */
+        return;
+
+    case GBE_FRM_SIZE_TILE:
+        s->frm_size_tile = v;
+        s->scan_dirty = true;
+        return;
+    case GBE_FRM_SIZE_PIXEL:
+        s->frm_size_pixel = v;
+        s->scan_dirty = true;
+        return;
+    case GBE_FRM_CTRL:
+        s->frm_ctrl = v;
+        s->scan_dirty = true;
+        trace_sgi_gbe_frm_ctrl(v);
+        return;
+    case GBE_FRM_INHWCTRL:
+        return;
+
+    case GBE_DID_CTRL:
+        s->did_ctrl = v;
+        return;
+    case GBE_DID_INHWCTRL:
+        return;
+
+    /* Cursor */
     case GBE_CRS_POS:
-        s->crs_pos = (uint32_t)value;
+        s->crs_pos = v;
+        s->scan_dirty = true;
         return;
     case GBE_CRS_CTRL:
-        s->crs_ctrl = (uint32_t)value;
+        s->crs_ctrl = v;
+        s->scan_dirty = true;
         return;
     case GBE_CRS_CMAP0:
-        s->crs_cmap[0] = (uint32_t)value;
+        s->crs_cmap[0] = v;
         return;
     case GBE_CRS_CMAP1:
-        s->crs_cmap[1] = (uint32_t)value;
+        s->crs_cmap[1] = v;
         return;
     case GBE_CRS_CMAP2:
-        s->crs_cmap[2] = (uint32_t)value;
-        return;
-
-    /* CMAP FIFO status — read-only */
-    case GBE_CM_FIFO:
+        s->crs_cmap[2] = v;
         return;
 
     default:
         break;
     }
 
-    /* Video timing registers (0x10008-0x1004C) */
-    if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VPIXENF) {
-        int idx = (offset - GBE_VT_VSYNC) / 4;
-        if (idx < GBE_VT_REG_COUNT) {
-            s->vt_regs[idx] = (uint32_t)value;
+    /* Video timing registers */
+    if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VCSTARTXY) {
+        int idx = GBE_VT_IDX(offset);
+        if (idx >= 0 && idx < GBE_VT_REG_COUNT) {
+            s->vt_regs[idx] = v;
+            sgi_gbe_update_geometry(s);
         }
         return;
     }
 
-    /* Mode registers (0x48000-0x4807F) */
+    /* WID mode registers */
     if (offset >= GBE_MODE_REGS_BASE &&
         offset < GBE_MODE_REGS_BASE + GBE_MODE_REGS_SIZE * 4) {
-        int idx = (offset - GBE_MODE_REGS_BASE) / 4;
-        s->mode_regs[idx] = (uint32_t)value;
+        s->mode_regs[(offset - GBE_MODE_REGS_BASE) / 4] = v;
         return;
     }
 
-    /* CMAP entries (0x50000-0x54800) */
+    /* CMAP: accepted into the array immediately (real HW delays the
+     * load to vsync; instant is fine — never clear/modify at vsync) */
     if (offset >= GBE_CMAP_BASE &&
         offset < GBE_CMAP_BASE + GBE_CMAP_SIZE * 4) {
-        int idx = (offset - GBE_CMAP_BASE) / 4;
-        s->cmap[idx] = (uint32_t)value;
+        s->cmap[(offset - GBE_CMAP_BASE) / 4] = v;
+        s->scan_dirty = true;
         return;
     }
 
-    /* GMAP entries (0x60000-0x603FF) */
+    /* GMAP */
     if (offset >= GBE_GMAP_BASE &&
         offset < GBE_GMAP_BASE + GBE_GMAP_SIZE * 4) {
-        int idx = (offset - GBE_GMAP_BASE) / 4;
-        s->gmap[idx] = (uint32_t)value;
+        s->gmap[(offset - GBE_GMAP_BASE) / 4] = v;
+        return;
+    }
+
+    /* Cursor glyphs */
+    if (offset >= GBE_CRS_GLYPH_BASE &&
+        offset < GBE_CRS_GLYPH_BASE + GBE_CRS_GLYPH_COUNT * 4) {
+        s->crs_glyph[(offset - GBE_CRS_GLYPH_BASE) / 4] = v;
+        s->scan_dirty = true;
         return;
     }
 
@@ -299,6 +614,67 @@ static const MemoryRegionOps sgi_gbe_ops = {
     },
 };
 
+/* ------------------------------- lifecycle ------------------------------ */
+
+static void sgi_gbe_reset(DeviceState *dev)
+{
+    SGIGBEState *s = SGI_GBE(dev);
+
+    /* gxemul default while running: 0x300ae001 (chip ID 1). Reset
+     * value before programming: display-off variant so the PROM's
+     * turnOffGbeDma "already off" check does not early-return. */
+    s->ctrlstat = 0x000ae000 | GBE_CHIPID;
+    s->dotclock = 0;
+    s->i2c = 0;
+    s->i2cfp = 0;
+
+    memset(s->vt_regs, 0, sizeof(s->vt_regs));
+    s->vt_xymax = 0;
+    s->vt_intr01 = 0;
+    s->vt_intr23 = 0;
+    s->vt_frozen = false;
+    s->vt_xy_frozen = 0;
+
+    s->ovr_width_tile = 0;
+    s->ovr_ctrl = 0;
+    s->ovr_inhwctrl = 0;
+    s->frm_size_tile = 0;
+    s->frm_size_pixel = 0;
+    s->frm_ctrl = 0;
+    s->frm_inhwctrl = 0;
+    s->did_ctrl = 0;
+    s->did_inhwctrl = 0;
+
+    memset(s->mode_regs, 0, sizeof(s->mode_regs));
+    memset(s->cmap, 0, sizeof(s->cmap));
+    memset(s->gmap, 0, sizeof(s->gmap));
+    s->crs_pos = 0;
+    s->crs_ctrl = 0;
+    memset(s->crs_cmap, 0, sizeof(s->crs_cmap));
+    memset(s->crs_glyph, 0, sizeof(s->crs_glyph));
+
+    s->scan_width = 0;
+    s->scan_height = 0;
+    s->scan_dirty = true;
+
+    /* Default raster geometry until the PROM programs real timing */
+    s->htotal = GBE_DEF_HTOTAL;
+    s->vtotal = GBE_DEF_VTOTAL;
+    s->hblank_start = 0;
+    s->hblank_end = 0;
+    s->vblank_start = 0;
+    s->vblank_end = 0;
+    s->refresh_hz = GBE_DEF_REFRESH;
+    sgi_gbe_update_geometry(s);
+
+    s->frame_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->frame_timer) {
+        timer_del(s->frame_timer);
+        timer_mod(s->frame_timer, s->frame_start_ns +
+                  NANOSECONDS_PER_SECOND / s->refresh_hz);
+    }
+}
+
 static void sgi_gbe_realize(DeviceState *dev, Error **errp)
 {
     SGIGBEState *s = SGI_GBE(dev);
@@ -307,20 +683,64 @@ static void sgi_gbe_realize(DeviceState *dev, Error **errp)
                           "sgi-gbe", GBE_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 
-    /*
-     * Interrupt outputs to CRIME, sysbus irqs 0-3 = GBE0-3
-     * (GBE0 = vertical retrace, GBE1 = pre-blank [sys/IP32.h GBE_INTR]).
-     * Nothing raises them yet — the raster/timing model that drives them
-     * is a later milestone; this is the plumbing only.
-     */
+    /* Interrupt outputs to CRIME, sysbus irqs 0-3 = GBE0-3
+     * (GBE0 = vertical retrace, GBE1 = pre-blank [sys/IP32.h GBE_INTR]). */
     qdev_init_gpio_out_named(dev, s->crime_irq, "crime-irq", 4);
+
+    /* Frame timer drives the raster sweep, the ctrl->inhwctrl vsync
+     * latch, the GBE0/GBE1 pulses, and the tile scanout. */
+    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_gbe_frame_tick, s);
+    timer_mod(s->frame_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / GBE_DEF_REFRESH);
+
+    /* QEMU graphical console (Newport pattern) */
+    s->con = graphic_console_init(dev, 0, &sgi_gbe_gfx_ops, s);
+    qemu_console_resize(s->con, GBE_DEF_HTOTAL >= 1280 ? 1280 : GBE_DEF_HTOTAL,
+                         1024);
 }
+
+static const VMStateDescription vmstate_sgi_gbe = {
+    .name = "sgi-gbe",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ctrlstat, SGIGBEState),
+        VMSTATE_UINT32(dotclock, SGIGBEState),
+        VMSTATE_UINT32(i2c, SGIGBEState),
+        VMSTATE_UINT32(i2cfp, SGIGBEState),
+        VMSTATE_UINT32_ARRAY(vt_regs, SGIGBEState, GBE_VT_REG_COUNT),
+        VMSTATE_UINT32(vt_xymax, SGIGBEState),
+        VMSTATE_UINT32(vt_intr01, SGIGBEState),
+        VMSTATE_UINT32(vt_intr23, SGIGBEState),
+        VMSTATE_BOOL(vt_frozen, SGIGBEState),
+        VMSTATE_UINT32(vt_xy_frozen, SGIGBEState),
+        VMSTATE_UINT32(ovr_width_tile, SGIGBEState),
+        VMSTATE_UINT32(ovr_ctrl, SGIGBEState),
+        VMSTATE_UINT32(ovr_inhwctrl, SGIGBEState),
+        VMSTATE_UINT32(frm_size_tile, SGIGBEState),
+        VMSTATE_UINT32(frm_size_pixel, SGIGBEState),
+        VMSTATE_UINT32(frm_ctrl, SGIGBEState),
+        VMSTATE_UINT32(frm_inhwctrl, SGIGBEState),
+        VMSTATE_UINT32(did_ctrl, SGIGBEState),
+        VMSTATE_UINT32(did_inhwctrl, SGIGBEState),
+        VMSTATE_UINT32_ARRAY(mode_regs, SGIGBEState, GBE_MODE_REGS_SIZE),
+        VMSTATE_UINT32_ARRAY(cmap, SGIGBEState, GBE_CMAP_SIZE),
+        VMSTATE_UINT32_ARRAY(gmap, SGIGBEState, GBE_GMAP_SIZE),
+        VMSTATE_UINT32(crs_pos, SGIGBEState),
+        VMSTATE_UINT32(crs_ctrl, SGIGBEState),
+        VMSTATE_UINT32_ARRAY(crs_cmap, SGIGBEState, 3),
+        VMSTATE_UINT32_ARRAY(crs_glyph, SGIGBEState, GBE_CRS_GLYPH_COUNT),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static void sgi_gbe_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = sgi_gbe_realize;
+    device_class_set_legacy_reset(dc, sgi_gbe_reset);
+    dc->vmsd = &vmstate_sgi_gbe;
 }
 
 static const TypeInfo sgi_gbe_info = {

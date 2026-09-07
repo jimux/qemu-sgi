@@ -463,3 +463,9 @@ sgi_hpc3_kbd_status(uint32_t status) "KBD status=0x%02x"
 sgi_hpc3_kbd_data_read(uint8_t data, int source) "KBD read data=0x%02x source=%d"
 sgi_hpc3_kbd_cmd(uint8_t cmd) "KBD cmd=0x%02x"
 sgi_hpc3_kbd_irq(int kbd_level, int mouse_level, uint32_t map_status) "KBD irq kbd=%d mouse=%d map=0x%02x"
+
+# sgi_crime_re.c (O2 CRIME RE pixel-pipe + MTE)
+sgi_crime_re_draw(uint32_t op, uint32_t drawmode, uint32_t bufmode, int x1, int y1, int x2, int y2, uint32_t fg, uint32_t pattern) "draw op=0x%08x dm=0x%08x bm=0x%08x (%d,%d)-(%d,%d) fg=0x%08x pat=0x%08x"
+sgi_crime_re_mte(uint32_t mode, uint64_t dst0, uint64_t dst1, uint32_t fg) "mte mode=0x%08x dst0=0x%"PRIx64" dst1=0x%"PRIx64" fg=0x%08x"
+sgi_crime_re_tlb_write(int bank, int entry, uint64_t val) "tlb[%d][%d] = 0x%016"PRIx64
+sgi_crime_re_bufmode(uint32_t src, uint32_t dst) "bufmode src=0x%08x dst=0x%08x"

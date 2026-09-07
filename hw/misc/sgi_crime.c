@@ -185,6 +185,25 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case CRM_ID:
+        /*
+         * CRM_ID is a 64-bit big-endian register whose meaningful byte
+         * sits in the LOW word (offset +4). The PROM's crmGetRev/
+         * crmGetType read the 32-bit word at 0x14000004 and compare
+         * against 0x000000a1 (CRIME rev 1 with graphics, per gxemul's
+         * dev_sgi_ip32 "0xa1 for machines with graphics"); a 4-byte
+         * read must therefore return the low 32 bits, not the full
+         * 64-bit register. 8-byte reads (kernel READ_REG64) get the
+         * whole value. s->id is 0xa1 so both views work: the kernel's
+         * get_crimerev() sees rev 1 (CRM_REV_11) either way.
+         */
+        if (size == 4) {
+            /* +0 selects the BE high word, +4 the BE low word */
+            val = (raw_offset & 4) ? (s->id & 0xffffffff)
+                                   : (s->id >> 32);
+            CRIME_DPRINTF("read  CRM_ID[32] @+%"PRIx64" = 0x%" PRIx64 "\n",
+                          raw_offset & 7, val);
+            return val;
+        }
         val = s->id;
         CRIME_DPRINTF("read  CRM_ID = 0x%" PRIx64 "\n", val);
         return val;

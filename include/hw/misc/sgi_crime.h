@@ -69,7 +69,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEState, SGI_CRIME)
 #define CRIME_REG_SIZE          0x280
 
 /* CRIME ID value: ID bits = 0xa0, revision = 0x02 */
-#define CRIME_ID_VALUE          0xa2
+/*
+ * 0xa1 = idbits 0xa0 | rev 1. The IP32 PROM's crmGetRev/crmGetType
+ * (32-bit read at CRM_ID+4) require exactly 0x000000a1 to register the
+ * CRM graphics component and run initGraphics (crm_init.c); gxemul
+ * uses the same value for "machine with graphics". The kernel's
+ * get_crimerev() reads the full 64-bit value and derives rev 1
+ * (CRM_REV_11) from the low nibble — same conclusion either way.
+ */
+#define CRIME_ID_VALUE          0xa1
 
 /* CRIME control register bits [sys/crime.h] */
 #define CRM_CONTROL_ENDIAN_BIG  0x0100
