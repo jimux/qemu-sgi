@@ -1541,7 +1541,8 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     put_be32(spb, 0x04, 0x44);  /* Length: 68 bytes (17 x uint32) */
     put_be16(spb, 0x08, ARCS_VERSION);
     put_be16(spb, 0x0A, ARCS_REVISION);
-    put_be32(spb, 0x0C, MIPS_K1BASE + ARCS_RESTARTBLOCK_PHYS);  /* RestartBlock */
+    put_be32(spb, 0x0C, s->sash_payload ? MIPS_K1BASE + ARCS_RESTARTBLOCK_PHYS
+                                        : 0);  /* RestartBlock */
     put_be32(spb, 0x10, 0);     /* DebugBlock */
     put_be32(spb, 0x14, 0);     /* GEVector */
     put_be32(spb, 0x18, 0);     /* UTLBMissVector */
@@ -1554,7 +1555,7 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     rom_add_blob_fixed("arcs-spb", spb, sizeof(spb), ARCS_SPB_PHYS);
 
     /* ---- Build RestartBlock (sash's rbclrbs dereferences it) ---- */
-    {
+    if (s->sash_payload) {
         uint8_t rb[ARCS_RESTARTBLOCK_SIZE];
         memset(rb, 0, sizeof(rb));
         put_be32(rb, 0x00, ARCS_RB_SIGNATURE);  /* Signature */
@@ -1570,7 +1571,7 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     }
 
     /* ---- Build sash argv/envp (argc=2 + environ so getenv/kernel_name work) */
-    {
+    if (s->sash_payload) {
         uint8_t sash_args[0x300];
         uint32_t env_ptrs[16];
         uint32_t cursor;
@@ -1917,6 +1918,7 @@ static const Property sgi_arcs_properties[] = {
     DEFINE_PROP_UINT32("ram-size", SGIARCSState, ram_size, 64 * 1024 * 1024),
     DEFINE_PROP_UINT32("kernel-start", SGIARCSState, kernel_start_phys, 0),
     DEFINE_PROP_UINT32("kernel-end", SGIARCSState, kernel_end_phys, 0),
+    DEFINE_PROP_BOOL("sash-payload", SGIARCSState, sash_payload, true),
     DEFINE_PROP_CHR("chardev", SGIARCSState, chr),
 };
 

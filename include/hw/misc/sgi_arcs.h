@@ -209,6 +209,7 @@ struct SGIARCSState {
     uint32_t ram_size;
     uint32_t kernel_start_phys; /* Physical address of kernel image (low) */
     uint32_t kernel_end_phys;   /* Physical address after kernel image */
+    bool sash_payload;          /* -kernel payload is sash (vs a raw kernel) */
 };
 
 /*
