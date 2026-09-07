@@ -25,6 +25,7 @@
 #define HW_MISC_SGI_MACE_H
 
 #include "chardev/char-fe.h"
+#include "hw/input/ps2.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
 #include "qemu/timer.h"
@@ -79,6 +80,49 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEState, SGI_MACE)
 #define ISA_INT_AUDIO_MASK      0x000000ffULL /* bits 0..7   -> CRIME bit 6 */
 #define ISA_INT_MISC_MASK       0x0000ff00ULL /* bits 8..15  -> CRIME bit 5 */
 #define ISA_INT_PERIPH_MASK     0xffff0000ULL /* bits 16..31 -> CRIME bit 4 */
+
+/*
+ * ISA_INT_STS/MSK bits 9 and 11: PS/2 keyboard / mouse interrupt
+ * requests (spec §5.1.3 interrupt map; kernel sys/pckm.h
+ * MACE_KEYBD_INTR 0x200 / MACE_MOUSE_INTR 0x800 and io/mhpckm.c
+ * PCKM_MACEMASK 0xA00).  Both live in the "misc" group (bits 8..15)
+ * -> CRIME bit 5 (MACE_PERIPH_MISC, MACE_INTR(5)).
+ */
+#define ISA_INT_KEYBOARD        0x00000200ULL /* bit 9:  PS/2 keyboard */
+#define ISA_INT_MOUSE           0x00000800ULL /* bit 11: PS/2 mouse    */
+#define ISA_INT_PCKM_MASK       (ISA_INT_KEYBOARD | ISA_INT_MOUSE)
+
+/*
+ * MACE PS/2 keyboard & mouse interface (spec §6 "PS/2 Keyboard & Mouse
+ * Interface"; kernel sys/pckm.h struct ps2if).  Two identical ports at
+ * MACE_KBDMS_OFFSET (keyboard, PIO A[5]=0) and +0x20 (mouse, A[5]=1);
+ * four 64-bit registers each.  The kernel PROM/IRIX driver addresses
+ * them with 64-bit PIO at byte lane +7 (PHYS_TO_K1(MACE_KBDMS)+off).
+ */
+#define MACE_PS2_TX_BUF         0x00    /* WO:  transmit shift buffer     */
+#define MACE_PS2_RX_BUF         0x08    /* RO:  receive buffer (data low) */
+#define MACE_PS2_CONTROL        0x10    /* RW:  command & control        */
+#define MACE_PS2_STATUS         0x18    /* RO:  tx/rx status & error      */
+
+/* PS/2 control register bits (spec §6.2.3 TABLE 73; sys/pckm.h PS2_CMD_*) */
+#define PS2_CTRL_CLKINH         0x01    /* inhibit clock after xmission */
+#define PS2_CTRL_TX_EN          0x02    /* transmit enable              */
+#define PS2_CTRL_TX_IEN          0x04    /* transmit interrupt enable    */
+#define PS2_CTRL_RX_IEN          0x08    /* receive interrupt enable     */
+#define PS2_CTRL_CLKASS         0x10    /* assert clock (Clken)         */
+#define PS2_CTRL_RESET          0x20    /* internal state machine reset */
+#define PS2_CTRL_IMPLEMENTED    0x3f
+
+/* PS/2 status register bits (spec §6.2.4 TABLE 74; sys/pckm.h PS2_SR_*) */
+#define PS2_STATUS_CLKSIG       0x01    /* external clock signal        */
+#define PS2_STATUS_CLKINH       0x02    /* Clken output asserted        */
+#define PS2_STATUS_TIP          0x04    /* transmission in progress     */
+#define PS2_STATUS_TBE          0x08    /* transmit buffer empty         */
+#define PS2_STATUS_RBF          0x10    /* receive buffer full           */
+#define PS2_STATUS_RIP          0x20    /* reception in progress         */
+#define PS2_STATUS_PARITY       0x40    /* parity error on last byte     */
+#define PS2_STATUS_FRAMING      0x80    /* framing error on last byte    */
+#define PS2_STATUS_RESET_VAL    0x02    /* Clken asserted, all else 0    */
 
 /*
  * ISA serial port interrupt status/mask bits (spec §5.1.3 table;
@@ -274,6 +318,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEState, SGI_MACE)
 /* Serial RX FIFO */
 #define MACE_SERIAL_FIFO_SIZE 16
 
+/* Per-port PS/2 transport state (spec §6; the data plane is the core) */
+typedef struct MACEPS2PortState {
+    uint8_t control;            /* PS2_CTRL_* bits                     */
+    uint8_t tx_byte;             /* latched tx_buf write (launched by   */
+                                 /* the TxEN control write — outb())    */
+    bool tx_pending;             /* tx_byte not yet shifted out          */
+    int irq_level;               /* last ps2-core irq gpio level        */
+} MACEPS2PortState;
+
 struct SGIMACEState {
     /*
      * The MACE is the PCI host bridge of the O2 (TYPE_PCI_HOST_BRIDGE,
@@ -315,6 +368,22 @@ struct SGIMACEState {
      * console port's RX channel is enabled.
      */
     QEMUTimer *isa_rx_timer;
+
+    /*
+     * PS/2 keyboard & mouse (spec §6).  Two ports: port 0 = keyboard
+     * at MACE_KBDMS_OFFSET, port 1 = mouse at +0x20.  The data plane
+     * is QEMU's PS/2 core (hw/input/ps2.c) embedded below — its
+     * queue holds the scancode/packet stream and implements the full
+     * device command set (ACK 0xFA, BAT 0xAA, keyboard ID 0xAB 0x83,
+     * mouse reset etc. that the PROM mh_kbd.c and kernel mhpckm.c
+     * drivers poll for).  This model implements only the MACE
+     * transport: the control register, the status register (RBF from
+     * the queue state, TBE always ready), and the ISA_INT_STS bits
+     * 9/11 that gate into CRIME bit 5.
+     */
+    PS2KbdState ps2kbd;        /* port 0: keyboard core (input handler) */
+    PS2MouseState ps2mouse;    /* port 1: mouse core (input handler)   */
+    MACEPS2PortState ps2_port[2];
 
     /* UST/MSC timer */
     uint64_t ust_compare[3];

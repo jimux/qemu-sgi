@@ -156,6 +156,7 @@ config SGI_CRIME_RE
 
 config SGI_MACE
     bool
+    select PS2
 
 config SGI_BOOTDISK
     bool

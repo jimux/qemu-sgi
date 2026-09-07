@@ -49,6 +49,7 @@
 #include "hw/pci/pci_host.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "trace.h"
 
 /* Verbose debug logging - set to 1 to enable */
 #define DEBUG_SGI_MACE 0
@@ -286,6 +287,219 @@ static void sgi_mace_serial_write(SGIMACEState *s, int port,
                       port, reg_index, val);
         break;
     }
+}
+
+/* Defined with the ISA serial DMA engine below. */
+static void sgi_mace_isa_int_update(SGIMACEState *s);
+
+/*
+ * ============================================================
+ *              PS/2 keyboard & mouse (spec §6)
+ *
+ * The MACE PS/2 interface is NOT an i8042: each port (keyboard at
+ * MACE_KBDMS_OFFSET, mouse at +0x20) is a bare PS/2 serial-cell
+ * transport with four 64-bit registers (tx_buf, rx_buf, control,
+ * status) — no controller command byte, no output-port bits, no
+ * muxed data stream.  Host->device bytes are written to tx_buf with
+ * PS2_CTRL_TX_EN in control; device->host bytes are read from
+ * rx_buf when status bit PS2_SR_RBF is set.  The PS/2 protocol
+ * itself (command ACKs 0xFA, BAT 0xAA/0xFC, keyboard ID 0xAB 0x83,
+ * mouse reset/sample-rate negotiation) belongs to the *device*
+ * behind the port, so QEMU's PS/2 core (hw/input/ps2.c) implements
+ * it; this model implements the transport registers and the ISA
+ * interrupt bits.
+ *
+ * Driver contract (both probed against this model):
+ *  - PROM mh_kbd.c: reset_kbd() polls CMD_DISABLE (0xF5) then
+ *    programs scancode set 3 (CMD_SELSCAN 0xF0, 3) with make/break
+ *    on caps/num lock; reset_pcms() polls CMD_DEFAULT (0xF6);
+ *    pckm_setleds() sends CMD_SETLEDS (0xED).  pckm_sendok() waits
+ *    for !(status & (TIP|RIP)) then TBE; pckm_pollcmd() reads
+ *    rx_buf when RBF, treating KBD_RESEND 0xFE as retry and
+ *    KBD_OVERRUN 0xFF as keep-waiting.
+ *  - kernel io/mhpckm.c: probes both ports with CMD_DISABLE then
+ *    CMD_ID (0xF2) — a keyboard answers ACK + 0xAB 0x83, a mouse
+ *    ACK + 0x00 0x00 (ps2.c AUX_GET_TYPE queues mouse_type=0);
+ *    init sets typematic/make-break via 0xFA/0xFC, then CMD_ENABLE
+ *    0xF4; the mouse gets CMD_DEFAULT, CMD_MSRES 0xE8/0x03,
+ *    CMD_ENABLE.  pckm_enable_interrupt() sets PS2_CMD_RxIEN on
+ *    both ports and ISA_INT_MSK |= 0xA00.
+ *  - Interrupts: rx-data available raises ISA_INT_STS bit 9
+ *    (keyboard) / bit 11 (mouse), gated by control RX_IEN and the
+ *    ISA mask, fanning into CRIME bit 5 (MACE_PERIPH_MISC,
+ *    MACE_INTR(5)) — mhpckm.c setmaceisavector(MACE_INTR(5),
+ *    PCKM_MACEMASK 0xA00, pckm_intr).
+ *
+ * Virtualization of the serial-cell timing: the real interface
+ * shifts 11 bits on a device-supplied clock at ~10-16 kHz.  With
+ * the transmit buffer always empty by the time the register write
+ * retires (the PS/2 core consumes the command synchronously) the
+ * drivers' "wait for TBE / !(TIP|RIP)" polling loops complete on
+ * their first status read, and a device reply is already in the
+ * queue when the driver first polls for RBF.  The clock signal
+ * (status bit 0) reads asserted whenever the port is not held in
+ * clock-inhibit (matching an idle device clock line).
+ */
+static PS2State *sgi_mace_ps2(SGIMACEState *s, int port)
+{
+    return port ? PS2_DEVICE(&s->ps2mouse) : PS2_DEVICE(&s->ps2kbd);
+}
+
+static void sgi_mace_ps2_int_update(SGIMACEState *s, int port)
+{
+    bool pending = s->ps2_port[port].irq_level &&
+        (s->ps2_port[port].control & PS2_CTRL_RX_IEN);
+    uint64_t bit = port ? ISA_INT_MOUSE : ISA_INT_KEYBOARD;
+
+    if (pending) {
+        s->isa_int_status |= bit;
+    } else {
+        s->isa_int_status &= ~bit;
+    }
+    trace_sgi_mace_ps2_irq(port, pending ? 1 : 0, s->isa_int_status);
+    sgi_mace_isa_int_update(s);
+}
+
+/*
+ * PS/2 core -> MACE glue: the core raises its output IRQ (GPIO
+ * PS2_DEVICE_IRQ) when its queue goes non-empty, and lowers it once
+ * the queue is drained by rx_buf reads.
+ */
+static void sgi_mace_ps2_irq(void *opaque, int n, int level)
+{
+    SGIMACEState *s = opaque;
+    int port = n;
+
+    s->ps2_port[port].irq_level = level;
+    sgi_mace_ps2_int_update(s, port);
+}
+
+static uint8_t sgi_mace_ps2_status(SGIMACEState *s, int port)
+{
+    PS2State *ps2 = sgi_mace_ps2(s, port);
+    uint8_t status = s->ps2_port[port].tx_pending ? 0 : PS2_STATUS_TBE;
+
+    if (!ps2_queue_empty(ps2)) {
+        status |= PS2_STATUS_RBF;
+    }
+    if (s->ps2_port[port].control & PS2_CTRL_CLKASS) {
+        status |= PS2_STATUS_CLKINH;
+    } else if (s->ps2_port[port].control & PS2_CTRL_CLKINH) {
+        /* clock inhibited (paused): device clock reads de-asserted */
+        status |= PS2_STATUS_CLKINH;
+    } else {
+        status |= PS2_STATUS_CLKSIG;
+    }
+    trace_sgi_mace_ps2_status(port, status);
+    return status;
+}
+
+static uint64_t sgi_mace_ps2_read(SGIMACEState *s, int port, hwaddr reg_off)
+{
+    switch (reg_off) {
+    case MACE_PS2_RX_BUF:
+        /*
+         * Spec TABLE 72: bits 15:8 alias the status register; bits
+         * 7:0 are the received byte.  The drivers mask with 0xff, and
+         * the PROM reads the status separately, so the alias is kept
+         * faithful for any 16-bit-wide consumer.
+         */
+        {
+            uint64_t status = sgi_mace_ps2_status(s, port);
+            if (status & PS2_STATUS_RBF) {
+                uint8_t data = ps2_read_data(sgi_mace_ps2(s, port));
+
+                trace_sgi_mace_ps2_rx(port, data);
+                return (status << 8) | data;
+            }
+            return status << 8;
+        }
+    case MACE_PS2_CONTROL:
+        return s->ps2_port[port].control;
+    case MACE_PS2_STATUS:
+        return sgi_mace_ps2_status(s, port);
+    default:
+        /* tx_buf is write-only; reads return 0 per TABLE 70 */
+        return 0;
+    }
+}
+
+static void sgi_mace_ps2_tx_byte(SGIMACEState *s, int port, uint8_t data)
+{
+    trace_sgi_mace_ps2_tx(port, data);
+    if (port == 0) {
+        ps2_write_keyboard(&s->ps2kbd, data);
+    } else {
+        ps2_write_mouse(&s->ps2mouse, data);
+    }
+}
+
+static void sgi_mace_ps2_write(SGIMACEState *s, int port, hwaddr reg_off,
+                               uint64_t value)
+{
+    switch (reg_off) {
+    case MACE_PS2_TX_BUF:
+        /*
+         * A byte written to the transmit buffer is LATCHED, not
+         * shifted: the real interface starts shifting only when
+         * TxEN is asserted in the control register.  Both drivers
+         * write the data first with control cleared to 0 and then
+         * set TxEN|CLKASS in a separate control write to launch the
+         * transfer (PROM mh_kbd.c outb() steps 3-4; kernel mhpckm.c
+         * outb() likewise).  Latch the byte here; the control
+         * write below performs the shift.
+         */
+        s->ps2_port[port].tx_byte = value & 0xff;
+        s->ps2_port[port].tx_pending = true;
+        break;
+    case MACE_PS2_CONTROL: {
+        uint8_t old = s->ps2_port[port].control;
+        uint8_t ctl = value & PS2_CTRL_IMPLEMENTED;
+
+        /*
+         * Transmission starts on the TxEN rising edge with a byte
+         * latched (the control write after the tx_buf write — see
+         * outb()).  The PS/2 core consumes the byte synchronously
+         * (command/data state machine), so by the time the driver's
+         * next pckm_sendok() polls for TBE the buffer is empty and
+         * any reply is already queued.
+         */
+        if ((ctl & PS2_CTRL_TX_EN) && !(old & PS2_CTRL_TX_EN) &&
+            s->ps2_port[port].tx_pending) {
+            sgi_mace_ps2_tx_byte(s, port, s->ps2_port[port].tx_byte);
+            s->ps2_port[port].tx_pending = false;
+        }
+        s->ps2_port[port].control = ctl;
+        sgi_mace_ps2_int_update(s, port);
+        break;
+    }
+    default:
+        /* rx_buf/status are read-only */
+        break;
+    }
+}
+
+/*
+ * Keyboard/mouse sub-address map (spec §12.1.1 TABLE 93): within the
+ * 0x20000 peripheral-controller slice, PIO A[5] selects the port and
+ * A[4:3] the register; the rest of each 32-byte port slice aliases.
+ * The PROM/kernel drivers use exact 64-bit offsets 0x00/0x08/0x10/0x18.
+ */
+static uint64_t sgi_mace_kbdms_read(SGIMACEState *s, hwaddr km_off)
+{
+    int port = (km_off >> 5) & 1;
+    hwaddr reg_off = km_off & 0x18;
+
+    return sgi_mace_ps2_read(s, port, reg_off);
+}
+
+static void sgi_mace_kbdms_write(SGIMACEState *s, hwaddr km_off,
+                                 uint64_t value)
+{
+    int port = (km_off >> 5) & 1;
+    hwaddr reg_off = km_off & 0x18;
+
+    sgi_mace_ps2_write(s, port, reg_off, value);
 }
 
 /*
@@ -1000,8 +1214,7 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
     /* Keyboard/mouse (0x320000-0x32FFFF) */
     if (offset >= MACE_KBDMS_OFFSET &&
         offset < MACE_KBDMS_OFFSET + 0x10000) {
-        /* kbdinit() probes this region — return 0 for no device */
-        return 0;
+        return sgi_mace_kbdms_read(s, offset - MACE_KBDMS_OFFSET);
     }
 
     /* UST/MSC timer (0x340000-0x34FFFF) */
@@ -1111,7 +1324,7 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
     /* Keyboard/mouse (0x320000-0x32FFFF) */
     if (offset >= MACE_KBDMS_OFFSET &&
         offset < MACE_KBDMS_OFFSET + 0x10000) {
-        /* kbdinit() writes here — accept silently */
+        sgi_mace_kbdms_write(s, offset - MACE_KBDMS_OFFSET, value);
         return;
     }
 
@@ -1231,6 +1444,19 @@ static void sgi_mace_reset(DeviceState *dev)
         timer_del(s->isa_rx_timer);
     }
 
+    /*
+     * PS/2 transport reset (spec TABLE 73/74 reset values: control
+     * all-zero except nothing, status Clken asserted).  The PS/2
+     * core devices reset themselves through the resettable
+     * machinery (BAT state, scancode set 2, queue flush).
+     */
+    for (i = 0; i < 2; i++) {
+        s->ps2_port[i].control = 0;
+        s->ps2_port[i].tx_byte = 0;
+        s->ps2_port[i].tx_pending = false;
+        s->ps2_port[i].irq_level = 0;
+    }
+
     s->pci_error_addr = 0;
     s->pci_error_flags = 0;
     s->pci_control = 0;
@@ -1282,6 +1508,26 @@ static void sgi_mace_realize(DeviceState *dev, Error **errp)
 
     /* Output IRQs to CRIME (16 lines) */
     qdev_init_gpio_out_named(dev, s->crime_irq, "crime-irq", 16);
+
+    /*
+     * PS/2 core devices (hw/input/ps2.c), embedded as children (the
+     * sgi_hpc3.c pattern): the keyboard registers the KEY input
+     * handler (host keys -> make/break scancodes), the mouse the
+     * BTN+REL handler (host pointer -> 3-byte packets).  The MACE
+     * port index rides along on the GPIO line index so one handler
+     * serves both ports.
+     */
+    qdev_init_gpio_in(dev, sgi_mace_ps2_irq, 2);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ps2kbd), errp)) {
+        return;
+    }
+    qdev_connect_gpio_out(DEVICE(&s->ps2kbd), PS2_DEVICE_IRQ,
+                          qdev_get_gpio_in(dev, 0));
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ps2mouse), errp)) {
+        return;
+    }
+    qdev_connect_gpio_out(DEVICE(&s->ps2mouse), PS2_DEVICE_IRQ,
+                          qdev_get_gpio_in(dev, 1));
 
     /* RX DMA engine poll timer (console serial port) */
     s->isa_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_mace_isa_rx_poll, s);
@@ -1347,10 +1593,28 @@ static const Property sgi_mace_properties[] = {
     DEFINE_PROP_CHR("chardev", SGIMACEState, serial),
 };
 
+static bool sgi_mace_ps2_needed(void *opaque)
+{
+    return true;
+}
+
+static const VMStateDescription vmstate_sgi_mace_ps2 = {
+    .name = "sgi-mace/ps2",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sgi_mace_ps2_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(control, MACEPS2PortState),
+        VMSTATE_UINT8(tx_byte, MACEPS2PortState),
+        VMSTATE_BOOL(tx_pending, MACEPS2PortState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_sgi_mace = {
     .name = "sgi-mace",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(isa_ringbase, SGIMACEState),
         VMSTATE_UINT64(isa_flash_nic, SGIMACEState),
@@ -1366,6 +1630,8 @@ static const VMStateDescription vmstate_sgi_mace = {
         VMSTATE_UINT32(pci_config_addr, SGIMACEState),
         VMSTATE_UINT32(pci_rev_info, SGIMACEState),
         VMSTATE_UINT8_ARRAY(pci_int_level, SGIMACEState, MACE_PCI_NUM_INTS),
+        VMSTATE_STRUCT_ARRAY(ps2_port, SGIMACEState, 2, 1,
+                             vmstate_sgi_mace_ps2, MACEPS2PortState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1380,10 +1646,21 @@ static void sgi_mace_class_init(ObjectClass *klass, const void *data)
     device_class_set_props(dc, sgi_mace_properties);
 }
 
+static void sgi_mace_init(Object *obj)
+{
+    SGIMACEState *s = SGI_MACE(obj);
+
+    object_initialize_child(obj, "ps2kbd", &s->ps2kbd,
+                            TYPE_PS2_KBD_DEVICE);
+    object_initialize_child(obj, "ps2mouse", &s->ps2mouse,
+                            TYPE_PS2_MOUSE_DEVICE);
+}
+
 static const TypeInfo sgi_mace_info = {
     .name = TYPE_SGI_MACE,
     .parent = TYPE_PCI_HOST_BRIDGE,
     .instance_size = sizeof(SGIMACEState),
+    .instance_init = sgi_mace_init,
     .class_init = sgi_mace_class_init,
 };
 
