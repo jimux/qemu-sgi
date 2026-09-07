@@ -29,7 +29,7 @@
 #include "migration/vmstate.h"
 
 /* Verbose debug logging - set to 1 to enable */
-#define DEBUG_SGI_CRIME 1
+#define DEBUG_SGI_CRIME 0
 
 #if DEBUG_SGI_CRIME
 #define CRIME_DPRINTF(fmt, ...) \
@@ -260,7 +260,14 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
 
     case CRM_INTMASK:
         CRIME_DPRINTF("write CRM_INTMASK = 0x%" PRIx64 "\n", value);
-        s->intmask = value & 0xffffffffULL;
+        /*
+         * CRM_INTMASK is a 64-bit register as read/written by the kernel
+         * (_crmreg_t, e.g. 0x2800000000): the low 32 bits are the per-source
+         * enable mask, the high 32 bits carry the interrupt delivery level.
+         * Keep the full value so the kernel's readback round-trips; update_irq
+         * only tests the low mask bits against intstat anyway.
+         */
+        s->intmask = value;
         sgi_crime_update_irq(s);
         break;
 
