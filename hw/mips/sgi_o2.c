@@ -986,6 +986,12 @@ static void sgi_o2_init(MachineState *machine) {
   /* MACE at 0x1F000000 */
   mace_dev = qdev_new(TYPE_SGI_MACE);
   /* Don't pass chardev to MACE — serial port 0 is handled by serial_mm below */
+  /*
+   * The MACE's MAC110 ethernet is always physically present on the
+   * O2 motherboard: claim the default -nic/-netdev backend (e.g.
+   * "-nic user" for slirp) for it if one is configured.
+   */
+  qemu_configure_nic_device(mace_dev, true, NULL);
   sysbus_realize_and_unref(SYS_BUS_DEVICE(mace_dev), &error_fatal);
   sysbus_mmio_map(SYS_BUS_DEVICE(mace_dev), 0, O2_MACE_BASE);
 

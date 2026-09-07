@@ -28,6 +28,7 @@
 #include "hw/input/ps2.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
+#include "net/net.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -312,6 +313,129 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEState, SGI_MACE)
 /* Total MACE region size */
 #define MACE_REG_SIZE   0x400000
 
+/* ============================================================
+ * MAC110 fast ethernet (spec §4, TABLE 37..51; kernel sys/if_me.h
+ * struct mac110).  The ethernet registers are 32-bit words at
+ * 64-bit slots inside MACE_ENET_OFFSET (0x280000); per the spec's
+ * big-endian byte lanes the 32-bit registers sit at slot+4 (the
+ * drivers' PIO helpers do 32-bit accesses at the exact offsets
+ * below, derived from struct mac110: __pad + reg pairs).
+ */
+#define MAC_REG_MAC_CONTROL     0x04    /* RW: MAC control (TABLE 38)  */
+#define MAC_REG_INT_STATUS      0x0c    /* W1C: interrupt status       */
+#define MAC_REG_DMA_CONTROL     0x14    /* RW: DMA control (TABLE 40)  */
+#define MAC_REG_TIMER           0x1c    /* RW: RX int delay            */
+#define MAC_REG_TX_ALIAS        0x24    /* WO: TX int enable alias     */
+#define MAC_REG_RX_ALIAS        0x2c    /* WO: RX int enable alias     */
+#define MAC_REG_TX_RING         0x34    /* RW: TX ring r/w ptrs        */
+#define MAC_REG_RX_FIFO_INFO    0x44    /* RO: RX mcl FIFO w/r/d       */
+#define MAC_REG_INT_REQUEST     0x58    /* WO: "generate intr" (diag)   */
+#define MAC_REG_LAST_TX_VECTOR  0x58    /* RO: last TX status vector   */
+#define MAC_REG_PHY_DATAIO      0x64    /* RW: PHY data (busy bit 16)  */
+#define MAC_REG_PHY_ADDRESS     0x6c    /* RW: PHY dev+reg address     */
+#define MAC_REG_PHY_READ_START  0x74    /* WO: initiate PHY read       */
+#define MAC_REG_BACKOFF         0x7c    /* WO: backoff LFSR seed       */
+#define MAC_REG_PHYSADDR        0xa0    /* RW: physical station addr   */
+#define MAC_REG_SECPHYSADDR     0xa8    /* RW: secondary address       */
+#define MAC_REG_MLAF            0xb0    /* RW: multicast filter hash  */
+#define MAC_REG_TX_RING_BASE    0xb8    /* RW: TX ring base [31:13]    */
+#define MAC_REG_RX_FIFO_DATA    0x104   /* RW: RX mcl FIFO data port   */
+#define MAC_REG_RX_FIFO_ALIAS_S 0x104   /* 32 aliases of the data port */
+#define MAC_REG_RX_FIFO_ALIAS_E 0x1f8
+
+/* MAC control bits (TABLE 38; if_me.h MAC_*) */
+#define MAC_CTRL_RESET          0x0001  /* core reset (sticky till 0)   */
+#define MAC_CTRL_REV_SHIFT      29      /* impl revision [31:29], RO   */
+#define MAC_CTRL_REV1           (1u << MAC_CTRL_REV_SHIFT) /* 1st rev */
+
+/* Interrupt status bits (TABLE 39; if_me.h INTR_*) */
+#define MAC_INTR_TX_DMA_REQ     0x01    /* TX ring empty                */
+#define MAC_INTR_TX_PKT_REQ     0x02    /* TX user interrupt request   */
+#define MAC_INTR_TX_LINK_FAIL   0x04
+#define MAC_INTR_TX_MEMORY_ERR  0x08
+#define MAC_INTR_TX_ABORTED     0x10
+#define MAC_INTR_RX_DMA_REQ     0x20    /* RX threshold condition      */
+#define MAC_INTR_RX_UNDERFLOW   0x40    /* mcl FIFO empty, packet lost */
+#define MAC_INTR_RX_OVERFLOW    0x80
+#define MAC_INTR_W1C_MASK       0x000000ffUL
+
+/* DMA control bits (TABLE 40; if_me.h DMA_*) */
+#define DMA_CTRL_TX_INTR_EN     0x0001
+#define DMA_CTRL_TX_DMA_EN      0x0002
+#define DMA_CTRL_TX_RING_MASK   0x000c  /* ring size: 8/16/32/64 KB    */
+#define DMA_CTRL_RX_THRESH_MASK 0x01f0  /* mcl FIFO threshold [8:4]    */
+#define DMA_CTRL_RX_THRESH_SHIFT 4
+#define DMA_CTRL_RX_INTR_EN     0x0200
+#define DMA_CTRL_RX_RUNTS_EN    0x0400
+#define DMA_CTRL_RX_GATHER_EN   0x0800
+#define DMA_CTRL_RX_OFFSET_MASK 0x7000  /* starting dword [14:12]      */
+#define DMA_CTRL_RX_OFFSET_SHIFT 12
+#define DMA_CTRL_RX_DMA_EN      0x8000
+
+/* MDIO (spec §4.2.9 TABLE 47..49) */
+#define MDIO_BUSY               0x10000
+
+/* RX mcl FIFO info register packing (TABLE 45) */
+#define RXFIFO_DEPTH_SHIFT      0
+#define RXFIFO_RPTR_SHIFT       8
+#define RXFIFO_GEN1_SHIFT       12
+#define RXFIFO_WPTR_SHIFT       16
+#define RXFIFO_GEN2_SHIFT        20
+
+/* TX ring geometry: 128-byte descriptors, pointer = entry index */
+#define MAC_TX_DESC_SIZE        128
+#define MAC_TX_RING_ENTRIES     512     /* max (64KB ring)             */
+#define MAC_TX_PTR_MASK         0x1ff
+#define MAC_TX_WPTR_SHIFT       0       /* reg bits [8:0]              */
+#define MAC_TX_RPTR_SHIFT       16      /* reg bits [24:16]            */
+
+/* RX mcl FIFO: 16 entries of 4KB cluster base addresses.  The FIFO
+ * pointers are 5-bit free-running counters (index [3:0] +
+ * generation bit [4]) so empty and full are distinguishable. */
+#define MAC_RX_MCL_ENTRIES      16
+#define MAC_RX_MCL_IDX_MASK     15
+#define MAC_RX_MCL_CNT_MASK     0x1f
+#define MAC_RX_MCL_SIZE         4096
+
+/* TX command header (spec §4.4.2) */
+#define TX_CMD_LENGTH_MASK      0x00007fffULL  /* length-1             */
+#define TX_CMD_OFFSET_MASK      0x007f0000ULL  /* ring data start byte */
+#define TX_CMD_OFFSET_SHIFT     16
+#define TX_CMD_TERM_DMA         0x00800000ULL
+#define TX_CMD_SENT_INT_EN      0x01000000ULL
+#define TX_CMD_CONCAT_SHIFT     25    /* bits 27:25: concat ptr valid  */
+
+/* TX status vector (spec §4.4.4) */
+#define TX_VEC_COMPLETED        0x00800000ULL
+#define TX_VEC_FINISHED          0x8000000000000000ULL
+
+/* RX status vector (spec §4.5.5, TABLE 51; if_me.h RX_VEC_*) */
+#define RX_VEC_LENGTH_MASK      0x0000000000007fffULL  /* total length  */
+#define RX_VEC_MULTICAST        0x0000000000080000ULL
+#define RX_VEC_BROADCAST        0x0000000000100000ULL
+#define RX_VEC_BAD_PACKET       0x0000000000800000ULL
+#define RX_VEC_MULTICAST_MATCH  0x0000000002000000ULL
+#define RX_VEC_PHYSICAL_MATCH   0x0000000004000000ULL
+#define RX_VEC_SEQNUM_SHIFT     27
+#define RX_VEC_CKSUM_SHIFT      32
+#define RX_VALID_PACKET         0x8000000000000000ULL  /* bit 63: valid */
+
+#define MAC_MAX_FRAME           1600   /* 1518 + margin                */
+#define MAC_RX_MBUF_SIZE        2048   /* driver reads this many bytes  */
+
+/*
+ * PHY identity: the IRIX driver probe (if_me.c mace_ether_mdio_probe)
+ * accepts QS6612 / ICS1889 / ICS1890 / National DP83840.  The O2
+ * shipped a National DP83840-class PHY (master.d/if_me carries the
+ * DP83840 rev-0 "link disconnect" errata workaround — the part SGI
+ * expected in the field); model that at MDIO device address 1.
+ *   reg 2 = 0x2000 (National OUI MSB), reg 3 = 0x5C0n
+ *   -> identity (p2<<12)|(p3>>4) = 0x20005C0 = PHY_DP83840.
+ */
+#define MAC_PHY_ADDR            1
+#define MAC_PHY_REG2_OUI        0x2000
+#define MAC_PHY_REG3_ID         0x5c01  /* model 0x5c0, rev 1           */
+
 /* Number of serial ports */
 #define MACE_NUM_SERIAL 2
 
@@ -415,6 +539,44 @@ struct SGIMACEState {
      * 128 registers: 0-13 = time/status, 14-127 = NVRAM/extended.
      */
     uint8_t rtc_regs[128];
+
+    /*
+     * MAC110 fast ethernet (spec §4).  Register window at
+     * MACE_ENET_OFFSET (0x280000), interrupt straight to CRIME bit 3
+     * (MACE_ETHERNET, kernel sys/mace.h; the ethernet does NOT fan
+     * through the ISA_INT map).
+     */
+    NICState *nic;                 /* QEMU net frontend (slirp &c)     */
+    NICConf nic_conf;              /* macaddr + netdev link            */
+    bool nic_present;              /* a NIC backend was instantiated   */
+    QEMUTimer *ec_rx_timer;        /* wire-delay RX delivery timer     */
+    uint8_t ec_rx_pending[MAC_MAX_FRAME];
+    int ec_rx_pending_len;        /* -1 = no packet pending            */
+
+    uint32_t ec_mac_control;       /* MAC_CONTROL + RO rev bits        */
+    bool ec_force_off;              /* 0x58 write parked the CRIME line */
+    uint32_t ec_int_status;        /* latched interrupt events         */
+    uint32_t ec_dma_control;       /* DMA_CONTROL                      */
+    uint32_t ec_timer;             /* interrupt delay ticks            */
+    uint32_t ec_tx_ring;           /* TX ring rptr[24:16]/wptr[8:0]    */
+    uint64_t ec_tx_ring_base;      /* TX ring base in guest RAM        */
+
+    /*
+     * TX ring [31:13] base is programmed by the driver; entries are
+     * 128-byte descriptors fetched over DMA.
+     */
+    uint32_t ec_rx_fifo[MAC_RX_MCL_ENTRIES];  /* mcl cluster addrs     */
+    uint32_t ec_rx_wptr;            /* mcl FIFO write index             */
+    uint32_t ec_rx_rptr;            /* mcl FIFO read index (hw pops)    */
+    uint32_t ec_rx_seq;             /* RX packet sequence stamp         */
+
+    uint16_t ec_phy_reg[32];        /* emulated DP83840 PHY registers   */
+    uint32_t ec_phy_addr;           /* latched MDIO dev+reg address     */
+    bool ec_phy_busy;               /* MDIO transfer in progress        */
+    uint64_t ec_physaddr;           /* physical station address (BE)   */
+    uint64_t ec_secphysaddr;        /* secondary station address        */
+    uint64_t ec_mlaf;               /* multicast hash filter            */
+    uint64_t ec_last_tx_vector;     /* last TX status vector (diag)     */
 
     /*
      * PCI host bridge (permanent, real): a QEMU PCI root bus plus the

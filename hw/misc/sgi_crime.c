@@ -28,6 +28,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
+#include "trace.h"
 
 /* Verbose debug logging - set to 1 to enable */
 #define DEBUG_SGI_CRIME 0
@@ -646,6 +647,7 @@ static void sgi_crime_set_irq(void *opaque, int irq, int level)
 
     assert(irq >= 0 && irq < CRM_NUM_IRQS);
 
+    trace_sgi_crime_irq(irq, level, s->intstat, s->intmask);
     if (level) {
         s->intstat |= (1ULL << irq);
     } else {

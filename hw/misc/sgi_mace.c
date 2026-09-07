@@ -504,6 +504,865 @@ static void sgi_mace_kbdms_write(SGIMACEState *s, hwaddr km_off,
 
 /*
  * ============================================================
+ *              MAC110 fast ethernet (spec §4)
+ *
+ * The ethernet interface is the LSI Cascade-110 MAC core plus DMA
+ * channels inside the MACE (spec §4, "Fast Ethernet Interface"), at
+ * MACE_ENET_OFFSET (0x280000, kernel MACE_ETHER_ADDRESS 0xBF280000).
+ * The IRIX driver is kern/bsd/mips/if_me.c ("ec0") + sys/if_me.h —
+ * the driver contract:
+ *
+ *  - attach (if_meedtinit): resets the MAC, reads the revision from
+ *    MAC_CONTROL bits 31:29 (must be 1: "first revision with improved
+ *    transmit concatenation" — rev 0 forces the driver down the
+ *    MACE1.0 100Mb-forced path), registers the CRIME vector
+ *    MACE_INTR(MACE_ETHERNET) = 3, and parks a 128-entry TX ring in
+ *    contig memory.
+ *  - PHY probe (mace_ether_mdio_probe): for each of the 32 MDIO
+ *    addresses, reads PHY regs 2/3 and accepts the identity
+ *    (p2<<12)|(p3>>4) if it matches QS6612/ICS1889/ICS1890/DP83840.
+ *    Then (rev!=0) writes MII_R0_AUTOEN and reads reg 1 once to
+ *    discard latched status; the watchdog later polls reg 1
+ *    (LINKSTAT must be 1) and reads 4/5 for ANLPAR.
+ *  - hardware init (mace_hdwrether_init): reset+0 the MAC, set
+ *    mode, program TX_RING_BASE, push 16 mcl cluster addresses
+ *    into the RX FIFO, set the timer, then DMA_CONTROL =
+ *    TX_DMA_EN | TX_16K | RX_DMA_EN | RX_INTR_EN | (off<<12) |
+ *    (16<<4).  off = (sizeof(etherbufhead)-14)/8 = 4 dwords = 32
+ *    bytes, so packets land at mcl+34 (status vector at +0, 2 bytes
+ *    padding, ethernet header at +32+2).
+ *  - TX (mace_ether_output): builds a 128-byte descriptor (cmd
+ *    header + up to 3 concat pointers), then pokes the TX ring
+ *    write pointer (16-bit write at 0x36).  Hardware advances the
+ *    read pointer (0x34) as descriptors complete, writing the
+ *    status vector into descriptor word 0 (bit 63 = finished).
+ *  - RX (mace_ether_intr -> mace_ether_receive): reads the 64-bit
+ *    dispatch register at 0x08 (must return {0, status} where the
+ *    word packs isf[7:0] + rx-mcl-rptr[12:8] + tx-rptr[24:16] +
+ *    rx-seqnum[29:25]); while non-zero, reclaims TX, processes
+ *    received clusters (rxrptr from the dispatch register), and
+ *    clears interrupt bits with 32-bit write-1-to-clear at 0x0C.
+ *    A processed cluster holds {cksum, stats} at its first two
+ *    words: stats[15:0] = total packet length, bit 63 of the first
+ *    word = RX_VALID_PACKET.  The driver then refills the FIFO by
+ *    writing a new cluster address to the FIFO data port (0x104+,
+ *    32 aliases), each write followed by a "pioflush" (write+write
+ *    +read of 0x304018).
+ *
+ * Virtualization: no wire timing, collisions, or IPG — the MDIO
+ * register file is a static DP83840 image with link always up, the
+ * TX DMA drains descriptors synchronously on write-pointer poke
+ * (status vectors land before the driver next polls), and RX
+ * packets are delivered as they arrive from the net backend into
+ * the next queued mcl cluster, raising INTR_RX_DMA_REQ
+ * (threshold-exceeded semantics: FIFO count != programmed
+ * threshold) straight to CRIME bit 3.
+ */
+
+/* Re-evaluate the ethernet interrupt output to CRIME bit 3. */
+static void sgi_mace_ec_irq_update(SGIMACEState *s)
+{
+    int level = !!(s->ec_int_status & 0xff) && !s->ec_force_off;
+
+    qemu_set_irq(s->crime_irq[3], level);
+    trace_sgi_mace_ec_irq(s->ec_int_status, level);
+}
+
+static void sgi_mace_ec_int_raise(SGIMACEState *s, uint32_t bits)
+{
+    s->ec_int_status |= bits & 0xff;
+    sgi_mace_ec_irq_update(s);
+}
+
+/* Current TX ring geometry from the DMA control register. */
+static int sgi_mace_ec_tx_entries(SGIMACEState *s)
+{
+    switch (s->ec_dma_control & DMA_CTRL_TX_RING_MASK) {
+    case 0x0: return 8 * 1024 / MAC_TX_DESC_SIZE;    /* 8K ring:  64  */
+    case 0x4: return 16 * 1024 / MAC_TX_DESC_SIZE;   /* 16K ring: 128 */
+    case 0x8: return 32 * 1024 / MAC_TX_DESC_SIZE;   /* 32K ring: 256 */
+    default:  return 64 * 1024 / MAC_TX_DESC_SIZE;    /* 64K ring: 512 */
+    }
+}
+
+static inline uint32_t sgi_mace_ec_tx_rptr(SGIMACEState *s)
+{
+    return (s->ec_tx_ring >> MAC_TX_RPTR_SHIFT) & MAC_TX_PTR_MASK;
+}
+
+static inline uint32_t sgi_mace_ec_tx_wptr(SGIMACEState *s)
+{
+    return s->ec_tx_ring & MAC_TX_PTR_MASK;
+}
+
+static inline void sgi_mace_ec_set_tx_rptr(SGIMACEState *s, uint32_t rptr)
+{
+    s->ec_tx_ring = (s->ec_tx_ring & ~(MAC_TX_PTR_MASK << MAC_TX_RPTR_SHIFT))
+                  | ((rptr & MAC_TX_PTR_MASK) << MAC_TX_RPTR_SHIFT);
+}
+
+static inline uint32_t sgi_mace_ec_rx_count(SGIMACEState *s)
+{
+    return (s->ec_rx_wptr - s->ec_rx_rptr) & MAC_RX_MCL_CNT_MASK;
+}
+
+/*
+ * RX threshold condition (spec TABLE 40 bits 9,8:4): the interrupt
+ * output follows !(Threshold != FIFO Count) — the RX interrupt is
+ * asserted whenever the live FIFO count differs from the programmed
+ * threshold.  The IRIX driver sets threshold=16 (fill the whole
+ * FIFO), so any used cluster raises the interrupt until all are
+ * replaced.
+ */
+static bool sgi_mace_ec_rx_threshold(SGIMACEState *s)
+{
+    unsigned thr = (s->ec_dma_control & DMA_CTRL_RX_THRESH_MASK)
+                   >> DMA_CTRL_RX_THRESH_SHIFT;
+
+    if (!(s->ec_dma_control & DMA_CTRL_RX_DMA_EN) ||
+        !(s->ec_dma_control & DMA_CTRL_RX_INTR_EN)) {
+        return false;
+    }
+    return sgi_mace_ec_rx_count(s) != thr;
+}
+
+/* Recompute the RX threshold interrupt after FIFO/enable changes. */
+static void sgi_mace_ec_rx_int_update(SGIMACEState *s)
+{
+    if (sgi_mace_ec_rx_threshold(s)) {
+        s->ec_int_status |= MAC_INTR_RX_DMA_REQ;
+    } else {
+        s->ec_int_status &= ~MAC_INTR_RX_DMA_REQ;
+    }
+    sgi_mace_ec_irq_update(s);
+}
+
+static ssize_t sgi_mace_ec_rx_deliver(SGIMACEState *s, const uint8_t *buf,
+                                      size_t size);
+static void sgi_mace_ec_rx_timer_cb(void *opaque);
+
+/*
+ * The physical station address register holds the 48-bit MAC in
+ * bits 47:0 of the 64-bit slot (the driver bcopy's its eaddr[] into
+ * bytes 2..7 of the union before the 64-bit write).  Extract it in
+ * wire order (byte 0 = first on the wire) for the RX filter.
+ */
+static void sgi_mace_ec_get_mac(SGIMACEState *s, uint8_t mac[6])
+{
+    uint64_t v = s->ec_physaddr;
+    int i;
+
+    for (i = 0; i < 6; i++) {
+        mac[i] = extract64(v, (5 - i) * 8, 8);
+    }
+}
+
+/*
+ * Ethernet CRC for the multicast hash (spec §4.3.3.1 — non-reflected
+ * CRC-32, top 6 bits used as hash index) and the RX status vector's
+ * IP checksum (§4.5.3 — 16-bit one's-complement wrap-around sum of
+ * all packet bytes).
+ */
+static uint32_t sgi_mace_ec_laf_hash(const uint8_t *addr)
+{
+    uint32_t crc = 0xffffffff;
+    int i, b;
+
+    for (i = 0; i < 6; i++) {
+        uint8_t byte = addr[i];
+        for (b = 0; b < 8; b++) {
+            uint32_t msb = crc >> 31;
+
+            crc <<= 1;
+            if (msb ^ (byte & 1)) {
+                crc ^= 0x04c11db6;
+                crc |= 1;
+            }
+            byte >>= 1;
+        }
+    }
+    return crc >> 26;
+}
+
+static uint32_t sgi_mace_ec_ip_cksum(const uint8_t *buf, int len)
+{
+    uint32_t sum = 0;
+    int i;
+
+    for (i = 0; i + 1 < len; i += 2) {
+        sum += (buf[i] << 8) | buf[i + 1];
+    }
+    if (len & 1) {
+        sum += buf[len - 1] << 8;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    return (~sum) & 0xffff;
+}
+
+/*
+ * Net-backend receive: stash the frame and deliver it after a short
+ * virtual-time wire delay (below).  Real wire latency means a reply
+ * never lands in the same guest PIO window as the transmit that
+ * provoked it; delivering synchronously (inside the guest's TX-ring
+ * write, which is where the net backend replies run) drops the
+ * follow-on interrupt work on the floor while the kernel network
+ * thread still holds the socket locks it needs — observed as the
+ * IRIX raw-socket layer discarding the reply between m_copy and
+ * sbappendaddr.
+ */
+static ssize_t sgi_mace_ec_receive(NetClientState *nc, const uint8_t *buf,
+                                   size_t size)
+{
+    SGIMACEState *s = qemu_get_nic_opaque(nc);
+
+    if (size < 14 || size > MAC_MAX_FRAME) {
+        return size;
+    }
+    if (s->ec_rx_pending_len >= 0) {
+        /* one pending frame: overwrite (last arrival wins) */
+    }
+    memcpy(s->ec_rx_pending, buf, size);
+    s->ec_rx_pending_len = size;
+    timer_mod_ns(s->ec_rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                 + 200000);   /* 200us wire delay */
+    return size;
+}
+
+static void sgi_mace_ec_rx_timer_cb(void *opaque)
+{
+    SGIMACEState *s = opaque;
+
+    if (s->ec_rx_pending_len >= 0) {
+        uint8_t pkt[MAC_MAX_FRAME];
+        int len = s->ec_rx_pending_len;
+
+        memcpy(pkt, s->ec_rx_pending, len);
+        s->ec_rx_pending_len = -1;
+        sgi_mace_ec_rx_deliver(s, pkt, len);
+    }
+}
+
+/*
+ * Pass one received packet from the net backend into the next queued
+ * mcl cluster (see the driver-contract block comment above): 64-bit
+ * status vector at cluster+0, the ethernet frame at cluster +
+ * off*8 + 2 (off = the DMA-control RX starting offset).
+ */
+static ssize_t sgi_mace_ec_rx_deliver(SGIMACEState *s, const uint8_t *buf,
+                                      size_t size)
+{
+    uint32_t off = (s->ec_dma_control & DMA_CTRL_RX_OFFSET_MASK)
+                   >> DMA_CTRL_RX_OFFSET_SHIFT;
+    uint32_t mcl, dest;
+    uint8_t frame[MAC_MAX_FRAME + 8];
+    uint64_t vector;
+    uint32_t stats, cksum, hashbit, filter_mode;
+    int frame_off, i, fill;
+    bool is_broadcast = true, is_multicast = (buf[0] & 1) != 0;
+
+    if (size < 14 || size > MAC_MAX_FRAME) {
+        return size;
+    }
+    if (!(s->ec_dma_control & DMA_CTRL_RX_DMA_EN) ||
+        (s->ec_mac_control & MAC_CTRL_RESET)) {
+        return 0;
+    }
+
+    /* Destination-address filter (spec §4.3 + MAC_CONTROL bits 6:5) */
+    filter_mode = (s->ec_mac_control >> 5) & 3;
+    {
+        uint8_t mac[6];
+        bool accept = false;
+
+        sgi_mace_ec_get_mac(s, mac);
+        for (i = 0; i < 6; i++) {
+            if (buf[i] != 0xff) {
+                is_broadcast = false;
+            }
+        }
+        /* Physical match: station address vs wire-order bytes */
+        if (memcmp(buf, mac, 6) == 0) {
+            accept = true;
+        } else if (filter_mode >= 1 && is_broadcast) {
+            accept = true;
+        } else if (filter_mode == 1 && is_multicast) {
+            hashbit = sgi_mace_ec_laf_hash(buf);
+            if (s->ec_mlaf & (1ULL << (hashbit & 0x3f))) {
+                accept = true;
+            }
+        } else if (filter_mode == 2 && is_multicast) {
+            accept = true;
+        }
+        if (filter_mode != 3 && !accept) {
+            trace_sgi_mace_ec_rx_drop(0);
+            return size;
+        }
+    }
+
+    if (sgi_mace_ec_rx_count(s) == 0) {
+        /* No free cluster: FIFO underflow event, packet dropped. */
+        sgi_mace_ec_int_raise(s, MAC_INTR_RX_UNDERFLOW);
+        trace_sgi_mace_ec_rx_drop(1);
+        return size;
+    }
+
+    /*
+     * Build the packet image at its final mcl-relative offset:
+     * 2 bytes of padding after the software header area (spec
+     * §4.5.2), frame padded to the 60-byte wire minimum (the MAC
+     * pads on TX, so a short frame arrives as 60 bytes + 4 FCS).
+     * The status-vector length must report the padded length + 4
+     * (FCS) — the IRIX driver flags anything shorter than 64
+     * (ETHERMINLEN) as RX_VEC_BAD_PACKET and snoop swallows it.
+     */
+    frame_off = off * 8 + 2;
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame + frame_off, buf, size);
+    fill = 60 - (int)size;
+    if (fill > 0) {
+        memset(frame + frame_off + size, 0, fill);
+        size += fill;
+    }
+    /* 4 trailing FCS bytes (zeros) for the length the vector claims */
+    size += 4;
+
+    stats = size & RX_VEC_LENGTH_MASK;
+    if (is_multicast) {
+        if (is_broadcast) {
+            stats |= RX_VEC_BROADCAST;
+        } else {
+            stats |= RX_VEC_MULTICAST;
+            if (s->ec_mlaf & (1ULL << (sgi_mace_ec_laf_hash(buf) & 0x3f))) {
+                stats |= RX_VEC_MULTICAST_MATCH;
+            }
+        }
+    }
+    {
+        uint8_t mac[6];
+
+        sgi_mace_ec_get_mac(s, mac);
+        if (memcmp(buf, mac, 6) == 0) {
+            stats |= RX_VEC_PHYSICAL_MATCH;
+        }
+    }
+    stats |= (s->ec_rx_seq << RX_VEC_SEQNUM_SHIFT);
+    s->ec_rx_seq = (s->ec_rx_seq + 1) & 0x1f;
+    cksum = sgi_mace_ec_ip_cksum(frame + frame_off, size);
+    vector = ((uint64_t)cksum << RX_VEC_CKSUM_SHIFT) | stats
+           | RX_VALID_PACKET;
+
+    mcl = s->ec_rx_fifo[s->ec_rx_rptr & MAC_RX_MCL_IDX_MASK];
+    dest = mcl & ~(MAC_RX_MCL_SIZE - 1);
+    {
+        uint8_t vecbuf[8];
+
+        stq_be_p(vecbuf, vector);
+        if (dma_memory_write(&address_space_memory, dest, vecbuf, 8,
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+            dma_memory_write(&address_space_memory, dest + frame_off,
+                             frame + frame_off, size,
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            trace_sgi_mace_ec_rx_drop(2);
+            return size;
+        }
+    }
+
+    /* Pop the cluster: hardware RX FIFO read pointer advances. */
+    s->ec_rx_rptr = (s->ec_rx_rptr + 1) & MAC_RX_MCL_CNT_MASK;
+    trace_sgi_mace_ec_rx_packet(dest, size, 0, s->ec_rx_rptr);
+    trace_sgi_mace_ec_frame(0, ldl_be_p(frame + frame_off),
+                            ldl_be_p(frame + frame_off + 4),
+                            ldl_be_p(frame + frame_off + 8),
+                            ldl_be_p(frame + frame_off + 12),
+                            vector, size);
+    sgi_mace_ec_rx_int_update(s);
+    return size;
+}
+
+static bool sgi_mace_ec_can_receive(NetClientState *nc)
+{
+    SGIMACEState *s = qemu_get_nic_opaque(nc);
+
+    return s->nic_present && (s->ec_dma_control & DMA_CTRL_RX_DMA_EN)
+           && !(s->ec_mac_control & MAC_CTRL_RESET);
+}
+
+static NetClientInfo net_sgi_mace_ec_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = sgi_mace_ec_can_receive,
+    .receive = sgi_mace_ec_receive,
+};
+
+/*
+ * TX DMA engine: drain descriptors from the TX ring (base +
+ * rptr*128) up to the software write pointer.  Each 128-byte
+ * descriptor: word 0 = cmd header (see the block comment), words
+ * 1..3 = optional concat pointers (address [31:3], len-1 [47:32]),
+ * bytes from the ring data area hold the packet TAIL back-filled so
+ * it ends at offset 128-start on an 8-byte boundary.  Hardware
+ * overwrites word 0 with the status vector (bit 63 set) once the
+ * packet has been sent.
+ */
+static void sgi_mace_ec_tx_drain(SGIMACEState *s)
+{
+    int entries = sgi_mace_ec_tx_entries(s);
+    hwaddr base = s->ec_tx_ring_base & ~0x1fffULL;
+    uint8_t pkt[MAC_TX_DESC_SIZE + MAC_MAX_FRAME];
+    uint32_t ring_mask = entries - 1;
+    uint32_t wptr, rptr;
+    NetClientState *nc;
+
+    if (!(s->ec_dma_control & DMA_CTRL_TX_DMA_EN) ||
+        (s->ec_mac_control & MAC_CTRL_RESET)) {
+        return;
+    }
+    wptr = sgi_mace_ec_tx_wptr(s) & ring_mask;
+    rptr = sgi_mace_ec_tx_rptr(s) & ring_mask;
+
+    while (rptr != wptr) {
+        uint8_t desc[MAC_TX_DESC_SIZE];
+        hwaddr a = base + (hwaddr)rptr * MAC_TX_DESC_SIZE;
+        uint64_t cmd, cptr, vector;
+        uint32_t tlen, doff, cats, clen, status;
+        int plen = 0, local, c;
+
+        if (dma_memory_read(&address_space_memory, a, desc,
+                            sizeof(desc), MEMTXATTRS_UNSPECIFIED)
+                != MEMTX_OK) {
+            return;
+        }
+        cmd = ldq_be_p(desc);
+        tlen = (cmd & TX_CMD_LENGTH_MASK) + 1;         /* packet length */
+        doff = (cmd & TX_CMD_OFFSET_MASK) >> TX_CMD_OFFSET_SHIFT;
+        cats = (cmd >> TX_CMD_CONCAT_SHIFT) & 7;
+
+        trace_sgi_mace_ec_tx_desc(rptr, cmd, tlen);
+
+        /*
+         * Dead / consumed descriptors (the driver marks reclaimed
+         * slots with DEADPACKET 0x7E0001, and boot-time ring memory
+         * reads back zero) carry no command.  Real hardware never
+         * fetches them (the ring between the hardware pointers only
+         * holds queued packets); skip rather than send garbage if a
+         * resync race ever leaves one in range.
+         */
+        if (cmd == 0x7e0001ULL || (cmd & ~TX_CMD_OFFSET_MASK) == 0) {
+            rptr = (rptr + 1) & ring_mask;
+            continue;
+        }
+
+        /* Concatenation buffers first (header part of the packet) */
+        for (c = 0; c < 3 && c < (int)cats; c++) {
+            cptr = ldq_be_p(desc + 8 * (c + 1));
+            clen = ((cptr >> 32) & 0xffff) + 1;
+            if (plen + (int)clen > MAC_MAX_FRAME) {
+                clen = MAC_MAX_FRAME - plen;
+            }
+            trace_sgi_mace_ec_tx_concat(c, (uint32_t)(cptr & ~7ULL), clen);
+            if (dma_memory_read(&address_space_memory, cptr & ~7ULL,
+                                pkt + plen, clen,
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return;
+            }
+            plen += clen;
+        }
+        /* Then the ring data area (the packet's tail bytes) */
+        if (doff >= 8 && doff <= 120) {
+            local = MAC_TX_DESC_SIZE - doff;
+            if (plen + local > MAC_MAX_FRAME) {
+                local = MAC_MAX_FRAME - plen;
+            }
+            memcpy(pkt + plen, desc + doff, local);
+            plen += local;
+        }
+
+        if (s->nic_present) {
+            nc = qemu_get_queue(s->nic);
+            /*
+             * Pad short frames to the 64-byte ethernet minimum
+             * (MAC110 "automatic transmit padding", spec §4): the
+             * packet on the wire is 60 bytes + 4 FCS.
+             */
+            if (plen < 60) {
+                memset(pkt + plen, 0, 60 - plen);
+                plen = 60;
+            }
+            qemu_send_packet(nc, pkt, plen);
+        }
+        trace_sgi_mace_ec_tx_packet(plen);
+        trace_sgi_mace_ec_frame(1, ldl_be_p(pkt), ldl_be_p(pkt + 4),
+                                ldl_be_p(pkt + 8), ldl_be_p(pkt + 12),
+                                cmd, plen);
+
+        /* Status vector overwrites the command header (spec §4.4.4) */
+        status = TX_VEC_COMPLETED | (plen & 0x7fff);
+        vector = TX_VEC_FINISHED | status;
+        s->ec_last_tx_vector = vector;
+        stq_be_p(desc, vector);
+        if (dma_memory_write(&address_space_memory, a, desc, 8,
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            return;
+        }
+
+        if (cmd & TX_CMD_SENT_INT_EN) {
+            sgi_mace_ec_int_raise(s, MAC_INTR_TX_PKT_REQ);
+        }
+        rptr = (rptr + 1) & ring_mask;
+    }
+
+    sgi_mace_ec_set_tx_rptr(s, rptr);
+
+    /*
+     * "TX ring empty" interrupt (DMA_CONTROL bit 0): raised whenever
+     * the drained ring is empty and the TX interrupt enable is on.
+     */
+    if ((s->ec_dma_control & DMA_CTRL_TX_INTR_EN) && rptr == wptr) {
+        s->ec_int_status |= MAC_INTR_TX_DMA_REQ;
+    }
+    sgi_mace_ec_irq_update(s);
+}
+
+/* Build the 64-bit interrupt dispatch value (the isr.lsr read). */
+static uint64_t sgi_mace_ec_dispatch(SGIMACEState *s)
+{
+    uint64_t v = 0;
+
+    /*
+     * While the 0x58 force-off is parked (driver reset window),
+     * report no pending interrupt flags — the pointer fields stay
+     * live.  A spinning ISR ithread polls this register; without
+     * the mask it would never observe the force-off.
+     */
+    v |= s->ec_force_off ? 0 : (s->ec_int_status & 0xff);
+    v |= ((uint64_t)(s->ec_rx_rptr & 0x1f) << 8);
+    v |= ((uint64_t)(sgi_mace_ec_tx_rptr(s) & 0x1ff) << 16);
+    v |= ((uint64_t)s->ec_rx_seq << 25);
+    return v;
+}
+
+/* Reset the PHY register file to the DP83840 link-up image. */
+static void sgi_mace_ec_phy_reset(SGIMACEState *s)
+{
+    memset(s->ec_phy_reg, 0, sizeof(s->ec_phy_reg));
+
+    /* reg 0 control: all zero (auto-neg enabled after reset) */
+    s->ec_phy_reg[1] = 0x7c2d;  /* 100T4/100TX-FD/HD/10T-FD/HD able,
+                                 * auto-neg done, link up, AN able,
+                                 * extended caps */
+    s->ec_phy_reg[2] = MAC_PHY_REG2_OUI;
+    s->ec_phy_reg[3] = MAC_PHY_REG3_ID;
+    s->ec_phy_reg[4] = 0x01e1;  /* advertise 100TX-FD/HD + 10T-FD/HD,
+                                 * selector 802.3 */
+    s->ec_phy_reg[5] = 0x01e1;  /* partner: same (ideal link) */
+    s->ec_phy_reg[6] = 0x0005;  /* NP able, page received, partner NWable */
+}
+
+/*
+ * Ethernet register window read (offset relative to MACE_ENET_OFFSET,
+ * spec TABLE 37).  64-bit slots; the 32-bit registers live in the
+ * high lane (slot+4) per the drivers' struct mac110 layout.
+ */
+static uint64_t sgi_mace_ec_read(SGIMACEState *s, hwaddr ec_off,
+                                 unsigned size)
+{
+    switch (ec_off) {
+    case MAC_REG_MAC_CONTROL:
+        /* implementation revision [31:29] = 1: "first revision with
+         * improved transmit concatenation support" — the driver keys
+         * its PHY autonegotiation path off this being non-zero. */
+        return s->ec_mac_control | MAC_CTRL_REV1;
+    case MAC_REG_INT_STATUS:
+        /* 32-bit alias of the low interrupt-status word */
+        return s->ec_int_status;
+    case 0x08:
+        /* 64-bit interrupt dispatch (isr.lsr): {0, packed status} */
+        return sgi_mace_ec_dispatch(s);
+    case MAC_REG_DMA_CONTROL:
+        return s->ec_dma_control;
+    case MAC_REG_TIMER:
+        return s->ec_timer;
+    case MAC_REG_TX_RING:
+    case MAC_REG_TX_RING + 8:
+        return s->ec_tx_ring;
+    case MAC_REG_RX_FIFO_INFO:
+    case MAC_REG_RX_FIFO_INFO + 8:
+    case MAC_REG_RX_FIFO_INFO + 16:
+        /*
+         * mcl FIFO write/read pointers + depth (TABLE 45).  The
+         * pointer fields carry the 4-bit index in [19:16]/[11:8]
+         * with a generation bit at [20]/[12]; the driver reads only
+         * the depth (bits [4:0]) via the dispatch register's rptr
+         * alias, so the generation bits are kept simple.
+         */
+        return (((s->ec_rx_wptr & 0x1f) >> 4) << RXFIFO_GEN2_SHIFT)
+             | ((s->ec_rx_wptr & 0xf) << RXFIFO_WPTR_SHIFT)
+             | (((s->ec_rx_rptr & 0x1f) >> 4) << RXFIFO_GEN1_SHIFT)
+             | ((s->ec_rx_rptr & 0xf) << RXFIFO_RPTR_SHIFT)
+             | (sgi_mace_ec_rx_count(s) << RXFIFO_DEPTH_SHIFT);
+    /*
+     * Byte/16-bit reads of the rx_info bytes (sys/if_me.h struct
+     * mac110: rx_info.u.bd at slot 0x44 — wptr byte 0x45, rptr
+     * byte 0x46, depth byte 0x47).  mace_ether_watchdog reads the
+     * FIFO rptr with an 8-bit access at 0x46.
+     */
+    case 0x45:
+        return s->ec_rx_wptr & 0xf;
+    case 0x46:
+        return s->ec_rx_rptr & 0x1f;
+    case 0x47:
+        return sgi_mace_ec_rx_count(s);
+    case MAC_REG_LAST_TX_VECTOR:
+        /* 64-bit read of the diagnostic last-TX-vector slot */
+        return s->ec_last_tx_vector;
+    case MAC_REG_PHY_DATAIO:
+        /* busy always clear (transfers complete instantly); data
+         * holds the last-read/written register of the addressed PHY
+         * — only MDIO device 1 carries a real register file. */
+        return ((s->ec_phy_addr >> 5) == MAC_PHY_ADDR)
+             ? s->ec_phy_reg[s->ec_phy_addr & 0x1f] : 0;
+    case MAC_REG_PHY_ADDRESS:
+        return s->ec_phy_addr;
+    /*
+     * The 64-bit DP-RAM registers (spec TABLE 37): 32-bit accesses
+     * at +0 address the HIGH half (BE lane), +4 the low half.
+     */
+    case MAC_REG_PHYSADDR:
+    case MAC_REG_PHYSADDR + 4:
+        if (size == 8) {
+            return s->ec_physaddr;
+        }
+        return (ec_off & 4) ? (s->ec_physaddr & 0xffffffffULL)
+                            : (s->ec_physaddr >> 32);
+    case MAC_REG_SECPHYSADDR:
+    case MAC_REG_SECPHYSADDR + 4:
+        if (size == 8) {
+            return s->ec_secphysaddr;
+        }
+        return (ec_off & 4) ? (s->ec_secphysaddr & 0xffffffffULL)
+                            : (s->ec_secphysaddr >> 32);
+    case MAC_REG_MLAF:
+    case MAC_REG_MLAF + 4:
+        if (size == 8) {
+            return s->ec_mlaf;
+        }
+        return (ec_off & 4) ? (s->ec_mlaf & 0xffffffffULL)
+                            : (s->ec_mlaf >> 32);
+    case MAC_REG_TX_RING_BASE:
+    case MAC_REG_TX_RING_BASE + 4:
+        if (size == 8) {
+            return s->ec_tx_ring_base;
+        }
+        return (ec_off & 4) ? (s->ec_tx_ring_base & 0xffffffffULL)
+                            : (s->ec_tx_ring_base >> 32);
+    default:
+        /* diagnostic TX descriptors / msgqueue: read as 0 */
+        return 0;
+    }
+}
+
+static void sgi_mace_ec_write(SGIMACEState *s, hwaddr ec_off,
+                              uint64_t value, unsigned size)
+{
+    trace_sgi_mace_ec_reg(1, ec_off, (uint32_t)value);
+
+    switch (ec_off) {
+    case MAC_REG_MAC_CONTROL:
+        if (value & MAC_CTRL_RESET) {
+            /*
+             * Core reset (spec TABLE 38 bit 0, "Global reset signal
+             * to MAC110 core is active"): resets the DMA engines.
+             * The IRIX driver's reset/init path relies on this —
+             * mace_hdwrether_init restarts its TX ring at 0 and
+             * pushes 16 fresh RX clusters without any pointer
+             * sync, which only works if the reset cleared the
+             * hardware TX ring pointers and the RX mcl FIFO.
+             */
+            s->ec_mac_control = MAC_CTRL_RESET;
+            s->ec_int_status = 0;
+            s->ec_tx_ring = 0;
+            s->ec_rx_wptr = 0;
+            s->ec_rx_rptr = 0;
+            sgi_mace_ec_irq_update(s);
+            return;
+        }
+        s->ec_mac_control = value & 0x1fffffff;
+        return;
+    case MAC_REG_INT_STATUS:
+        /* write-1-to-clear (spec TABLE 39 note); the live RX
+         * threshold level must survive the clear. */
+        s->ec_int_status &= ~(value & MAC_INTR_W1C_MASK);
+        sgi_mace_ec_rx_int_update(s);
+        return;
+    case MAC_REG_DMA_CONTROL:
+        s->ec_dma_control = value & 0xffff;
+        s->ec_force_off = false;    /* re-init: interrupts re-enabled */
+        sgi_mace_ec_rx_int_update(s);
+        sgi_mace_ec_tx_drain(s);
+        return;
+    case MAC_REG_TIMER:
+        s->ec_timer = value & 0x3f;
+        return;
+    case MAC_REG_TX_ALIAS:
+        /* WO alias of the DMA_CONTROL TX interrupt enable (§4.2.5) */
+        s->ec_dma_control = (s->ec_dma_control & ~DMA_CTRL_TX_INTR_EN)
+                          | (value & DMA_CTRL_TX_INTR_EN);
+        return;
+    case MAC_REG_RX_ALIAS:
+        /* WO alias of the DMA_CONTROL RX enable + threshold (§4.2.6) */
+        s->ec_dma_control = (s->ec_dma_control
+                             & ~(DMA_CTRL_RX_INTR_EN
+                                 | DMA_CTRL_RX_THRESH_MASK))
+                          | (value & (DMA_CTRL_RX_INTR_EN
+                                      | DMA_CTRL_RX_THRESH_MASK));
+        sgi_mace_ec_rx_int_update(s);
+        return;
+    case MAC_REG_TX_RING:
+    case MAC_REG_TX_RING + 2:
+        /* 16/32-bit write pointer poke (driver: write16 at +2) */
+        s->ec_tx_ring = (s->ec_tx_ring
+                         & ~(MAC_TX_PTR_MASK << MAC_TX_WPTR_SHIFT))
+                      | ((value & MAC_TX_PTR_MASK) << MAC_TX_WPTR_SHIFT);
+        sgi_mace_ec_tx_drain(s);
+        return;
+    case MAC_REG_TX_RING + 8:
+        s->ec_tx_ring = (uint32_t)value;
+        sgi_mace_ec_tx_drain(s);
+        return;
+    case MAC_REG_INT_REQUEST:
+        /*
+         * Interrupt Request / diag register aliased with the last
+         * TX vector (spec TABLE 37, offset 0x58).  The IRIX reset
+         * path writes 1<<(MACE_ETHERNET+16) here to force the CRIME
+         * line off while it rebuilds the rings — without this, the
+         * core reset emptying the mcl FIFO instantly re-asserts the
+         * RX threshold interrupt and the ISR deadlocks the init
+         * thread.  The force-off releases when the re-init programs
+         * DMA_CONTROL (interrupts re-enabled).
+         */
+        s->ec_force_off = true;
+        sgi_mace_ec_irq_update(s);
+        return;
+    case MAC_REG_PHY_DATAIO:
+        /* PHY register write (spec §4.2.9.2) */
+        if ((s->ec_phy_addr >> 5) == MAC_PHY_ADDR) {
+            int reg = s->ec_phy_addr & 0x1f;
+
+            if (reg == 0) {
+                s->ec_phy_reg[0] = value & 0x7f;
+            } else if (reg == 4) {
+                s->ec_phy_reg[4] = value & 0x01ff;
+            }
+        }
+        trace_sgi_mace_ec_mdio(1, s->ec_phy_addr, (uint32_t)value);
+        return;
+    case MAC_REG_PHY_ADDRESS:
+        s->ec_phy_addr = value & 0x3ff;
+        return;
+    case MAC_REG_PHY_READ_START:
+        /* read completes instantly: data already in PHY_DATAIO */
+        trace_sgi_mace_ec_mdio(0, s->ec_phy_addr,
+                               (s->ec_phy_addr >> 5) == MAC_PHY_ADDR
+                               ? s->ec_phy_reg[s->ec_phy_addr & 0x1f] : 0);
+        return;
+    case MAC_REG_BACKOFF:
+        /* backoff LFSR seed: no collisions to randomize */
+        return;
+    /*
+     * The 64-bit DP-RAM registers (spec TABLE 37): a 64-bit write
+     * stores the whole value; a 32-bit write at +0 sets the HIGH
+     * half (BE lane), at +4 the low half.  (The driver programs
+     * the station address with one 64-bit write of eau.laddr —
+     * the eaddr bytes live in bits 47:0.)
+     */
+    case MAC_REG_PHYSADDR:
+    case MAC_REG_PHYSADDR + 4:
+        if (size == 8) {
+            s->ec_physaddr = value;
+        } else if (ec_off & 4) {
+            s->ec_physaddr = (s->ec_physaddr & ~0xffffffffULL)
+                           | (value & 0xffffffff);
+        } else {
+            s->ec_physaddr = (s->ec_physaddr & 0xffffffffULL)
+                           | (value << 32);
+        }
+        return;
+    case MAC_REG_SECPHYSADDR:
+    case MAC_REG_SECPHYSADDR + 4:
+        if (size == 8) {
+            s->ec_secphysaddr = value;
+        } else if (ec_off & 4) {
+            s->ec_secphysaddr = (s->ec_secphysaddr & ~0xffffffffULL)
+                              | (value & 0xffffffff);
+        } else {
+            s->ec_secphysaddr = (s->ec_secphysaddr & 0xffffffffULL)
+                              | (value << 32);
+        }
+        return;
+    case MAC_REG_MLAF:
+    case MAC_REG_MLAF + 4:
+        if (size == 8) {
+            s->ec_mlaf = value;
+        } else if (ec_off & 4) {
+            s->ec_mlaf = (s->ec_mlaf & ~0xffffffffULL)
+                       | (value & 0xffffffff);
+        } else {
+            s->ec_mlaf = (s->ec_mlaf & 0xffffffffULL)
+                       | (value << 32);
+        }
+        return;
+    case MAC_REG_TX_RING_BASE:
+    case MAC_REG_TX_RING_BASE + 4:
+        if (size == 8) {
+            s->ec_tx_ring_base = value;
+        } else if (ec_off & 4) {
+            s->ec_tx_ring_base = (s->ec_tx_ring_base & ~0xffffffffULL)
+                               | (value & 0xffffffff);
+        } else {
+            s->ec_tx_ring_base = (s->ec_tx_ring_base & 0xffffffffULL)
+                               | (value << 32);
+        }
+        sgi_mace_ec_tx_drain(s);
+        return;
+    default:
+        /*
+         * RX mcl FIFO data port: 32 aliases at 0x100-0x1F8 (spec
+         * §4.2.8): push a 4KB cluster base address.  Spec §4.2.8:
+         * "hardware does not prevent the system software from
+         * overrunning ... the FIFO from the PIO access port" —
+         * pushes into a full FIFO discard the OLDEST entries (the
+         * newest 16 win).  The IRIX error-recovery path
+         * (rt_not_valid / deadman) runs mace_ether_reset +
+         * mace_hdwrether_init, which frees the old clusters and
+         * pushes 16 fresh ones without any hardware FIFO reset;
+         * discard-oldest makes the driver's view and the FIFO
+         * self-consistent again after exactly 16 pushes.
+         */
+        if (ec_off >= MAC_REG_RX_FIFO_ALIAS_S
+            && ec_off <= MAC_REG_RX_FIFO_ALIAS_E && (ec_off & 4)) {
+            if (sgi_mace_ec_rx_count(s) >= MAC_RX_MCL_ENTRIES) {
+                s->ec_rx_rptr = (s->ec_rx_rptr + 1) & MAC_RX_MCL_CNT_MASK;
+            }
+            {
+                int slot = s->ec_rx_wptr & MAC_RX_MCL_IDX_MASK;
+
+                s->ec_rx_fifo[slot] = value & 0xfffff000;
+                s->ec_rx_wptr = (s->ec_rx_wptr + 1) & MAC_RX_MCL_CNT_MASK;
+                trace_sgi_mace_ec_rx_fifo_push((uint32_t)value,
+                                               sgi_mace_ec_rx_count(s),
+                                               s->ec_rx_wptr & 15,
+                                               s->ec_rx_rptr & 15);
+                sgi_mace_ec_rx_int_update(s);
+            }
+            return;
+        }
+        /* diagnostic TX descriptor slots: read-only */
+        return;
+    }
+}
+
+/*
+ * ============================================================
  *                  PCI host bridge
  *
  * The MACE is the PCI host bridge of the O2 (spec §9): a QEMU PCI
@@ -1199,6 +2058,14 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIMACEState *s = SGI_MACE(opaque);
 
+    /* Ethernet (0x280000-0x2FFFFF, spec §4) */
+    if (offset >= MACE_ENET_OFFSET &&
+        offset < MACE_ENET_OFFSET + 0x80000) {
+        uint64_t v = sgi_mace_ec_read(s, offset - MACE_ENET_OFFSET, size);
+        trace_sgi_mace_ec_reg(0, offset - MACE_ENET_OFFSET, (uint32_t)v);
+        return v;
+    }
+
     /* PCI interface (0x080000-0x0FFFFF) */
     if (offset >= MACE_PCI_OFFSET &&
         offset < MACE_PCI_OFFSET + 0x80000) {
@@ -1306,6 +2173,13 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
                              uint64_t value, unsigned size)
 {
     SGIMACEState *s = SGI_MACE(opaque);
+
+    /* Ethernet (0x280000-0x2FFFFF, spec §4) */
+    if (offset >= MACE_ENET_OFFSET &&
+        offset < MACE_ENET_OFFSET + 0x80000) {
+        sgi_mace_ec_write(s, offset - MACE_ENET_OFFSET, value, size);
+        return;
+    }
 
     /* PCI interface */
     if (offset >= MACE_PCI_OFFSET &&
@@ -1466,6 +2340,45 @@ static void sgi_mace_reset(DeviceState *dev)
 
     memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
 
+    /* MAC110 ethernet (spec §4): all state zeros at reset; the
+     * station address register is pre-loaded with the ARCS env
+     * MAC (kernel init_sysid writes its own copy anyway) and the
+     * PHY file with the DP83840 link-up image. */
+    memset(s->ec_rx_fifo, 0, sizeof(s->ec_rx_fifo));
+    s->ec_mac_control = 0;
+    s->ec_int_status = 0;
+    s->ec_dma_control = 0;
+    s->ec_timer = 0;
+    s->ec_tx_ring = 0;
+    s->ec_tx_ring_base = 0;
+    s->ec_rx_wptr = 0;
+    s->ec_rx_rptr = 0;
+    s->ec_rx_seq = 0;
+    /*
+     * Default station address 08:00:69:de:ad:01 in the register's
+     * big-endian wire order (the same byte order the driver
+     * bcopy's in from kernel eaddr[]).  Overwritten below from the
+     * NIC backend's MAC if one was instantiated.
+     */
+    {
+        const uint8_t defmac[6] = { 0x08, 0x00, 0x69, 0xde, 0xad, 0x01 };
+        memcpy(&s->ec_physaddr, defmac, 6);
+    }
+    s->ec_secphysaddr = 0;
+    s->ec_mlaf = 0;
+    s->ec_last_tx_vector = 0;
+    s->ec_phy_addr = 0;
+    s->ec_phy_busy = false;
+    s->ec_force_off = false;
+    s->ec_rx_pending_len = -1;
+    if (s->ec_rx_timer) {
+        timer_del(s->ec_rx_timer);
+    }
+    sgi_mace_ec_phy_reset(s);
+    if (s->nic_present) {
+        memcpy(&s->ec_physaddr, s->nic_conf.macaddr.a, 6);
+    }
+
     /*
      * DS17287 RTC reset values:
      *   Reg A (10): 0x20 = oscillator running, divider chain on
@@ -1533,6 +2446,28 @@ static void sgi_mace_realize(DeviceState *dev, Error **errp)
     s->isa_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_mace_isa_rx_poll, s);
 
     /*
+     * MAC110 ethernet NIC: always present on the O2 motherboard.
+     * The machine file claims the default -nic/-netdev backend
+     * (qemu_configure_nic_device) before realize; if none was
+     * given (e.g. -nodefaults tests) we still model the register
+     * file so the driver attaches, with no packet transport.
+     */
+    if (s->nic_conf.peers.ncs[0]) {
+        s->nic_present = true;
+        s->nic = qemu_new_nic(&net_sgi_mace_ec_info, &s->nic_conf,
+                              object_get_typename(OBJECT(dev)), dev->id,
+                              &dev->mem_reentrancy_guard, s);
+        qemu_format_nic_info_str(qemu_get_queue(s->nic),
+                                 s->nic_conf.macaddr.a);
+        memcpy(&s->ec_physaddr, s->nic_conf.macaddr.a, 6);
+    } else {
+        s->nic_present = false;
+        s->nic = NULL;
+    }
+    s->ec_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_mace_ec_rx_timer_cb, s);
+    s->ec_rx_pending_len = -1;
+
+    /*
      * PCI root bus.  Devices live on PCI slots 1..5 (the kernel scans
      * exactly those); CONFIG_ADDRESS/CONFIG_DATA in the register file
      * above forward config cycles to this bus.  pci_mem is the flat
@@ -1591,6 +2526,7 @@ static void sgi_mace_realize(DeviceState *dev, Error **errp)
 
 static const Property sgi_mace_properties[] = {
     DEFINE_PROP_CHR("chardev", SGIMACEState, serial),
+    DEFINE_NIC_PROPERTIES(SGIMACEState, nic_conf),
 };
 
 static bool sgi_mace_ps2_needed(void *opaque)
@@ -1607,6 +2543,40 @@ static const VMStateDescription vmstate_sgi_mace_ps2 = {
         VMSTATE_UINT8(control, MACEPS2PortState),
         VMSTATE_UINT8(tx_byte, MACEPS2PortState),
         VMSTATE_BOOL(tx_pending, MACEPS2PortState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool sgi_mace_ec_needed(void *opaque)
+{
+    SGIMACEState *s = opaque;
+
+    return s->nic_present;
+}
+
+static const VMStateDescription vmstate_sgi_mace_ec = {
+    .name = "sgi-mace/ec",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sgi_mace_ec_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ec_mac_control, SGIMACEState),
+        VMSTATE_BOOL(ec_force_off, SGIMACEState),
+        VMSTATE_UINT32(ec_int_status, SGIMACEState),
+        VMSTATE_UINT32(ec_dma_control, SGIMACEState),
+        VMSTATE_UINT32(ec_timer, SGIMACEState),
+        VMSTATE_UINT32(ec_tx_ring, SGIMACEState),
+        VMSTATE_UINT64(ec_tx_ring_base, SGIMACEState),
+        VMSTATE_UINT32_ARRAY(ec_rx_fifo, SGIMACEState, MAC_RX_MCL_ENTRIES),
+        VMSTATE_UINT32(ec_rx_wptr, SGIMACEState),
+        VMSTATE_UINT32(ec_rx_rptr, SGIMACEState),
+        VMSTATE_UINT32(ec_rx_seq, SGIMACEState),
+        VMSTATE_UINT16_ARRAY(ec_phy_reg, SGIMACEState, 32),
+        VMSTATE_UINT32(ec_phy_addr, SGIMACEState),
+        VMSTATE_UINT64(ec_physaddr, SGIMACEState),
+        VMSTATE_UINT64(ec_secphysaddr, SGIMACEState),
+        VMSTATE_UINT64(ec_mlaf, SGIMACEState),
+        VMSTATE_UINT64(ec_last_tx_vector, SGIMACEState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1633,6 +2603,10 @@ static const VMStateDescription vmstate_sgi_mace = {
         VMSTATE_STRUCT_ARRAY(ps2_port, SGIMACEState, 2, 1,
                              vmstate_sgi_mace_ps2, MACEPS2PortState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_sgi_mace_ec,
+        NULL
     }
 };
 
@@ -1644,6 +2618,7 @@ static void sgi_mace_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, sgi_mace_reset);
     dc->vmsd = &vmstate_sgi_mace;
     device_class_set_props(dc, sgi_mace_properties);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
 
 static void sgi_mace_init(Object *obj)

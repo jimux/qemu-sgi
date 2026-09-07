@@ -470,6 +470,21 @@ sgi_mace_ps2_rx(int port, uint8_t data) "PS2 port %d RX 0x%02x"
 sgi_mace_ps2_status(int port, uint32_t status) "PS2 port %d status 0x%02x"
 sgi_mace_ps2_irq(int port, int level, uint64_t isa_status) "PS2 port %d irq level=%d ISA_INT_STS=0x%03"PRIx64
 
+# sgi_mace.c (O2 MACE MAC110 ethernet, spec §4)
+sgi_mace_ec_reg(int rw, uint64_t addr, uint32_t val) "EC rw=%d 0x%04"PRIx64" = 0x%08x"
+sgi_mace_ec_tx_desc(uint32_t rptr, uint64_t cmd, int len) "TX desc[%d] cmd=0x%016"PRIx64" len=%d"
+sgi_mace_ec_tx_concat(int idx, uint32_t addr, int len) "TX concat[%d] addr=0x%08x len=%d"
+sgi_mace_ec_tx_packet(int len) "TX packet %d bytes"
+sgi_mace_ec_rx_fifo_push(uint32_t addr, int count, int wptr, int rptr) "RX mcl push 0x%08x count=%d wptr=%d rptr=%d"
+sgi_mace_ec_rx_packet(uint32_t addr, int len, int skipped, uint32_t rptr) "RX packet mcl=0x%08x len=%d skipped=%d rptr=%d"
+sgi_mace_ec_frame(int is_tx, uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3, uint64_t v0, int len) "frame is_tx=%d %08x %08x %08x %08x v0=0x%016"PRIx64" len=%d"
+sgi_mace_ec_rx_drop(int reason) "RX dropped reason=%d"
+sgi_mace_ec_irq(uint32_t status, int level) "EC int status=0x%02x level=%d"
+sgi_mace_ec_mdio(int rw, uint32_t addr, uint32_t val) "MDIO rw=%d addr=0x%03x val=0x%04x"
+
+# sgi_crime.c (O2 CRIME interrupt controller)
+sgi_crime_irq(int irq, int level, uint64_t intstat, uint64_t intmask) "crime irq %d level=%d intstat=0x%08"PRIx64" intmask=0x%08"PRIx64
+
 # sgi_crime_re.c (O2 CRIME RE pixel-pipe + MTE)
 sgi_crime_re_draw(uint32_t op, uint32_t drawmode, uint32_t bufmode, int x1, int y1, int x2, int y2, uint32_t fg, uint32_t pattern) "draw op=0x%08x dm=0x%08x bm=0x%08x (%d,%d)-(%d,%d) fg=0x%08x pat=0x%08x"
 sgi_crime_re_mte(uint32_t mode, uint64_t dst0, uint64_t dst1, uint32_t fg) "mte mode=0x%08x dst0=0x%"PRIx64" dst1=0x%"PRIx64" fg=0x%08x"
