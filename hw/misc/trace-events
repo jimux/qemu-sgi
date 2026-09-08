@@ -482,6 +482,16 @@ sgi_mace_ec_rx_drop(int reason) "RX dropped reason=%d"
 sgi_mace_ec_irq(uint32_t status, int level) "EC int status=0x%02x level=%d"
 sgi_mace_ec_mdio(int rw, uint32_t addr, uint32_t val) "MDIO rw=%d addr=0x%03x val=0x%04x"
 
+# sgi_mace.c (O2 MACE audio + AD1843 codec, spec §3)
+sgi_mace_audio_reg(int rw, uint64_t addr, uint64_t val) "AUD rw=%d 0x%03"PRIx64" = 0x%016"PRIx64
+sgi_mace_audio_codec(int rw, uint8_t addr, uint16_t val) "codec rw=%d reg[%d] = 0x%04x"
+sgi_mace_audio_codec_read_latch(uint8_t addr) "codec read latch reg %d"
+sgi_mace_audio_dma(int ch, int blocks, uint32_t rptr, uint32_t wptr, uint32_t depth) "AUD DMA ch=%d blocks=%d rptr=0x%03x wptr=0x%03x depth=0x%03x"
+sgi_mace_audio_irq(uint64_t isa_status, int level) "AUD irq ISA_INT_STS=0x%02"PRIx64" level=%d"
+sgi_mace_audio_write(int ch, int frames, int bytes) "AUD host write ch=%d frames=%d bytes=%d"
+sgi_mace_audio_mscust(uint64_t addr, uint64_t val) "MSC/UST 0x%02"PRIx64" = 0x%016"PRIx64
+sgi_mace_isa_reg(int rw, uint64_t addr, uint64_t val) "ISA rw=%d 0x%03"PRIx64" = 0x%016"PRIx64
+
 # sgi_crime.c (O2 CRIME interrupt controller)
 sgi_crime_irq(int irq, int level, uint64_t intstat, uint64_t intmask) "crime irq %d level=%d intstat=0x%08"PRIx64" intmask=0x%08"PRIx64
 

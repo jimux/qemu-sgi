@@ -29,6 +29,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pci_host.h"
 #include "net/net.h"
+#include "qemu/audio.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -238,8 +239,143 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEState, SGI_MACE)
 #define UST_COMPARE2    0x10
 #define UST_COMPARE3    0x18
 
+/*
+ * Per-channel audio MSC/UST registers (kernel sys/mace.h
+ * MACE_AIN_MSC_UST 0x20 / MACE_AOUT1_MSC_UST 0x28 / MACE_AOUT2_MSC_UST
+ * 0x30; spec §3.4 "Stereo DMA MSC/UST Registers").  64-bit: low word =
+ * sample-pair counter (MSC), high word = UST snapshot.  Writable so the
+ * driver can zero the counter (a3_start_dma writes 0 before enabling).
+ */
+#define UST_AIN_MSCUST  0x20
+#define UST_AOUT1_MSCUST 0x28
+#define UST_AOUT2_MSCUST 0x30
+
 /* UST period in nanoseconds */
 #define MACE_UST_PERIOD_NS  960
+
+/*
+ * ============================================================
+ * MACE audio codec interface + AD1843 codec (spec §3, TABLE 26-35)
+ *
+ * Register window at MACE_AUDIO_OFFSET (0x300000; kernel MACE_AUDIO
+ * 0xBF300000).  16 64-bit registers at 8-byte stride:
+ *   0x00 Control & Status (codec reset, codec-present, ring-ptr aliases)
+ *   0x08 Codec status address/control (addr[23:17], R/W bar[16], data[15:0])
+ *   0x10 Codec status input mask (interrupt mask on the status word)
+ *   0x18 Codec status input (last register read value, RO)
+ *   0x20..0x38  Ch1 in  ring: control/read-ptr/write-ptr/depth
+ *   0x40..0x58  Ch2 out ring
+ *   0x60..0x78  Ch3 out ring
+ *
+ * Rings: three 4KB buffers in guest RAM at
+ *   (isa_ringbase & ~0x7fff) + ring_id * 4KB, ring ids 0/1/2
+ *   (spec §3.5.3 TABLE 35).  64-bit stereo sample pairs, 8 bytes each.
+ * Channel control register (spec TABLE 33):
+ *   bit 10 reset, bit 9 DMA enable, bits 7:5 interrupt threshold.
+ * Pointers (spec TABLE 31/32): byte offsets into the 4KB ring, 8-byte
+ * (sample-pair) granularity — the PROM hello_tune and the kernel
+ * a3_dd/kdsp drivers both traffic in byte offsets (the kdsp shadow
+ * units are 4 bytes, the write pointer register value = shadow << 2
+ * = bytes; observed session fill = 0x358 = 856 bytes).  The DMA
+ * engine bursts four 64-bit samples (32 bytes) per transaction, so
+ * output drains advance the hardware read pointer in 32-byte steps.
+ * Output channels: hw owns the READ pointer (visible in cntrl_stat
+ * aliases); input channel: hw owns the WRITE pointer.
+ */
+#define AUD_CNTRL_STAT_REG     0x00
+#define AUD_CODEC_REG_REG      0x08
+#define AUD_CODEC_INTR_MASK_REG 0x10
+#define AUD_CODEC_READ_REG     0x18
+
+#define AUD_CHAN_NUM           3
+#define AUD_CHAN_REGS          4
+#define AUD_CH_CNTRL           0
+#define AUD_CH_READ            1
+#define AUD_CH_WRITE           2
+#define AUD_CH_DEPTH           3
+
+/* CNTRL_STAT bits (spec TABLE 27; kernel ad1843.h) */
+#define AUD_CODEC_RESET        (1 << 0)
+#define AUD_CODEC_PRESENT      (1 << 1)
+/* ring pointer aliases (kernel ad1843.h GET_CH*_RING_*_ALIAS) */
+#define AUD_CH1_WRITE_ALIAS_SHIFT 2    /* bits 8:2  = ch1 wptr >> 5 */
+#define AUD_CH1_WRITE_ALIAS_MASK  0xfc
+#define AUD_CH2_READ_ALIAS_SHIFT  4    /* bits 15:9 = ch2 rptr >> 5 */
+#define AUD_CH2_READ_ALIAS_MASK  0x7f00
+#define AUD_CH3_READ_ALIAS_SHIFT 11    /* bits 22:16 = ch3 rptr >> 5 */
+#define AUD_CH3_READ_ALIAS_MASK  0x3f8000
+#define AUD_VOLUME_UP           (1 << 23)
+#define AUD_VOLUME_DOWN         (1 << 24)
+
+/* channel control bits (spec TABLE 33; kernel CHAN_*) */
+#define AUD_CHAN_THR_MASK      0xe0    /* bits 7:5 interrupt threshold */
+#define AUD_CHAN_THR_SHIFT     5
+#define AUD_CHAN_THR_OFF       0
+#define AUD_CHAN_THR_25        1
+#define AUD_CHAN_THR_50        2
+#define AUD_CHAN_THR_75        3
+#define AUD_CHAN_THR_EMPTY     4
+#define AUD_CHAN_THR_NEMPTY    5
+#define AUD_CHAN_THR_FULL      6
+#define AUD_CHAN_THR_NFULL     7
+#define AUD_CHAN_DMA_ENABLE    (1 << 9)
+#define AUD_CHAN_RESET         (1 << 10)
+
+/* codec status address/control register (spec TABLE 28) */
+#define AUD_CODEC_ADDR_SHIFT   17     /* bits 23:17: codec register addr */
+#define AUD_CODEC_ADDR_MASK    0x7f
+#define AUD_CODEC_READ_OP      (1 << 16)  /* 1 = read, 0 = write */
+
+/* audio ring geometry (spec §3.5.3): 4KB rings, 32-byte blocks */
+#define AUD_RING_SIZE          4096
+#define AUD_RING_BLOCK         32
+#define AUD_RING_ID_ADC        0      /* ring id 0: audio input  */
+#define AUD_RING_ID_DAC1       1      /* ring id 1: audio out #1 */
+#define AUD_RING_ID_DAC2       2      /* ring id 2: audio out #2 */
+
+/*
+ * ISA interrupt bits for audio (spec §5.1.3 table): bits 0..7, all in
+ * the "audio" group (CRIME slot 6, kernel MACE_PERIPH_AUDIO).
+ */
+#define ISA_INT_AUD_CODEC_STATUS  0x00000001ULL  /* bit 0: status word */
+#define ISA_INT_AUD_VOLUME        0x00000002ULL  /* bit 1: volume buttons */
+#define ISA_INT_AUD_CH1_THIR      0x00000004ULL  /* bit 2: in #1 threshold */
+#define ISA_INT_AUD_CH1_OVF       0x00000008ULL  /* bit 3: in #1 overflow */
+#define ISA_INT_AUD_CH2_THIR      0x00000010ULL  /* bit 4: out #2 threshold */
+#define ISA_INT_AUD_CH2_MERR       0x00000020ULL  /* bit 5: out #2 mem err */
+#define ISA_INT_AUD_CH3_THIR      0x00000040ULL  /* bit 6: out #3 threshold */
+#define ISA_INT_AUD_CH3_MERR      0x00000080ULL  /* bit 7: out #3 mem err */
+
+/*
+ * AD1843 codec register file (kernel sys/ad1843.h; reset defaults from
+ * the PROM hello_tune.c codec_reset_default table — the kernel a3_dd
+ * driver bcopy's the same table at probe).
+ */
+#define AD1843_NUM_REGS         32
+#define AD1843_REG_STAT_REV     0
+#define AD1843_REG_CH_STAT      1
+#define AD1843_REG_CLK_SRC      15
+#define AD1843_REG_CG1_MODE     16
+#define AD1843_REG_CG1_RATE     17
+#define AD1843_REG_CG2_MODE     19
+#define AD1843_REG_CG2_RATE     20
+#define AD1843_REG_CG3_MODE     22
+#define AD1843_REG_CG3_RATE     23
+#define AD1843_REG_SERIAL       26
+#define AD1843_REG_CH_POWERDOWN 27
+#define AD1843_REG_CONFIG       28
+
+/* STAT_REV bits (kernel ad1843.h) */
+#define AD1843_INIT             (1 << 15)  /* clock init flag */
+#define AD1843_PDNO             (1 << 14)  /* conversion pwr down */
+#define AD1843_REV_MASK         0xf       /* revision nibble */
+
+/*
+ * Default sample rate of the codec model when the guest never programs
+ * a clock generator (the driver does program CG1; this is only a
+ * fallback for the host voice).
+ */
+#define AUD_DEFAULT_RATE       48000
 
 /*
  * PCI host bridge registers (relative to MACE_PCI_OFFSET).
@@ -539,6 +675,36 @@ struct SGIMACEState {
      * 128 registers: 0-13 = time/status, 14-127 = NVRAM/extended.
      */
     uint8_t rtc_regs[128];
+
+    /*
+     * Audio codec interface + AD1843 codec (spec §3).  The codec is a
+     * register file whose DAC outputs feed a QEMU audio voice; the three
+     * DMA ring engines move stereo sample pairs between the rings in
+     * guest RAM and the codec/voice.  Only the two output channels
+     * (DAC1/DAC2, MACE "Ch2 out"/"Ch3 out") produce sound; the input
+     * channel ring is serviced with silence (no host capture wired).
+     */
+    AudioBackend *audio_be;             /* -audiodev backend (may be NULL) */
+    SWVoiceOut *audio_voice;            /* host playback voice           */
+    QEMUTimer *audio_dma_timer;         /* DMA engine tick                */
+    int64_t audio_tick_ns;              /* ns per 32-byte ring block      */
+
+    uint64_t audio_cntrl_stat;          /* 0x00 CNTRL_STAT               */
+    uint64_t audio_codec_reg;           /* 0x08 codec addr/control latch */
+    uint16_t audio_codec_intr_mask;     /* 0x10 status-word int mask     */
+    uint16_t audio_codec_read;          /* 0x18 last codec read value    */
+    uint16_t ad1843_reg[AD1843_NUM_REGS];  /* codec register file         */
+
+    /*
+     * Per-channel DMA state.  ch[0] = stereo input (ring 0), ch[1] and
+     * ch[2] = stereo outputs (rings 1, 2).  ctrl/read/write follow the
+     * spec's register layout; mscust holds the channel's 64-bit
+     * MSC/UST pair (low 32 = sample-pair counter, high 32 = UST).
+     */
+    uint64_t audio_ch_ctrl[AUD_CHAN_NUM];
+    uint32_t audio_ch_rptr[AUD_CHAN_NUM];   /* byte offset, 32-aligned */
+    uint32_t audio_ch_wptr[AUD_CHAN_NUM];
+    uint64_t audio_ch_mscust[AUD_CHAN_NUM];
 
     /*
      * MAC110 fast ethernet (spec §4).  Register window at

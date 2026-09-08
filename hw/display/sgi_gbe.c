@@ -89,8 +89,10 @@ static void sgi_gbe_update_geometry(SGIGBEState *s)
 }
 
 /*
- * Current raster position from real time. The sweep starts at
- * frame_start_ns and covers htotal*vtotal dots in 1/refresh seconds.
+ * Current raster position from real time.  The beam sweeps the full
+ * htotal*vtotal dot extent once per 1/refresh seconds, phase-locked
+ * to the virtual clock (see the comment inside for why the position
+ * is a pure clock function rather than frame-tick-relative).
  * X bits [11:0], Y bits [23:12]; bit 31 = freeze flag (NetBSD
  * crmfbreg.h CRMFB_VT_XY_X/Y_MASK — the same layout the PROM's
  * waitForBlanking decodes).
@@ -99,18 +101,29 @@ static uint32_t sgi_gbe_current_xy(SGIGBEState *s, int64_t now)
 {
     int64_t frame_ns = NANOSECONDS_PER_SECOND / (int64_t)s->refresh_hz;
     int64_t sweep = ((int64_t)s->htotal * s->vtotal);
-    int64_t off = now - s->frame_start_ns;
     uint64_t dot;
 
-    if (off < 0) {
-        off = 0;
+    /*
+     * Free-running raster: the sweep position is a pure function of
+     * the virtual clock (dot = phase of now within the frame period,
+     * scaled to the full htotal*vtotal sweep, wrapping per frame).
+     * The old frame_start_ns-relative computation stalled at the top
+     * of the frame whenever the QEMU frame timer fired late under
+     * load (the kernel's gbeStartVideoTiming poll, which waits for
+     * VT_XY to pass through the top-of-frame window, then wedged
+     * forever seeing only clamped end-of-frame positions — observed
+     * as a pre-login hang at crime_init.c:815).  Deriving the
+     * position directly from the clock keeps the raster sweeping
+     * every frame_ns regardless of timer lag; the frame tick (which
+     * still maintains frame_start_ns for the scanout/vsync latch)
+     * stays aligned because it re-arms on the same frame_ns period.
+     */
+    if (frame_ns <= 0 || sweep <= 0 || s->htotal <= 0) {
+        return 0;
     }
-    if (off >= frame_ns) {
-        off = frame_ns - 1;
-    }
-    dot = ((uint64_t)off * sweep) / frame_ns;
-    if (dot >= sweep) {
-        dot = sweep - 1;
+    dot = (((uint64_t)now % (uint64_t)frame_ns) * (uint64_t)sweep) / frame_ns;
+    if (dot >= (uint64_t)sweep) {
+        dot = (uint64_t)sweep - 1;
     }
     uint32_t x = dot % s->htotal;
     uint32_t y = dot / s->htotal;

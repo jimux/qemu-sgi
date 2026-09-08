@@ -292,6 +292,9 @@ static void sgi_mace_serial_write(SGIMACEState *s, int port,
 /* Defined with the ISA serial DMA engine below. */
 static void sgi_mace_isa_int_update(SGIMACEState *s);
 
+/* Defined with the audio block below. */
+static void sgi_mace_audio_out_cb(void *opaque, int avail);
+
 /*
  * ============================================================
  *              PS/2 keyboard & mouse (spec §6)
@@ -500,6 +503,590 @@ static void sgi_mace_kbdms_write(SGIMACEState *s, hwaddr km_off,
     hwaddr reg_off = km_off & 0x18;
 
     sgi_mace_ps2_write(s, port, reg_off, value);
+}
+
+/*
+ * ============================================================
+ *          Audio codec interface + AD1843 codec (spec §3)
+ *
+ * The MACE audio block (register window at MACE_AUDIO_OFFSET,
+ * 0x1F300000; kernel MACE_AUDIO) is a TDM master for one external
+ * AD1843 stereo codec plus three DMA ring engines (one stereo input,
+ * two stereo outputs).  The IRIX driver is kdsp/a3_dd (linked into the
+ * stock IP32 kernel; the module on the installed disk is
+ * /usr/cpu/sysgen/IP32boot/a3_dd.o) — its contract, recovered from the
+ * module disassembly (a3_probe/a3_init_codec/a3_start_dma/do_*_codec_
+ * reg in tmp/o2-qemu/m10/a3_dd.dis):
+ *
+ *  - probe: read CNTRL_STAT, require CODEC_PRESENT (bit 1); pulse
+ *    CODEC_RESET; write codec-reg READ of STAT_REV into 0x08, wait,
+ *    read the revision nibble from 0x18 (add_to_inventory rev = v0&0xf);
+ *    a3_init_codec then polls STAT_REV.INIT (0x8000) until CLEAR (the
+ *    codec finished clock init), programs AD1843_SERIAL (16-bit SCLK),
+ *    clears CONFIG.PDNI and polls STAT_REV.PDNO until CLEAR, enables
+ *    the converters via CH_POWERDOWN, selects clock sources and
+ *    unmutes the DACs.  All of that is plain codec register traffic
+ *    through the 0x08/0x18 window — the model only has to answer
+ *    reads with plausible values.
+ *  - codec register access: write (addr<<17)|(rw<<16)|data to 0x08,
+ *    then read the 16-bit result from 0x18 (reads; the driver caches
+ *    the last address and skips the round trip when unchanged).
+ *    The MACE repeats the programmed word every TDM cycle; the
+ *    "channel status word" (AD1843_CH_STAT, reg 1) is continuously
+ *    received and can raise ISA bit 0 when masked bits appear.
+ *  - DMA rings: three 4KB rings in guest RAM at
+ *    (isa_ringbase & ~0x7fff) + ring_id*4KB, ids 0/1/2 (spec §3.5.3
+ *    TABLE 35).  Stereo sample pairs are 8 bytes (left<<32|right in
+ *    24-bit fields; hardware clips to 16).  Output channels: hw owns
+ *    the read pointer, exposed through CNTRL_STAT aliases (the byte
+ *    offset >> 4, 7 bits at bits 14:8 for ch2 / 22:16 for ch3; the
+ *    input channel's hw write pointer uses 6 bits at 7:2 — kernel
+ *    ad1843.h GET_CH*_RING_*_ALSHIFT macros) — the driver reads its
+ *    position from there and updates the software write pointer
+ *    (0x50/0x70) as it fills.  a3_start_dma: write CHAN_RESET (0x400)
+ *    to the control register, zero both software pointers, write the
+ *    threshold|DMA_ENABLE (0x280 = empty-threshold|enable observed)
+ *    to start the engine.
+ *  - interrupt: threshold conditions raise the per-channel ISA bits
+ *    (bit 2/4/6), gated by ISA_INT_MSK, fanning into CRIME slot 6
+ *    (kernel MACE_PERIPH_AUDIO).  The driver registers vectors on
+ *    slot 6 and services the rings from the kdsp core.
+ *
+ * Virtualization: no TDM wire, no codec calibration waits — the codec
+ * register file answers immediately (INIT/PDNO always clear after
+ * reset), and the output DMA engines drain their rings to a QEMU
+ * audio voice at the codec's programmed sample rate.  The input ring
+ * is fed silence so a capture open() doesn't stall.  Sample pairs are
+ * 32-bit-per-channel in the ring; the voice consumes 16-bit stereo
+ * (hardware clips 24 to 16 bits, spec §3.5.2.1).
+ */
+
+/* Reset the AD1843 register file to the power-on defaults (the PROM
+ * hello_tune.c codec_reset_default table — the kernel bcopy's the
+ * same image at probe). */
+static void sgi_mace_audio_codec_reset(SGIMACEState *s)
+{
+    static const uint16_t reset_default[AD1843_NUM_REGS] = {
+        0xc001,       /*  0 STAT_REV: INIT done, rev 1              */
+        0,            /*  1 CH_STAT                                 */
+        0,            /*  2 ADC_SRC_GATTN                           */
+        0x8888,       /*  3 DAC2_MIX                                */
+        0x8888,       /*  4 AUX1_MIX                                */
+        0x8888,       /*  5 AUX2_MIX                                */
+        0x8888,       /*  6 AUX3_MIX                                */
+        0x8888,       /*  7 MIC_MIX                                 */
+        0x8860,       /*  8 MONO_MIX_MISC                           */
+        0x8888,       /*  9 DAC1_GATTN                              */
+        0x8888,       /* 10 DAC2_GATTN                              */
+        0,            /* 11 DAC1_DIGITAL_ATTN                      */
+        0,            /* 12 DAC2_DIGITAL_ATTN                      */
+        0x8080,       /* 13 ADC_DAC1_MIX                            */
+        0x8080,       /* 14 ADC_DAC2_MIX                            */
+        0,            /* 15 CLK_SRC_SELECT                         */
+        0x00ff,       /* 16 CG1_MODE                                */
+        0xbb80,       /* 17 CG1_RATE (48000 Hz)                     */
+        0,            /* 18 CG1_PHASE                              */
+        0x00ff,       /* 19 CG2_MODE                                */
+        0xbb80,       /* 20 CG2_RATE (48000 Hz)                     */
+        0,            /* 21 CG2_PHASE                              */
+        0x00ff,       /* 22 CG3_MODE                                */
+        0xbb80,       /* 23 CG3_RATE (48000 Hz)                     */
+        0,            /* 24 CG3_PHASE                              */
+        0,            /* 25 FILTER_MODE                            */
+        0,            /* 26 SERIAL                                  */
+        0x00c0,       /* 27 CH_POWERDOWN (converters off)           */
+        0xc400,       /* 28 CONFIG (PDNI: powered down)             */
+        0, 0, 0,      /* 29..31 reserved                           */
+    };
+
+    QEMU_BUILD_BUG_ON(AD1843_NUM_REGS != 32);
+    memcpy(s->ad1843_reg, reset_default, sizeof(reset_default));
+    /*
+     * The codec is on the (always-clocked) TDM bus: present.  Clock
+     * initialization completes immediately (a3_init_codec polls
+     * STAT_REV.INIT until clear; 400-800us on real silicon, instantly
+     * here), so INIT reads clear and only PDNO reflects the PDNI
+     * power state.  Revision 1 (the O2's AD1843 stepping per the
+     * PROM/kernel reset tables).
+     */
+    s->ad1843_reg[AD1843_REG_STAT_REV] = 0x4001;
+    s->audio_codec_read = s->ad1843_reg[AD1843_REG_CH_STAT];
+}
+
+/*
+ * Current output sample rate: the driver routes the DACs at one of the
+ * three clock generators (CLK_SRC_SELECT reg 15) and programs the
+ * generator rate (regs 17/20/23) in Hz.  CG1 is the default DAC clock
+ * after a3_init_codec (DAC1<-CG1, DAC2<-CG3, ADC<-CG2 per reg 15 write
+ * of 0xD0A), and sfplay's default rate lands there.
+ */
+static int sgi_mace_audio_rate(SGIMACEState *s)
+{
+    int dac1_src = (s->ad1843_reg[AD1843_REG_CLK_SRC] >> 8) & 3;
+    int dac2_src = (s->ad1843_reg[AD1843_REG_CLK_SRC] >> 10) & 3;
+    int rate1, rate2;
+    static const int rate_reg[4] = {
+        AUD_DEFAULT_RATE,          /* 0: fixed 48kHz              */
+        AD1843_REG_CG1_RATE,        /* 1: clock generator 1        */
+        AD1843_REG_CG2_RATE,        /* 2: clock generator 2        */
+        AD1843_REG_CG3_RATE,        /* 3: clock generator 3        */
+    };
+
+    if (dac1_src == 0) {
+        rate1 = AUD_DEFAULT_RATE;
+    } else {
+        rate1 = s->ad1843_reg[rate_reg[dac1_src]];
+    }
+    if (dac2_src == 0) {
+        rate2 = AUD_DEFAULT_RATE;
+    } else {
+        rate2 = s->ad1843_reg[rate_reg[dac2_src]];
+    }
+    /* both DACs are mixed to one stereo output; require them equal */
+    if (rate1 != rate2) {
+        rate2 = rate1;
+    }
+    if (rate1 < 4000 || rate1 > 54000) {
+        return AUD_DEFAULT_RATE;
+    }
+    return rate1;
+}
+
+/* (Re)open the host playback voice with the codec's current format. */
+static void sgi_mace_audio_open_voice(SGIMACEState *s)
+{
+    struct audsettings as;
+
+    if (!s->audio_be) {
+        return;
+    }
+    if (s->audio_voice) {
+        AUD_close_out(s->audio_be, s->audio_voice);
+        s->audio_voice = NULL;
+    }
+    as.freq = sgi_mace_audio_rate(s);
+    as.nchannels = 2;
+    as.fmt = AUDIO_FORMAT_S16;
+    as.endianness = 1;    /* big-endian (MIPS) sample pairs */
+    s->audio_voice = AUD_open_out(s->audio_be, s->audio_voice, "sgi-mace-audio",
+                                  s, sgi_mace_audio_out_cb, &as);
+    AUD_set_active_out(s->audio_voice, true);
+}
+
+/* Number of 32-byte blocks pending in one channel's ring. */
+static uint32_t sgi_mace_audio_depth(SGIMACEState *s, int ch)
+{
+    return (s->audio_ch_wptr[ch] + AUD_RING_SIZE - s->audio_ch_rptr[ch])
+           & (AUD_RING_SIZE - 1);
+}
+
+/*
+ * Re-evaluate the audio ISA interrupt bits (threshold conditions of
+ * the three channels + codec status word + volume buttons) and the
+ * gated CRIME slot-6 output.
+ */
+static void sgi_mace_audio_irq_update(SGIMACEState *s)
+{
+    uint64_t bits = 0;
+    int ch;
+
+    for (ch = 0; ch < AUD_CHAN_NUM; ch++) {
+        uint64_t ctrl = s->audio_ch_ctrl[ch];
+        unsigned thr = (ctrl & AUD_CHAN_THR_MASK) >> AUD_CHAN_THR_SHIFT;
+        uint32_t blocks = sgi_mace_audio_depth(s, ch) / AUD_RING_BLOCK;
+        bool is_output = (ch != 0);
+        bool cond = false;
+
+        if (ctrl & AUD_CHAN_RESET) {
+            continue;
+        }
+        switch (thr) {
+        case AUD_CHAN_THR_OFF:
+            cond = false;
+            break;
+        case AUD_CHAN_THR_25:
+            cond = is_output ? blocks < AUD_RING_SIZE / AUD_RING_BLOCK / 4
+                             : blocks >= AUD_RING_SIZE / AUD_RING_BLOCK / 4;
+            break;
+        case AUD_CHAN_THR_50:
+            cond = is_output ? blocks < AUD_RING_SIZE / AUD_RING_BLOCK / 2
+                             : blocks >= AUD_RING_SIZE / AUD_RING_BLOCK / 2;
+            break;
+        case AUD_CHAN_THR_75:
+            cond = is_output ? blocks < (AUD_RING_SIZE / AUD_RING_BLOCK) * 3 / 4
+                             : blocks >= (AUD_RING_SIZE / AUD_RING_BLOCK) * 3 / 4;
+            break;
+        case AUD_CHAN_THR_EMPTY:
+            cond = blocks == 0;
+            break;
+        case AUD_CHAN_THR_NEMPTY:
+            cond = blocks != 0;
+            break;
+        case AUD_CHAN_THR_FULL:
+            cond = blocks >= AUD_RING_SIZE / AUD_RING_BLOCK - 1;
+            break;
+        case AUD_CHAN_THR_NFULL:
+            cond = blocks < AUD_RING_SIZE / AUD_RING_BLOCK - 1;
+            break;
+        }
+        if (cond) {
+            /* ch 0 = input threshold (bit 2), ch 1/2 = output (bits 4/6) */
+            bits |= ch == 0 ? ISA_INT_AUD_CH1_THIR
+                  : ch == 1 ? ISA_INT_AUD_CH2_THIR : ISA_INT_AUD_CH3_THIR;
+        }
+    }
+    /* codec channel-status word (masked bits set) */
+    if (s->audio_codec_read & s->ad1843_reg[AD1843_REG_CH_STAT]
+        & s->audio_codec_intr_mask) {
+        bits |= ISA_INT_AUD_CODEC_STATUS;
+    }
+    /* volume buttons: not wired (no host source), stays clear */
+
+    s->isa_int_status = (s->isa_int_status & ~ISA_INT_AUDIO_MASK) | bits;
+    sgi_mace_isa_int_update(s);
+    trace_sgi_mace_audio_irq(s->isa_int_status,
+                             !!(s->isa_int_status & s->isa_int_mask
+                                & ISA_INT_AUDIO_MASK));
+}
+
+/*
+ * Audio DMA engine tick.  The real engine moves sample pairs at the
+ * codec's frame rate; the hardware bursts four stereo pairs (32
+ * bytes) per memory transaction, so the tick fires every 4/rate
+ * seconds and drains up to four pairs (a partial tail is allowed —
+ * the driver's kdsp shadow tracks the ring in 4-byte units).  Output
+ * rings drain to the host voice; the input ring is filled with
+ * silence.  The threshold interrupt is re-evaluated every tick so
+ * the driver's fill loop wakes exactly like on hardware.
+ */
+static void sgi_mace_audio_tick(void *opaque)
+{
+    SGIMACEState *s = SGI_MACE(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int ch;
+
+    for (ch = 0; ch < AUD_CHAN_NUM; ch++) {
+        uint64_t ctrl = s->audio_ch_ctrl[ch];
+        bool is_output = (ch != 0);
+
+        if ((ctrl & (AUD_CHAN_RESET | AUD_CHAN_DMA_ENABLE))
+            != AUD_CHAN_DMA_ENABLE) {
+            continue;
+        }
+        /* up to four stereo pairs (one 32-byte burst) per tick */
+        if (is_output) {
+            uint32_t depth = sgi_mace_audio_depth(s, ch);
+
+            if (depth >= 8) {
+                hwaddr base = (s->isa_ringbase & ~0x7fffULL)
+                             + (hwaddr)ch * AUD_RING_SIZE;
+                uint8_t blk[AUD_RING_BLOCK];
+                int16_t frames[4][2];
+                int n = MIN(4, depth / 8);
+                int i;
+
+                address_space_read(&address_space_memory,
+                                   base + s->audio_ch_rptr[ch],
+                                   MEMTXATTRS_UNSPECIFIED, blk, n * 8);
+                /*
+                 * Each 64-bit word is one stereo pair, verified
+                 * against the ring the dms library actually fills
+                 * (RAM dump: fffffc00ffffe800 = L=-4, R=-24, the
+                 * source file's first pair): L and R are 16-bit
+                 * samples left-justified into sign-extended 24-bit
+                 * fields at bits 55:32 and 23:0 (spec §3.5.1
+                 * figure).  The output path clips the 24-bit fields
+                 * to 16 bits (spec §3.5.2.1): take the top 16 bits
+                 * of each sign-extended field.
+                 */
+                for (i = 0; i < n; i++) {
+                    uint64_t pair = ldq_be_p(blk + i * 8);
+                    uint32_t ru = pair & 0xffffffu;
+                    int32_t l = (int32_t)(pair >> 32) >> 8;
+                    int32_t r = (ru & 0x800000u)
+                              ? (int32_t)(ru | 0xff000000u) : (int32_t)ru;
+
+                    r >>= 8;
+                    frames[i][0] = (int16_t)l;
+                    frames[i][1] = (int16_t)r;
+                }
+                if (s->audio_voice) {
+                    AUD_write(s->audio_voice, frames, n * 8);
+                    trace_sgi_mace_audio_write(ch, n, n * 8);
+                }
+                s->audio_ch_rptr[ch] = (s->audio_ch_rptr[ch] + n * 8)
+                                       & (AUD_RING_SIZE - 1);
+                /*
+                 * MSC increments once per sample pair; UST snapshots
+                 * the MACE uptime counter (spec §3.4).
+                 */
+                s->audio_ch_mscust[ch] += n;
+                s->audio_ch_mscust[ch] =
+                    (s->audio_ch_mscust[ch] & 0xffffffffULL)
+                    | ((uint64_t)(uint32_t)(now / MACE_UST_PERIOD_NS) << 32);
+            }
+            /* ring drained below the threshold: the driver refills */
+            sgi_mace_audio_irq_update(s);
+        } else {
+            /* input channel: deliver silence while there is room */
+            if (sgi_mace_audio_depth(s, ch) <= AUD_RING_SIZE - AUD_RING_BLOCK) {
+                hwaddr base = (s->isa_ringbase & ~0x7fffULL);
+                uint8_t blk[AUD_RING_BLOCK];
+
+                memset(blk, 0, sizeof(blk));
+                address_space_write(&address_space_memory,
+                                    base + (s->audio_ch_wptr[ch]
+                                            & (AUD_RING_SIZE - AUD_RING_BLOCK)),
+                                    MEMTXATTRS_UNSPECIFIED, blk, sizeof(blk));
+                s->audio_ch_wptr[ch] = (s->audio_ch_wptr[ch]
+                                        + AUD_RING_BLOCK)
+                                       & (AUD_RING_SIZE - 1);
+                s->audio_ch_mscust[ch] += 4;
+                s->audio_ch_mscust[ch] =
+                    (s->audio_ch_mscust[ch] & 0xffffffffULL)
+                    | ((uint64_t)(uint32_t)(now / MACE_UST_PERIOD_NS) << 32);
+                sgi_mace_audio_irq_update(s);
+            }
+        }
+    }
+
+    /* pace the engine at 4 sample pairs (= one ring block) */
+    timer_mod_ns(s->audio_dma_timer, now + s->audio_tick_ns);
+}
+
+static void sgi_mace_audio_start_engine(SGIMACEState *s)
+{
+    if (!s->audio_dma_timer) {
+        return;
+    }
+    if (s->audio_tick_ns == 0) {
+        int rate = sgi_mace_audio_rate(s);
+
+        s->audio_tick_ns = (int64_t)4 * 1000000000 / rate;
+    }
+    timer_mod_ns(s->audio_dma_timer,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->audio_tick_ns);
+}
+
+/*
+ * Audio register window read (offset relative to MACE_AUDIO_OFFSET,
+ * spec TABLE 26).  All registers are 64-bit slots; the codec data
+ * registers hold 16-bit values in the low half.
+ */
+static uint64_t sgi_mace_audio_read(SGIMACEState *s, hwaddr aud_off)
+{
+    uint64_t v;
+
+    switch (aud_off) {
+    case AUD_CNTRL_STAT_REG:
+        /*
+         * CODEC_PRESENT always set (the codec hangs on the TDM bus),
+         * reset reflects the software latch, and the three ring
+         * pointer aliases expose the hardware-owned pointers.  Alias
+         * field encodings per the kernel macros (ad1843.h
+         * GET_CH1_WRITE_ALIAS / GET_CH2_READ_ALIAS / GET_CH3_READ_
+         * ALIAS): the reconstructed byte offset = (cs >> N) & 0xfe0,
+         * so the field at bits N+11..N+5 holds byte_offset >> 4:
+         *   ch1 write ptr: (w>>4) & 0x3f at bits 7:2  (6 bits)
+         *   ch2 read  ptr: (r>>4) & 0x7f at bits 14:8 (7 bits)
+         *   ch3 read  ptr: (r>>4) & 0x7f at bits 22:16 (7 bits)
+         */
+        v = AUD_CODEC_PRESENT | (s->audio_cntrl_stat & AUD_CODEC_RESET);
+        v |= ((uint64_t)s->audio_ch_wptr[0] >> 4) & 0x3f;
+        v |= (((uint64_t)s->audio_ch_rptr[1] >> 4) & 0x7f) << 8;
+        v |= (((uint64_t)s->audio_ch_rptr[2] >> 4) & 0x7f) << 16;
+        return v;
+    case AUD_CODEC_REG_REG:
+        return s->audio_codec_reg;
+    case AUD_CODEC_INTR_MASK_REG:
+        return s->audio_codec_intr_mask;
+    case AUD_CODEC_READ_REG:
+        return s->audio_codec_read;
+    default:
+        if (aud_off >= 0x20 && aud_off <= 0x78 && (aud_off & 7) == 0) {
+            int ch = (aud_off - 0x20) >> 5;
+            int reg = ((aud_off - 0x20) >> 3) & 3;
+
+            if (ch < AUD_CHAN_NUM) {
+                switch (reg) {
+                case AUD_CH_CNTRL:
+                    return s->audio_ch_ctrl[ch];
+                case AUD_CH_READ:
+                    return s->audio_ch_rptr[ch];
+                case AUD_CH_WRITE:
+                    return s->audio_ch_wptr[ch];
+                case AUD_CH_DEPTH:
+                    return sgi_mace_audio_depth(s, ch);
+                }
+            }
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_mace: audio read at offset 0x%03" HWADDR_PRIx
+                      " (unimplemented -> 0)\n", aud_off);
+        return 0;
+    }
+}
+
+static void sgi_mace_audio_write(SGIMACEState *s, hwaddr aud_off,
+                                 uint64_t value)
+{
+    trace_sgi_mace_audio_reg(1, aud_off, value);
+
+    switch (aud_off) {
+    case AUD_CNTRL_STAT_REG:
+        if (value & AUD_CODEC_RESET) {
+            /* codec reset pulse: register file back to defaults */
+            s->audio_cntrl_stat = AUD_CODEC_RESET;
+            sgi_mace_audio_codec_reset(s);
+        } else {
+            s->audio_cntrl_stat = 0;
+        }
+        return;
+    case AUD_CODEC_REG_REG: {
+        uint8_t addr = (value >> AUD_CODEC_ADDR_SHIFT) & AUD_CODEC_ADDR_MASK;
+
+        s->audio_codec_reg = value & 0xffffff;
+        if (addr >= AD1843_NUM_REGS) {
+            return;
+        }
+        if (value & AUD_CODEC_READ_OP) {
+            /* read op: the TDM cycle returns the register contents */
+            s->audio_codec_read = s->ad1843_reg[addr];
+            trace_sgi_mace_audio_codec(0, addr, s->audio_codec_read);
+        } else {
+            uint16_t data = value & 0xffff;
+
+            s->ad1843_reg[addr] = data;
+            trace_sgi_mace_audio_codec(1, addr, data);
+            /*
+             * Conversion power state follows CONFIG.PDNI (kernel
+             * ad1843.h PDNI/PDNO): while PDNI is set the converters are
+             * powered down and STAT_REV.PDNO reads set; clearing PDNI
+             * (the driver's "power-up to standby" step) brings them up
+             * and PDNO clears — a3_init_codec polls for exactly that.
+             */
+            if (addr == AD1843_REG_CONFIG) {
+                if (data & 0x8000) {
+                    s->ad1843_reg[AD1843_REG_STAT_REV] |= 0x4000;
+                } else {
+                    s->ad1843_reg[AD1843_REG_STAT_REV] &= ~0x4000;
+                }
+            }
+            /*
+             * Clock-affecting writes: re-open the host voice with the
+             * new rate and re-pace the DMA engine.  The driver commits
+             * sample-rate changes through the clock generator mode/rate
+             * registers and the source selector.
+             */
+            if (addr == AD1843_REG_CLK_SRC || addr == AD1843_REG_CG1_RATE
+                || addr == AD1843_REG_CG2_RATE || addr == AD1843_REG_CG3_RATE
+                || addr == AD1843_REG_CG1_MODE || addr == AD1843_REG_CG2_MODE
+                || addr == AD1843_REG_CG3_MODE) {
+                s->audio_tick_ns = 0;
+                sgi_mace_audio_open_voice(s);
+                sgi_mace_audio_start_engine(s);
+            }
+        }
+        return;
+    }
+    case AUD_CODEC_INTR_MASK_REG:
+        s->audio_codec_intr_mask = value & 0xffff;
+        sgi_mace_audio_irq_update(s);
+        return;
+    case AUD_CODEC_READ_REG:
+        /* read-only */
+        return;
+    default:
+        if (aud_off >= 0x20 && aud_off <= 0x78 && (aud_off & 7) == 0) {
+            int ch = (aud_off - 0x20) >> 5;
+            int reg = ((aud_off - 0x20) >> 3) & 3;
+
+            if (ch < AUD_CHAN_NUM) {
+                switch (reg) {
+                case AUD_CH_CNTRL:
+                    s->audio_ch_ctrl[ch] = value & 0x7ff;
+                    if (value & AUD_CHAN_RESET) {
+                        /* reset channel: pointers cleared, int off */
+                        s->audio_ch_rptr[ch] = 0;
+                        s->audio_ch_wptr[ch] = 0;
+                        s->audio_ch_mscust[ch] = 0;
+                        sgi_mace_audio_irq_update(s);
+                        return;
+                    }
+                    if (value & AUD_CHAN_DMA_ENABLE) {
+                        sgi_mace_audio_start_engine(s);
+                    }
+                    sgi_mace_audio_irq_update(s);
+                    return;
+                case AUD_CH_READ:
+                    /* hw-owned on output channels; sw-owned on input */
+                    if (ch == 0) {
+                        s->audio_ch_rptr[ch] = value
+                            & (AUD_RING_SIZE - 1) & ~0x7ULL;
+                        sgi_mace_audio_irq_update(s);
+                    }
+                    return;
+                case AUD_CH_WRITE:
+                    /* sw-owned on output channels; hw-owned on input */
+                    if (ch != 0) {
+                        s->audio_ch_wptr[ch] = value
+                            & (AUD_RING_SIZE - 1) & ~0x7ULL;
+                        sgi_mace_audio_irq_update(s);
+                    }
+                    return;
+                case AUD_CH_DEPTH:
+                    /* read-only */
+                    return;
+                }
+            }
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_mace: audio write at offset 0x%03" HWADDR_PRIx
+                      " value 0x%016" PRIx64 " (discarded)\n",
+                      aud_off, value);
+        return;
+    }
+}
+
+/*
+ * MSC/UST register read/write (MACE_UST_MSC_OFFSET + 0x20/0x28/0x30;
+ * kernel MACE_AIN/AOUT1/AOUT2_MSC_UST).  The register is writable so
+ * the driver can zero the sample counter when a device starts.
+ */
+static uint64_t sgi_mace_audio_mscust_read(SGIMACEState *s, hwaddr off)
+{
+    int ch = (off - UST_AIN_MSCUST) >> 3;
+
+    if (ch >= 0 && ch < AUD_CHAN_NUM) {
+        return s->audio_ch_mscust[ch];
+    }
+    return sgi_mace_get_ust_msc();
+}
+
+static void sgi_mace_audio_mscust_write(SGIMACEState *s, hwaddr off,
+                                        uint64_t value)
+{
+    int ch = (off - UST_AIN_MSCUST) >> 3;
+
+    if (ch >= 0 && ch < AUD_CHAN_NUM) {
+        s->audio_ch_mscust[ch] = value;
+    }
+}
+
+/*
+ * Host-voice callback: the QEMU audio backend has room for `avail`
+ * bytes.  The DMA timer paces the ring drain to real time, so this
+ * callback only needs to keep the voice fed when the timer is not
+ * running (voice open with DMA stopped — silence there is fine, the
+ * idle zero-fill of spec §3.5.4 is what the guest sees).
+ */
+static void sgi_mace_audio_out_cb(void *opaque, int avail)
+{
+    SGIMACEState *s = opaque;
+
+    /* Nothing to push: the DMA timer drives the actual ring drain. */
+    (void)s;
+    (void)avail;
 }
 
 /*
@@ -2023,6 +2610,7 @@ static void sgi_mace_isa_write(SGIMACEState *s, hwaddr isa_off,
     case ISA_RINGBASE_REG:
     case ISA_RINGBASE_REG + 4:
         s->isa_ringbase = value;
+        trace_sgi_mace_isa_reg(1, ISA_RINGBASE_REG, value);
         break;
     case ISA_FLASH_NIC_REG:
     case ISA_FLASH_NIC_REG + 4:
@@ -2043,6 +2631,7 @@ static void sgi_mace_isa_write(SGIMACEState *s, hwaddr isa_off,
     case ISA_INT_MSK_REG:
     case ISA_INT_MSK_REG + 4:
         s->isa_int_mask = value;
+        trace_sgi_mace_isa_reg(1, ISA_INT_MSK_REG, value);
         sgi_mace_isa_int_update(s);
         break;
     default:
@@ -2070,6 +2659,15 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
     if (offset >= MACE_PCI_OFFSET &&
         offset < MACE_PCI_OFFSET + 0x80000) {
         return sgi_mace_pci_reg_read(s, offset - MACE_PCI_OFFSET, size);
+    }
+
+    /* Audio codec interface (0x300000-0x30FFFF, spec §3) */
+    if (offset >= MACE_AUDIO_OFFSET &&
+        offset < MACE_AUDIO_OFFSET + 0x10000) {
+        uint64_t v = sgi_mace_audio_read(s, offset - MACE_AUDIO_OFFSET);
+
+        trace_sgi_mace_audio_reg(0, offset - MACE_AUDIO_OFFSET, v);
+        return v;
     }
 
     /* ISA interface (0x310000-0x31FFFF) — includes serial DMA channels */
@@ -2101,6 +2699,19 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
         case UST_COMPARE3:
         case UST_COMPARE3 + 4:
             return s->ust_compare[2];
+        case UST_AIN_MSCUST:
+        case UST_AIN_MSCUST + 4:
+        case UST_AOUT1_MSCUST:
+        case UST_AOUT1_MSCUST + 4:
+        case UST_AOUT2_MSCUST:
+        case UST_AOUT2_MSCUST + 4:
+            /* per-channel sample-pair counter / UST (spec §3.4) */
+            {
+                uint64_t v = sgi_mace_audio_mscust_read(s, ust_off & ~7ULL);
+
+                trace_sgi_mace_audio_mscust(ust_off & ~7ULL, v);
+                return v;
+            }
         default:
             return sgi_mace_get_ust_msc();
         }
@@ -2188,6 +2799,13 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
         return;
     }
 
+    /* Audio codec interface (0x300000-0x30FFFF, spec §3) */
+    if (offset >= MACE_AUDIO_OFFSET &&
+        offset < MACE_AUDIO_OFFSET + 0x10000) {
+        sgi_mace_audio_write(s, offset - MACE_AUDIO_OFFSET, value);
+        return;
+    }
+
     /* ISA interface — includes serial DMA channels */
     if (offset >= MACE_ISA_OFFSET &&
         offset < MACE_ISA_OFFSET + 0x10000) {
@@ -2218,6 +2836,15 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
         case UST_COMPARE3:
         case UST_COMPARE3 + 4:
             s->ust_compare[2] = value;
+            break;
+        case UST_AIN_MSCUST:
+        case UST_AIN_MSCUST + 4:
+        case UST_AOUT1_MSCUST:
+        case UST_AOUT1_MSCUST + 4:
+        case UST_AOUT2_MSCUST:
+        case UST_AOUT2_MSCUST + 4:
+            /* writable: the driver zeroes the sample counter on start */
+            sgi_mace_audio_mscust_write(s, ust_off & ~7ULL, value);
             break;
         default:
             /* UST counter is read-only */
@@ -2340,6 +2967,28 @@ static void sgi_mace_reset(DeviceState *dev)
 
     memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
 
+    /*
+     * Audio block (spec §3): codec register file to power-on defaults,
+     * channel control registers held in reset (spec TABLE 33 bit 10),
+     * pointers cleared, MSC/UST zeroed.
+     */
+    s->audio_cntrl_stat = 0;
+    s->audio_codec_reg = 0;
+    s->audio_codec_intr_mask = 0;
+    s->audio_codec_read = 0;
+    memset(s->audio_ch_ctrl, 0, sizeof(s->audio_ch_ctrl));
+    memset(s->audio_ch_rptr, 0, sizeof(s->audio_ch_rptr));
+    memset(s->audio_ch_wptr, 0, sizeof(s->audio_ch_wptr));
+    memset(s->audio_ch_mscust, 0, sizeof(s->audio_ch_mscust));
+    sgi_mace_audio_codec_reset(s);
+    if (s->audio_dma_timer) {
+        timer_del(s->audio_dma_timer);
+    }
+    s->audio_tick_ns = 0;
+    if (s->audio_be) {
+        sgi_mace_audio_open_voice(s);
+    }
+
     /* MAC110 ethernet (spec §4): all state zeros at reset; the
      * station address register is pre-loaded with the ARCS env
      * MAC (kernel init_sysid writes its own copy anyway) and the
@@ -2446,6 +3095,20 @@ static void sgi_mace_realize(DeviceState *dev, Error **errp)
     s->isa_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_mace_isa_rx_poll, s);
 
     /*
+     * Audio DMA engine tick (spec §3.5): one 32-byte ring block per
+     * four stereo sample pairs at the codec's frame rate.  The host
+     * playback voice is opened only when an audiodev was wired
+     * (-global sgi-mace.audiodev=...), like sgi-pvaudio: without a
+     * backend the register file still serves the driver attach, just
+     * silently.
+     */
+    s->audio_dma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      sgi_mace_audio_tick, s);
+    if (s->audio_be) {
+        sgi_mace_audio_open_voice(s);
+    }
+
+    /*
      * MAC110 ethernet NIC: always present on the O2 motherboard.
      * The machine file claims the default -nic/-netdev backend
      * (qemu_configure_nic_device) before realize; if none was
@@ -2527,6 +3190,7 @@ static void sgi_mace_realize(DeviceState *dev, Error **errp)
 static const Property sgi_mace_properties[] = {
     DEFINE_PROP_CHR("chardev", SGIMACEState, serial),
     DEFINE_NIC_PROPERTIES(SGIMACEState, nic_conf),
+    DEFINE_AUDIO_PROPERTIES(SGIMACEState, audio_be),
 };
 
 static bool sgi_mace_ps2_needed(void *opaque)
@@ -2581,6 +3245,32 @@ static const VMStateDescription vmstate_sgi_mace_ec = {
     },
 };
 
+static bool sgi_mace_audio_needed(void *opaque)
+{
+    SGIMACEState *s = opaque;
+
+    return s->audio_be != NULL;
+}
+
+static const VMStateDescription vmstate_sgi_mace_audio = {
+    .name = "sgi-mace/audio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = sgi_mace_audio_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(audio_cntrl_stat, SGIMACEState),
+        VMSTATE_UINT64(audio_codec_reg, SGIMACEState),
+        VMSTATE_UINT16(audio_codec_intr_mask, SGIMACEState),
+        VMSTATE_UINT16(audio_codec_read, SGIMACEState),
+        VMSTATE_UINT16_ARRAY(ad1843_reg, SGIMACEState, AD1843_NUM_REGS),
+        VMSTATE_UINT64_ARRAY(audio_ch_ctrl, SGIMACEState, AUD_CHAN_NUM),
+        VMSTATE_UINT32_ARRAY(audio_ch_rptr, SGIMACEState, AUD_CHAN_NUM),
+        VMSTATE_UINT32_ARRAY(audio_ch_wptr, SGIMACEState, AUD_CHAN_NUM),
+        VMSTATE_UINT64_ARRAY(audio_ch_mscust, SGIMACEState, AUD_CHAN_NUM),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_sgi_mace = {
     .name = "sgi-mace",
     .version_id = 4,
@@ -2606,6 +3296,7 @@ static const VMStateDescription vmstate_sgi_mace = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_sgi_mace_ec,
+        &vmstate_sgi_mace_audio,
         NULL
     }
 };
