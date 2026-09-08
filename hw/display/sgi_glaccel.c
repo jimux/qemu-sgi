@@ -1685,6 +1685,69 @@ static void sgi_glaccel_update(void *opaque)
          * is identical to the last blitted frame — the surface already holds the
          * composited output, so skip everything. */
         sig = glaccel_composite_signature(s);
+        {
+            /* BL-92 A/B decode instrumentation: one line per gfx_update while the
+             * env is set, reporting exactly what the composite decision path
+             * saw — desk_render rc, the signature vs last, and the per-ctx
+             * frame serials — so a frozen display can be attributed to the
+             * skip vs a stale serial vs a dead render.  Pure print; no
+             * behavior change.  SGI_GLACCEL_DECISION_DBG=<n> prints only every
+             * n-th update (1 = all). */
+            static int dd_dbg = -1;
+            static int dd_every = 1;
+            if (dd_dbg < 0) {
+                const char *e = getenv("SGI_GLACCEL_DECISION_DBG");
+                dd_dbg = e ? 1 : 0;
+                if (e) dd_every = atoi(e) > 0 ? atoi(e) : 1;
+            }
+            if (dd_dbg && (s->n_updates % dd_every) == 0) {
+                /* one entry can exceed 16 bytes by far (the format is
+                 * ~55-96 chars); sized per PVGPU_MAXCTX with a clamp
+                 * after each snprintf — snprintf returns the WOULD-BE
+                 * length, so an unclamped off would write the trailing
+                 * NUL past the buffer end (review fix). */
+                char ctxs[PVGPU_MAXCTX * 96 + 1];
+                int off = 0, ci;
+                for (ci = 0; ci < PVGPU_MAXCTX && off < (int)sizeof(ctxs) - 96; ci++) {
+                    PVGPUCtx *c = &s->ctx[ci];
+                    if (!c->active) continue;
+                    /* BL-92 decode: fold a cheap FNV hash of the delivered
+                     * frame CONTENT — serials advancing while this hash is
+                     * constant means the renderer is re-delivering identical
+                     * pixels (frozen content), not a device-side skip. */
+                    uint64_t fh = 1469598103934665603ULL;
+                    if (c->frame && c->w > 0 && c->h > 0) {
+                        const uint32_t *px = c->frame;
+                        size_t np = (size_t)c->w * c->h, k;
+                        for (k = 0; k < np; k++) {
+                            fh = (fh ^ px[k]) * 1099511628211ULL;
+                        }
+                    } else {
+                        fh = 0;
+                    }
+                    off += snprintf(ctxs + off, sizeof(ctxs) - off,
+                                    " c%d[%d %dx%d@%d,%d ser=%u fh=%llx xid=%u]", ci,
+                                    c->frame ? 1 : 0, c->w, c->h, c->x, c->y,
+                                    (unsigned)c->frame_serial,
+                                    (unsigned long long)fh, c->bound_xid);
+                    if (off > (int)sizeof(ctxs) - 1) {
+                        off = (int)sizeof(ctxs) - 1;
+                    }
+                }
+                ctxs[off] = 0;
+                fprintf(stderr, "pvgpu: DECISION upd=%" PRIu64 " rrc=%d "
+                        "desk_changed=%d force=%d desk_full=%d geom=%d "
+                        "sig=%llx last=%llx have=%d skip=%d%s\n",
+                        s->n_updates, n_desk_rects ? n_desk_rects : 0,
+                        desk_changed, force, desk_full, geom_changed,
+                        (unsigned long long)sig,
+                        (unsigned long long)s->last_composite_sig,
+                        s->have_composite_sig,
+                        (!desk_changed && s->have_composite_sig &&
+                         sig == s->last_composite_sig),
+                        ctxs);
+            }
+        }
         if (!desk_changed && s->have_composite_sig &&
             sig == s->last_composite_sig) {
             return;   /* nothing changed; leave the surface as-is */
