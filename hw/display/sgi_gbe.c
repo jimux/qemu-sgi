@@ -203,13 +203,37 @@ static void sgi_gbe_frame_tick(void *opaque)
         fired[3] = true;
     }
 
+    /*
+     * Interrupt lines: the old code raised AND lowered within this
+     * one callback — a zero-virtual-time pulse the vCPU could never
+     * observe, so the kernel's GBE0 (retrace) / GBE1 (preblank)
+     * vectors never fired and Xsgi stalled in its retrace waits
+     * until the gthread watchdog (GfxKiller) SIGKILLed it.
+     *
+     * The line must stay asserted long enough for the vCPU to take
+     * the interrupt (the kernel's crime_intr masks the source in
+     * CRM_INTMASK before signalling its ithread), then drop before
+     * the ithread re-enables the mask — otherwise a held level
+     * re-interrupts on every unmask and the guest spins in an
+     * interrupt storm (observed: boot stalls in splint dispatch).
+     * GBE0/GBE1 are edge-style in software terms: nobody writes
+     * INTSTAT to clear them, so the line itself must go low.  A
+     * 100 us pulse satisfies both (about 6000 CPU instructions at
+     * the emulated clock — far more than the take-and-mask path
+     * needs, far less than the ithread service time).
+     */
     for (int i = 0; i < 4; i++) {
         if (fired[i]) {
             qemu_irq_raise(s->crime_irq[i]);
+        } else {
+            qemu_irq_lower(s->crime_irq[i]);
         }
     }
     if (fired[0] || fired[1] || fired[2] || fired[3]) {
         trace_sgi_gbe_irq_raise();
+        if (s->irq_timer) {
+            timer_mod(s->irq_timer, now + 100000);   /* 100 us */
+        }
     }
 
     /* Scanout + display update while the beam is in blanking */
@@ -219,17 +243,17 @@ static void sgi_gbe_frame_tick(void *opaque)
 
     s->frame_start_ns = now;
     timer_mod(s->frame_timer, now + frame_ns);
+}
 
-    /* Level pulses: drop before the next frame tick so intstat stays
-     * clean unless the guest deliberately holds the source. */
+/* Drop the GBE interrupt lines at the end of the pulse window. */
+static void sgi_gbe_irq_pulse_end(void *opaque)
+{
+    SGIGBEState *s = SGI_GBE(opaque);
+
     for (int i = 0; i < 4; i++) {
-        if (fired[i]) {
-            qemu_irq_lower(s->crime_irq[i]);
-        }
+        qemu_irq_lower(s->crime_irq[i]);
     }
-    if (fired[0] || fired[1] || fired[2] || fired[3]) {
-        trace_sgi_gbe_irq_lower();
-    }
+    trace_sgi_gbe_irq_lower();
 }
 
 /* -------------------- tile scanout into the console ------------------- */
@@ -346,9 +370,18 @@ static void sgi_gbe_scanout(SGIGBEState *s)
         }
     }
 
-    hwaddr list_ptr = s->frm_ctrl & 0xffffffc0;
-    if (!(s->frm_ctrl & 1) || list_ptr == 0) {
-        return;     /* DMA not enabled */
+    /*
+     * Tile-descriptor-list pointers: FRM_2/OVR_1 field "frm_tile_ptr"
+     * is bits 31:5 of the ctrl register (GBE spec §3.2.3/§3.2.4 — 32
+     * byte aligned; gbedefs.h GBE_FRM_TILE_PTR_MASK 0xFFFFFFE0).
+     * The old 0xFFFFFFC0 mask rounded 32-byte-aligned lists (e.g. the
+     * overlay list at 0x7d1120) down 64 bytes — into the middle of the
+     * FRM list — so the overlay channel composited garbage tiles.
+     */
+    hwaddr list_ptr = s->frm_ctrl & 0xffffffe0;
+    bool frm_on = (s->frm_ctrl & 1) != 0 && list_ptr != 0;
+    if (!frm_on && !(s->ovr_ctrl & 1)) {
+        return;     /* neither channel's DMA enabled */
     }
     trace_sgi_gbe_scanout(width, height, width_tiles, list_ptr);
 
@@ -356,10 +389,17 @@ static void sgi_gbe_scanout(SGIGBEState *s)
      * Overlay channel: ovr_width_tile packs (rhs<<16)|width_tiles like
      * frm_size_tile's tile geometry; overlay is 8bpp so a tile is 512
      * pixels wide. Enable = ovr_inhwctrl bit 0 (latched at vsync).
+     * The overlay has its OWN tile geometry: the descriptor list is
+     * indexed with the overlay's tiles-per-row (not the normal planes'
+     * tilenr), per spec §2.2 "tiles ordered top to bottom, left to
+     * right" — a 1280px overlay at 8bpp is 3 tile columns (2 full +
+     * rhs 256px), independent of the 10-tile 32bpp normal-plane row.
      */
     bool ovr_on = (s->ovr_inhwctrl & 1) != 0;
     int ovr_tiles = (s->ovr_width_tile >> 5) & 0xff;
-    hwaddr ovr_list = s->ovr_ctrl & 0xffffffc0;
+    int ovr_rhs_px = (s->ovr_width_tile & 0x1f) * 32;    /* 8bpp: bytes == px */
+    int ovr_cols = ovr_tiles + (ovr_rhs_px > 0 ? 1 : 0); /* tile columns */
+    hwaddr ovr_list = s->ovr_ctrl & 0xffffffe0;
 
     int w = width_tiles + (rhs_pixels > 0 ? 1 : 0);
     int stride = surface_stride(surface) / sizeof(uint32_t);
@@ -394,11 +434,13 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                  * (The 0x8000 valid marker is an RE-TLB-entry-only
                  * convention; a stray flagged entry still decodes as a
                  * tile number through the 0x7fff mask.) */
-                uint16_t desc;
-                address_space_read(&address_space_memory,
-                                   list_ptr + 2 * tilenr, MEMTXATTRS_UNSPECIFIED,
-                                   &desc, 2);
-                desc = be16_to_cpu(desc);
+                uint16_t desc = 0;
+                if (frm_on) {
+                    address_space_read(&address_space_memory,
+                                       list_ptr + 2 * tilenr,
+                                       MEMTXATTRS_UNSPECIFIED, &desc, 2);
+                    desc = be16_to_cpu(desc);
+                }
                 if (desc == 0) {
                     x += pix_per_tile;
                     continue;
@@ -417,19 +459,28 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                 /* overlay tile line for this span (8bpp: 512 px/tile) */
                 uint8_t ovr_buf[512];
                 bool have_ovr = false;
-                if (ovr_on && ovr_list != 0 && tx < ovr_tiles) {
-                    uint16_t odesc;
-                    address_space_read(&address_space_memory,
-                                       ovr_list + 2 * tilenr,
-                                       MEMTXATTRS_UNSPECIFIED, &odesc, 2);
-                    odesc = be16_to_cpu(odesc);
-                    if (odesc != 0) {
-                        hwaddr obase = (hwaddr)(odesc & 0x7fff) << 16;
+                if (ovr_on && ovr_list != 0) {
+                    /*
+                     * Overlay descriptor index: the overlay's own
+                     * tile-row/column geometry (row * ovr_cols + col),
+                     * NOT the normal planes' tilenr.
+                     */
+                    int ov_col = x / 512;
+                    int ov_tilenr = (y >> 7) * ovr_cols + ov_col;
+                    if (ov_tilenr < 256) {
+                        uint16_t odesc;
                         address_space_read(&address_space_memory,
-                                           obase + 512 * line,
-                                           MEMTXATTRS_UNSPECIFIED, ovr_buf,
-                                           MIN(pix_here, 512));
-                        have_ovr = true;
+                                           ovr_list + 2 * ov_tilenr,
+                                           MEMTXATTRS_UNSPECIFIED, &odesc, 2);
+                        odesc = be16_to_cpu(odesc);
+                        if (odesc != 0) {
+                            hwaddr obase = (hwaddr)(odesc & 0x7fff) << 16;
+                            address_space_read(&address_space_memory,
+                                               obase + 512 * (y & 127),
+                                               MEMTXATTRS_UNSPECIFIED, ovr_buf,
+                                               MIN(pix_here, 512));
+                            have_ovr = true;
+                        }
                     }
                 }
 
@@ -493,7 +544,12 @@ static void sgi_gbe_invalidate(void *opaque)
 static void sgi_gbe_update(void *opaque)
 {
     SGIGBEState *s = opaque;
-    if (s->con && (s->frm_ctrl & 1)) {
+    /*
+     * Repaint when EITHER channel's DMA is enabled: during the console
+     * switch the kernel runs with the overlay channel alone (frm DMA
+     * off, ovr on); gating on frm only froze the display.
+     */
+    if (s->con && ((s->frm_ctrl & 1) || (s->ovr_ctrl & 1))) {
         sgi_gbe_scanout(s);
         dpy_gfx_update(s->con, 0, 0,
                        surface_width(qemu_console_surface(s->con)),
@@ -867,8 +923,10 @@ static void sgi_gbe_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_out_named(dev, s->crime_irq, "crime-irq", 4);
 
     /* Frame timer drives the raster sweep, the ctrl->inhwctrl vsync
-     * latch, the GBE0/GBE1 pulses, and the tile scanout. */
+     * latch, the GBE0/GBE1 pulses, and the tile scanout. The irq timer
+     * ends the interrupt pulse window (see sgi_gbe_frame_tick). */
     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_gbe_frame_tick, s);
+    s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_gbe_irq_pulse_end, s);
     timer_mod(s->frame_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / GBE_DEF_REFRESH);
 

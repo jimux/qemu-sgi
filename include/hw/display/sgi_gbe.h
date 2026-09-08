@@ -150,6 +150,7 @@ struct SGIGBEState {
 
     /* Frame (raster) timer */
     QEMUTimer *frame_timer;
+    QEMUTimer *irq_timer;       /* end of the GBE irq pulse window */
     int64_t frame_start_ns;     /* start of the current frame sweep */
 
     /* Control block */
