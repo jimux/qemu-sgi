@@ -146,9 +146,19 @@ static void sgi_gbe_update(void *opaque);
 /*
  * Called at each frame boundary (VSync edge):
  *  1. latch ovr/frm/did ctrl -> inhwctrl (enable bits kept)
- *  2. raise GBE0 (retrace) and GBE1 (preblank) as brief level pulses
+ *  2. raise the vt_intr line-compare interrupts (M11a): GBE0 when the
+ *     programmed vt_intr0 line equals the retrace line, GBE1 for
+ *     vt_intr1, GBE2/GBE3 for vt_intr2/vt_intr3 — replacing the M7
+ *     unconditional GBE0/GBE1 per-frame pulses. When no compare lines
+ *     are programmed (vt_intr01/23 == 0, the PROM/textport case), GBE0
+ *     (retrace) still fires at vsync so the kernel's retrace handler
+ *     sees frames (matches the M7 behavior for unprogrammed regs).
  *  3. run the tile scanout into the QEMU console
  *  4. re-arm the timer for the next frame
+ *
+ * vt_intr01 packs intr1:intr0 as 24-bit halves: bits 27:16 = intr1,
+ * bits 11:0 = intr0 (VT_7 diagram: "vt_int1 / vt_intr0"; same layout
+ * for vt_intr23 = VT_9: intr3:intr2).
  */
 static void sgi_gbe_frame_tick(void *opaque)
 {
@@ -164,10 +174,43 @@ static void sgi_gbe_frame_tick(void *opaque)
     s->did_inhwctrl = s->did_ctrl;
     trace_sgi_gbe_latch(s->ovr_ctrl, s->frm_ctrl, s->did_ctrl);
 
-    /* GBE0 retrace / GBE1 preblank pulses to CRIME (level, brief) */
-    qemu_irq_raise(s->crime_irq[0]);
-    qemu_irq_raise(s->crime_irq[1]);
-    trace_sgi_gbe_irq_raise();
+    /*
+     * Line-compare interrupts. The compares are against vt_y during
+     * the frame sweep; we evaluate at the vsync boundary: a programmed
+     * line is "crossed" by the end of the frame. Unprogrammed (0)
+     * compare lines never match (line 0 is the top of the frame —
+     * treat 0 as "not programmed" for intr0/intr1 so the legacy
+     * per-frame retrace pulse is preserved for the textport).
+     */
+    uint32_t intr0 = s->vt_intr01 & 0xfff;
+    uint32_t intr1 = (s->vt_intr01 >> 16) & 0xfff;
+    uint32_t intr2 = s->vt_intr23 & 0xfff;
+    uint32_t intr3 = (s->vt_intr23 >> 16) & 0xfff;
+    bool fired[4] = { false, false, false, false };
+
+    if (intr0 == 0) {
+        fired[0] = true;         /* GBE0 retrace default at vsync */
+    } else if (intr0 < s->vtotal) {
+        fired[0] = true;
+    }
+    if (intr1 != 0 && intr1 < s->vtotal) {
+        fired[1] = true;
+    }
+    if (intr2 != 0 && intr2 < s->vtotal) {
+        fired[2] = true;
+    }
+    if (intr3 != 0 && intr3 < s->vtotal) {
+        fired[3] = true;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (fired[i]) {
+            qemu_irq_raise(s->crime_irq[i]);
+        }
+    }
+    if (fired[0] || fired[1] || fired[2] || fired[3]) {
+        trace_sgi_gbe_irq_raise();
+    }
 
     /* Scanout + display update while the beam is in blanking */
     if (s->con) {
@@ -177,22 +220,99 @@ static void sgi_gbe_frame_tick(void *opaque)
     s->frame_start_ns = now;
     timer_mod(s->frame_timer, now + frame_ns);
 
-    /* Deassert shortly after: model the pulse width as one scanline-ish.
-     * Simplest correct approach for the level-triggered CRIME model:
-     * raise at vsync (above), drop before the next frame tick. We
-     * deassert immediately after the scanout so intstat stays clean
-     * unless the guest deliberately holds the source. */
-    qemu_irq_lower(s->crime_irq[0]);
-    qemu_irq_lower(s->crime_irq[1]);
-    trace_sgi_gbe_irq_lower();
+    /* Level pulses: drop before the next frame tick so intstat stays
+     * clean unless the guest deliberately holds the source. */
+    for (int i = 0; i < 4; i++) {
+        if (fired[i]) {
+            qemu_irq_lower(s->crime_irq[i]);
+        }
+    }
+    if (fired[0] || fired[1] || fired[2] || fired[3]) {
+        trace_sgi_gbe_irq_lower();
+    }
 }
 
 /* -------------------- tile scanout into the console ------------------- */
 
 /*
+ * Composite the hardware cursor over the scanned-out frame (spec
+ * §2.10 Cursor): 32x32 glyph, 2 bits/pixel packed 16-per-u32 in
+ * crs_glyph[64], position from crs_pos with the (31,31) offset —
+ * "the lower right pixel of the cursor glyph corresponds to the upper
+ * left corner of the active raster", i.e. screen pixel (sx,sy) samples
+ * glyph pixel (sx - posx + 31, sy - posy + 31). Glyph value 0 is
+ * transparent; 1-3 index crs_cmap[0..2] (packed RGB). crs_ctrl bit 0
+ * = enable, bit 1 = crosshair mode (crosshair uses color 1).
+ */
+static void sgi_gbe_composite_cursor(SGIGBEState *s, DisplaySurface *surface)
+{
+    if (!(s->crs_ctrl & 1) || !surface) {
+        return;
+    }
+    int posx = (s->crs_pos >> 16) & 0xfff;
+    int posy = s->crs_pos & 0xfff;
+    int sw = surface_width(surface);
+    int sh = surface_height(surface);
+    int stride = surface_stride(surface) / sizeof(uint32_t);
+    uint32_t *dst = (uint32_t *)surface_data(surface);
+
+    if (s->crs_ctrl & 2) {
+        /* crosshair: full-width/height lines in crs_cmap[0] (color 1) */
+        uint32_t ent = s->crs_cmap[0];
+        uint32_t c = rgb_to_pixel32((ent >> 24) & 0xff,
+                                    (ent >> 16) & 0xff,
+                                    (ent >> 8) & 0xff);
+        if (posy < sh) {
+            for (int x = 0; x < sw; x++) {
+                dst[posy * stride + x] = c;
+            }
+        }
+        if (posx < sw) {
+            for (int y = 0; y < sh; y++) {
+                dst[y * stride + posx] = c;
+            }
+        }
+        return;
+    }
+
+    for (int gy = 0; gy < 32; gy++) {
+        int sy = posy - 31 + gy;
+        if (sy < 0 || sy >= sh) {
+            continue;
+        }
+        for (int gx = 0; gx < 32; gx++) {
+            int sx = posx - 31 + gx;
+            if (sx < 0 || sx >= sw) {
+                continue;
+            }
+            /* glyph row gy: crs_glyph[2*gy] = left 16 px, [2*gy+1] = right */
+            uint32_t word = s->crs_glyph[2 * gy + (gx >= 16 ? 1 : 0)];
+            int bit_off = (gx & 15) * 2;
+            uint32_t val = (word >> (30 - bit_off)) & 3;
+            if (val == 0) {
+                continue;               /* transparent */
+            }
+            uint32_t ent = s->crs_cmap[val - 1];
+            dst[sy * stride + sx] =
+                rgb_to_pixel32((ent >> 24) & 0xff, (ent >> 16) & 0xff,
+                               (ent >> 8) & 0xff);
+        }
+    }
+}
+
+/*
  * Decode one pixel through the FRM channel. The PROM programs all 32
  * WIDs to I8/CM0 (initFramebuffer), so 8bpp cmap lookups are the gate
  * path; 16bpp RGB5 and 32bpp direct are supported for the kernel.
+ *
+ * M11a adds the deferred M7 items:
+ *  - OVR overlay channel scanout: 8bpp, always indexes cmap entries
+ *    4352..4607 (GBE_OVR_CMAP_OFFSET 0x1100), pixel 0x00 = transparent
+ *    (GBE spec §Overlay planes). Preferred over FRM when its DMA is
+ *    enabled (gxemul does the same).
+ *  - cursor compositing: 32x32 2bpp glyph, position (crs_posx,crs_posy)
+ *    with the (31,31) offset convention, color from crs_cmap[0..2]
+ *    (glyph value 0 transparent; spec §2.10 Cursor).
  */
 static void sgi_gbe_scanout(SGIGBEState *s)
 {
@@ -231,6 +351,15 @@ static void sgi_gbe_scanout(SGIGBEState *s)
         return;     /* DMA not enabled */
     }
     trace_sgi_gbe_scanout(width, height, width_tiles, list_ptr);
+
+    /*
+     * Overlay channel: ovr_width_tile packs (rhs<<16)|width_tiles like
+     * frm_size_tile's tile geometry; overlay is 8bpp so a tile is 512
+     * pixels wide. Enable = ovr_inhwctrl bit 0 (latched at vsync).
+     */
+    bool ovr_on = (s->ovr_inhwctrl & 1) != 0;
+    int ovr_tiles = (s->ovr_width_tile >> 5) & 0xff;
+    hwaddr ovr_list = s->ovr_ctrl & 0xffffffc0;
 
     int w = width_tiles + (rhs_pixels > 0 ? 1 : 0);
     int stride = surface_stride(surface) / sizeof(uint32_t);
@@ -285,23 +414,56 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                 address_space_read(&address_space_memory, tile_base + 512 * line,
                                    MEMTXATTRS_UNSPECIFIED, buf, MIN(nbytes, 512 * 4));
 
+                /* overlay tile line for this span (8bpp: 512 px/tile) */
+                uint8_t ovr_buf[512];
+                bool have_ovr = false;
+                if (ovr_on && ovr_list != 0 && tx < ovr_tiles) {
+                    uint16_t odesc;
+                    address_space_read(&address_space_memory,
+                                       ovr_list + 2 * tilenr,
+                                       MEMTXATTRS_UNSPECIFIED, &odesc, 2);
+                    odesc = be16_to_cpu(odesc);
+                    if (odesc != 0) {
+                        hwaddr obase = (hwaddr)(odesc & 0x7fff) << 16;
+                        address_space_read(&address_space_memory,
+                                           obase + 512 * line,
+                                           MEMTXATTRS_UNSPECIFIED, ovr_buf,
+                                           MIN(pix_here, 512));
+                        have_ovr = true;
+                    }
+                }
+
                 for (int i = 0; i < pix_here && x < width; i++, x++) {
                     uint32_t r, g, b;
-                    if (bpp == 1) {
-                        uint32_t idx = buf[i];
-                        uint32_t ent = s->cmap[idx];
-                        r = (ent >> 24) & 0xff;
-                        g = (ent >> 16) & 0xff;
-                        b = (ent >> 8) & 0xff;
-                    } else if (bpp == 2) {
-                        uint16_t p = (buf[2 * i] << 8) | buf[2 * i + 1];
-                        r = ((p >> 10) & 0x1f) << 3;
-                        g = ((p >> 5) & 0x1f) << 3;
-                        b = (p & 0x1f) << 3;
-                    } else {
-                        r = buf[4 * i];
-                        g = buf[4 * i + 1];
-                        b = buf[4 * i + 2];
+                    bool ov_used = false;
+                    if (have_ovr) {
+                        uint32_t oidx = ovr_buf[i];
+                        if (oidx != 0) {
+                            /* overlay indexes cmap[4352..4607] */
+                            uint32_t ent = s->cmap[0x1100 + oidx];
+                            r = (ent >> 24) & 0xff;
+                            g = (ent >> 16) & 0xff;
+                            b = (ent >> 8) & 0xff;
+                            ov_used = true;
+                        }
+                    }
+                    if (!ov_used) {
+                        if (bpp == 1) {
+                            uint32_t idx = buf[i];
+                            uint32_t ent = s->cmap[idx];
+                            r = (ent >> 24) & 0xff;
+                            g = (ent >> 16) & 0xff;
+                            b = (ent >> 8) & 0xff;
+                        } else if (bpp == 2) {
+                            uint16_t p = (buf[2 * i] << 8) | buf[2 * i + 1];
+                            r = ((p >> 10) & 0x1f) << 3;
+                            g = ((p >> 5) & 0x1f) << 3;
+                            b = (p & 0x1f) << 3;
+                        } else {
+                            r = buf[4 * i];
+                            g = buf[4 * i + 1];
+                            b = buf[4 * i + 2];
+                        }
                     }
                     if (x >= 0 && x < surface_width(surface) &&
                         y < surface_height(surface)) {
@@ -311,6 +473,10 @@ static void sgi_gbe_scanout(SGIGBEState *s)
             }
         }
     }
+
+    /* ---- cursor compositing (spec §2.10) ---- */
+    sgi_gbe_composite_cursor(s, surface);
+
     s->scan_dirty = false;
 }
 
