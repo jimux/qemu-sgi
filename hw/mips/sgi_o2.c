@@ -98,6 +98,29 @@
  */
 #define O2_HIGH_RAM_BASE 0x40000000ULL
 
+/*
+ * No-ECC memory alias base: physical 0x80000000.
+ *
+ * CRIME 1.5 spec §3.1.2 Table 3-1 ("CPU Address Space"): the O2 CPU physical
+ * map carries a 1 GB "No-ECC Memory" region at 0x0080000000 handled by CRIME —
+ * an alias of system memory through which the CPU can access any physical
+ * memory location without ECC checking/correction (used for ECC error fixup
+ * and for reading CRIME-renderer-written memory).
+ *
+ * The IRIX 6.5 tile manager (tile_mapin, tile_free's zero-tile helper) relies
+ * on this alias: it builds kernel PTEs whose PFN carries the 0x80000 marker
+ * bit (pfn | 0x80000), deliberately addressing tiles through the No-ECC
+ * alias so the 64 KB bzero of a freed tile does not trigger ECC
+ * read-modify-write cycles. Without this alias region, a freed-tile bzero
+ * faults to a nonexistent physical address (e.g. 0x83010000) and the kernel
+ * double-panics with EXC 28 Data Bus Error — observed when a second Xsgi
+ * re-initializes the CRM/GBE screen (M11y).
+ *
+ * The region is 1 GB per spec; alias exactly machine->ram_size (the alias is
+ * defined to cover "any location of physical memory").
+ */
+#define O2_NOECC_RAM_BASE 0x80000000ULL
+
 static void main_cpu_reset(void *opaque) {
   MIPSCPU *cpu = opaque;
   cpu_reset(CPU(cpu));
@@ -920,6 +943,20 @@ static void sgi_o2_init(MachineState *machine) {
       memory_region_add_subregion(system_memory,
                                   base + (hwaddr)m * 32 * MiB, bank);
     }
+  }
+
+  /*
+   * No-ECC memory alias at 0x80000000 (CRIME 1.5 spec §3.1.2 Table 3-1):
+   * 1 GB region aliasing all installed RAM. The IRIX tile manager addresses
+   * tiles through this alias (PFN | 0x80000); see the O2_NOECC_RAM_BASE
+   * comment above. The SEG1 windows above end at 0x80000000, so this region
+   * does not overlap them.
+   */
+  {
+    MemoryRegion *noecc = g_new(MemoryRegion, 1);
+    memory_region_init_alias(noecc, OBJECT(machine), "o2-noecc-ram",
+                             machine->ram, 0, machine->ram_size);
+    memory_region_add_subregion(system_memory, O2_NOECC_RAM_BASE, noecc);
   }
 
   /* PROM at 0x1FC00000 */
