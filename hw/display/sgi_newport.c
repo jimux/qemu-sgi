@@ -1945,9 +1945,18 @@ static void newport_decode_drawmode0(SGINewportState *s)
  * ============================================================
  */
 
-static uint64_t sgi_newport_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * 32-bit register access. addr must already be 4-byte aligned (except for
+ * sub-word accesses, which carry the byte offset in addr). Real REX3
+ * registers are accessed by the guest as 32-bit or 64-bit transactions;
+ * 64-bit accesses are split by the sgi_newport_read/write wrappers into two
+ * 32-bit register accesses so register pairs (e.g. XENDF at 0x140 + YENDF
+ * at 0x144) land in the right slots (BL-93: libgl stores coordinate pairs
+ * with single 64-bit `sd` instructions).
+ */
+static uint32_t newport_read32(SGINewportState *s, hwaddr addr, unsigned size,
+                               bool go_trigger)
 {
-    SGINewportState *s = SGI_NEWPORT(opaque);
     uint32_t val = 0;
     bool is_go;
     hwaddr reg;
@@ -2191,7 +2200,7 @@ static uint64_t sgi_newport_read(void *opaque, hwaddr addr, unsigned size)
         break;
     }
 
-    if (is_go) {
+    if (is_go && go_trigger) {
         newport_do_rex3_command(s);
     }
 
@@ -2211,10 +2220,36 @@ static uint64_t sgi_newport_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
-static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
-                               unsigned size)
+static uint64_t sgi_newport_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGINewportState *s = SGI_NEWPORT(opaque);
+
+    if (size == 8) {
+        /* 64-bit read: hi 32 bits from addr, lo 32 bits from addr+4. One
+         * Go trigger for the whole transaction, not one per half. */
+        hwaddr base = addr & ~3ULL;
+        bool go = (base >= REX3_GO_OFFSET && base < 0x1000) ||
+                  (base + 4 >= REX3_GO_OFFSET && base + 4 < 0x1000);
+        uint32_t hi = newport_read32(s, base, 4, false);
+        uint32_t lo = newport_read32(s, base + 4, 4, false);
+        if (go) {
+            newport_do_rex3_command(s);
+        }
+        return ((uint64_t)hi << 32) | lo;
+    }
+    return newport_read32(s, addr, size, true);
+}
+
+/*
+ * One 32-bit register write (addr 4-aligned). go_trigger: fire the REX3
+ * command after the register store when the access is in Go space. The
+ * 64-bit wrapper splits an 8-byte store into two newport_write32() calls
+ * but fires the Go trigger exactly once — a 64-bit Go-space write is a
+ * single hardware transaction that launches one command (BL-93).
+ */
+static void newport_write32(SGINewportState *s, hwaddr addr, uint64_t val,
+                            unsigned size, bool go_trigger)
+{
     bool is_go;
     hwaddr reg;
     unsigned byte_offset = addr & 3;
@@ -2549,9 +2584,29 @@ static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     }
 
-    if (is_go) {
+    if (is_go && go_trigger) {
         newport_do_rex3_command(s);
     }
+}
+
+static void sgi_newport_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    SGINewportState *s = SGI_NEWPORT(opaque);
+
+    if (size == 8) {
+        /* 64-bit write: hi 32 bits to addr, lo 32 bits to addr+4. One Go
+         * trigger for the whole transaction, not one per half. */
+        hwaddr base = addr & ~3ULL;
+        bool go = base >= REX3_GO_OFFSET && base < 0x1000;
+        newport_write32(s, base, (uint32_t)(val >> 32), 4, false);
+        newport_write32(s, base + 4, (uint32_t)val, 4, false);
+        if (go) {
+            newport_do_rex3_command(s);
+        }
+        return;
+    }
+    newport_write32(s, addr, val, size, true);
 }
 
 static const MemoryRegionOps sgi_newport_ops = {
@@ -2560,11 +2615,11 @@ static const MemoryRegionOps sgi_newport_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
     .impl = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 8,
     },
     .valid = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 8,
     },
 };
 
