@@ -96,11 +96,25 @@ static uint16_t sgi_crime_re_tile_desc(SGICRIMEREState *s, int tlb_sel,
 static bool sgi_crime_re_tiled_addr(SGICRIMEREState *s, int tlb_sel,
                                     int x, int y, int bpp, hwaddr *phys)
 {
-    if (x < 0 || y < 0 || x >= 2048 || y >= 2048) {
+    /*
+     * M11k: the coordinate space is 2048x2048 PIXELS, but the MTE path
+     * feeds BYTE-x coordinates (gxemul's dev_sgi_re divides by depth/8 —
+     * and the X DDX's 8bpp fills reach byte-x 0x13ff = 5119 for a
+     * 1280-word row). The old 2048 bound rejected every byte-x past 2047,
+     * silently truncating the DDX's full-screen fills to the left 1024
+     * bytes (= the 256-pixel strip observed on the v3 gate). The physical
+     * space still caps at 16 tile columns x 16 rows (64KB*256 = the full
+     * RE TLB reach, 512px/col at 8bpp = 8192 byte-x); accept the wider
+     * x and let the tile_nr math + TLB-valid decode handle the bounds.
+     */
+    if (x < 0 || y < 0 || x >= 8192 || y >= 2048) {
         return false;
     }
     int tile_w = 512 / bpp;             /* pixels across one tile */
     int tile_nr = (y >> 7) * 16 + x / tile_w;
+    if (tile_nr >= 256) {
+        return false;                  /* beyond the 64-entry/256-tile TLB */
+    }
     uint16_t desc = sgi_crime_re_tile_desc(s, tlb_sel, tile_nr);
     if (!(desc & 0x8000)) {
         return false;                  /* tile not valid/mapped */
@@ -804,9 +818,18 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
         return;                 /* reserved */
     }
 
-    int x1 = (s->mte_dst0 >> 16) & 0xfff;
+    /*
+     * M11k: the MTE dst/src x fields hold BYTE coordinates wider than
+     * 12 bits — the X DDX's 8bpp full-screen fill reaches byte-x 0x13ff
+     * (5119 = a full 1280-word row's bytes). The old 0xfff mask truncated
+     * every fill past byte 4095 (observed live as the 256-px red strip on
+     * the left of the v3 gate screen). Take the full 16-bit field; the
+     * 0x1000+ bits are byte-x, not flags (the byte-lane-rotating weave
+     * fills use exactly 0x13ff_xxxx for their rows).
+     */
+    int x1 = (s->mte_dst0 >> 16) & 0xffff;
     int y1 = s->mte_dst0 & 0xfff;
-    int x2 = (s->mte_dst1 >> 16) & 0xfff;
+    int x2 = (s->mte_dst1 >> 16) & 0xffff;
     int y2 = (s->mte_dst1 & 0xfff);
     int depth_code = (mode >> MTE_PIX_DEPTH_SHFT) & 3;
     int bpp = 1 << depth_code;
@@ -835,7 +858,7 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
 
     /* COPY: src rect in the src TLB (tiled or linear) + y-step strides */
     bool src_linear = src_tlb == 4 || src_tlb == 5;
-    int sx1 = (s->mte_src0 >> 16) & 0xfff;
+    int sx1 = (s->mte_src0 >> 16) & 0xffff;
     int sy1 = s->mte_src0 & 0xfff;
     sx1 /= bpp;
     int64_t lin_off = s->mte_src0;      /* linear src: byte offset */

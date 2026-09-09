@@ -517,28 +517,67 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                         }
                     }
                     if (!ov_used) {
+                        /*
+                         * Pixel decode is governed by the effective WID's
+                         * typ field (spec §2.4 window table: typ 0=I8,
+                         * 1=I12, 2=RG3B2, 3=RGB4, 4=RGB5, 5=RGB8; cm =
+                         * the upper 5 cmap bits for I8; buf = the 8+8 /
+                         * 16+16 double-buffer half). With the DID stream's
+                         * DMA off every pixel takes WID 0 / mode_regs[0]
+                         * (the M11a/M11o rule, kept below for the 8bpp
+                         * fetch geometry).
+                         *
+                         * M11k: the O2 X server runs its 8bpp PseudoColor
+                         * screen through the 32bpp NORMAL planes using the
+                         * spec's 8+8 split ("The normal stream can be 16 or
+                         * 32 bits deep, and can be split using the DIDs to
+                         * provide 8+8 and 16+16 double buffering" — §1
+                         * Overview): the DDX writes its 8bpp pixels into the
+                         * byte lanes of the 32-bit words (observed live:
+                         * byte-lane-rotated per-scanline MTE fills; the
+                         * xsetroot red fill = byte 1 in every lane) and the
+                         * WID's I8 typ + cm=16 (WID0=0x203) makes GBE decode
+                         * each fetched word's 8bpp index through the cmap
+                         * window the DDX loaded (cmap[4096+byte]). The old
+                         * direct-RGB decode of the 32bpp fetch ignored the
+                         * WID typ entirely, so X's 8bpp content decoded as
+                         * near-black RGB (byte 1 -> (1,1,1)) and the screen
+                         * stayed dark. Honor the WID typ for every fetch
+                         * depth; the byte lane for the 8+8 split follows
+                         * the WID buf bits (11=both -> lane 0; 01 lower /
+                         * 10 upper half), and 'both' composites lane 0 (the
+                         * DDX fills replicate to all lanes, so any fixed
+                         * lane choice renders its content).
+                         */
+                        uint32_t wid = s->mode_regs[0];
+                        uint32_t typ = (wid >> 2) & 0x7;   /* WID[4:2] typ */
+                        uint32_t cm = (wid >> 5) & 0x1f;   /* WID[9:5] cm */
+                        uint32_t bufsel = wid & 0x3;       /* WID[1:0] buf */
                         if (bpp == 1) {
                             /*
-                             * I8 pixels index the cmap through the WID's CM
-                             * field: spec §2.7 Color map — "I8 pixels are
-                             * concatenated with the DID cm field to produce a
-                             * 13 bit color index : cm(4 downto 0) & i8(7
-                             * downto 0)" (gbedefs.h GBE_WID_CM_SHIFT 5,
-                             * GBE_WID_CM_MASK 0x3e0). With the DID stream's
-                             * DMA off (the long-standing observed state,
-                             * did_ctrl bit16=0) there is no per-pixel DID, so
-                             * every pixel takes WID 0 / mode_regs[0]. The
-                             * PROM programs all 32 WIDs I8/cm=0
-                             * (initFramebuffer), where this reduces to the
-                             * old cmap[pixel] lookup — behavior preserved.
-                             * Xsgi installs its colormap at cm=16
-                             * (cmap[4096+pixel], WID1=0x203); when its 8bpp
-                             * pixels flow, they now decode through the window
-                             * the guest actually loaded instead of window 0.
+                             * 8bpp fetch: the old M11o decode (WID-CM
+                             * window) — unchanged semantics.
                              */
-                            uint32_t wid = s->mode_regs[0];
-                            uint32_t cm = (wid >> 5) & 0x1f;
                             uint32_t idx = (cm << 8) | buf[i];
+                            uint32_t ent = s->cmap[idx];
+                            r = (ent >> 24) & 0xff;
+                            g = (ent >> 16) & 0xff;
+                            b = (ent >> 8) & 0xff;
+                        } else if (typ == 0) {
+                            /*
+                             * I8 WID on a 16/32-bit fetch (the 8+8 / 16+16
+                             * split): the pixel index is the 8bpp byte in
+                             * the WID-selected half of the fetched word.
+                             * Lane per buf: 01 = lower half (byte 0 of the
+                             * half), 10 = upper half, 11 = both -> byte 0.
+                             */
+                            int lane;
+                            if (bpp == 2) {
+                                lane = (bufsel == 2) ? 1 : 0;
+                            } else {
+                                lane = (bufsel == 2) ? 2 : 0;
+                            }
+                            uint32_t idx = (cm << 8) | buf[bpp * i + lane];
                             uint32_t ent = s->cmap[idx];
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
