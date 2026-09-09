@@ -333,10 +333,16 @@ static void sgi_gbe_composite_cursor(SGIGBEState *s, DisplaySurface *surface)
  *  - OVR overlay channel scanout: 8bpp, always indexes cmap entries
  *    4352..4607 (GBE_OVR_CMAP_OFFSET 0x1100), pixel 0x00 = transparent
  *    (GBE spec §Overlay planes). Preferred over FRM when its DMA is
- *    enabled (gxemul does the same).
+ *    enabled (gxemul does the same). The 0x1100 base is FIXED by the
+ *    spec ("GBE does not support display ID bits for the overlay
+ *    planes") — NOT WID-derived (m11o: kernel tp mapcolor writes land
+ *    at exactly 0x1100+col+1).
  *  - cursor compositing: 32x32 2bpp glyph, position (crs_posx,crs_posy)
  *    with the (31,31) offset convention, color from crs_cmap[0..2]
  *    (glyph value 0 transparent; spec §2.10 Cursor).
+ *  - I8 FRM pixels index cmap through the WID CM field (spec §2.7
+ *    "cm(4:0) & i8(7:0)"); with the DID stream off all pixels take
+ *    WID 0 / mode_regs[0] (cm=0 → identical to the old window-0 lookup).
  */
 static void sgi_gbe_scanout(SGIGBEState *s)
 {
@@ -490,7 +496,19 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                     if (have_ovr) {
                         uint32_t oidx = ovr_buf[i];
                         if (oidx != 0) {
-                            /* overlay indexes cmap[4352..4607] */
+                            /*
+                             * Overlay cmap window: FIXED at entries 4352..4607
+                             * (0x1100..0x11ff). GBE spec §2.3 Overlay planes:
+                             * "GBE does not support display ID bits for the
+                             * overlay planes. The 8 bits of overlay color index
+                             * always point to entries 4352 to 4607 in the color
+                             * map." Verified against the guest: the kernel
+                             * textport's mapcolor (0x80277444) writes
+                             * cmap[0x1101 + col] while its color() (0x80277418)
+                             * draws pixel col+1 — self-consistent only with
+                             * this fixed base (m11o run2 trace: writes at
+                             * 0x1101/0x1102 land exactly here).
+                             */
                             uint32_t ent = s->cmap[0x1100 + oidx];
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
@@ -500,7 +518,27 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                     }
                     if (!ov_used) {
                         if (bpp == 1) {
-                            uint32_t idx = buf[i];
+                            /*
+                             * I8 pixels index the cmap through the WID's CM
+                             * field: spec §2.7 Color map — "I8 pixels are
+                             * concatenated with the DID cm field to produce a
+                             * 13 bit color index : cm(4 downto 0) & i8(7
+                             * downto 0)" (gbedefs.h GBE_WID_CM_SHIFT 5,
+                             * GBE_WID_CM_MASK 0x3e0). With the DID stream's
+                             * DMA off (the long-standing observed state,
+                             * did_ctrl bit16=0) there is no per-pixel DID, so
+                             * every pixel takes WID 0 / mode_regs[0]. The
+                             * PROM programs all 32 WIDs I8/cm=0
+                             * (initFramebuffer), where this reduces to the
+                             * old cmap[pixel] lookup — behavior preserved.
+                             * Xsgi installs its colormap at cm=16
+                             * (cmap[4096+pixel], WID1=0x203); when its 8bpp
+                             * pixels flow, they now decode through the window
+                             * the guest actually loaded instead of window 0.
+                             */
+                            uint32_t wid = s->mode_regs[0];
+                            uint32_t cm = (wid >> 5) & 0x1f;
+                            uint32_t idx = (cm << 8) | buf[i];
                             uint32_t ent = s->cmap[idx];
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
@@ -809,7 +847,9 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
      * load to vsync; instant is fine — never clear/modify at vsync) */
     if (offset >= GBE_CMAP_BASE &&
         offset < GBE_CMAP_BASE + GBE_CMAP_SIZE * 4) {
-        s->cmap[(offset - GBE_CMAP_BASE) / 4] = v;
+        uint32_t idx = (offset - GBE_CMAP_BASE) / 4;
+        s->cmap[idx] = v;
+        trace_sgi_gbe_cmap_write(idx, v);
         s->scan_dirty = true;
         return;
     }

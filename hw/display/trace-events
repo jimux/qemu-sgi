@@ -261,3 +261,4 @@ sgi_gbe_irq_lower(void) "GBE0/GBE1 lower"
 sgi_gbe_frm_ctrl(uint32_t val) "frm_ctrl = 0x%08x"
 sgi_gbe_frame_tick(uint32_t htotal, uint32_t vtotal, uint32_t refresh) "frame tick htotal=%u vtotal=%u refresh=%u"
 sgi_gbe_scanout(int width, int height, int width_tiles, uint64_t list) "scanout %dx%d tiles=%d list=0x%"PRIx64
+sgi_gbe_cmap_write(uint32_t index, uint32_t val) "cmap[%u] = 0x%08x"
