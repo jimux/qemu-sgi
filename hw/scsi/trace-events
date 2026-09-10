@@ -393,3 +393,21 @@ scsi_generic_ioctl_sgio_done(uint8_t cmd, int ret, uint8_t status, uint8_t host_
 
 # sgi_aic7880.c
 sgi_aic7880_mode_sense_page0_synth(uint8_t bus, uint8_t target, uint8_t lun, bool dbd, uint8_t page_control, uint32_t alloc_len, int blocksize, uint64_t nblocks) "bus %u target %u lun %u dbd %d pc %u xfer %u blksz %d nblocks %"PRIu64
+sgi_aic7880_seq_fetch(uint8_t bus, uint32_t pc, uint8_t opcode) "bus %u seq pc %u op 0x%02x"
+sgi_aic7880_seq_pause(uint8_t bus, uint32_t pc, uint8_t intcode) "bus %u seq PAUSE @ pc %u INTCODE 0x%02x"
+sgi_aic7880_seq_jump(uint8_t bus, uint32_t from, uint32_t to) "bus %u seq jump %u -> %u"
+sgi_aic7880_phase(uint8_t bus, uint8_t phase, uint8_t active_scb) "bus %u phase 0x%02x scb %u"
+sgi_aic7880_hdma(uint8_t bus, bool to_host, uint32_t n, uint32_t haddr, uint32_t hcnt) "bus %u hdma to_host %d n %u haddr 0x%x hcnt %u"
+sgi_aic7880_scb_fetch(uint8_t bus, uint8_t scb, uint32_t host, uint8_t tarlun) "bus %u scb %u fetched @0x%x tarlun 0x%02x"
+sgi_aic7880_selto(uint8_t bus, uint8_t scb, uint8_t target) "bus %u scb %u SELTO target %u"
+sgi_aic7880_bus_complete(uint8_t bus, uint8_t scb, int status) "bus %u scb %u bus-complete status %d"
+sgi_aic7880_qin_write(uint8_t bus, uint8_t scb, uint16_t count) "bus %u qinfifo <- scb %u (count %u)"
+sgi_aic7880_qout_post(uint8_t bus, uint8_t scb, uint8_t slot, uint8_t conv_off, uint8_t ring_at_conv4, uint8_t next_byte) "bus %u QOUT post scb %u slot %u (conv %u) ring[conv4]=0x%02x next=0x%02x"
+sgi_aic7880_clrint(uint8_t bus, uint8_t val, uint8_t intstat, uint8_t qout_slot) "bus %u clrint 0x%02x (intstat was 0x%02x, qout_slot %u)"
+sgi_aic7880_sel_start(uint8_t bus, uint8_t scb, uint8_t tarlun, uint8_t found) "bus %u sel scb %u tarlun 0x%02x dev %u"
+sgi_aic7880_sel_drop(uint8_t bus, uint8_t scb, uint8_t has_req, uint8_t bus_sel) "bus %u sel DROP scb %u (cur_req %u bus_selected %u)"
+sgi_aic7880_qin_pop(uint8_t bus, uint8_t scb, uint16_t count) "bus %u qinfifo pop -> scb %u (count %u)"
+sgi_aic7880_hcntrl_write(uint8_t bus, uint8_t val, uint8_t running, uint8_t host_pause, uint8_t int_pause) "bus %u hcntrl write 0x%02x (running %u host_pause %u int_pause %u)"
+sgi_aic7880_intstat_read_ring(uint8_t bus, uint8_t intstat, uint8_t qout_slot, uint8_t lane4, uint8_t lane0, uint8_t lane252, uint8_t lane248) "bus %u intstat read -> 0x%02x (slot %u) lanes 4:0x%02x 0:0x%02x 252:0x%02x 248:0x%02x"
+sgi_aic7880_qout_scratch_write(uint8_t bus, uint8_t chip, uint8_t val, uint8_t qout_slot) "bus %u QOUT scratch write chip 0x%02x = 0x%02x (slot was %u)"
+sgi_aic7880_seq_idle_gate(uint8_t bus, uint32_t pc, uint8_t sstat0, uint8_t scsiseq, uint8_t qincnt) "bus %u idle gate pc %u sstat0 0x%02x scsiseq 0x%02x qincnt %u"
