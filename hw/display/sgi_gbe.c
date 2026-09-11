@@ -32,6 +32,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "hw/display/sgi_gbe.h"
+#include "hw/display/edid.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -642,6 +643,180 @@ static const GraphicHwOps sgi_gbe_gfx_ops = {
 
 
 
+/* --------------------------- DDC/EDID on I2C ---------------------------- */
+/*
+ * The display's physical size reaches X through the monitor's EDID, which
+ * crmQryMonitor (the DDX) and the PROM's crime_i2cMonitorProbe read by
+ * bit-banging SDA/SCL in the GBE I2C window.  With no device on the bus the
+ * probe fails, the screen gets no mm size (Screen.mwidth == 0), and libXt's
+ * SgiResetScheme divides by zero -- SIGTRAP for every Motif app.  So we
+ * answer as a DDC2B slave carrying a standard 376x301 mm panel.
+ *
+ * Register/line convention (crm_i2c.c): the guest writes the COMPLEMENT of
+ * the line state and its own I2C_READ macro complements it back, so the
+ * register holds the raw value and a read returns it unmodified.  Real bits:
+ * 0 = SDA, 1 = SCL, 1 = released/high.  The slave can only pull SDA LOW.
+ *
+ * Bus model: the master's access pattern is known and fixed
+ * (crime_i2cMonitorProbe): START, 0xA0, 0x00, START, 0xA1, then 128 read
+ * bytes.  We therefore drive a frame counter on real SCL edges rather than
+ * trying to detect START/STOP at the register level -- in this bit-banged
+ * protocol the master moves SDA while SCL is high both for bit setup and to
+ * release the line for each ACK, which is indistinguishable from a START or
+ * STOP and resets the state machine on every bit.
+ *
+ * Per frame: 9 SCL clocks -- clocks 1..8 carry the data (MSB first), clock 9
+ * is the ACK clock.  During a READ frame the master samples SDA on each of
+ * the first eight clocks, so the bit index advances at frame start, not
+ * frame end, or the whole stream comes out one byte ahead.
+ *
+ * Verified offline against a transcription of crm_i2c.c before landing:
+ * tmp/o2-qemu/m13i/sim.py decodes all 128 bytes bit-exactly.
+ */
+enum { DDC_ADDR = 0, DDC_OFFSET, DDC_READ };
+
+/* EDID bytes 0x15/0x16 are the max image size in cm; 38x30 is 380x300 mm. */
+#define DDC_PANEL_MM_W      376
+#define DDC_PANEL_MM_H      301
+
+static void sgi_gbe_ddc_build_edid(SGIGBEState *s)
+{
+    qemu_edid_info info = {
+        .vendor       = "SGI",
+        .name         = "O2",
+        .width_mm     = DDC_PANEL_MM_W,
+        .height_mm    = DDC_PANEL_MM_H,
+        .prefx        = 1280,
+        .prefy        = 1024,
+        .maxx         = 1280,
+        .maxy         = 1024,
+        .refresh_rate = 60,
+    };
+
+    qemu_edid_generate(s->ddc_edid, sizeof(s->ddc_edid), &info);
+
+    /*
+     * Established-timings byte 36 ("Established Timings II").  QEMU advertises
+     * 1024x768@60 here, which crm_init.c:matchEDIDTiming prefers over the
+     * preferred timing descriptor and which would put the display into
+     * 1024x768 -- whereas the PROM's no-EDID fallback is hardcoded to
+     * 1280x1024@60 (crm_init.c:328) and that is the mode the machine has
+     * always come up in.  Advertise 1280x1024@75 (bit 0) instead so both
+     * paths agree and this change is purely "the screen now reports a
+     * physical size", not a resolution change.
+     */
+    s->ddc_edid[36] &= ~0x08;   /* clear 1024x768@60 */
+    s->ddc_edid[36] |=  0x01;   /* set   1280x1024@75 */
+    s->ddc_edid[127] = 0;       /* recompute the checksum */
+    for (int i = 0; i < 127; i++) {
+        s->ddc_edid[127] = (uint8_t)(s->ddc_edid[127] + s->ddc_edid[i]);
+    }
+    s->ddc_edid[127] = (uint8_t)(0x100 - s->ddc_edid[127]);
+
+    /* The header is what crime_i2cValidEdid checks. */
+    assert(s->ddc_edid[0] == 0x00 && s->ddc_edid[7] == 0x00);
+    /* A bad checksum would make the probe fail and drop us back to mwidth 0. */
+    {
+        int sum = 0;
+        for (int i = 0; i < 128; i++) {
+            sum += s->ddc_edid[i];
+        }
+        assert((sum & 0xff) == 0);
+    }
+}
+
+/*
+ * Advance the slave to the given REAL line state and return 1 if the slave
+ * pulls SDA low.  Called from BOTH handlers: the master's END of message is
+ * synchronised with i2c_sync_clk (a read poll while SCL is high), so the
+ * last byte of every sendbyte is only observable on a read -- the machine
+ * must therefore run on reads as well as writes.
+ */
+static int sgi_gbe_ddc_step(SGIGBEState *s, int real)
+{
+    int sda = real & 1, scl = (real >> 1) & 1;
+    int start, rising, falling;
+
+    if (!s->ddc_started) {
+        s->ddc_started = true;
+        s->ddc_pclk = scl;
+        s->ddc_pdat = sda;
+        return 0;
+    }
+
+    start   = s->ddc_pclk && scl && s->ddc_pdat && !sda;
+    rising  = !s->ddc_pclk && scl;
+    falling = s->ddc_pclk && !scl;
+
+    if (start) {
+        trace_sgi_gbe_i2c_start(s->ddc_phase);
+        s->ddc_phase = DDC_ADDR;
+        s->ddc_clocks = 0;
+        s->ddc_shift = 0;
+        s->ddc_off = 0;
+        s->ddc_frame_ack = false;
+        s->ddc_read_frame = false;
+    } else if (rising) {
+        s->ddc_clocks++;
+        if (s->ddc_clocks == 1) {
+            /* Latch at frame start: the master samples the read bits on
+             * clocks 1..8 and the offset must be current for all of them. */
+            s->ddc_read_frame = (s->ddc_phase == DDC_READ);
+        }
+        if (s->ddc_clocks <= 8) {
+            if (s->ddc_phase != DDC_READ) {
+                s->ddc_shift = (uint8_t)((s->ddc_shift << 1) | sda);
+            }
+            if (s->ddc_clocks == 8) {
+                /* Eight data bits in: interpret the frame, decide the ACK. */
+                uint8_t b = s->ddc_shift;
+                trace_sgi_gbe_i2c_byte(b, s->ddc_phase);
+                if (s->ddc_phase == DDC_ADDR) {
+                    if (b == 0xa0) {
+                        s->ddc_phase = DDC_OFFSET;
+                        s->ddc_frame_ack = true;
+                    } else if (b == 0xa1) {
+                        s->ddc_phase = DDC_READ;
+                        s->ddc_off = 0;
+                        s->ddc_frame_ack = true;
+                    }
+                } else if (s->ddc_phase == DDC_OFFSET) {
+                    s->ddc_off = b & 0x7f;
+                    s->ddc_frame_ack = true;
+                }
+            }
+        }
+    } else if (falling) {
+        if (s->ddc_clocks >= 9) {
+            /* The ACK clock has ended: advance and re-arm for the next frame. */
+            if (s->ddc_read_frame) {
+                s->ddc_off = (s->ddc_off + 1) & 0x7f;
+            }
+            s->ddc_clocks = 0;
+            s->ddc_shift = 0;
+            s->ddc_frame_ack = false;
+            s->ddc_read_frame = false;
+        }
+    }
+
+    s->ddc_pclk = scl;
+    s->ddc_pdat = sda;
+
+    /* The slave only drives while SCL is high. */
+    if (!scl) {
+        return 0;
+    }
+    if (s->ddc_phase == DDC_READ && s->ddc_clocks >= 1 && s->ddc_clocks <= 8) {
+        uint8_t b = s->ddc_edid[s->ddc_off & 0x7f];
+        /* SDA is open-drain: the slave can only pull it low. */
+        return !((b >> (7 - (s->ddc_clocks - 1))) & 1);
+    }
+    if (s->ddc_clocks == 9) {
+        return s->ddc_frame_ack;
+    }
+    return 0;
+}
+
 static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGBEState *s = SGI_GBE(opaque);
@@ -657,7 +832,7 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
     case GBE_ID:
         return GBE_ID_VALUE;
 
-    case GBE_I2C:
+    case GBE_I2C: {
         /*
          * Return the RAW register value.  The guest's own I2C_READ macro
          * complements it -- crm_i2c.c:
@@ -669,7 +844,16 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
          * to its retry limit: the PROM/Xsgi always reported "no DDC monitor",
          * leaving Screen.mwidth == 0.
          */
-        return s->i2c & 3;
+        uint32_t raw = s->i2c;
+        /* The DDC slave must run on reads too: the master's sync_clk poll is
+         * a read while SCL is high, and it is the only observation point for
+         * the last bit of each byte. */
+        if (sgi_gbe_ddc_step(s, (~raw) & 3)) {
+            raw |= 1;       /* slave pulls SDA low */
+        }
+        trace_sgi_gbe_i2c_read(s->i2c, raw);
+        return raw;
+    }
 
     case GBE_I2CFP:
         return (~s->i2cfp) & 3;
@@ -791,6 +975,11 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
 
     case GBE_I2C:
         s->i2c = v & 3;
+        /* START/STOP are write-only sequences (the master writes the two
+         * line states back to back with no read between), so the slave must
+         * see writes as well as reads. */
+        sgi_gbe_ddc_step(s, (~s->i2c) & 3);
+        trace_sgi_gbe_i2c_write(s->i2c);
         return;
     case GBE_I2CFP:
         s->i2cfp = v & 3;
@@ -951,6 +1140,19 @@ static void sgi_gbe_reset(DeviceState *dev)
     s->i2c = 0;
     s->i2cfp = 0;
 
+    /* DDC slave: rebuild the EDID and re-arm the bus machine. */
+    sgi_gbe_ddc_build_edid(s);
+    s->ddc_phase = DDC_ADDR;
+    s->ddc_clocks = 0;
+    s->ddc_shift = 0;
+    s->ddc_off = 0;
+    s->ddc_started = false;
+    s->ddc_frame_ack = false;
+    s->ddc_read_frame = false;
+    /* Idle-high: the guest's reset loop spins until a read reports 3. */
+    s->ddc_pclk = 1;
+    s->ddc_pdat = 1;
+
     memset(s->vt_regs, 0, sizeof(s->vt_regs));
     s->vt_xymax = 0;
     s->vt_intr01 = 0;
@@ -1033,6 +1235,16 @@ static const VMStateDescription vmstate_sgi_gbe = {
         VMSTATE_UINT32(dotclock, SGIGBEState),
         VMSTATE_UINT32(i2c, SGIGBEState),
         VMSTATE_UINT32(i2cfp, SGIGBEState),
+        VMSTATE_UINT8_ARRAY(ddc_edid, SGIGBEState, 128),
+        VMSTATE_UINT8(ddc_phase, SGIGBEState),
+        VMSTATE_UINT8(ddc_clocks, SGIGBEState),
+        VMSTATE_UINT8(ddc_shift, SGIGBEState),
+        VMSTATE_UINT8(ddc_off, SGIGBEState),
+        VMSTATE_UINT8(ddc_pclk, SGIGBEState),
+        VMSTATE_UINT8(ddc_pdat, SGIGBEState),
+        VMSTATE_BOOL(ddc_started, SGIGBEState),
+        VMSTATE_BOOL(ddc_frame_ack, SGIGBEState),
+        VMSTATE_BOOL(ddc_read_frame, SGIGBEState),
         VMSTATE_UINT32_ARRAY(vt_regs, SGIGBEState, GBE_VT_REG_COUNT),
         VMSTATE_UINT32(vt_xymax, SGIGBEState),
         VMSTATE_UINT32(vt_intr01, SGIGBEState),

@@ -254,6 +254,11 @@ sgi_pvrex3_vc2(uint32_t reg, uint32_t val, int write) "vc2 reg=0x%02x val=0x%04x
 
 # sgi_gbe.c (O2 GBE raster/timing + tile scanout)
 sgi_gbe_vt_xy_read(uint32_t xy) "vt_xy read -> 0x%08x"
+sgi_gbe_i2c_write(uint32_t raw) "i2c write raw=0x%x"
+sgi_gbe_i2c_read(uint32_t master, uint32_t ret) "i2c read master=0x%x ret=0x%x"
+sgi_gbe_i2c_byte(uint32_t byte, uint32_t phase) "ddc frame byte=0x%02x phase=%u"
+sgi_gbe_i2c_start(uint32_t phase) "ddc start (was phase=%u)"
+sgi_gbe_i2c_unimpl(uint32_t raw) "ddc unexpected line pattern raw=0x%x"
 sgi_gbe_xymax(uint32_t xymax) "vt_xymax = 0x%08x"
 sgi_gbe_latch(uint32_t ovr, uint32_t frm, uint32_t did) "vsync latch ovr=0x%08x frm=0x%08x did=0x%08x"
 sgi_gbe_irq_raise(void) "GBE0/GBE1 raise (retrace/preblank)"

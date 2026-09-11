@@ -159,6 +159,23 @@ struct SGIGBEState {
     uint32_t i2c;
     uint32_t i2cfp;
 
+    /* DDC/EDID slave on the I2C window.  crmQryMonitor / the PROM's
+     * crime_i2cMonitorProbe read the monitor's EDID by bit-banging SDA/SCL
+     * through the GBE_I2C register; with no device the probe fails, the X
+     * screen gets no physical size (Screen.mwidth == 0), and libXt's
+     * SgiResetScheme divides by zero -> SIGTRAP for every Motif app.
+     * We answer as a DDC2B slave so the screen gets a real mm size. */
+    uint8_t  ddc_edid[128];
+    uint8_t  ddc_phase;      /* DDC_ADDR / DDC_OFFSET / DDC_READ */
+    uint8_t  ddc_clocks;     /* SCL rising edges in the current frame (9) */
+    uint8_t  ddc_shift;      /* data bits accumulated in this frame */
+    uint8_t  ddc_off;        /* EDID byte being read */
+    uint8_t  ddc_pclk;       /* previous REAL SCL (edge detect) */
+    uint8_t  ddc_pdat;       /* previous REAL SDA (edge detect) */
+    bool     ddc_started;    /* have we seen any edge yet */
+    bool     ddc_frame_ack;  /* ACK to present on this frame's 9th clock */
+    bool     ddc_read_frame; /* frame's data clocks were in READ phase */
+
     /* Video timing */
     uint32_t vt_xymax;      /* (vtotal<<12)|htotal as written by the PROM */
     uint32_t vt_intr01;
