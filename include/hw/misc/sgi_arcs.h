@@ -210,6 +210,26 @@ struct SGIARCSState {
     uint32_t kernel_start_phys; /* Physical address of kernel image (low) */
     uint32_t kernel_end_phys;   /* Physical address after kernel image */
     bool sash_payload;          /* -kernel payload is sash (vs a raw kernel) */
+
+    /*
+     * SYSTEMID identity (arcs/hinv.h "typedef struct systemid"):
+     *   CHAR VendorId[8]; CHAR ProductId[8];
+     * Consumed by GetSystemId(). Per-machine because this device is SHARED by
+     * sgi-o2 / sgi-indy / sgi-virtuix: a hardcoded product string is by
+     * construction correct for at most one of them (the O2 was handed
+     * "IP55" + "SGI-IP22", i.e. two other machines' branding).
+     *
+     * QEMU string properties are char*, not char[], so these are pointers and
+     * the copy into the 8-byte guest fields is bounded at use (never more than
+     * 7 characters + terminator; longer values are truncated, which keeps the
+     * guest struct well-formed no matter what a caller passes).
+     */
+    char *vendor_id;
+    char *product_id;
+
+    /* ARCS component-tree root Identifier string (COMPONENT.Identifier).
+     * Per-machine for the same reason; 8 bytes like the field it fills. */
+    char *component_id;
 };
 
 /*

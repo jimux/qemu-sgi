@@ -1215,6 +1215,12 @@ static void sgi_o2_init(MachineState *machine) {
      * starts at phys 0 so the kernel's PT_LOAD (0x2000+) would collide with
      * the sash-oriented restart/sash-args blobs at 0x2000/0x2230. */
     qdev_prop_set_bit(arcs_dev, "sash-payload", false);
+    /* IP32 identity for SYSTEMID/GetSystemId and the ARCS component root —
+     * these are per-machine because sgi_arcs.c is shared (the O2 must not
+     * report the Indy or Virtuix product string). */
+    qdev_prop_set_string(arcs_dev, "vendor-id", "SGI");
+    qdev_prop_set_string(arcs_dev, "product-id", "IP32");
+    qdev_prop_set_string(arcs_dev, "component-id", "SGI-IP32");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(arcs_dev), &error_fatal);
     memory_region_add_subregion_overlap(system_memory, SGI_ARCS_MMIO_BASE,
                                         &SGI_ARCS(arcs_dev)->iomem, 10);

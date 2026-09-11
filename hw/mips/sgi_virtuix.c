@@ -1445,6 +1445,8 @@ static void sgi_virtuix_load_ide_ecoff(const char *path, MachineState *machine,
    * SPB/FV/env/memdesc. */
   DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
   qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+  qdev_prop_set_string(arcs_dev, "product-id", "IP55");
+  qdev_prop_set_string(arcs_dev, "component-id", "SGI-IP55");
   qdev_prop_set_uint32(arcs_dev, "kernel-start", kernel_start);
   qdev_prop_set_uint32(arcs_dev, "kernel-end", kernel_end);
   if (serial_hd(1)) {
@@ -1596,6 +1598,8 @@ static void sgi_virtuix_mode_c_boot(MachineState *machine,
     /* ARCS firmware stubs (identical Mode K tail) so sash finds the SPB/FV. */
     DeviceState *arcs_dev = qdev_new(TYPE_SGI_ARCS);
     qdev_prop_set_uint32(arcs_dev, "ram-size", machine->ram_size);
+    qdev_prop_set_string(arcs_dev, "product-id", "IP55");
+    qdev_prop_set_string(arcs_dev, "component-id", "SGI-IP55");
     qdev_prop_set_uint32(arcs_dev, "kernel-start", phys_text);
     qdev_prop_set_uint32(arcs_dev, "kernel-end", phys_bss + bsize);
     /* Firmware console: bind to a SECOND -serial if one was provided (the

@@ -1625,13 +1625,32 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     {
         uint8_t comp[0x60];
         uint32_t idptr = MIPS_K0BASE + ARCS_COMPONENT_ID_PHYS;
-        memset(comp, 0, sizeof(comp));
-        /* Identifier string "SGI-IP22" at +0x40. */
-        memcpy(comp + 0x40, "SGI-IP22", 8);
+        const char *id = s->component_id ? s->component_id : "";
+        /* Identifier string at +0x40. The struct ends at +0x24, so the blob
+         * leaves 0x60-0x40 = 32 bytes for it — write into the real space
+         * rather than an 8-byte window (an 8-char id like "SGI-IP32" was
+         * silently truncated to "SGI-IP3"). */
+        int idlen = snprintf((char *)comp + 0x40, sizeof(comp) - 0x40, "%s", id);
+        if (idlen < 0) {
+            idlen = 0;
+        }
         /* COMPONENT struct at +0 (arcs/hinv.h: Class/Type/Flags/Version/
          * Revision/Key/AffinityMask/ConfigurationDataSize/IdentifierLength/
-         * Identifier — 36 bytes, big-endian). */
-        comp[31] = 8;                       /* IdentifierLength = 8 */
+         * Identifier — 36 bytes, big-endian).
+         *
+         * ⚠ ABI-SENSITIVE: the IdentifierLength write below targets byte 31
+         * (the big-endian LSB of the ULONG at +0x1c) and the Identifier pointer
+         * occupies bytes 32-35 (@0x20), which is correct ONLY at the 32-bit
+         * ARCS ABI — the variant IP32 builds with, per __USE_SPB32 in
+         * irix-657m stand/arcs/lib/libsk/lib/spb.c. Under a 64-bit ULONG the
+         * pointer would shift to @0x28 and this layout would be silently wrong.
+         * If this file is ever built for the 64-bit ARCS variant, fix this. */
+        /* IdentifierLength includes the terminating NUL — the PROM's own
+         * component tables do the same (e.g. irix-657m stand/arcs/lib/libsk/
+         * net/if_ef.c:599 pairs IdentifierLength=4 with the 3-char "ef0").
+         * It is the length of the string at Identifier, not a fixed field
+         * size, so it must follow the actual id length. */
+        comp[31] = (idlen + 1) & 0xff;       /* IdentifierLength at @0x1c (BE low byte) */
         comp[32] = idptr >> 24;             /* Identifier pointer */
         comp[33] = idptr >> 16;
         comp[34] = idptr >> 8;
@@ -1765,12 +1784,20 @@ void sgi_arcs_setup_stubs(SGIARCSState *s, AddressSpace *as)
     memset(scratch, 0, sizeof(scratch));
 
     /*
-     * SystemID at scratch+0 (16 bytes):
-     *   +0: VendorId[8] = "SGI\0\0\0\0\0"
-     *   +8: ProductId[8] = "IP55\0\0\0\0"  (IP55 branding, C4)
+     * SystemID at scratch+0 (16 bytes), per arcs/hinv.h:
+     *   typedef struct systemid { CHAR VendorId[8]; CHAR ProductId[8]; }
+     * consumed by GetSystemId().
+     *
+     * The values are PER-MACHINE properties (see sgi_arcs.h): this device is
+     * shared by sgi-o2 / sgi-indy / sgi-virtuix, so a hardcoded product string
+     * is by construction correct for at most one of them — the O2 was
+     * previously handed "IP55"/"SGI-IP22", i.e. two other machines' branding.
+     *
+     * Copy at most 7 characters plus a terminator into each 8-byte field, so
+     * an over-long property truncates instead of overrunning the guest struct.
      */
-    memcpy(&scratch[0], "SGI\0\0\0\0\0", 8);
-    memcpy(&scratch[8], "IP55\0\0\0\0", 8);
+    snprintf((char *)&scratch[0], 8, "%s", s->vendor_id ? s->vendor_id : "");
+    snprintf((char *)&scratch[8], 8, "%s", s->product_id ? s->product_id : "");
 
     /* TimeInfo at scratch+0x10 (all zeros = epoch) */
 
@@ -1892,6 +1919,22 @@ static void sgi_arcs_realize(DeviceState *dev, Error **errp)
 {
     SGIARCSState *s = SGI_ARCS(dev);
 
+    /*
+     * Per-machine SYSTEMID / component identity defaults. A machine that cares
+     * sets these (sgi-o2 sets SGI/IP32, sgi-virtuix SGI/IP55); without them we
+     * keep the historical Indy values so the un-set path is unchanged. Property
+     * strings must stay alive for the device's lifetime, hence string literals.
+     */
+    if (!s->vendor_id) {
+        s->vendor_id = (char *)"SGI";
+    }
+    if (!s->product_id) {
+        s->product_id = (char *)"IP22";
+    }
+    if (!s->component_id) {
+        s->component_id = (char *)"SGI-IP22";
+    }
+
     /* Bind the firmware console input FIFO to the chardev (if configured). */
     if (qemu_chr_fe_backend_connected(&s->chr)) {
         qemu_chr_fe_set_handlers(&s->chr, arcs_chr_can_receive,
@@ -1919,6 +1962,15 @@ static const Property sgi_arcs_properties[] = {
     DEFINE_PROP_UINT32("kernel-start", SGIARCSState, kernel_start_phys, 0),
     DEFINE_PROP_UINT32("kernel-end", SGIARCSState, kernel_end_phys, 0),
     DEFINE_PROP_BOOL("sash-payload", SGIARCSState, sash_payload, true),
+    /*
+     * Per-machine SYSTEMID identity (see sgi_arcs.h). Defaults are the neutral
+     * "SGI"/"IP22" pair that Indy and the raw ARCS path expect; sgi-o2 and
+     * sgi-virtuix override them at device construction. 8-byte NUL-terminated
+     * fields, so at most 7 characters.
+     */
+    DEFINE_PROP_STRING("vendor-id", SGIARCSState, vendor_id),
+    DEFINE_PROP_STRING("product-id", SGIARCSState, product_id),
+    DEFINE_PROP_STRING("component-id", SGIARCSState, component_id),
     DEFINE_PROP_CHR("chardev", SGIARCSState, chr),
 };
 
