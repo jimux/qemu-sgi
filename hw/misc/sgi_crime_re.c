@@ -364,11 +364,23 @@ static void sgi_crime_re_stipple_init(SGICRIMEREState *s, CrimStipple *st)
     pattern <<= strip_left;
     st->pattern = pattern;
     st->mid_bits = 32 - strip_left - strip_right;
+    /*
+     * Harden the rotate: strip_left + strip_right can reach 32 (e.g.
+     * mode with maxIndex=0 -> strip_right=31 and index=1 ->
+     * strip_left=1), which makes mid_bits 0 and the step's right shift
+     * `>> (mid_bits - 1)` a shift by -1 — undefined behaviour. Clamp to
+     * a 1-bit window, where the step degenerates to a pure left shift.
+     */
+    if (st->mid_bits < 1) {
+        st->mid_bits = 1;
+    }
 }
 
 static inline void crim_stipple_step(CrimStipple *st)
 {
-    st->pattern = (st->pattern << 1) | (st->pattern >> (st->mid_bits - 1));
+    st->pattern = (st->pattern << 1) |
+                  (st->mid_bits > 1 ? (st->pattern >> (st->mid_bits - 1))
+                                    : 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -572,7 +584,8 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
     int16_t sx2 = (int16_t)x2, sy2 = (int16_t)y2;
 
     trace_sgi_crime_re_draw(op, dm, s->bufmode_dst, sx1, sy1, sx2, sy2,
-                            s->shade_fgcolor, s->stipple_pattern);
+                            s->shade_fgcolor, s->stipple_pattern,
+                            s->stipple_mode);
 
     /* direction bits: edgeType@16, 2 bits (RL=bit16, TB=bit17) */
     int dx = (op & 0x10000) ? -1 : 1;
@@ -802,7 +815,8 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
     int dst_tlb = (mode >> DST_TLB_SHIFT) & 7;
     uint32_t fg = s->mte_fgvalue;
 
-    trace_sgi_crime_re_mte(mode, s->mte_dst0, s->mte_dst1, fg);
+    trace_sgi_crime_re_mte(mode, s->mte_dst0, s->mte_dst1, fg,
+                           s->mte_stipplemask, s->mte_bytemask);
 
     /* linear destination (or linear<->linear copy) */
     if ((dst_tlb == 4 || dst_tlb == 5) && !is_copy) {
@@ -847,9 +861,42 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
     bool use_bytemask = (s->mte_bytemask != 0xffffffffu);
 
     if (!is_copy) {
-        /* tiled fill: same walk as M7 (mte_zero / PROM textport) */
+        /*
+         * Tiled fill: same walk as M7 (mte_zero / PROM textport), but
+         * honor MTE.enStipple — the spec (CRIME 1.5 §7.3.2.1) calls bit
+         * 10 "enStipple: enable/disable stipple pixel mask application
+         * during clear operations" and MTE.stippleMask (0x10) a
+         * "32-bit stipple mask".
+         *
+         * This is the FONT-GLYPH path: Xsgi's DDX renders 1-bit glyph
+         * bitmaps by programming the glyph's bitmap rows into
+         * MTE.stippleMask and issuing an enStipple CLEAR per cell row
+         * (pixDepth=2/32-bit, fgValue=the text colour). Ignoring the
+         * mask filled the whole cell rectangle → solid bars.
+         *
+         * Mask semantics: the mask is anchored at the run's start pixel
+         * and advances once per pixel written, MSB first, repeating
+         * every 32 bits (@@SEMANTICS@@ — the spec gives no bit-order
+         * text; this follows the conventional 1-bit-expand anchor and
+         * is the value the trace must be read against).
+         */
+        bool en_stipple = (mode & MTE_EN_STIPPLE) != 0;
+        uint32_t mask = s->mte_stipplemask;
+        int bit = 0;
         for (int y = y1; y != y2 + dy; y += dy) {
-            for (int x = x1; x != x2 + dx; x += dx) {
+            /*
+             * Re-anchor the mask at each new row: a glyph cell clears
+             * each bitmap row with its own mask (the DDX issues one
+             * MTE per row, so bit resets here; when a single MTE spans
+             * many rows the anchored behaviour is what the spec's
+             * "start address" wording implies).
+             */
+            bit = 0;
+            for (int x = x1; x != x2 + dx; x += dx, bit++) {
+                if (en_stipple &&
+                    !((mask >> (31 - (bit & 31))) & 1)) {
+                    continue;
+                }
                 sgi_crime_re_put_pixel(s, bufmode, x, y, fg);
             }
         }
