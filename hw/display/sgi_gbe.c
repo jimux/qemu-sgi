@@ -658,9 +658,18 @@ static uint64_t sgi_gbe_read(void *opaque, hwaddr offset, unsigned size)
         return GBE_ID_VALUE;
 
     case GBE_I2C:
-        /* open-drain lines idle-high, no DDC device: invert low 2 bits
-         * of the last written value (crm_i2c.c I2C_READ semantics) */
-        return (~s->i2c) & 3;
+        /*
+         * Return the RAW register value.  The guest's own I2C_READ macro
+         * complements it -- crm_i2c.c:
+         *   #define I2C_READ(hwp, buf) gbeGetReg(hwp, i2c, buf); buf = ((~buf) & 3)
+         * -- so complementing in the handler too inverted the line state
+         * twice.  The visible symptom was that crime_i2cMonitorProbe's reset
+         * loop ("while rbuf != I2C_REALVAL(I2C_CLK_HIGH_DATA_HIGH)", i.e.
+         * rbuf != 3) never saw the bus idle-high after i2c_stop(), and spun
+         * to its retry limit: the PROM/Xsgi always reported "no DDC monitor",
+         * leaving Screen.mwidth == 0.
+         */
+        return s->i2c & 3;
 
     case GBE_I2CFP:
         return (~s->i2cfp) & 3;
