@@ -228,6 +228,79 @@ static uint32_t sgi_crime_re_apply_rop(uint32_t rop, uint32_t src,
 }
 
 /*
+ * Ordered dither (DrawMode.enDither, bit 8).
+ *
+ * The CRIME 1.5 spec does NOT define the algorithm — §7.3.7.13
+ * "Dithering" is literally the single word "TBD" — but it does bound the
+ * feature twice: the pipeline-order section §7.3.7.14 says a logic op is
+ * applied "between the fragment's source color value *after dithering*
+ * and the corresponding destination color value read from the
+ * framebuffer" (so dither precedes the logic op), and the feature list
+ * scopes it to "Dithering for 8-bit and 16-bit RGB pixels".
+ *
+ * We therefore use the conventional ordered (Bayer) dither: a 4x4 matrix
+ * applied to the low bits of each 8-bit component when the component is
+ * being reduced to fewer bits.  For a 24-bit RGB destination stored as
+ * RGB5 (the 16-bit case) the low 3 bits of R/B and low 2 bits of G are
+ * added to a threshold; for a plain 8-bit component the dither resolves
+ * the fractional error introduced by rounding to the framebuffer's
+ * precision.
+ *
+ * @@SEMANTICS@@ — spec-silent; this is the conventional model, marked so
+ * the next reader can challenge it against a real-hardware reference.
+ * NOT applied to colour-index (pix_type 0) pixels: the feature list scopes
+ * enDither to 8/16-bit RGB, and dithering an index is not meaningful
+ * (the index is a table lookup, not an intensity).  Callers gate on
+ * pix_type; see sgi_crime_re_put_pixel.
+ */
+static const uint8_t crim_bayer4[4][4] = {
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 },
+};
+
+/*
+ * Dither the three 8-bit RGB components of a packed 0xRRGGBB(A) fragment
+ * for a destination of `bits` bits per component (5 or 8).  The Bayer
+ * threshold is scaled to the discarded range so that the average value
+ * is preserved; a component already at 8 bits is left unchanged.
+ */
+static inline uint32_t crim_dither_rgb(uint32_t color, int x, int y, int bits)
+{
+    if (bits >= 8) {
+        return color;                   /* already 8 bits/component */
+    }
+    int discard = 8 - bits;             /* bits dropped per component */
+    int range = 1 << discard;           /* number of dropped codes */
+    int thr = crim_bayer4[y & 3][x & 3];   /* 0..15 */
+    /* Map the 16-level Bayer threshold onto the dropped range. */
+    int bias = (thr * range) >> 4;
+    uint32_t r = (color >> 24) & 0xff;
+    uint32_t g = (color >> 16) & 0xff;
+    uint32_t bl = (color >> 8) & 0xff;
+    r = (r + bias) > 0xff ? 0xff : r + bias;
+    g = (g + bias) > 0xff ? 0xff : g + bias;
+    bl = (bl + bias) > 0xff ? 0xff : bl + bias;
+    /* Preserve the alpha/attribute byte (bits 7:0) untouched. */
+    return (color & 0x000000ffu) | (r << 24) | (g << 16) | (bl << 8);
+}
+
+/*
+ * RGB component precision a BufMode denotes, per BufMode.pixDepth:
+ * 0 = 8-bit, 1 = 16-bit, 2 = 32-bit (spec §7.3.4 BufMode).  Only the
+ * 16-bit form (RGB5) actually discards component precision, so that is
+ * the only case where ordered dithering has anything to resolve.
+ */
+static inline int crim_bufmode_rgb_bits(uint32_t bufmode)
+{
+    switch ((bufmode >> BM_BUF_DEPTH_SHIFT) & 3) {
+    case 1:  return 5;                  /* 16-bit RGB5 */
+    default: return 8;                  /* 8/32-bit: no reduction */
+    }
+}
+
+/*
  * Write one pixel through the dst BufMode with ROP/masking applied.
  * Color packing per gxemul getputpixel semantics (CI8/RGB/RGBA).
  */
@@ -243,6 +316,16 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
     }
 
     uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
+
+    /*
+     * Dithering (spec §7.3.7.14: dither precedes the logic op).  RGB
+     * destinations only — the feature list scopes enDither to 8/16-bit
+     * RGB, and a colour index carries no intensity to dither.
+     */
+    if ((s->drawmode & DM_ENDITHER) && pix_type != 0) {
+        color = crim_dither_rgb(color, x, y, crim_bufmode_rgb_bits(bufmode));
+    }
+
     switch (pix_type) {
     case 0:                             /* color index */
         bpp = 1;
