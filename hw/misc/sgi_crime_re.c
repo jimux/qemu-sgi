@@ -744,16 +744,37 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
                              + (int32_t)s->pixelxfer_src_ystep
                            : 0;
 
+        /*
+         * Tiled (framebuffer) source: PixelXfer.src.addr packs the source
+         * pixel (x in bits 31:16, y in bits 15:0) and the engine walks it in
+         * LOCKSTEP with the destination.  The spec's edgeType (§7.3.1.7
+         * Table 7-8) gives the shared traversal direction, so x advances by
+         * the primitive's dx between pixels (resetting at each row) and y
+         * advances by dy between rows.  gxemul does exactly this in its
+         * DE_PRIM_RECTANGLE walk (saved_src_x per row, src_x += dx,
+         * src_y += dy).  Evidence: the 6 granite backdrop ops carry
+         * src=(255,0) with dx=-1 (tile 0 copied right-to-left) and
+         * src=(0,255) with dy=-1 (band copied bottom-to-top); treating the
+         * packed address as a fixed (x,y) and stepping it by xStep only
+         * smeared one source row down the whole rect (the tear).
+         * @@SEMANTICS@@
+         */
+        int src_x = (int)(((uint32_t)src_off >> 16) & 0x7ff);
+        int src_y = (int)((uint32_t)src_off & 0x7ff);
+
         int ity = 0;
         for (uint32_t yy = starty; yy != endy && ity < MAX_ITER;
              yy = (yy + dy) & (MOD - 1), ity++) {
             int64_t row_src = src_linear ? xfer_row : src_off;
+            int sx = src_x;
             int itx = 0;
             for (uint32_t xx = startx; xx != endx && itx < MAX_ITER;
                  xx = (xx + dx) & (MOD - 1), itx++) {
                 uint32_t color = s->shade_fgcolor;
                 if (xfer) {
-                    color = sgi_crime_re_xfer_fetch(s, row_src, src_linear);
+                    int64_t fetch_off = src_linear ? row_src
+                                      : (((int64_t)sx << 16) | (src_y & 0x7ff));
+                    color = sgi_crime_re_xfer_fetch(s, fetch_off, src_linear);
                 }
                 int fx, fy;
                 if (sgi_crime_re_clip_pass(s, (int)xx, (int)yy, &fx, &fy)) {
@@ -772,10 +793,16 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
                     }
                 }
                 crim_stipple_step(&st);
-                row_src += xstep;
+                if (src_linear) {
+                    row_src += xstep;
+                } else {
+                    sx = (sx + dx) & (MOD - 1);
+                }
             }
             if (src_linear) {
                 xfer_row += xfer_pitch;
+            } else {
+                src_y = (src_y + dy) & (MOD - 1);
             }
         }
         break;
