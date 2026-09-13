@@ -931,9 +931,34 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
     int depth_code = (mode >> MTE_PIX_DEPTH_SHFT) & 3;
     int bpp = 1 << depth_code;
     x1 /= bpp; x2 /= bpp;
+
+    /*
+     * Destination pixel FORMAT comes from BufMode.dst, not from MTE.mode:
+     * the spec's MTE.mode register (§7.3.2.1) carries only opCode, enStipple,
+     * pixDepth and the src/dst buffer-TYPE (TLB select) — there is no pixType
+     * field.  The previous code forced RGB for every bpp>1 transfer, so an
+     * MTE CLEAR at 32-bit depth into a COLOR_INDEX destination packed the
+     * 8-bit colour index as big-endian RGB (b[0]=color>>24=0, the index in
+     * b[3]) and left byte 0 — the byte get_pixel()/the GBE read — at 0, i.e.
+     * black.
+     *
+     * @@SEMANTICS@@ Derived, not guessed.  Decisive internal consistency:
+     * the SAME fg index 0x29 paints (102,102,102) through an 8-bit-depth MTE
+     * CLEAR (xterm body) but black through a 32-bit-depth one (xterm text
+     * row) — same index, same CMAP, two depths.  A COLOR_INDEX destination
+     * must map both through the CMAP, so the 32-bit op must write the index.
+     * Corroboration: Xsgi programs BufMode.dst=0x00000200 (pixType=0 CI,
+     * bufDepth=32) and the DRAW path, which already uses s->bufmode_dst,
+     * renders the same 0x29 index correctly.  This is why the toolchest
+     * "Toolchest" title (bg index 0x0f + fg 0), the xterm white text
+     * (fg 0x07) and the xterm text-row background (fg 0x29) were all black.
+     *
+     * Keep the MTE depth for the byte-x stride and buffer word depth; take
+     * only the pixel type from the destination BufMode.
+     */
     uint32_t bufmode = (dst_tlb << BM_BUF_TYPE_SHIFT)
                      | (depth_code << BM_BUF_DEPTH_SHIFT)
-                     | (bpp == 1 ? 0 : 1 << BM_PIX_TYPE_SHIFT);
+                     | (s->bufmode_dst & BM_PIX_TYPE_MASK);
     int dx = x1 > x2 ? -1 : 1;
     int dy = y1 > y2 ? -1 : 1;
 
