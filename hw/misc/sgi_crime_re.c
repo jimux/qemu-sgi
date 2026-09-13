@@ -631,11 +631,31 @@ static uint32_t sgi_crime_re_xfer_fetch(SGICRIMEREState *s,
     int bpp = 1 << ((s->bufmode_src >> BM_BUF_DEPTH_SHIFT) & 3);
 
     if (src_linear) {
-        if (!sgi_crime_re_linear_addr(s,
-                (s->bufmode_src >> BM_BUF_TYPE_SHIFT) & 1,
-                (uint32_t)src_off, &phys)) {
+        /*
+         * PixelXfer's linear source is addressed through the same 16-entry
+         * (x2 paired page) 128 KB linear-TLB aperture the kernel programs in
+         * irix-655/.../ml/MOOSEHEAD/mte_copy.c:289:
+         *     index = (page & 0x1f) >> 1;
+         *     CRIME_SET64(..., (1<<31 | page) << 32 | (1<<31 | page+1));
+         * i.e. the low FIVE page bits select the slot and the entry itself
+         * holds the physical page.  Xsgi's icon source is a virtual address
+         * (0x105ff380 -> page 0x105ff, (0x105ff & 0x1f)>>1 = 15) and it
+         * programs exactly entry 15; the un-masked `page >> 1` rejected every
+         * address past the first 128 KB, so xfer_fetch() returned 0 and the
+         * toolchest menu icons were solid black.  Scoped to this path (not
+         * sgi_crime_re_linear_addr): the MTE linear path drives real physical
+         * addresses and its current mapping is load-bearing for the PROM menu.
+         */
+        int page = (int)((uint32_t)src_off >> 12);
+        int entry = (page & 0x1f) >> 1;
+        int sub = page & 1;
+        int lin = (s->bufmode_src >> BM_BUF_TYPE_SHIFT) & 1;
+        uint32_t d = sub ? (uint32_t)s->tlb_linear[lin][entry]
+                         : (uint32_t)(s->tlb_linear[lin][entry] >> 32);
+        if (!(d & 0x80000000u)) {
             return 0;
         }
+        phys = ((hwaddr)(d & 0x7fffffffu) << 12) + ((uint32_t)src_off & 0xfff);
     } else {
         int x = (src_off >> 16) & 0xfff;
         int y = src_off & 0xfff;
@@ -699,10 +719,35 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
         const uint32_t MOD = 0x800;            /* 2048-pixel space */
         const int MAX_ITER = 2 * MOD;          /* hard cap per axis */
 
+        /*
+         * PixelXfer source row stride (linear sources only).
+         *
+         * @@SEMANTICS@@ — the spec gives only the field names ("x-direction
+         * step size" / "y-direction step size", §7.3.1.3).  Derived from a
+         * real toolchest menu-icon transfer: dest RECT (85,41)-(102,56)
+         * (w=18), src.addr=0x105ff380, xStep=1, yStep=3, src BufMode linear
+         * 8-bit CI.  Dumping the mapped source page showed the 18x16 bitmap
+         * has a 20-byte row pitch, and 20 is the ONLY candidate that reads a
+         * clean palette over the whole glyph (stride 20: 288/288 valid
+         * indices; 18: 260, 21: 247).  So the engine advances by xStep
+         * between pixels WITHIN a row and by yStep from a row's LAST pixel to
+         * the next row's FIRST: pitch = (w-1)*xStep + yStep = 17*1 + 3 = 20.
+         * (gxemul does not model a y-step stride at all — it resets the
+         * source per row — which is why the icons stayed single-row.)
+         */
+        int xfer_w = (dx > 0)
+                   ? (int)((endx + MOD - startx) & (MOD - 1))
+                   : (int)((startx + MOD - endx) & (MOD - 1));
+        int64_t xfer_row = src_off;
+        int64_t xfer_pitch = (src_linear && xfer_w > 0)
+                           ? (int64_t)(xfer_w - 1) * xstep
+                             + (int32_t)s->pixelxfer_src_ystep
+                           : 0;
+
         int ity = 0;
         for (uint32_t yy = starty; yy != endy && ity < MAX_ITER;
              yy = (yy + dy) & (MOD - 1), ity++) {
-            int64_t row_src = src_off;
+            int64_t row_src = src_linear ? xfer_row : src_off;
             int itx = 0;
             for (uint32_t xx = startx; xx != endx && itx < MAX_ITER;
                  xx = (xx + dx) & (MOD - 1), itx++) {
@@ -728,6 +773,9 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
                 }
                 crim_stipple_step(&st);
                 row_src += xstep;
+            }
+            if (src_linear) {
+                xfer_row += xfer_pitch;
             }
         }
         break;
