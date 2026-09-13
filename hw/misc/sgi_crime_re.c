@@ -957,24 +957,27 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
          * (pixDepth=2/32-bit, fgValue=the text colour). Ignoring the
          * mask filled the whole cell rectangle → solid bars.
          *
-         * Mask semantics: the mask is anchored at the run's start pixel
-         * and advances once per pixel written, MSB first, repeating
-         * every 32 bits (@@SEMANTICS@@ — the spec gives no bit-order
-         * text; this follows the conventional 1-bit-expand anchor and
-         * is the value the trace must be read against).
+         * Mask semantics (@@SEMANTICS@@ — the CRIME 1.5 spec gives no
+         * stipple-to-pixel algorithm, so this is derived from the trace):
+         * the 32-bit mask is anchored to the destination 32-bit WORD, not
+         * to the run's start pixel.  The first run pixel consumes bit
+         * `31 - (x1 & 7)`, then one bit per pixel MSB-first, wrapping
+         * mod 32 across the run — 8 px = one 32-bit word at this depth.
+         * Empirical proof: against the exact PCF bitmap of the toolchest
+         * Helvetica-Bold-Oblique-14 menu (all seven labels — Toolchest,
+         * Desktop, Selected, Internet, Find, System, Help — every glyph
+         * row), this rule is XOR 0, while the old run-start anchor (bit
+         * 31) misses by 18-28 and renders different letters.  It is also
+         * the correction for the greeter headline's 1-bit shift noted in
+         * progress note 39.
+         *
+         * Re-anchor at each row at the same word phase (the DDX issues one
+         * MTE per glyph row).
          */
         bool en_stipple = (mode & MTE_EN_STIPPLE) != 0;
         uint32_t mask = s->mte_stipplemask;
-        int bit = 0;
         for (int y = y1; y != y2 + dy; y += dy) {
-            /*
-             * Re-anchor the mask at each new row: a glyph cell clears
-             * each bitmap row with its own mask (the DDX issues one
-             * MTE per row, so bit resets here; when a single MTE spans
-             * many rows the anchored behaviour is what the spec's
-             * "start address" wording implies).
-             */
-            bit = 0;
+            int bit = x1 & 7;
             for (int x = x1; x != x2 + dx; x += dx, bit++) {
                 if (en_stipple &&
                     !((mask >> (31 - (bit & 31))) & 1)) {
