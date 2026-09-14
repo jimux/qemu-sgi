@@ -188,7 +188,10 @@ static uint32_t sgi_crime_re_get_pixel(SGICRIMEREState *s, uint32_t bufmode,
 
     uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
     switch (pix_type) {
-    case 0:                             /* color index */
+    case 0:                             /* color index (8/16-bit) */
+        if (((bufmode >> BM_PIX_DEPTH_SHIFT) & 3) == 1) {
+            return ((uint32_t)b[0] << 8) | b[1];
+        }
         return b[0];
     case 1:                             /* RGB (alpha reads 0) */
         return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
@@ -327,10 +330,25 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
     }
 
     switch (pix_type) {
-    case 0:                             /* color index */
-        bpp = 1;
-        b[0] = color & 0xff;
+    case 0: {                           /* color index / packed 16-bit */
+        /*
+         * BufMode.pixDepth sets the stored CI width.  A 16-bit CI
+         * destination (pixDepth=1, e.g. the O2 depth-15 RGB5 windows
+         * whose packed value is not an index but an RGB5 pixel) must
+         * store the full 16-bit value: truncating to the low byte made
+         * the GBE read an unallocated cmap index and render black.
+         * 8-bit CI (pixDepth=0) stays byte-identical.
+         */
+        if (((bufmode >> BM_PIX_DEPTH_SHIFT) & 3) == 1) {
+            bpp = 2;
+            b[0] = (color >> 8) & 0xff;
+            b[1] = color & 0xff;
+        } else {
+            bpp = 1;
+            b[0] = color & 0xff;
+        }
         break;
+    }
     case 1:                             /* RGB */
         bpp = 4;
         b[0] = color >> 24; b[1] = color >> 16; b[2] = color >> 8; b[3] = 0;
@@ -353,7 +371,12 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
         uint32_t old = sgi_crime_re_get_pixel(s, bufmode, x, y);
         color = sgi_crime_re_apply_rop(s->logicop, color, old);
         if (pix_type == 0) {
-            b[0] = color & 0xff;
+            if (bpp == 2) {
+                b[0] = (color >> 8) & 0xff;
+                b[1] = color & 0xff;
+            } else {
+                b[0] = color & 0xff;
+            }
         } else {
             b[0] = color >> 24; b[1] = color >> 16;
             b[2] = color >> 8;  b[3] = color;
@@ -361,13 +384,16 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
     }
     if (dm & DM_ENCOLORMASK) {
         /* ColorMask: bit per color component (RGBA planes) — apply to
-         * the 4-byte forms by byte-lane; CI8 uses bit 0 of byte 0. */
+         * the 4-byte forms by byte-lane; CI covers its 8/16-bit width. */
         uint32_t m = s->colormask;
         uint8_t ob[4];
         address_space_rw(&address_space_memory, phys,
                          MEMTXATTRS_UNSPECIFIED, ob, bpp, false);
         if (bpp == 1) {
             b[0] = (b[0] & m) | (ob[0] & ~m);
+        } else if (pix_type == 0) {
+            b[0] = (b[0] & m) | (ob[0] & ~m);
+            b[1] = (b[1] & (m >> 8)) | (ob[1] & ~(m >> 8));
         } else {
             if (!(m & 0xff000000u)) { b[0] = ob[0]; }
             if (!(m & 0x00ff0000u)) { b[1] = ob[1]; }
@@ -1003,7 +1029,17 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
     int y1 = s->mte_dst0 & 0xfff;
     int x2 = (s->mte_dst1 >> 16) & 0xffff;
     int y2 = (s->mte_dst1 & 0xfff);
-    int depth_code = (mode >> MTE_PIX_DEPTH_SHFT) & 3;
+    /*
+     * dst0/dst1 x fields are BYTE addresses into the destination buffer,
+     * so the byte-x -> pixel-x stride is the destination BufMode's buffer
+     * word depth (bufDepth), not MTE.mode.pixDepth.  The guest sends
+     * pixDepth=0 for its 32-bit fills (e.g. the Icon Catalog panel), which
+     * only BufMode.dst records correctly.  This is placement-invariant
+     * with the tiled address walk (which scales byte-x by bpp), but it is
+     * what makes the synthesized BufMode below carry the true word depth
+     * so the pixel store lands at the right width.
+     */
+    int depth_code = (s->bufmode_dst >> BM_BUF_DEPTH_SHIFT) & 3;
     int bpp = 1 << depth_code;
     x1 /= bpp; x2 /= bpp;
 
@@ -1028,12 +1064,15 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
      * "Toolchest" title (bg index 0x0f + fg 0), the xterm white text
      * (fg 0x07) and the xterm text-row background (fg 0x29) were all black.
      *
-     * Keep the MTE depth for the byte-x stride and buffer word depth; take
-     * only the pixel type from the destination BufMode.
+     * Both the word depth and the pixel depth come from BufMode.dst: the
+     * former addresses the buffer, the latter (BM_PIX_DEPTH, 8/16/32-bit)
+     * sizes the CI store so a packed 16-bit RGB5 destination is written in
+     * full instead of being truncated to its low byte.
      */
     uint32_t bufmode = (dst_tlb << BM_BUF_TYPE_SHIFT)
                      | (depth_code << BM_BUF_DEPTH_SHIFT)
-                     | (s->bufmode_dst & BM_PIX_TYPE_MASK);
+                     | (s->bufmode_dst & (BM_PIX_TYPE_MASK |
+                                          BM_PIX_DEPTH_MASK));
     int dx = x1 > x2 ? -1 : 1;
     int dy = y1 > y2 ? -1 : 1;
 

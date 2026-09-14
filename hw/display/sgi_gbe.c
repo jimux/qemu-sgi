@@ -326,6 +326,39 @@ static void sgi_gbe_composite_cursor(SGIGBEState *s, DisplaySurface *surface)
 }
 
 /*
+ * DID (display ID) window resolver — GBE ASIC spec §2.4 (frame table ->
+ * line table -> 32-entry WID RAM).
+ *
+ * The normal planes may carry a display-ID stream that assigns a WID to
+ * each scanline span: did_ctrl[15:0] is the upper 16 bits of a 64K-aligned
+ * table and did_ctrl[16] is the DMA enable.  The table holds a frame table
+ * (32-bit entries: [25:19] block, [18:11] offset, [10:0] yend) followed by
+ * per-run line tables at did_base + 512*block + 2*offset (16-bit entries:
+ * [15:11] did, [10:0] xend).  A frame entry covers lines up to its yend;
+ * the line entries select the 5-bit WID (mode_regs[did]) up to each xend.
+ *
+ * With the DMA disabled, or when no entry matches, every pixel keeps the
+ * pre-DID behaviour: WID 0 / mode_regs[0].
+ */
+static bool sgi_gbe_did_line_base(SGIGBEState *s, hwaddr did_base, int y,
+                                  hwaddr *lt_base)
+{
+    for (int i = 0; i < 64; i++) {
+        uint32_t fe;
+        address_space_read(&address_space_memory, did_base + 4 * i,
+                           MEMTXATTRS_UNSPECIFIED, &fe, 4);
+        fe = be32_to_cpu(fe);
+        if ((fe & 0x7ff) >= y) {
+            uint32_t block = (fe >> 19) & 0x7f;
+            uint32_t offset = (fe >> 11) & 0xff;
+            *lt_base = did_base + 512 * block + 2 * offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * Decode one pixel through the FRM channel. The PROM programs all 32
  * WIDs to I8/CM0 (initFramebuffer), so 8bpp cmap lookups are the gate
  * path; 16bpp RGB5 and 32bpp direct are supported for the kernel.
@@ -354,6 +387,15 @@ static void sgi_gbe_scanout(SGIGBEState *s)
 
     int depth = (s->frm_size_tile >> 13) & 3;   /* 0=8 1=16 2=32bpp */
     int bpp = (depth == 0) ? 1 : (depth == 1) ? 2 : 4;
+    /*
+     * DID window selection.  did_ctrl carries the live base/enable; the
+     * frame tick latches it into did_inhwctrl at blanking.  The scanout's
+     * y/x are 0-based active-raster coordinates, which map 1:1 to the
+     * table's yend/xend boundaries for this raster.
+     */
+    uint32_t didv = s->did_ctrl;
+    bool did_on = (didv & 0x10000) != 0 && (didv & 0xffff) != 0;
+    hwaddr did_base = (hwaddr)(didv & 0xffff) << 16;
     int width_tiles = (s->frm_size_tile >> 5) & 0xff;
     int rhs_pixels = (s->frm_size_tile & 0x1f) * 32 / bpp;
     int height = s->frm_size_pixel >> 16;
@@ -430,6 +472,16 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                 break;
             }
             int x = 0;
+            /*
+             * Resolve this scanline's DID line table once, then advance a
+             * segment index as x grows instead of re-walking per pixel.
+             */
+            hwaddr did_lt = 0;
+            bool did_line = did_on &&
+                            sgi_gbe_did_line_base(s, did_base, y, &did_lt);
+            int did_li = 0;
+            uint32_t did_cur = 0, did_xend = 0;
+            bool did_have = false;
             for (int tx = 0; tx < w; tx++) {
                 int tilenr = tx + row * w;
                 if (tilenr >= 256) {
@@ -550,7 +602,26 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                          * DDX fills replicate to all lanes, so any fixed
                          * lane choice renders its content).
                          */
-                        uint32_t wid = s->mode_regs[0];
+                        if (did_line) {
+                            if (!did_have || x > did_xend) {
+                                while (did_li < 256) {
+                                    uint16_t le;
+                                    address_space_read(&address_space_memory,
+                                                       did_lt + 2 * did_li,
+                                                       MEMTXATTRS_UNSPECIFIED,
+                                                       &le, 2);
+                                    le = be16_to_cpu(le);
+                                    if ((le & 0x7ff) >= x) {
+                                        did_cur = (le >> 11) & 0x1f;
+                                        did_xend = le & 0x7ff;
+                                        break;
+                                    }
+                                    did_li++;
+                                }
+                                did_have = true;
+                            }
+                        }
+                        uint32_t wid = s->mode_regs[did_line ? did_cur : 0];
                         uint32_t typ = (wid >> 2) & 0x7;   /* WID[4:2] typ */
                         uint32_t cm = (wid >> 5) & 0x1f;   /* WID[9:5] cm */
                         uint32_t bufsel = wid & 0x3;       /* WID[1:0] buf */
@@ -588,6 +659,25 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             r = ((p >> 10) & 0x1f) << 3;
                             g = ((p >> 5) & 0x1f) << 3;
                             b = (p & 0x1f) << 3;
+                        } else if (typ == 4) {
+                            /*
+                             * RGB5 on a 32bpp fetch: the WID buf field
+                             * selects which 16-bit half of the fetched
+                             * word holds the pixel (01/11 = lower bytes
+                             * 0..1, 10 = upper bytes 2..3).  A 5:5:5
+                             * value is expanded to 8 bits by bit
+                             * replication (GBE spec "RGB5 ... expanded
+                             * to RGB8 by bit replication"), not a shift.
+                             */
+                            int hoff = (bufsel == 2) ? 2 : 0;
+                            uint32_t p = (buf[4 * i + hoff] << 8) |
+                                         buf[4 * i + hoff + 1];
+                            uint32_t r5 = (p >> 10) & 0x1f;
+                            uint32_t g5 = (p >> 5) & 0x1f;
+                            uint32_t b5 = p & 0x1f;
+                            r = (r5 << 3) | (r5 >> 2);
+                            g = (g5 << 3) | (g5 >> 2);
+                            b = (b5 << 3) | (b5 >> 2);
                         } else {
                             r = buf[4 * i];
                             g = buf[4 * i + 1];
