@@ -244,6 +244,12 @@ struct SGICRIMEREState {
     uint64_t ib_addr[CRIME_FIFO_DEPTH];
     uint32_t ib_ctl;
     uint32_t ib_count;              /* entries posted since last drain */
+    /*
+     * IB start pointer (SetStartPtr register @0x4008).  The status
+     * register's WrPtr/StartPtr fields (bits 11:6 / 5:0) must both
+     * reflect this — see sgi_crime_re_read().
+     */
+    uint32_t ib_startptr;
 
     /*
      * Framebuffer TLBs — each entry is a u64 packing four 16-bit tile

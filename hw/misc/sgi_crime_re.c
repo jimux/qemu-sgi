@@ -1338,13 +1338,32 @@ static uint64_t sgi_crime_re_read(void *opaque, hwaddr offset, unsigned size)
         /*
          * Compose the status word: all idle (crmWaitReIdle spins bits
          * 27|25; libGLcore FlushAndConfirm spins bit 28 — both must
-         * see idle immediately), IB level 0 with ptrs equal (our RE
-         * executes synchronously so the FIFO is always drained), and
-         * the programmed start ptr echoed back.
+         * see idle immediately), IB level 0 with the two FIFO pointers
+         * EQUAL (our RE executes synchronously so the FIFO is always
+         * drained), and both pointers mirroring the programmed start
+         * pointer (@0x4008).
+         *
+         * The pointers MUST be equal: the IRIX CRIME driver's crmSavePP()
+         * computes the pending-entry count as WrPtr - StartPtr (mod 64)
+         * and harvests that many interface-buffer addr/data slots as the
+         * switching-out context's pixel-pipe descriptor list.  If WrPtr
+         * and StartPtr disagree, the range includes never-written (zero)
+         * IB slots; the zero descriptor is saved and, on the next
+         * crmRestorePP(), its 2-bit write mask decodes to 0, which is
+         * neither 1 (low-32), 2 (high-32) nor 3 (64-bit) — the driver
+         * then calls
+         *   cmn_err(CE_PANIC, "pcxswap wmask 0 addr %x (%x) data %x%x")
+         * (seen as "PANIC: pcxswap wmask 0 addr b5000000 (0) data 00").
+         *
+         * NOTE: do NOT derive the start pointer from ib_ctl — bits 5:0
+         * of the interface-buffer ctl register are the stall-count field
+         * (crimeInit programs full/empty/stall thresholds, e.g. the
+         * 0x0fefff0a written to 0x400), not the FIFO start pointer.
          */
         uint32_t st = CRMSTAT_ALL_IDLE;
-        uint32_t stptr = s->ib_ctl & CRMSTAT_IB_STPTR_MASK; /* echo */
-        st |= stptr & CRMSTAT_IB_STPTR_MASK;
+        uint32_t stptr = s->ib_startptr & CRMSTAT_IB_STPTR_MASK;
+        st |= stptr << CRMSTAT_IB_STPTR_SHIFT;
+        st |= stptr << CRMSTAT_IB_WRPTR_SHIFT;
         return st;
     }
 
@@ -1499,7 +1518,17 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
 
     /* ---- Status page (0x4000) ---- */
     if (off >= CRM_RE_STATUS_BASE) {
-        return;                        /* read-only; absorb writes */
+        /*
+         * SetStartPtr (@0x4008): the CRIME driver writes the FIFO start
+         * pointer here (and clears it to 0 around crmSavePP()/context
+         * switches).  Track it so the status register's WrPtr/StartPtr
+         * fields stay coherent; everything else in the status page is
+         * read-only and absorbed.
+         */
+        if (off == CRM_RE_SET_STARTPTR) {
+            s->ib_startptr = (uint32_t)value & CRMSTAT_IB_STPTR_MASK;
+        }
+        return;
     }
 }
 
@@ -1537,6 +1566,7 @@ static void sgi_crime_re_reset(DeviceState *dev)
     memset(s->ib_addr, 0, sizeof(s->ib_addr));
     s->ib_ctl = 0;
     s->ib_count = 0;
+    s->ib_startptr = 0;
     s->bufmode_src = 0;
     s->bufmode_dst = 0;
     s->clipmode = 0;
@@ -1585,6 +1615,7 @@ static const VMStateDescription vmstate_sgi_crime_re = {
         VMSTATE_UINT64_ARRAY(ib_addr, SGICRIMEREState, CRIME_FIFO_DEPTH),
         VMSTATE_UINT32(ib_ctl, SGICRIMEREState),
         VMSTATE_UINT32(ib_count, SGICRIMEREState),
+        VMSTATE_UINT32(ib_startptr, SGICRIMEREState),
         VMSTATE_UINT64_2DARRAY(tlb_fb, SGICRIMEREState, 3,
                                CRM_TLB_FB_ENTRIES),
         VMSTATE_UINT64_ARRAY(tlb_tex, SGICRIMEREState, CRM_TLB_TEX_ENTRIES),
