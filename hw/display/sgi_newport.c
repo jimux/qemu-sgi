@@ -385,6 +385,26 @@ static uint32_t newport_get_host_color(SGINewportState *s)
 }
 
 /*
+ * Push one 32-bit word onto the 64-bit REX3 host data port.
+ *
+ * The port is fed by successive 32-bit writes and the guest relies on the
+ * *newer* write becoming the HIGH half: the unaligned colourhost fill
+ * (start x % 8 == 4) emits `0x238 = hi` then `0xa34 = lo (GO)`, while the
+ * aligned path emits `0x234 = lo` then `0xa30 = hi (GO)`.  A plain
+ * high/low split (what MAME's byte-lane COMBINE_DATA on 0x0230/8 implies)
+ * drops the high half on the unaligned path, because 0x0238 is also the
+ * DCB mode register, so pixels 0-3 of each 8-px group read stale port bits
+ * and the exposed root shows a 4-on/4-off grey dither.  Shifting the port
+ * right by 32 and inserting the new word at 63:32 makes both write orders
+ * converge to hi:lo, which is what the guest's fills draw correctly with.
+ */
+static void newport_host_push(SGINewportState *s, uint32_t val)
+{
+    s->host_dataport = (s->host_dataport >> 32) | ((uint64_t)val << 32);
+    s->host_shift = 64 - host_depth_bpp[s->dm1_hostdepth];
+}
+
+/*
  * Get RGB color from current color slope accumulators.
  * Extracts 9-bit value from bits [19:11] of each color register,
  * clamps negative (>= 0x180 or sign bit set) to 0, overflow (> 0xff) to 0xff,
@@ -2466,23 +2486,25 @@ static void newport_write32(SGINewportState *s, hwaddr addr, uint64_t val,
         s->zero_overflow = val;
         break;
     case REX3_HOSTRW0:
-        s->host_dataport = ((uint64_t)(uint32_t)val << 32) |
-                           (s->host_dataport & 0xffffffffULL);
-        /* Reset host shift position on new data write */
-        s->host_shift = 64 - host_depth_bpp[s->dm1_hostdepth];
-        break;
     case REX3_HOSTRW1:
-        s->host_dataport = (s->host_dataport & 0xffffffff00000000ULL) |
-                           (uint32_t)val;
+    case REX3_DCBMODE:
+        /*
+         * 0x0238 (and its GO alias 0xa38) is dual-use: a DCB mode register
+         * *and*, during a colourhost blit, the host-port high half (see
+         * newport_host_push).  Always feed the host port, and *also* keep
+         * the DCB mode store so legitimate CMAP/XMAP setup writes
+         * (0x84100b / 0x841032) still reach dcb_mode.
+         */
+        newport_host_push(s, (uint32_t)val);
+        if (reg == REX3_DCBMODE) {
+            s->dcb_mode = val;
+        }
         break;
     case REX3_SLOPEREDCOPY:
         s->slope_red = newport_twos_to_sm((uint32_t)val, 24);
         break;
 
     /* DCB registers */
-    case REX3_DCBMODE:
-        s->dcb_mode = val;
-        break;
     case REX3_DCBDATA0:
         /*
          * Handle sub-word writes: merge written bytes into dcb_data_msw.
