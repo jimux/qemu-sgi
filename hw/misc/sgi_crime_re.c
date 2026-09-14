@@ -433,19 +433,43 @@ static bool sgi_crime_re_clip_pass(SGICRIMEREState *s, int wx, int wy,
         }
     }
 
-    /* screen masks: framebuffer-relative rects (ScrMask[i] hi=min lo=max) */
+    /*
+     * Screen masks: framebuffer-relative rects, ScrMask[i] = [2i]=min,
+     * [2i+1]=max (each a 64-bit register written as two 32-bit halves).
+     *
+     * @@SEMANTICS@@ — the enabled masks form a clip *list*, not an
+     * intersection: crm.so programs a window's clip region as the union
+     * of up to 5 rects. A 4Dwm window frame is exactly such a list — e.g.
+     * the Icon Catalog frame is programmed as four disjoint border rects
+     * (top bar, left, right, bottom). A pixel passes if it is inside ANY
+     * enabled pass-inside mask (mode bit 1), and outside ALL enabled
+     * pass-outside masks (mode bit 0). With no pass-inside mask enabled
+     * the base region is the whole screen. The previous all-and
+     * implementation rejected every multi-rect clip list; single-rect
+     * lists (the common case) were unaffected because union == intersect
+     * for one rect — except that the dropped high half made even those
+     * read the wrong max. This is what dropped 4Dwm's window titles.
+     */
     uint32_t en = (s->clipmode >> CM_ENSCRMASK_SHIFT) & 0x1f;
+    bool any_in = false, in_union = false, out_union = false;
     for (int i = 0; i < 5; i++) {
-        if (en & (1u << i)) {
-            uint32_t lo = s->scrmask[2 * i + 1], hi = s->scrmask[2 * i];
-            int minx = (hi >> 16) & 0xffff, miny = hi & 0xffff;
-            int maxx = (lo >> 16) & 0xffff, maxy = lo & 0xffff;
-            bool inside = x >= minx && x < maxx && y >= miny && y < maxy;
-            /* scrMaskMode bit i: 1 = pass inside, 0 = pass outside */
-            if (inside != ((s->clipmode >> i) & 1)) {
-                return false;
-            }
+        if (!(en & (1u << i))) {
+            continue;
         }
+        uint32_t mn = s->scrmask[2 * i], mx = s->scrmask[2 * i + 1];
+        int minx = (mn >> 16) & 0xffff, miny = mn & 0xffff;
+        int maxx = (mx >> 16) & 0xffff, maxy = mx & 0xffff;
+        bool inside = x >= minx && x < maxx && y >= miny && y < maxy;
+        /* scrMaskMode bit i: 1 = pass inside, 0 = pass outside */
+        if ((s->clipmode >> i) & 1) {
+            any_in = true;
+            in_union |= inside;
+        } else {
+            out_union |= inside;
+        }
+    }
+    if ((any_in && !in_union) || out_union) {
+        return false;
     }
 
     *fx = x;
@@ -1220,11 +1244,13 @@ static void sgi_crime_re_pp_store(SGICRIMEREState *s, hwaddr p, uint32_t v)
     case CRM_CLIP_MODE_REG:      s->clipmode = v; return;
     case CRM_DRAW_MODE_REG:      s->drawmode = v; return;
 
-    /* ---- screen masks (64-bit: hi=min, lo=max) ---- */
-    case CRM_SCRMASK0_REG: case CRM_SCRMASK0_REG + 8:
-    case CRM_SCRMASK0_REG + 16: case CRM_SCRMASK0_REG + 24:
-    case CRM_SCRMASK0_REG + 32:
-        s->scrmask[(p - CRM_SCRMASK0_REG) / 8] = v;
+    /* ---- screen masks: 5 x 64-bit, each two 32-bit stores (min,max) ---- */
+    case CRM_SCRMASK0_REG + 0:  case CRM_SCRMASK0_REG + 4:
+    case CRM_SCRMASK0_REG + 8:  case CRM_SCRMASK0_REG + 12:
+    case CRM_SCRMASK0_REG + 16: case CRM_SCRMASK0_REG + 20:
+    case CRM_SCRMASK0_REG + 24: case CRM_SCRMASK0_REG + 28:
+    case CRM_SCRMASK0_REG + 32: case CRM_SCRMASK0_REG + 36:
+        s->scrmask[(p - CRM_SCRMASK0_REG) / 4] = v;
         return;
 
     /* ---- scissor + winoffset ---- */
@@ -1569,7 +1595,7 @@ static const VMStateDescription vmstate_sgi_crime_re = {
         VMSTATE_UINT32(bufmode_dst, SGICRIMEREState),
         VMSTATE_UINT32(clipmode, SGICRIMEREState),
         VMSTATE_UINT32(drawmode, SGICRIMEREState),
-        VMSTATE_UINT32_ARRAY(scrmask, SGICRIMEREState, 5),
+        VMSTATE_UINT32_ARRAY(scrmask, SGICRIMEREState, 10),
         VMSTATE_UINT32(scissor_lo, SGICRIMEREState),
         VMSTATE_UINT32(scissor_hi, SGICRIMEREState),
         VMSTATE_UINT32(winoffset_src, SGICRIMEREState),

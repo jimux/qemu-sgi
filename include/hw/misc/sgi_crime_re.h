@@ -264,7 +264,7 @@ struct SGICRIMEREState {
     uint32_t bufmode_src, bufmode_dst;
     uint32_t clipmode;
     uint32_t drawmode;
-    uint32_t scrmask[5];            /* 64-bit regs stored as two u32 LE */
+    uint32_t scrmask[10];           /* 5 x 64-bit: [2i]=min [2i+1]=max */
     uint32_t scissor_lo, scissor_hi;
     uint32_t winoffset_src, winoffset_dst;
     uint32_t primitive;
