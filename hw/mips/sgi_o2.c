@@ -917,31 +917,45 @@ static void sgi_o2_init(MachineState *machine) {
    * SEG1 CRIME memory-bank windows at 0x40000000+.
    *
    * The real O2 PROM SizeMEM() probes eight 128 MiB bank windows in SEG1.
-   * Each CRIME bank holds a 32 MiB SIMM (128 MiB SIMMs on larger machines);
-   * with 32 MiB SIMMs the SIMM address-mirrors 4× within its 128 MiB window.
-   * Empty banks must read 0 ("no SIMM") so the probe terminates.
+   * Each CRIME bank holds either a 32 MiB or a 128 MiB SIMM, and the kernel
+   * sizes memory from the CRIME bank-config registers (sgi_crime.c): up to
+   * 256 MiB the banks are 32 MiB (mirroring 4× within each 128 MiB window),
+   * above that they are 128 MiB with no mirror. This must match the bank
+   * geometry CRIME advertises, or the kernel will use RAM the map never
+   * backs. Empty banks must read 0 ("no SIMM") so the probe terminates.
    *
-   * Map each populated bank's 32 MiB slice as 4 mirrored aliases across its
-   * window, and cover empty windows with an unimplemented device. This is the
-   * historical "SEG1 RAM Aliases" fix; the IP54-era flat >256 MiB alias that
-   * replaced it is removed. TODO (milestone 3): 128 MiB SIMMs / bank interleave
-   * for >256 MiB machines.
+   * Map each populated bank accordingly and cover the rest of each window
+   * (empty banks, and the tail of a partial last bank) with an unimplemented
+   * device.
    */
+  bool big_sdram = machine->ram_size > (256 * MiB);
   for (int b = 0; b < 8; b++) {
     hwaddr base = O2_HIGH_RAM_BASE + (hwaddr)b * 128 * MiB;
-    hwaddr slice = (hwaddr)b * 32 * MiB;
+    hwaddr bank_off = (hwaddr)b * (big_sdram ? 128 * MiB : 32 * MiB);
 
-    if (slice >= machine->ram_size) {
+    if (bank_off >= machine->ram_size) {
       create_unimplemented_device("o2-seg1-bank", base, 128 * MiB);
       continue;
     }
-    hwaddr slice_len = MIN((uint64_t)32 * MiB, machine->ram_size - slice);
-    for (int m = 0; m < 4; m++) {
+    if (big_sdram) {
+      hwaddr bank_len = MIN((uint64_t)128 * MiB, machine->ram_size - bank_off);
       MemoryRegion *bank = g_new(MemoryRegion, 1);
       memory_region_init_alias(bank, OBJECT(machine), "o2-seg1-bank-ram",
-                               machine->ram, slice, slice_len);
-      memory_region_add_subregion(system_memory,
-                                  base + (hwaddr)m * 32 * MiB, bank);
+                               machine->ram, bank_off, bank_len);
+      memory_region_add_subregion(system_memory, base, bank);
+      if (bank_len < 128 * MiB) {
+        create_unimplemented_device("o2-seg1-bank-tail", base + bank_len,
+                                    128 * MiB - bank_len);
+      }
+    } else {
+      hwaddr slice_len = MIN((uint64_t)32 * MiB, machine->ram_size - bank_off);
+      for (int m = 0; m < 4; m++) {
+        MemoryRegion *bank = g_new(MemoryRegion, 1);
+        memory_region_init_alias(bank, OBJECT(machine), "o2-seg1-bank-ram",
+                                 machine->ram, bank_off, slice_len);
+        memory_region_add_subregion(system_memory,
+                                    base + (hwaddr)m * 32 * MiB, bank);
+      }
     }
   }
 
