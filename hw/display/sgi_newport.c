@@ -1084,6 +1084,15 @@ static void newport_draw_iline(SGINewportState *s)
     bool skip_last  = !!(s->drawmode0 & DM0_SKIPLAST);
     bool shade = !!(s->drawmode0 & DM0_SHADE);
     bool first = true;
+    /*
+     * Single-step line mode: when neither STOPONX (bit 8) nor STOPONY (bit 9)
+     * is set the hardware draws ONE pixel per Go and advances the start
+     * cursor; the server issues repeated Go's to walk the line.  MAME ref:
+     * do_iline() iterate_one at newport.cpp:3082.  Without this the line
+     * engine draws the whole span on every Go, turning the server's
+     * one-pixel cursor walks into a long visible diagonal.
+     */
+    bool iterate_one = ((s->drawmode0 & 0x300) == 0);
 
     trace_sgi_newport_draw_line(x0, y0, x1, y1, octant);
     int dx = abs(x1 - x0);
@@ -1095,7 +1104,8 @@ static void newport_draw_iline(SGINewportState *s)
 
     for (;;) {
         bool is_last = (x0 == x1 && y0 == y1);
-        bool skip = (first && skip_first) || (is_last && skip_last);
+        bool skip = (first && skip_first && !iterate_one) ||
+                    (is_last && skip_last);
 
         if (!skip) {
             if (shade) {
@@ -1121,6 +1131,10 @@ static void newport_draw_iline(SGINewportState *s)
         if (e2 < dx) {
             err += dx;
             y0 += sy;
+        }
+        if (iterate_one) {
+            /* One pixel per Go; leave the advanced cursor in START. */
+            break;
         }
     }
 
@@ -1146,6 +1160,9 @@ static void newport_draw_fline(SGINewportState *s)
     bool skip_last  = !!(s->drawmode0 & DM0_SKIPLAST);
     bool shade = !!(s->drawmode0 & DM0_SHADE);
     bool first = true;
+    /* Single-step line mode — see newport_draw_iline(). MAME ref: do_fline()
+     * iterate_one at newport.cpp:2884. */
+    bool iterate_one = ((s->drawmode0 & 0x300) == 0);
     int dx = abs(x1 - x0);
     int dy = abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1;
@@ -1155,7 +1172,8 @@ static void newport_draw_fline(SGINewportState *s)
 
     for (;;) {
         bool is_last = (x0 == x1 && y0 == y1);
-        bool skip = (first && skip_first) || (is_last && skip_last);
+        bool skip = (first && skip_first && !iterate_one) ||
+                    (is_last && skip_last);
 
         if (!skip) {
             if (shade) {
@@ -1181,6 +1199,10 @@ static void newport_draw_fline(SGINewportState *s)
         if (e2 < dx) {
             err += dx;
             y0 += sy;
+        }
+        if (iterate_one) {
+            /* One pixel per Go; leave the advanced cursor in START. */
+            break;
         }
     }
 
