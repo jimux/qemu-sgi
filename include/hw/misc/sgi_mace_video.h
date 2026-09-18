@@ -216,6 +216,19 @@ struct SGIMACEVideoState {
     size_t rx_len;
     uint8_t *rx_payload;
     size_t rx_payload_len;
+
+    /*
+     * Host decoder helper driven by the GTK "Video" menu (the
+     * sgi-video-source interface).  QEMU itself never decodes video: the
+     * helper is an external process (ffmpeg) that connects to the
+     * video-in chardev and streams MVPF frames.
+     */
+    char *video_helper;    /* property: helper executable path       */
+    char *video_in_path;   /* property: unix socket the helper uses  */
+    GPid helper_pid;       /* running helper, 0 when none            */
+    guint helper_watch;    /* g_child_watch source id                */
+    char *helper_source;   /* attached source, for describe()        */
+    bool helper_is_url;
 };
 
 /**

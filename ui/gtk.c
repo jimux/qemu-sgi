@@ -2199,6 +2199,156 @@ static void gd_connect_signals(GtkDisplayState *s)
                      G_CALLBACK(gd_change_page), s);
 }
 
+/*
+ * @@SEMANTICS@@ "Video" menu.  A machine whose video device implements the
+ * sgi-video-source interface (the O2 MACE video block) gets a menu to
+ * attach a host video file or stream URL to a video input, and to detach
+ * it.  Decoding stays outside QEMU: the device starts an external helper
+ * that connects to the video-in chardev.  Machines without such a device
+ * get no menu, so this cannot affect them.
+ */
+static void gd_video_show_error(GtkDisplayState *s, Error *err)
+{
+    GtkWidget *dialog;
+
+    dialog = gtk_message_dialog_new(GTK_WINDOW(s->window), GTK_DIALOG_MODAL,
+                                    GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+                                    "%s", error_get_pretty(err));
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    error_free(err);
+}
+
+static void gd_video_update(GtkDisplayState *s)
+{
+    SGIVideoSourceClass *vsc;
+    const char *desc;
+    bool attached;
+    char *label;
+
+    if (!s->video_src) {
+        return;
+    }
+    vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+    attached = vsc->is_attached(s->video_src, "vin1");
+    desc = vsc->describe(s->video_src, "vin1");
+
+    gtk_widget_set_sensitive(s->video_attach_item, !attached);
+    gtk_widget_set_sensitive(s->video_url_item, !attached);
+    gtk_widget_set_sensitive(s->video_detach_item, attached);
+
+    if (attached) {
+        label = g_strdup_printf(_("VIN1: %s"), desc ? desc : _("attached"));
+    } else {
+        label = g_strdup(_("VIN1: no source"));
+    }
+    gtk_menu_item_set_label(GTK_MENU_ITEM(s->video_status_item), label);
+    g_free(label);
+}
+
+static void gd_video_attach_file(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+    GtkWidget *dialog;
+    Error *err = NULL;
+
+    dialog = gtk_file_chooser_dialog_new(
+        _("Attach video to VIN1"), GTK_WINDOW(s->window),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        _("_Cancel"), GTK_RESPONSE_CANCEL,
+        _("_Attach"), GTK_RESPONSE_ACCEPT, NULL);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+
+        if (!vsc->attach(s->video_src, "vin1", fn, false, &err)) {
+            gd_video_show_error(s, err);
+        }
+        g_free(fn);
+    }
+    gtk_widget_destroy(dialog);
+    gd_video_update(s);
+}
+
+static void gd_video_attach_url(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+    GtkWidget *dialog;
+    GtkWidget *entry;
+    GtkWidget *content;
+    Error *err = NULL;
+
+    dialog = gtk_dialog_new_with_buttons(
+        _("Attach stream URL to VIN1"), GTK_WINDOW(s->window),
+        GTK_DIALOG_MODAL,
+        _("_Cancel"), GTK_RESPONSE_CANCEL,
+        _("_Attach"), GTK_RESPONSE_ACCEPT, NULL);
+    content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "rtsp://host/stream");
+    gtk_box_pack_start(GTK_BOX(content), entry, TRUE, TRUE, 6);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        const char *url = gtk_entry_get_text(GTK_ENTRY(entry));
+
+        if (!vsc->attach(s->video_src, "vin1", url, true, &err)) {
+            gd_video_show_error(s, err);
+        }
+    }
+    gtk_widget_destroy(dialog);
+    gd_video_update(s);
+}
+
+static void gd_video_detach(GtkMenuItem *item, void *opaque)
+{
+    GtkDisplayState *s = opaque;
+    SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+
+    vsc->detach(s->video_src, "vin1");
+    gd_video_update(s);
+}
+
+static GtkWidget *gd_create_menu_video(GtkDisplayState *s)
+{
+    GtkWidget *video_menu;
+    GtkWidget *separator;
+
+    video_menu = gtk_menu_new();
+    gtk_menu_set_accel_group(GTK_MENU(video_menu), s->accel_group);
+
+    s->video_status_item = gtk_menu_item_new_with_label("");
+    gtk_widget_set_sensitive(s->video_status_item, FALSE);
+    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_status_item);
+
+    separator = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), separator);
+
+    s->video_attach_item =
+        gtk_menu_item_new_with_mnemonic(_("_Attach Video File to VIN1..."));
+    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_attach_item);
+
+    s->video_url_item =
+        gtk_menu_item_new_with_mnemonic(_("Attach Stream _URL to VIN1..."));
+    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_url_item);
+
+    s->video_detach_item =
+        gtk_menu_item_new_with_mnemonic(_("_Detach VIN1"));
+    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_detach_item);
+
+    g_signal_connect(s->video_attach_item, "activate",
+                     G_CALLBACK(gd_video_attach_file), s);
+    g_signal_connect(s->video_url_item, "activate",
+                     G_CALLBACK(gd_video_attach_url), s);
+    g_signal_connect(s->video_detach_item, "activate",
+                     G_CALLBACK(gd_video_detach), s);
+
+    gd_video_update(s);
+    return video_menu;
+}
+
 static GtkWidget *gd_create_menu_machine(GtkDisplayState *s)
 {
     GtkWidget *machine_menu;
@@ -2473,6 +2623,7 @@ static GtkWidget *gd_create_menu_view(GtkDisplayState *s, DisplayOptions *opts)
 static void gd_create_menus(GtkDisplayState *s, DisplayOptions *opts)
 {
     GtkSettings *settings;
+    Object *vobj;
 
     s->accel_group = gtk_accel_group_new();
     s->machine_menu = gd_create_menu_machine(s);
@@ -2486,6 +2637,17 @@ static void gd_create_menus(GtkDisplayState *s, DisplayOptions *opts)
     s->view_menu_item = gtk_menu_item_new_with_mnemonic(_("_View"));
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->view_menu_item), s->view_menu);
     gtk_menu_shell_append(GTK_MENU_SHELL(s->menu_bar), s->view_menu_item);
+
+    vobj = object_resolve_path_type("", TYPE_SGI_VIDEO_SOURCE, NULL);
+    if (vobj) {
+        s->video_src = SGI_VIDEO_SOURCE(vobj);
+        s->video_menu = gd_create_menu_video(s);
+        s->video_menu_item = gtk_menu_item_new_with_mnemonic(_("_Video"));
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(s->video_menu_item),
+                                  s->video_menu);
+        gtk_menu_shell_append(GTK_MENU_SHELL(s->menu_bar),
+                              s->video_menu_item);
+    }
 
     g_object_set_data(G_OBJECT(s->window), "accel_group", s->accel_group);
     gtk_window_add_accel_group(GTK_WINDOW(s->window), s->accel_group);

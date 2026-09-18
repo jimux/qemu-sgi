@@ -21,6 +21,7 @@
 #include "ui/clipboard.h"
 #include "ui/console.h"
 #include "ui/kbd-state.h"
+#include "hw/misc/sgi_video_source.h"
 #if defined(CONFIG_OPENGL)
 #include "ui/egl-helpers.h"
 #include "ui/egl-context.h"
@@ -106,6 +107,14 @@ struct GtkDisplayState {
     GtkWidget *reset_item;
     GtkWidget *powerdown_item;
     GtkWidget *quit_item;
+
+    GtkWidget *video_menu_item;
+    GtkWidget *video_menu;
+    GtkWidget *video_attach_item;
+    GtkWidget *video_url_item;
+    GtkWidget *video_detach_item;
+    GtkWidget *video_status_item;
+    SGIVideoSource *video_src;
 
     GtkWidget *view_menu_item;
     GtkWidget *view_menu;

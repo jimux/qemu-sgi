@@ -21,14 +21,19 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/display/saa7111.h"
 #include "hw/display/saa7185.h"
 #include "hw/misc/sgi_mace_video.h"
+#include "hw/misc/sgi_video_source.h"
 #include "migration/vmstate.h"
 #include "trace.h"
+
+#include <signal.h>
+#include <sys/wait.h>
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -823,6 +828,132 @@ static void mvp_video_in_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /* ------------------------------------------------------------------ */
+/* host source attach/detach (sgi-video-source interface)              */
+/*
+ * @@SEMANTICS@@ The GTK "Video" menu drives this.  QEMU never links or
+ * embeds a video decoder: attaching spawns an external helper process
+ * (ffmpeg, wrapped by a small script) that connects to the video-in
+ * chardev and streams MVPF frames; detaching kills it.  The emulated
+ * capture DMA is unchanged -- it copies whatever frame the chardev last
+ * delivered, so an attach is visible to the guest on the next field.
+ */
+
+static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
+{
+    SGIMACEVideoState *s = opaque;
+
+    g_spawn_close_pid(pid);
+    if (s->helper_pid == pid) {
+        s->helper_pid = 0;
+        s->helper_watch = 0;
+        g_free(s->helper_source);
+        s->helper_source = NULL;
+        s->helper_is_url = false;
+        s->frame_len = 0;   /* fall back to the internal test pattern */
+    }
+}
+
+static void mvp_video_detach(SGIVideoSource *src, const char *input)
+{
+    SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+    GPid pid = s->helper_pid;
+    int i;
+
+    if (s->helper_watch) {
+        g_source_remove(s->helper_watch);
+        s->helper_watch = 0;
+    }
+    s->helper_pid = 0;
+    g_free(s->helper_source);
+    s->helper_source = NULL;
+    s->helper_is_url = false;
+    s->frame_len = 0;
+
+    if (pid <= 0) {
+        return;
+    }
+    kill(pid, SIGTERM);
+    /* Reap synchronously so detach is complete when it returns. */
+    for (i = 0; i < 50; i++) {
+        if (waitpid(pid, NULL, WNOHANG) == pid) {
+            g_spawn_close_pid(pid);
+            return;
+        }
+        g_usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    g_spawn_close_pid(pid);
+}
+
+static bool mvp_video_attach(SGIVideoSource *src, const char *input,
+                             const char *source, bool is_url, Error **errp)
+{
+    SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+    char *argv[8];
+    GError *err = NULL;
+
+    if (strcmp(input, "vin1") != 0) {
+        error_setg(errp, "only the VIN1 input is wired in this build");
+        return false;
+    }
+    if (!s->video_helper) {
+        error_setg(errp, "no video-helper configured: pass "
+                   "-global sgi-mace-video.video-helper=<wrapper>");
+        return false;
+    }
+    if (!s->video_in_path) {
+        error_setg(errp, "no video-in-path configured: pass "
+                   "-global sgi-mace-video.video-in-path=<socket>");
+        return false;
+    }
+    if (!source || !*source) {
+        error_setg(errp, "empty video source");
+        return false;
+    }
+
+    mvp_video_detach(src, input);
+
+    argv[0] = s->video_helper;
+    argv[1] = (char *)"--socket";
+    argv[2] = s->video_in_path;
+    argv[3] = (char *)"--source";
+    argv[4] = (char *)source;
+    argv[5] = is_url ? (char *)"--url" : NULL;
+    argv[6] = NULL;
+
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_DO_NOT_REAP_CHILD |
+                       G_SPAWN_STDOUT_TO_DEV_NULL |
+                       G_SPAWN_STDERR_TO_DEV_NULL,
+                       NULL, NULL, &s->helper_pid, &err)) {
+        error_setg(errp, "cannot launch video helper '%s': %s",
+                   s->video_helper, err->message);
+        g_error_free(err);
+        return false;
+    }
+    s->helper_watch = g_child_watch_add(s->helper_pid,
+                                        mvp_video_helper_exit, s);
+    s->helper_source = g_strdup(source);
+    s->helper_is_url = is_url;
+    return true;
+}
+
+static bool mvp_video_is_attached(SGIVideoSource *src, const char *input)
+{
+    SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+
+    return s->helper_pid > 0;
+}
+
+static const char *mvp_video_describe(SGIVideoSource *src, const char *input)
+{
+    SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+
+    return s->helper_source;
+}
+
+/* ------------------------------------------------------------------ */
 /* reset / realize                                                     */
 
 static void mvp_channel_reset(MVPChannelState *ch)
@@ -900,6 +1031,9 @@ static void sgi_mace_video_realize(DeviceState *dev, Error **errp)
 
 static const Property sgi_mace_video_properties[] = {
     DEFINE_PROP_CHR("video-in", SGIMACEVideoState, video_in),
+    /* GTK "Video" menu: external decoder helper + its chardev socket. */
+    DEFINE_PROP_STRING("video-helper", SGIMACEVideoState, video_helper),
+    DEFINE_PROP_STRING("video-in-path", SGIMACEVideoState, video_in_path),
 };
 
 static const VMStateDescription vmstate_sgi_mace_video_chan = {
@@ -952,11 +1086,17 @@ static const VMStateDescription vmstate_sgi_mace_video = {
 static void sgi_mace_video_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_CLASS(klass);
 
     dc->realize = sgi_mace_video_realize;
     device_class_set_legacy_reset(dc, sgi_mace_video_reset);
     dc->vmsd = &vmstate_sgi_mace_video;
     device_class_set_props(dc, sgi_mace_video_properties);
+
+    vsc->attach = mvp_video_attach;
+    vsc->detach = mvp_video_detach;
+    vsc->is_attached = mvp_video_is_attached;
+    vsc->describe = mvp_video_describe;
 }
 
 static const TypeInfo sgi_mace_video_info = {
@@ -964,10 +1104,21 @@ static const TypeInfo sgi_mace_video_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(SGIMACEVideoState),
     .class_init = sgi_mace_video_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_SGI_VIDEO_SOURCE },
+        { }
+    },
+};
+
+static const TypeInfo sgi_video_source_info = {
+    .name = TYPE_SGI_VIDEO_SOURCE,
+    .parent = TYPE_INTERFACE,
+    .class_size = sizeof(SGIVideoSourceClass),
 };
 
 static void sgi_mace_video_register_types(void)
 {
+    type_register_static(&sgi_video_source_info);
     type_register_static(&sgi_mace_video_info);
 }
 
