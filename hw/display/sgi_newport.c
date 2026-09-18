@@ -676,6 +676,13 @@ static void newport_logic_pixel(SGINewportState *s, uint32_t addr,
 
     dst = buf[addr];
 
+    /* Fastclear bypasses the logic op and stores the source directly.
+     * MAME ref: rb2_device::write_pixel() — if (m_blend || m_fast_clear)
+     * store_pixel(data); else logic_pixel(data).  (Blend is a separate,
+     * larger port; MAME defines it for 12/24bpp only.) */
+    if (s->dm1_fastclear) {
+        result = src;
+    } else {
     /* 16 ROP logic operations */
     switch (s->dm1_logicop) {
     case 0x0: result = 0; break;
@@ -695,6 +702,7 @@ static void newport_logic_pixel(SGINewportState *s, uint32_t addr,
     case 0xe: result = ~(src & dst); break;     /* NAND */
     case 0xf: result = 0xffffffff; break;
     default:  result = src; break;
+    }
     }
 
     mask = s->write_mask & s->global_mask;
@@ -774,7 +782,10 @@ static void newport_output_pixel(SGINewportState *s, int16_t x, int16_t y,
     wy = y + (int16_t)(s->xy_window & 0xffff) - 0x1000;
 
     /* Bounds check against VRAM */
-    if (wx < 0 || wx >= NEWPORT_VRAM_W || wy < 0 || wy >= NEWPORT_VRAM_H) {
+    /* Draws are clipped at y >= 1024 (the bottom 64 rows of the 1088-tall
+     * buffer are never a legal draw target).  MAME ref: pixel_clip_pass()
+     * newport.cpp:2345.  x keeps the full 1344 width. */
+    if (wx < 0 || wx >= NEWPORT_VRAM_W || wy < 0 || wy >= NEWPORT_SCREEN_H) {
         return;
     }
 
@@ -1113,7 +1124,7 @@ static void newport_draw_iline(SGINewportState *s)
             }
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, x0, y0, newport_get_host_color(s));
-            } else if (shade && !s->dm1_fastclear) {
+            } else if (shade || s->dm1_rgbmode) {
                 newport_output_pixel(s, x0, y0, newport_get_rgb_color(s, x0, y0));
             } else {
                 newport_output_pixel(s, x0, y0, color);
@@ -1189,7 +1200,7 @@ static void newport_draw_fline(SGINewportState *s)
             }
             if (s->dm0_colorhost) {
                 newport_output_pixel(s, x0, y0, newport_get_host_color(s));
-            } else if (shade && !s->dm1_fastclear) {
+            } else if (shade || s->dm1_rgbmode) {
                 newport_output_pixel(s, x0, y0, newport_get_rgb_color(s, x0, y0));
             } else {
                 newport_output_pixel(s, x0, y0, color);
@@ -1264,7 +1275,15 @@ static void newport_draw_scr2scr(SGINewportState *s)
                 src_wy >= 0 && src_wy < NEWPORT_VRAM_H) {
                 src_addr = (uint32_t)src_wy * NEWPORT_VRAM_W +
                            (uint32_t)src_wx;
-                pixel = s->vram_rgbci[src_addr];
+                /* Read the selected plane buffer, not always RGB/CI — the
+                 * aux buffer holds overlay(4)/popup(5)/CID(6).  MAME ref:
+                 * do_rex3_command scr2scr uses set_address() -> m_dest_buf. */
+                if (s->dm1_planes == 4 || s->dm1_planes == 5 ||
+                    s->dm1_planes == 6) {
+                    pixel = s->vram_cidaux[src_addr];
+                } else {
+                    pixel = s->vram_rgbci[src_addr];
+                }
             } else {
                 pixel = 0;
             }
@@ -1308,7 +1327,10 @@ static uint32_t newport_read_one_pixel(SGINewportState *s)
 
     if (wx >= 0 && wx < NEWPORT_VRAM_W && wy >= 0 && wy < NEWPORT_VRAM_H) {
         uint32_t addr = (uint32_t)wy * NEWPORT_VRAM_W + (uint32_t)wx;
-        if (s->dm1_planes == 4 || s->dm1_planes == 5) {
+        /* CID (plane 6) lives in the aux buffer too — keep the read path
+         * symmetric with the write path (logic_pixel) and MAME set_flags. */
+        if (s->dm1_planes == 4 || s->dm1_planes == 5 ||
+            s->dm1_planes == 6) {
             ret = s->vram_cidaux[addr];
         } else {
             ret = s->vram_rgbci[addr];
@@ -1444,6 +1466,9 @@ static void newport_do_rex3_command(SGINewportState *s)
         case DM0_ADR_FLINE:
             newport_draw_fline(s);
             break;
+        case 4: /* A_Line — MAME aliases it to ILINE (newport.cpp:3512) */
+            newport_draw_iline(s);
+            break;
         default:
             qemu_log_mask(LOG_UNIMP,
                           "newport: unimplemented draw adrmode %d\n", adrmode);
@@ -1451,6 +1476,10 @@ static void newport_do_rex3_command(SGINewportState *s)
         }
         break;
     case DM0_OP_SCR2SCR:
+        /* MAME only runs scr2scr for adrmode < 2 (newport.cpp:3520). */
+        if (adrmode >= 2) {
+            break;
+        }
         newport_draw_scr2scr(s);
         break;
     }
