@@ -2455,6 +2455,30 @@ static void newport_write32(SGINewportState *s, hwaddr addr, uint64_t val,
     case REX3_COLORRED:
         s->color_red = val & 0x00ffffff;
         s->curr_color_red = s->color_red;
+        /*
+         * 0x0200 is the high half of the 8-byte "Red/CI Full State Write",
+         * so the CI index rides in this same word (MAME: (data >> 43) —
+         * i.e. bits 11+ here).  In CI mode (draw_mode1 bit 15 = 0) this is
+         * the fill colour index used by every span/block, including glyph
+         * bitmaps.  Without it color_i stays 0, so every CI fill — bars,
+         * backgrounds and text — draws black.  MAME ref: newport.cpp
+         * case 0x0200/8.
+         */
+        if (!s->dm1_rgbmode) {
+            switch (s->dm1_drawdepth) {
+            case 0: /* 4bpp  */
+                s->color_i = (val >> 11) & 0x00f;
+                break;
+            case 1: /* 8bpp  */
+                s->color_i = (val >> 11) & 0x0ff;
+                break;
+            case 2: /* 12bpp */
+                s->color_i = (val >> 9) & 0xfff;
+                break;
+            default: /* 24bpp — invalid for CI mode */
+                break;
+            }
+        }
         break;
     case REX3_COLORALPHA:
         s->color_alpha = val & 0x000fffff;
