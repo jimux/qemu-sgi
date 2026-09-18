@@ -118,8 +118,26 @@ static void mvp_fill_test_pattern(uint8_t *buf, unsigned fmt, unsigned stride,
                 row[x + 2] = mvp_bars_v[bar];
                 row[x + 3] = mvp_bars_y[bar];
             }
+        } else if (fmt == MVP_FORMAT_ABGR32) {
+            /*
+             * @@SEMANTICS@@ Open GL ABGR 32-bit (MACE spec FIGURE 9): the
+             * big-endian memory bytes are A, B, G, R.  The pattern
+             * previously wrote R,G,B,0xff for every 32-bit format, so the
+             * guest converted it as if byte0 were alpha and the bars came
+             * out with one channel pinned at 0xff.  The host helper emits
+             * ABGR too, so this keeps the no-host negative control the
+             * genuine SMPTE bars.
+             */
+            for (x = 0; x + 3 < stride; x += 4) {
+                unsigned bar = (x * 8) / stride;
+
+                row[x + 0] = 0xff;
+                row[x + 1] = mvp_bars_b[bar];
+                row[x + 2] = mvp_bars_g[bar];
+                row[x + 3] = mvp_bars_r[bar];
+            }
         } else {
-            /* 32-bit RGBA/ABGR: opaque colour bars, R G B X. */
+            /* Open GL RGBA 32: big-endian bytes R, G, B, A. */
             for (x = 0; x + 3 < stride; x += 4) {
                 unsigned bar = (x * 8) / stride;
 

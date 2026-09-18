@@ -770,6 +770,22 @@ static uint32_t sgi_crime_re_xfer_fetch(SGICRIMEREState *s,
     if (pix_type == 0) {
         return b[crim_ci_lane(s->bufmode_src)];
     }
+    if (pix_type == 3) {
+        /*
+         * @@SEMANTICS@@ — BufMode.src pixType 3 is ABGR (spec §7.3.1.4
+         * Table 7-4): the big-endian word is A(31:24) B(23:16) G(15:8)
+         * R(7:0), i.e. memory bytes A,B,G,R.  This is exactly the MACE
+         * capture packing the OpenGL video path feeds in, and the
+         * destination here is pixType 2 (RGBA: memory R,G,B,A) whose
+         * GBE RGB8 scanout reads byte0 as R.  Return the canonical
+         * internal RGBA (the same convention get_pixel/put_pixel and
+         * the shade/dither arithmetic use: R=31:24..A=7:0) so the
+         * engine performs the ABGR->RGBA component reorder; without it
+         * the window showed the alpha byte (0xff) as red.
+         */
+        return ((uint32_t)b[3] << 24) | ((uint32_t)b[2] << 16)
+             | ((uint32_t)b[1] << 8) | b[0];
+    }
     return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16)
          | ((uint32_t)b[2] << 8) | b[3];
 }
@@ -803,6 +819,64 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
 
     switch (op & PRIM_OPCODE_MASK) {
     case PRIM_OPCODE_RECT: {
+        /*
+         * @@SEMANTICS@@ — OpenGL pixel transfer (glDrawPixels /
+         * glCopyPixels; DrawMode.enGL=1 + enPixelXfer=1).  The spec ties
+         * the coordinate register set to the mode: §7.3.1.6 DrawMode.enGL
+         * selects "GL mode" vs "X mode", and §7.3.6.1 says a rectangle's
+         * window coordinates come from Rasterize.vertexX for X primitives
+         * *or* Rasterize.vertexGL for OpenGL primitives.  libGLcore's
+         * video upload programs a 640x480 window as ~10 horizontal bands
+         * in Vertex.GL as 13.6 values against a +4096 window-space origin
+         * (x 4096..4735, y 4096..4575) with WinOffset.dst = -3846, which
+         * compose (fb = window + offset) to the on-screen window
+         * 250..889 x 250..729 — the exact rectangle of the GBE DID window.
+         *
+         * The engine must walk this rect in the GL vertex space (no
+         * X-mode 2048-pixel modular wrap: a GL coord of 4096 masked to
+         * 0x7ff becomes 0, and the whole transfer then translated to
+         * fb -3846..-2567, which the screen-mask clip rejected — leaving
+         * the video window at the MTE clear colour).  We therefore take a
+         * dedicated bounded walk with the source row pitch derived from
+         * the GL extent.  X-mode PixelXfer (the toolchest-icon upload,
+         * enGL=0) keeps the existing modular path byte-for-byte, and a
+         * (not yet observed) tiled GL source falls back to that path
+         * rather than being misread as a linear walk.
+         */
+        if (xfer && (dm & DM_ENGL) && src_linear) {
+            int64_t gx1 = (int64_t)((int32_t)s->vertex_gl[0][0] >> 6);
+            int64_t gy1 = (int64_t)((int32_t)s->vertex_gl[0][1] >> 6);
+            int64_t gx2 = (int64_t)((int32_t)s->vertex_gl[1][0] >> 6);
+            int64_t gy2 = (int64_t)((int32_t)s->vertex_gl[1][1] >> 6);
+            if (gx2 < gx1) { int64_t t = gx1; gx1 = gx2; gx2 = t; }
+            if (gy2 < gy1) { int64_t t = gy1; gy1 = gy2; gy2 = t; }
+            trace_sgi_crime_re_xfer(s->bufmode_src, s->bufmode_dst,
+                                    s->pixelxfer_src_addr,
+                                    s->pixelxfer_src_xstep,
+                                    s->pixelxfer_src_ystep,
+                                    s->clipmode, s->winoffset_dst, dm,
+                                    (int)gx1, (int)gy1);
+            int64_t gl_xstep = (int32_t)s->pixelxfer_src_xstep;
+            int64_t gl_pitch = (gx2 - gx1) * gl_xstep
+                             + (int32_t)s->pixelxfer_src_ystep;
+            int64_t gl_row = src_off;
+            for (int64_t gy = gy1; gy <= gy2; gy++) {
+                int64_t gl_col = gl_row;
+                for (int64_t gx = gx1; gx <= gx2; gx++) {
+                    int fx, fy;
+                    if (sgi_crime_re_clip_pass(s, (int)gx, (int)gy,
+                                               &fx, &fy)) {
+                        uint32_t color = sgi_crime_re_xfer_fetch(s, gl_col,
+                                                                 src_linear);
+                        sgi_crime_re_put_pixel(s, s->bufmode_dst, fx, fy,
+                                               color);
+                    }
+                    gl_col += gl_xstep;
+                }
+                gl_row += gl_pitch;
+            }
+            break;
+        }
         /*
          * gxemul semantics (dev_sgi_re.c DE_PRIM_RECTANGLE): coords are
          * masked to the 2048-pixel space and the walk WRAPS modulo
@@ -860,6 +934,15 @@ static void sgi_crime_re_draw(SGICRIMEREState *s)
          */
         int src_x = (int)(((uint32_t)src_off >> 16) & 0x7ff);
         int src_y = (int)((uint32_t)src_off & 0x7ff);
+
+        if (xfer) {
+            trace_sgi_crime_re_xfer(s->bufmode_src, s->bufmode_dst,
+                                    (uint32_t)src_off,
+                                    s->pixelxfer_src_xstep,
+                                    s->pixelxfer_src_ystep,
+                                    s->clipmode, s->winoffset_dst, dm,
+                                    (int)sx1, (int)sy1);
+        }
 
         int ity = 0;
         for (uint32_t yy = starty; yy != endy && ity < MAX_ITER;
@@ -1512,8 +1595,12 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
                 s->tlb_cid[(t - CRM_TLB_CID_OFFSET) / 8] = value;
             } else if (t < CRM_TLB_LINEAR_A_OFFSET + 0x80) {
                 s->tlb_linear[0][(t - CRM_TLB_LINEAR_A_OFFSET) / 8] = value;
+                trace_sgi_crime_re_ltlb_write(0,
+                        (t - CRM_TLB_LINEAR_A_OFFSET) / 8, value);
             } else if (t < CRM_TLB_LINEAR_B_OFFSET + 0x80) {
                 s->tlb_linear[1][(t - CRM_TLB_LINEAR_B_OFFSET) / 8] = value;
+                trace_sgi_crime_re_ltlb_write(1,
+                        (t - CRM_TLB_LINEAR_B_OFFSET) / 8, value);
             }
         }
         return;
@@ -1523,6 +1610,8 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
     if (off >= CRM_RE_PIXPIPE_BASE && off < CRM_RE_MTE_BASE) {
         hwaddr p = off - CRM_RE_PIXPIPE_BASE;
         uint32_t v = (uint32_t)value;
+
+        trace_sgi_crime_re_ppwrite((int)p, value, (int)size);
 
         if (size == 8) {
             /*
