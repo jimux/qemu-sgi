@@ -43,7 +43,11 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/sgi_vice.h"
 #include "migration/vmstate.h"
+#include "system/address-spaces.h"
 #include "trace.h"
+
+#include <stdlib.h>
+#include <unistd.h>
 
 /*
  * VICE internal clock is the CRIME master clock (66.67 MHz, ~15 ns/tick);
@@ -178,6 +182,103 @@ static uint32_t sgi_vice_tlb_phys(const SGIViceState *s, unsigned entry)
  * at 0x8000/0x8008 into the atom, then calls the atom completion callback
  * (vice_dms_jintr), which enqueues the DMS output block.
  */
+#define VICE_TILE_SIZE 0x10000      /* 64 KB DMS TLB page */
+
+/*
+ * @@SEMANTICS@@ tier-ii host-codec offload seam: the output handoff.
+ *
+ * Traced contract (tmp/o2-qemu/vice6/REPORT.md): the produced codec bytes are
+ * read from the DMS output tile (TLB entry VICE_DMS_OUT, 64 KB page, physical
+ * page from the TLB) starting at offset 0, and the produced BYTE COUNT is read
+ * from MSP Data RAM word 0 (VICE offset 0x8000, i.e. vice_request.vr_stat[0]).
+ * viceintr copies DRAM 0x8000/0x8008 into the driver atom; vice_dms_jintr
+ * hands vr_stat[0..3] to the DMS consumer, whose wrapper treats a count of 0 as
+ * the empty output and a non-zero vr_stat[2] as the 704-byte-header variant.
+ * The device must therefore (a) leave the produced bytes in the OUT tile and
+ * (b) write the count into MSP DRAM word 0 -- the old completion zeroed DRAM
+ * 0..15, which erased the count and is why the round-trip stayed empty.
+ *
+ * QEMU never interprets MSP/BSP microcode.  The bytes come from the external
+ * host-codec helper named by the VICE_HOST_CODEC environment variable (the
+ * vice6_encoder.py contract: <helper> <intile.bin> <out.jpg> <w> <h> <q>, the
+ * DMS input tile dumped to intile.bin).  If no helper is configured we do NOT
+ * fabricate an output: the count stays 0 (the driver's empty-output case) and
+ * an UNIMP is logged.  Change this seam to a chardev transport if QEMU must
+ * stay free of any exec().
+ */
+static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
+{
+    const char *helper = getenv("VICE_HOST_CODEC");
+    uint32_t in_phys = sgi_vice_tlb_phys(s, VICE_DMS_IN);
+    uint32_t out_phys = sgi_vice_tlb_phys(s, VICE_DMS_OUT);
+    const unsigned w = 128, h = 128;
+    const gsize tile = (gsize)w * h * 4;   /* dmedia packed 32-bit pixels */
+    gchar *in_tmp = NULL, *out_tmp = NULL, *cmd = NULL;
+    gchar *out_data = NULL;
+    GError *err = NULL;
+    gsize out_len = 0;
+    gint status = 0;
+    gchar *in_buf;
+    int fd;
+
+    if (!helper || !in_phys || !out_phys) {
+        return;
+    }
+    in_buf = g_malloc(tile);
+    address_space_read(&address_space_memory, in_phys,
+                       MEMTXATTRS_UNSPECIFIED, in_buf, tile);
+
+    fd = g_file_open_tmp("vice6-in-XXXXXX", &in_tmp, &err);
+    if (fd < 0) {
+        g_clear_error(&err);
+        g_free(in_buf);
+        return;
+    }
+    if (write(fd, in_buf, tile) != (ssize_t)tile) {
+        close(fd);
+        qemu_log_mask(LOG_UNIMP, "sgi_vice: host-codec input write failed\n");
+        goto out;
+    }
+    close(fd);
+    out_tmp = g_strdup_printf("%s.jpg", in_tmp);
+    cmd = g_strdup_printf("%s %s %s %u %u 75", helper, in_tmp, out_tmp, w, h);
+    if (!g_spawn_command_line_sync(cmd, NULL, NULL, &status, &err) ||
+        status != 0 || !g_file_get_contents(out_tmp, &out_data, &out_len, &err)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: host-codec helper failed: %s\n",
+                      err && err->message ? err->message : "?");
+        goto out;
+    }
+    if (out_len == 0 || out_len > VICE_TILE_SIZE) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: host-codec produced %zu bytes (tile %u)\n",
+                      out_len, VICE_TILE_SIZE);
+        goto out;
+    }
+    /* Place the produced bytes in the OUT tile ... */
+    address_space_write(&address_space_memory, out_phys,
+                        MEMTXATTRS_UNSPECIFIED, out_data, out_len);
+    /* ... and report the produced count in MSP Data RAM word 0 (vr_stat[0]). */
+    s->msp_dram[0] = (out_len >> 24) & 0xff;
+    s->msp_dram[1] = (out_len >> 16) & 0xff;
+    s->msp_dram[2] = (out_len >> 8) & 0xff;
+    s->msp_dram[3] = (out_len >> 0) & 0xff;
+    trace_sgi_vice_offload(codec, out_len, out_phys);
+out:
+    if (in_tmp) {
+        unlink(in_tmp);
+    }
+    if (out_tmp) {
+        unlink(out_tmp);
+        g_free(out_tmp);
+    }
+    g_free(in_tmp);
+    g_free(in_buf);
+    g_free(out_data);
+    g_free(cmd);
+    g_clear_error(&err);
+}
+
 static void sgi_vice_msp_go(SGIViceState *s, uint32_t ctl)
 {
     const char *codec = sgi_vice_fingerprint(s);
@@ -196,9 +297,13 @@ static void sgi_vice_msp_go(SGIViceState *s, uint32_t ctl)
     /*
      * @@SEMANTICS@@ the MSP writes its 4-word result (vr_stat) back to the
      * first 16 bytes of Data RAM; viceintr copies DRAM 0x8000/0x8008 into the
-     * atom.  EXPERIMENT: report a zero (success) status.
+     * atom.  Start from a zero (empty-output) result, then let the host-codec
+     * seam fill in the produced count and bytes.
      */
     memset(s->msp_dram, 0, 16);
+    if (strstr(codec, "jpeg")) {
+        sgi_vice_host_offload(s, codec);
+    }
     s->int_status |= VICE_INT_MSP_INTR;
     sgi_vice_update_irq(s);
 }
