@@ -200,12 +200,25 @@ static uint32_t sgi_vice_tlb_phys(const SGIViceState *s, unsigned entry)
  *
  * QEMU never interprets MSP/BSP microcode.  The bytes come from the external
  * host-codec helper named by the VICE_HOST_CODEC environment variable (the
- * vice6_encoder.py contract: <helper> <intile.bin> <out.jpg> <w> <h> <q>, the
- * DMS input tile dumped to intile.bin).  If no helper is configured we do NOT
- * fabricate an output: the count stays 0 (the driver's empty-output case) and
- * an UNIMP is logged.  Change this seam to a chardev transport if QEMU must
- * stay free of any exec().
+ * vice7_encoder.py contract: <helper> <intile.bin> <out.jpg> <w> <h> <q>
+ * <mode>, the DMS input tile dumped to intile.bin).  If no helper is
+ * configured we do NOT fabricate an output: the count stays 0 (the driver's
+ * empty-output case) and an UNIMP is logged.  Change this seam to a chardev
+ * transport if QEMU must stay free of any exec().
+ *
+ * @@SEMANTICS@@ the produced stream is a VICE-framed JPEG, not a bare JFIF:
+ * the guest wrapper overwrites the first 408 (grayscale) or 704 (4:2:2 colour)
+ * bytes of the codec output with its own header (tmp/o2-qemu/vice6/REPORT.md;
+ * RE'd in vice7), so the helper emits that exact RE'd header followed by the
+ * entropy scan + EOI and the wrapper's substitution is then a no-op.  The
+ * helper chooses the mode from the fingerprinted codec: cjpeg_luma.mex is the
+ * 1-component (408) variant, cjpeg.mex / cjfif.mex the 3-component 4:2:2
+ * (704) variant.  The variant is selected by vr_stat[2] (MSP DRAM 0x8008):
+ * zero -> 408-byte header, non-zero -> 704-byte header.
  */
+#define VICE_JPEG_HDR_GRAY  408
+#define VICE_JPEG_HDR_COLOR 704
+
 static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
 {
     const char *helper = getenv("VICE_HOST_CODEC");
@@ -213,6 +226,9 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
     uint32_t out_phys = sgi_vice_tlb_phys(s, VICE_DMS_OUT);
     const unsigned w = 128, h = 128;
     const gsize tile = (gsize)w * h * 4;   /* dmedia packed 32-bit pixels */
+    const gboolean color = strstr(codec, "luma") == NULL;
+    const char *mode = color ? "color" : "gray";
+    const uint32_t hdr_len = color ? VICE_JPEG_HDR_COLOR : VICE_JPEG_HDR_GRAY;
     gchar *in_tmp = NULL, *out_tmp = NULL, *cmd = NULL;
     gchar *out_data = NULL;
     GError *err = NULL;
@@ -241,7 +257,8 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
     }
     close(fd);
     out_tmp = g_strdup_printf("%s.jpg", in_tmp);
-    cmd = g_strdup_printf("%s %s %s %u %u 75", helper, in_tmp, out_tmp, w, h);
+    cmd = g_strdup_printf("%s %s %s %u %u 100 %s",
+                          helper, in_tmp, out_tmp, w, h, mode);
     if (!g_spawn_command_line_sync(cmd, NULL, NULL, &status, &err) ||
         status != 0 || !g_file_get_contents(out_tmp, &out_data, &out_len, &err)) {
         qemu_log_mask(LOG_UNIMP,
@@ -249,10 +266,11 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
                       err && err->message ? err->message : "?");
         goto out;
     }
-    if (out_len == 0 || out_len > VICE_TILE_SIZE) {
+    if (out_len < hdr_len || out_len > VICE_TILE_SIZE) {
         qemu_log_mask(LOG_UNIMP,
-                      "sgi_vice: host-codec produced %zu bytes (tile %u)\n",
-                      out_len, VICE_TILE_SIZE);
+                      "sgi_vice: host-codec produced %zu bytes "
+                      "(header %u, tile %u)\n",
+                      out_len, hdr_len, VICE_TILE_SIZE);
         goto out;
     }
     /* Place the produced bytes in the OUT tile ... */
@@ -263,6 +281,19 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
     s->msp_dram[1] = (out_len >> 16) & 0xff;
     s->msp_dram[2] = (out_len >> 8) & 0xff;
     s->msp_dram[3] = (out_len >> 0) & 0xff;
+    /*
+     * @@SEMANTICS@@ vr_stat[2] (MSP DRAM 0x8008, big-endian) selects the
+     * wrapper's colour/grayscale header variant: non-zero = the 704-byte
+     * 3-component 4:2:2 header, zero = the 408-byte 1-component header.  For
+     * colour we report the RE'd 704-byte header length; for grayscale the
+     * field stays zero (the empty memset baseline).
+     */
+    if (color) {
+        s->msp_dram[8]  = (VICE_JPEG_HDR_COLOR >> 24) & 0xff;
+        s->msp_dram[9]  = (VICE_JPEG_HDR_COLOR >> 16) & 0xff;
+        s->msp_dram[10] = (VICE_JPEG_HDR_COLOR >> 8) & 0xff;
+        s->msp_dram[11] = (VICE_JPEG_HDR_COLOR >> 0) & 0xff;
+    }
     trace_sgi_vice_offload(codec, out_len, out_phys);
 out:
     if (in_tmp) {
