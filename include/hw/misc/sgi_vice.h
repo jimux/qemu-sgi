@@ -44,6 +44,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIViceState, SGI_VICE)
 #define VICE_BSP_FIFO_SIZE  0x0040      /* in/out FIFO    @ 0x7000/0x7800 */
 #define VICE_MSP_DRAM_SIZE  0x1800      /* VICEMSP_DRAM   @ 0x8000 */
 #define VICE_NTLBENTRIES    0x0080      /* 128 entries (rev.h) @ 0xf000 */
+/*
+ * Each TLB entry is a 32-bit value (spec 099-0123-003 Table 5: Valid,
+ * Writable, 64k Physical Page Number) but the host PIO register slots are
+ * 64-bit, so entry N lives at 0xf000 + N*8 with the value in the big-endian
+ * high (32-bit register) lane at +4. Observed in a live movie-JPEG run:
+ *   0xf004=entry 0 (VICE_DMS_IN) phys 0x13900000
+ *   0xf204=entry 64 (VICE_DMS_OUT) phys 0x13b00000
+ *   0xf3f4=entry 126 (VICE_DMS_AUX) phys 0x13800000
+ * Modelling 4-byte stride would silently drop every mapping >= entry 64.
+ */
+#define VICE_TLB_STRIDE     8
+#define VICE_TLB_SIZE       (VICE_NTLBENTRIES * VICE_TLB_STRIDE)
 
 /*
  * Chip register byte offsets (from the host PIO window base). Access is
@@ -138,6 +150,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIViceState, SGI_VICE)
 /* DMA channel control GO bit (VICEDMA_CTL_GO). */
 #define VICEDMA_CTL_GO      0x0001
 
+/*
+ * DMS TLB entry slots [vice_drv.h]: the input block is always mapped at entry
+ * 0, the output at 64 and the auxiliary (quantisation table) at 126 when a
+ * dmedia converter runs a VP (vice process).
+ */
+#define VICE_DMS_IN         0
+#define VICE_DMS_OUT        64
+#define VICE_DMS_AUX        126
+
 struct SGIViceState {
     SysBusDevice parent_obj;
 
@@ -154,7 +175,7 @@ struct SGIViceState {
     uint8_t bsp_out_fifo[VICE_BSP_FIFO_SIZE];
     uint8_t bsp_in_fifo[VICE_BSP_FIFO_SIZE];
     uint8_t msp_dram[VICE_MSP_DRAM_SIZE];
-    uint8_t tlb[VICE_NTLBENTRIES * 4];
+    uint8_t tlb[VICE_TLB_SIZE];
     uint8_t debug_regs[VICE_DEBUG_END - VICE_DEBUG_BASE];
 
     /* VICE_CFG, interrupt control/status, and BSP run state. */

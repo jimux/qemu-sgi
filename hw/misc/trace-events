@@ -510,6 +510,8 @@ sgi_vice_reg_write(uint64_t off, uint64_t val, unsigned size) "VICE write off=0x
 sgi_vice_int(uint64_t status, uint64_t en, int level) "VICE int status=0x%"PRIx64" en=0x%"PRIx64" level=%d"
 sgi_vice_sw_int(const char *which) "VICE %s software interrupt latched"
 sgi_vice_dma_go(int ch, uint32_t ctl) "VICE DMA ch%d GO ctl=0x%08x (transfer unimplemented)"
+sgi_vice_msp_go(uint32_t ctl, const char *codec) "VICE MSP GO ctl=0x%08x codec=%s"
+sgi_vice_job(const char *codec, uint32_t in_phys, uint32_t out_phys, uint32_t aux_phys) "VICE job codec=%s IN=0x%08x OUT=0x%08x AUX=0x%08x"
 
 # sgi_mace_video.c (O2 MACE VIN/VOUT + I2C master)
 sgi_mace_video_reg(int out, uint64_t reg, uint64_t val, unsigned size) "MVP out=%d reg 0x%02"PRIx64" = 0x%"PRIx64" (size %u)"

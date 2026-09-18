@@ -95,6 +95,114 @@ static void sgi_vice_write_bytes(uint8_t *buf, hwaddr off, uint64_t value,
     }
 }
 
+/*
+ * Microcode fingerprint database.
+ *
+ * @@SEMANTICS@@ tier-ii identification: VICE is a programmable DSP+BSP, but
+ * every codec the guest ever runs is shipped as a fixed file under
+ * /var/arch/vicetre/ and uploaded into VICE_MSP_IRAM verbatim (the vice_exec
+ * copy length is the .mex body length; the tail of IRAM is left zero). So the
+ * operation can be identified by *content* without any MSP/BSP interpreter.
+ * These are FNV-1a 64 hashes of the 4096-byte IRAM image (body then zeros),
+ * computed offline from the .mex files in mxview/var/arch/vicetre/; see
+ * tmp/o2-qemu/vice5/fingerprint.py and REPORT.md. Unknown images are reported
+ * as "?" and are NOT completed (fail loud, never guess).
+ */
+static const struct {
+    const char *name;
+    uint64_t fnv1a;
+} sgi_vice_codecs[] = {
+    { "cjpeg.mex",         0xc59dfde671182066ULL },
+    { "cjpeg_luma.mex",    0x0a61cb6cc9a99ec4ULL },
+    { "cjfif.mex",         0x27ad4e032000d701ULL },
+    { "djpeg.mex",         0x160f55a6f9008c6eULL },
+    { "djfif.mex",         0xc9fd4fd42d7ab025ULL },
+    { "dfjpeg.mex",        0x8fc6a05beb4ab09fULL },
+    { "dvcntsc.mex",       0xcfb32f66da2c343dULL },
+    { "dvcpal411.mex",     0xef8a3decb6f0755fULL },
+    { "dvcpal420.mex",     0xfc7ab4ccd205ebd9ULL },
+    { "dvencodentsc.mex",  0x981fe13f270f8d07ULL },
+    { "dvencodepal411.mex", 0xbded7c1ad7f49c43ULL },
+    { "dvencodepal420.mex", 0xce532b04b6bcf11dULL },
+    { "mpeg1dec.mex",      0x9c9fed37af28f2cdULL },
+    { "mpeg2dec.mex",      0xd7cf41e83f154ab3ULL },
+    { "rs.mex",            0x0f939ddfca6a5b41ULL },
+};
+
+static void sgi_vice_update_irq(SGIViceState *s);
+
+static uint64_t sgi_vice_fnv1a(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static const char *sgi_vice_fingerprint(const SGIViceState *s)
+{
+    uint64_t h = sgi_vice_fnv1a(s->msp_iram, sizeof(s->msp_iram));
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(sgi_vice_codecs); i++) {
+        if (h == sgi_vice_codecs[i].fnv1a) {
+            return sgi_vice_codecs[i].name;
+        }
+    }
+    return NULL;
+}
+
+static uint32_t sgi_vice_tlb_phys(const SGIViceState *s, unsigned entry)
+{
+    uint32_t v;
+
+    if (entry >= VICE_NTLBENTRIES) {
+        return 0;
+    }
+    v = sgi_vice_read_bytes(s->tlb, entry * VICE_TLB_STRIDE + 4, 4);
+    return (v & 0x1) ? (v & 0xffff0000u) : 0;
+}
+
+/*
+ * @@SEMANTICS@@ tier-ii completion.  A codec job is started when the driver
+ * takes the MSP out of reset and asserts GO: MSP_CTL_STAT bit0=1, bit1=1
+ * (value 0x3) [spec 099-0123-003 Table 14; vice_chip.c:vice_exec_msp writes
+ * exactly 0x3].  The driver then waits for VICE_INT_MSP_INTR (bit 2), which is
+ * enabled by the VICE_INT_EN=0x7c it wrote just before [vice_exec].  The real
+ * MSP would raise it from the DSP; we identify the uploaded program and raise
+ * the same interrupt.  The ISR (viceintr) reads the MSP Data RAM status words
+ * at 0x8000/0x8008 into the atom, then calls the atom completion callback
+ * (vice_dms_jintr), which enqueues the DMS output block.
+ */
+static void sgi_vice_msp_go(SGIViceState *s, uint32_t ctl)
+{
+    const char *codec = sgi_vice_fingerprint(s);
+
+    trace_sgi_vice_msp_go(ctl, codec ? codec : "?");
+    if (!codec) {
+        /* Fail loud rather than fabricate a completion for unknown ucode. */
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: MSP GO with unrecognised IRAM; no completion\n");
+        return;
+    }
+
+    trace_sgi_vice_job(codec, sgi_vice_tlb_phys(s, VICE_DMS_IN),
+                       sgi_vice_tlb_phys(s, VICE_DMS_OUT),
+                       sgi_vice_tlb_phys(s, VICE_DMS_AUX));
+    /*
+     * @@SEMANTICS@@ the MSP writes its 4-word result (vr_stat) back to the
+     * first 16 bytes of Data RAM; viceintr copies DRAM 0x8000/0x8008 into the
+     * atom.  EXPERIMENT: report a zero (success) status.
+     */
+    memset(s->msp_dram, 0, 16);
+    s->int_status |= VICE_INT_MSP_INTR;
+    sgi_vice_update_irq(s);
+}
+
 static void sgi_vice_update_irq(SGIViceState *s)
 {
     int level = (s->int_status & s->int_enable) != 0;
@@ -239,8 +347,12 @@ static void sgi_vice_write(void *opaque, hwaddr off, uint64_t value,
             return; /* read-only */
         case MSP_CTL_STAT:
             if (value & 0x1) {
-                qemu_log_mask(LOG_UNIMP, "sgi_vice: MSP GO ignored "
-                              "(no interpreter)\n");
+                /*
+                 * @@SEMANTICS@@ bit0 GO (spec Table 14): the driver has
+                 * uploaded the program and is starting the MSP. Identify the
+                 * codec and raise the documented completion interrupt.
+                 */
+                sgi_vice_msp_go(s, (uint32_t)value);
             }
             return;
         case VICEDMA_CTL_CH1:
@@ -363,7 +475,7 @@ static const VMStateDescription vmstate_sgi_vice = {
         VMSTATE_UINT8_ARRAY(bsp_out_fifo, SGIViceState, VICE_BSP_FIFO_SIZE),
         VMSTATE_UINT8_ARRAY(bsp_in_fifo, SGIViceState, VICE_BSP_FIFO_SIZE),
         VMSTATE_UINT8_ARRAY(msp_dram, SGIViceState, VICE_MSP_DRAM_SIZE),
-        VMSTATE_UINT8_ARRAY(tlb, SGIViceState, VICE_NTLBENTRIES * 4),
+        VMSTATE_UINT8_ARRAY(tlb, SGIViceState, VICE_TLB_SIZE),
         VMSTATE_UINT8_ARRAY(debug_regs, SGIViceState, VICE_DEBUG_END -
                             VICE_DEBUG_BASE),
         VMSTATE_UINT32(cfg, SGIViceState),
