@@ -203,6 +203,8 @@ struct SGIGBEState {
 
     /* GMAP entries */
     uint32_t gmap[GBE_GMAP_SIZE];
+    /* true while every GMAP entry is the direct identity ramp (gamma off) */
+    bool gmap_direct_id;
 
     /* Cursor */
     uint32_t crs_pos;

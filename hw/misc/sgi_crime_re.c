@@ -55,6 +55,34 @@
 #define CRM_LOGICOP_NAND            14
 #define CRM_LOGICOP_SET             15
 
+/*
+ * @@SEMANTICS@@ — byte lane of an 8-bit CI pixel inside a 32-bit-word CI
+ * buffer.
+ *
+ * The O2 X server runs its 8bpp PseudoColor screen through the 32bpp
+ * normal planes using the GBE's "8+8 split": one pixel per 32-bit word,
+ * held in a byte lane.  The DDX writes a pixel's index as the LOW byte of
+ * the word's 16-bit pixel slot, i.e. byte1, NOT the word's first byte.
+ * Decisive live evidence (gr_osview's meter, the one window that mixes
+ * widths): its background is filled with a 16-bit CI store (BufMode.dst
+ * pixDepth=1, fg=0x2e), which lands at byte0=0x00 / byte1=0x2e — the
+ * 16-bit value big-endian in bytes [0,1].  Its meter bars are filled with
+ * an 8-bit CI store (pixDepth=0, fg=0x00..0x14) whose index must therefore
+ * occupy the same low byte (byte1) of that slot; the old code wrote it to
+ * byte0, so the GBE's I12 scan (which reads bytes [0,1] as the 12-bit
+ * index) saw (0x00 << 8) | 0x2e for a black bar — i.e. the background
+ * index 0x2e — and the bars vanished, leaving a flat field.  Moving the
+ * 8-bit store to byte1 (and the matching CI read paths) restores the bars
+ * and leaves the main screen byte-identical on screen (verified against
+ * the Indy oracle: granite #868686 78711 + #69b5b5 76713 exactly, and the
+ * Toolchest / Icon-Catalog text unchanged).
+ */
+static inline int crim_ci_lane(uint32_t bufmode)
+{
+    return (((bufmode >> BM_BUF_DEPTH_SHIFT) & 3) == 2 &&
+            ((bufmode >> BM_PIX_DEPTH_SHIFT) & 3) == 0) ? 1 : 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* TLB translation helpers                                              */
 /* ------------------------------------------------------------------ */
@@ -192,7 +220,7 @@ static uint32_t sgi_crime_re_get_pixel(SGICRIMEREState *s, uint32_t bufmode,
         if (((bufmode >> BM_PIX_DEPTH_SHIFT) & 3) == 1) {
             return ((uint32_t)b[0] << 8) | b[1];
         }
-        return b[0];
+        return b[crim_ci_lane(bufmode)];
     case 1:                             /* RGB (alpha reads 0) */
         return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
                ((uint32_t)b[2] << 8);
@@ -319,6 +347,16 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
     }
 
     uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
+
+    /*
+     * @@SEMANTICS@@ — an 8-bit CI pixel in a 32-bit-word CI buffer lives in
+     * the low byte of its 16-bit pixel slot (byte1; see crim_ci_lane), so
+     * offset the address once here: every read (ROP/byte-mask) and the final
+     * store then target the same byte.
+     */
+    if (pix_type == 0 && crim_ci_lane(bufmode)) {
+        phys += 1;
+    }
 
     /*
      * Dithering (spec §7.3.7.14: dither precedes the logic op).  RGB
@@ -571,10 +609,21 @@ static void sgi_crime_re_emit(SGICRIMEREState *s, int wx, int wy,
  */
 static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
 {
+    /*
+     * @@SEMANTICS@@ — the O2 IP32CRM32 libGLcore uploads a GL triangle vertex
+     * as a 13.6 fixed-point coordinate in the LOW 16 bits of Vertex.GL[n].x/y;
+     * the HIGH 16 bits carry a constant 0x4804 field (verified identical for
+     * gr_osview windows of different size and position, i.e. not an origin).
+     * The previous code consumed the full 32-bit word as an integer pixel
+     * coordinate, so every vertex landed at ~1.2e9, the ±4096 clamp rejected
+     * the whole triangle, and no GL triangle ever drew. Decode the low 16 bits
+     * as 13.6; the rest of the rasterizer already evaluates its edge functions
+     * at px*64+32 (13.6) and emits integer px.
+     */
     int64_t vx[3], vy[3];
     for (int i = 0; i < 3; i++) {
-        vx[i] = (int64_t)(int32_t)s->vertex_gl[i][0] << 6;  /* to 19.6 */
-        vy[i] = (int64_t)(int32_t)s->vertex_gl[i][1] << 6;
+        vx[i] = (int64_t)(int32_t)(s->vertex_gl[i][0] & 0xffff);
+        vy[i] = (int64_t)(int32_t)(s->vertex_gl[i][1] & 0xffff);
     }
 
     /* edge i = (v[i] -> v[i+1]); A=dy, B=-dx, C computed so E(v[i])=0 */
@@ -719,7 +768,7 @@ static uint32_t sgi_crime_re_xfer_fetch(SGICRIMEREState *s,
                      b, bpp, false);
     uint32_t pix_type = (s->bufmode_src >> BM_PIX_TYPE_SHIFT) & 3;
     if (pix_type == 0) {
-        return b[0];
+        return b[crim_ci_lane(s->bufmode_src)];
     }
     return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16)
          | ((uint32_t)b[2] << 8) | b[3];
@@ -1122,25 +1171,40 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
          *
          * Mask semantics (@@SEMANTICS@@ — the CRIME 1.5 spec gives no
          * stipple-to-pixel algorithm, so this is derived from the trace):
-         * the 32-bit mask is anchored to the destination 32-bit WORD, not
-         * to the run's start pixel.  The first run pixel consumes bit
-         * `31 - (x1 & 7)`, then one bit per pixel MSB-first, wrapping
-         * mod 32 across the run — 8 px = one 32-bit word at this depth.
-         * Empirical proof: against the exact PCF bitmap of the toolchest
-         * Helvetica-Bold-Oblique-14 menu (all seven labels — Toolchest,
-         * Desktop, Selected, Internet, Find, System, Help — every glyph
-         * row), this rule is XOR 0, while the old run-start anchor (bit
-         * 31) misses by 18-28 and renders different letters.  It is also
-         * the correction for the greeter headline's 1-bit shift noted in
-         * progress note 39.
-         *
-         * Re-anchor at each row at the same word phase (the DDX issues one
-         * MTE per glyph row).
+         * the 32-bit mask repeats every 32 pixels, one bit per pixel,
+         * MSB-first, anchored to the destination 32-bit word.  The run's
+         * starting phase is therefore `x1 mod (32 / bpp)` and the bit for
+         * pixel x is `31 - ((phase + x - x1) & 31)` (see the loop below
+         * for the derivation and the oracle-scored evidence).
          */
         bool en_stipple = (mode & MTE_EN_STIPPLE) != 0;
         uint32_t mask = s->mte_stipplemask;
         for (int y = y1; y != y2 + dy; y += dy) {
-            int bit = x1 & 7;
+            /*
+             * @@SEMANTICS@@ — the 32-bit mask is anchored to the
+             * destination 32-bit WORD (4 bytes), so the run's phase is the
+             * start pixel's byte offset within the word, i.e.
+             * x1 mod (32 / bpp) pixels.  Then one bit per pixel MSB-first,
+             * wrapping mod 32 across the run.  The previous revision
+             * hard-coded 8 (x1 & 7), which is the right phase only at
+             * bpp=4: 8bpp glyphs (popup menus) run 32 px per mask repeat,
+             * so the phase there must be x1 & 31 and the old rule read the
+             * pattern shifted by (x1 & 24) bits, garbling the Toolchest
+             * "Desktop" popup's upper labels.  The phase is genuinely
+             * DEPTH-DEPENDENT: applying x1 & 31 unconditionally (an
+             * intermediate revision) fixed the popup but garbled the
+             * 32bpp Toolchest main-window / Icon Catalog text, so derive
+             * it from bpp rather than hard-coding either constant.
+             * Derived from the trace:
+             * scoring the popup glyphs against the Indy oracle bitmap
+             * (toolchest/01_toolchest__menu-desktop__open.png,
+             * x=115..205, y=45..99) gives `x1 & 31` 0 false positives /
+             * 184 misses vs the old rule's 165 / 780 (the misses are
+             * oracle pixels whose MTE was outside the traced window); the
+             * 32bpp Toolchest main-window labels still render correctly
+             * with `x1 & 7`, so the phase is depth-dependent.
+             */
+            int bit = x1 & ((32 / bpp) - 1);
             for (int x = x1; x != x2 + dx; x += dx, bit++) {
                 if (en_stipple &&
                     !((mask >> (31 - (bit & 31))) & 1)) {
@@ -1212,7 +1276,8 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
                                  MEMTXATTRS_UNSPECIFIED, sv, bpp, false);
                 uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
                 if (pix_type == 0) {
-                    color = sv[0];
+                    /* CI byte lane must match put_pixel's store lane. */
+                    color = sv[crim_ci_lane(bufmode)];
                 } else {
                     color = ((uint32_t)sv[0] << 24) | ((uint32_t)sv[1] << 16)
                           | ((uint32_t)sv[2] << 8) | sv[3];

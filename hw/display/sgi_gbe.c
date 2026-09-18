@@ -359,6 +359,48 @@ static bool sgi_gbe_did_line_base(SGIGBEState *s, hwaddr did_base, int y,
 }
 
 /*
+ * GAMMA stage (GBE ASIC spec §2.8 "Gamma map").
+ *
+ * The GBE colour pipeline is CMAP -> GAMMA -> DAC.  The gamma map is
+ * three 256x8 RAMs (GMAP[0..255], register 0x060000, [31:24] red /
+ * [23:16] green / [15:8] blue).  Per spec: cursor pixels bypass it,
+ * overlay pixels are always gamma corrected, and normal-plane pixels
+ * are gamma corrected only when the effective WID's gm bit is 0
+ * (WID[10]; 0 = enable, 1 = disable).
+ *
+ * @@SEMANTICS@@ Data convention: the guest DDX (Xsgi's -gamma /
+ * SGIvc gamma loader) stores each component BIT-REVERSED, so the RAM
+ * holds bitrev8(H(i)) at entry i, where H is the intended LUT.  Verified
+ * live over the monitor for the authentic `-gamma 1.7` boot: entry 85 =
+ * 0x61616100 and the 1.7 curve H(85)=255*(85/255)^(1/1.7)=134, i.e.
+ * bitrev8(134)=0x61 exactly; entry 128 = 0x55555500 = bitrev8(H(128)=170);
+ * entry 2 = 0xf0f0f000 = bitrev8(H(2)=15); entry 3 = 0xc8c8c800 =
+ * bitrev8(H(3)=19).  With the default `-gamma 1.0` (H(i)=i) the whole
+ * table degenerates to bitrev8(i) (entry 1 = 0x80808000 …), which is what
+ * an unwary reader mistakes for "identity".  The pipeline therefore
+ * indexes GMAP by the component directly and reverses the resulting
+ * 8-bit value.  We do not hard-code an exponent: the curve comes from the
+ * guest's own table, which /usr/bin/X11/X loads from -gamma 1.7.
+ */
+static inline uint32_t sgi_gbe_gamma(SGIGBEState *s,
+                                     uint32_t r, uint32_t g, uint32_t b)
+{
+    uint32_t er, eg, eb;
+
+    /* Direct identity ramp == the guest asking for gamma off (PROM). */
+    if (s->gmap_direct_id) {
+        return ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff);
+    }
+
+    er = s->gmap[r & 0xff];
+    eg = s->gmap[g & 0xff];
+    eb = s->gmap[b & 0xff];
+    return ((uint32_t)revbit8((er >> 24) & 0xff) << 16) |
+           ((uint32_t)revbit8((eg >> 16) & 0xff) << 8) |
+           (uint32_t)revbit8((eb >> 8) & 0xff);
+}
+
+/*
  * Decode one pixel through the FRM channel. The PROM programs all 32
  * WIDs to I8/CM0 (initFramebuffer), so 8bpp cmap lookups are the gate
  * path; 16bpp RGB5 and 32bpp direct are supported for the kernel.
@@ -534,8 +576,24 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                         odesc = be16_to_cpu(odesc);
                         if (odesc != 0) {
                             hwaddr obase = (hwaddr)(odesc & 0x7fff) << 16;
+                            /*
+                             * @@SEMANTICS@@ — an overlay tile is 512 bytes
+                             * wide (8bpp: 512 px), but the normal-plane walk
+                             * advances a span at a time (128 px at 32bpp).
+                             * The byte for screen x inside the overlay tile
+                             * row is therefore at offset (x % 512), not 0:
+                             * reading from 0 for every span re-served bytes
+                             * 0..127 of the row for screen x=128,256,384...
+                             * Observed live on the Toolchest "Desktop" popup
+                             * (drawn into the 8bpp overlay plane, ov_used=1):
+                             * its left 22 px reappeared as narrow strips at
+                             * x=234/362/490 — exactly 128 px apart.  Offset
+                             * the row fetch by (x % 512) so each span reads
+                             * its own slice.
+                             */
                             address_space_read(&address_space_memory,
-                                               obase + 512 * (y & 127),
+                                               obase + 512 * (y & 127)
+                                               + (x % 512),
                                                MEMTXATTRS_UNSPECIFIED, ovr_buf,
                                                MIN(pix_here, 512));
                             have_ovr = true;
@@ -546,6 +604,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                 for (int i = 0; i < pix_here && x < width; i++, x++) {
                     uint32_t r, g, b;
                     bool ov_used = false;
+                    uint32_t eff_wid = 0;   /* effective WID (0 when overlay) */
                     if (have_ovr) {
                         uint32_t oidx = ovr_buf[i];
                         if (oidx != 0) {
@@ -622,6 +681,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             }
                         }
                         uint32_t wid = s->mode_regs[did_line ? did_cur : 0];
+                        eff_wid = wid;
                         uint32_t typ = (wid >> 2) & 0x7;   /* WID[4:2] typ */
                         uint32_t cm = (wid >> 5) & 0x1f;   /* WID[9:5] cm */
                         uint32_t bufsel = wid & 0x3;       /* WID[1:0] buf */
@@ -644,13 +704,45 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                              * half), 10 = upper half, 11 = both -> byte 0.
                              */
                             int lane;
+                            /*
+                             * @@SEMANTICS@@ — the DDX stores an 8-bit CI
+                             * pixel in the LOW byte of its 16-bit slot
+                             * (byte1 of a 32-bit word; see CRIME
+                             * crim_ci_lane), so read byte1 for the lower
+                             * half and byte3 for the upper.  Reading byte0
+                             * matched the old wrong store lane but lost
+                             * gr_osview's 8-bit meter bars, whose I12
+                             * window is scanned by the typ-1 path below.
+                             */
                             if (bpp == 2) {
                                 lane = (bufsel == 2) ? 1 : 0;
                             } else {
-                                lane = (bufsel == 2) ? 2 : 0;
+                                lane = (bufsel == 2) ? 3 : 1;
                             }
                             uint32_t idx = (cm << 8) | buf[bpp * i + lane];
                             uint32_t ent = s->cmap[idx];
+                            r = (ent >> 24) & 0xff;
+                            g = (ent >> 16) & 0xff;
+                            b = (ent >> 8) & 0xff;
+                        } else if (typ == 1) {
+                            /*
+                             * I12 (WID typ 1): a 12-bit colour index that
+                             * passes straight through the colour map
+                             * (spec §2.7 "I12 pixels are passed through
+                             * the color map, using locations 0..4095").
+                             * The index sits in the WID-selected 16-bit
+                             * half of the fetched word, same half rule as
+                             * RGB5.  Observed live on gr_osview's meter
+                             * (WID 0x05 = typ 1, cm 0, buf 1): fetched
+                             * 0x002e6d9e -> lower half 0x002e -> index 46
+                             * = the MTE fill's fgValue, drawn as cmap[46].
+                             * Without this branch I12 fell through to the
+                             * raw-RGB default and the meter bands were lost.
+                             */
+                            int hoff = (bpp == 4 && bufsel == 2) ? 2 : 0;
+                            uint32_t p = (buf[bpp * i + hoff] << 8) |
+                                         buf[bpp * i + hoff + 1];
+                            uint32_t ent = s->cmap[p & 0x0fff];
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
                             b = (ent >> 8) & 0xff;
@@ -682,6 +774,23 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             r = buf[4 * i];
                             g = buf[4 * i + 1];
                             b = buf[4 * i + 2];
+                        }
+                    }
+                    /*
+                     * GAMMA stage (spec §2.8): overlay pixels are always
+                     * gamma corrected; normal-plane pixels only when the
+                     * effective WID's gm bit (WID[10]) is 0 (0=enable,
+                     * 1=disable).  Cursor is composited separately and
+                     * always bypasses (sgi_gbe_composite_cursor).
+                     */
+                    {
+                        bool gamma_en = ov_used ||
+                                        ((eff_wid >> 10) & 1) == 0;
+                        if (gamma_en) {
+                            uint32_t grgb = sgi_gbe_gamma(s, r, g, b);
+                            r = (grgb >> 16) & 0xff;
+                            g = (grgb >> 8) & 0xff;
+                            b = grgb & 0xff;
                         }
                     }
                     if (x >= 0 && x < surface_width(surface) &&
@@ -1184,7 +1293,22 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     /* GMAP */
     if (offset >= GBE_GMAP_BASE &&
         offset < GBE_GMAP_BASE + GBE_GMAP_SIZE * 4) {
-        s->gmap[(offset - GBE_GMAP_BASE) / 4] = v;
+        uint32_t idx = (offset - GBE_GMAP_BASE) / 4;
+        s->gmap[idx] = v;
+        /*
+         * Track whether the guest's gamma table is the *direct* identity
+         * ramp (R=G=B=index).  The PROM's SetGammaIdentity loads exactly
+         * that to mean "no gamma" (measured live: gmap[1]=0x01010100 …),
+         * whereas the X DDX's -gamma loader stores bitrev8(H(i)); the two
+         * encodings cannot both be honoured by the same lookup, so a
+         * direct identity ramp is treated as a gamma bypass (see
+         * sgi_gbe_gamma).  Any non-identity entry clears the flag.
+         */
+        uint32_t ident = ((idx << 24) | (idx << 16) | (idx << 8));
+        if (v != ident) {
+            s->gmap_direct_id = false;
+        }
+        s->scan_dirty = true;
         return;
     }
 
@@ -1263,6 +1387,7 @@ static void sgi_gbe_reset(DeviceState *dev)
     memset(s->mode_regs, 0, sizeof(s->mode_regs));
     memset(s->cmap, 0, sizeof(s->cmap));
     memset(s->gmap, 0, sizeof(s->gmap));
+    s->gmap_direct_id = true;
     s->crs_pos = 0;
     s->crs_ctrl = 0;
     memset(s->crs_cmap, 0, sizeof(s->crs_cmap));
@@ -1353,6 +1478,7 @@ static const VMStateDescription vmstate_sgi_gbe = {
         VMSTATE_UINT32_ARRAY(mode_regs, SGIGBEState, GBE_MODE_REGS_SIZE),
         VMSTATE_UINT32_ARRAY(cmap, SGIGBEState, GBE_CMAP_SIZE),
         VMSTATE_UINT32_ARRAY(gmap, SGIGBEState, GBE_GMAP_SIZE),
+        VMSTATE_BOOL(gmap_direct_id, SGIGBEState),
         VMSTATE_UINT32(crs_pos, SGIGBEState),
         VMSTATE_UINT32(crs_ctrl, SGIGBEState),
         VMSTATE_UINT32_ARRAY(crs_cmap, SGIGBEState, 3),
