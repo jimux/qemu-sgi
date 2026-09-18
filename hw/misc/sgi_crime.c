@@ -50,11 +50,24 @@
  */
 #define CRM_HARDINT_VIEW_MASK 0xf0ffffffULL
 
+/*
+ * Edge-sensitive interrupt sources [CRIME 1.5 spec §5.7.3, §5.7.6]:
+ * GBE0-3 (INTSTAT bits 19:16). GBE raises a one-shot interrupt command per
+ * event (§4.1.6), so CRIME must latch it: the source pulse is gone before
+ * the handler can run, yet the request must survive until software clears
+ * it. These bits are latched in intlatch and cleared by writing CRM_HARDINT
+ * (write 0 to the bit — §5.7.3: "cleared by writing a 0 to the appropriate
+ * bit"). All other sources in this model (MACE 15:0, CRMERR 20, MEMERR 21,
+ * RE 22-27) are level-driven by their devices and stay in intstat.
+ */
+#define CRM_EDGE_INT_MASK (CRM_INT_GBE0 | CRM_INT_GBE1 | \
+                           CRM_INT_GBE2 | CRM_INT_GBE3)
+
 static void sgi_crime_update_irq(SGICRIMEState *s)
 {
     /*
-     * Pending interrupts = (hardware intstat | software softint) & mask.
-     * SOFTINT bits are kept separate from INTSTAT (not OR'd in).
+     * Pending interrupts = (hardware (intstat | intlatch) | software softint)
+     * & mask. SOFTINT bits are kept separate from INTSTAT (not OR'd in).
      * The kernel clears soft interrupts by reading CRM_SOFTINT,
      * clearing the desired bit, and writing it back.
      *
@@ -63,10 +76,12 @@ static void sgi_crime_update_irq(SGICRIMEState *s)
      * delivery (INTSTAT/INTMASK are 32-bit registers [sys/crime.h]).
      *
      * HARDINT mirrors the pending hardware sources (see the HARDINT read
-     * below); keep it in sync whenever intstat changes.
+     * below); keep it in sync whenever intstat/intlatch change.
      */
-    uint64_t pending = (s->intstat | s->softint) & s->intmask & 0xffffffffULL;
-    s->hardint = s->intstat & CRM_HARDINT_VIEW_MASK;
+    uint64_t hw = s->intstat | s->intlatch;
+    uint64_t pending = (hw | s->softint) & s->intmask & 0xffffffffULL;
+
+    s->hardint = hw & CRM_HARDINT_VIEW_MASK;
     qemu_set_irq(s->cpu_irq, pending ? 1 : 0);
 }
 
@@ -104,14 +119,54 @@ static uint64_t sgi_crime_raw_time(void)
  */
 #define MIN_TIME_ADVANCE 300
 
+/*
+ * Calibration-interval floor.
+ *
+ * delay_calibrate() (mlsetup -> initmasterpda) reads CRM_TIME twice around a
+ * ~100000-iteration register-only loop and stores
+ *   decinsperloop = delta * DNS_PER_TICK / 100000 = delta * 15 / 100000.
+ * The quotient is an integer, so decinsperloop is 0 whenever the measured
+ * delta is < 6667 ticks (100 µs).  A zero decinsperloop is fatal: us_delay()
+ * loads it into delayloop()'s decrement and spins forever.
+ *
+ * That loop contains no MMIO, so QEMU executes it inside a single translation
+ * block and the only CRM_TIME movement is the host wall-clock time it takes,
+ * which on a fast host is ~1 ns per iteration — i.e. delta ≈ 6000-7000 ticks,
+ * right on the truncation boundary (and below it on a faster or less loaded
+ * host).  The unclamped host clock (last_raw_time) tells us whether a real
+ * interval passed since the previous read: poll loops re-read faster than the
+ * floor and never qualify, while the calibration loop does.  Clamp such an
+ * interval up to CALIB_MIN_TIME_ADVANCE so the calibration can never truncate
+ * to 0.  us_delay() stays wall-clock self-consistent: at QEMU's execution rate
+ * one delayloop iteration really does take ~1 ns, which is exactly what a
+ * decinsperloop of ~1 tells the kernel.
+ */
+#define CALIB_MIN_TIME_ADVANCE 7000
+
 static uint64_t sgi_crime_get_time(SGICRIMEState *s)
 {
-    uint64_t val = (sgi_crime_raw_time() + s->time_offset) & 0xffffffffffffULL;
+    uint64_t raw = (sgi_crime_raw_time() + s->time_offset) & 0xffffffffffffULL;
+    uint64_t val;
 
     /* Ensure monotonic advancement by at least MIN_TIME_ADVANCE per read */
+    val = raw;
     if (val < s->last_time_read + MIN_TIME_ADVANCE) {
         val = s->last_time_read + MIN_TIME_ADVANCE;
     }
+
+    /*
+     * The unclamped host clock moved by more than the poll-loop floor since
+     * the previous read: a real computational interval (e.g. the register-only
+     * delay loop in delay_calibrate()), not a sub-µs poll cycle.  Clamp it up
+     * far enough that the kernel's integer calibration quotient
+     * (delta * 15 / 100000) cannot truncate to zero.
+     */
+    if (raw > s->last_raw_time + MIN_TIME_ADVANCE &&
+        val < s->last_time_read + CALIB_MIN_TIME_ADVANCE) {
+        val = s->last_time_read + CALIB_MIN_TIME_ADVANCE;
+    }
+
+    s->last_raw_time = raw;
     s->last_time_read = val;
 
     return val;
@@ -218,8 +273,9 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
         /*
          * INTSTAT returns hardware interrupts | software interrupts.
          * The IRIX kernel reads this to determine which interrupts are pending.
+         * Latched edge sources (GBE0-3) are part of the hardware set.
          */
-        val = s->intstat | s->softint;
+        val = s->intstat | s->intlatch | s->softint;
         CRIME_DPRINTF("read  CRM_INTSTAT = 0x%" PRIx64 "\n", val);
         return val;
 
@@ -235,13 +291,14 @@ static uint64_t sgi_crime_read(void *opaque, hwaddr offset, unsigned size)
 
     case CRM_HARDINT:
         /*
-         * CRM_HARDINT is a live (not latched) view of the currently-asserted
-         * hardware sources, masked to 0xf0ffffff [sys/crime.h]. Refresh
-         * from intstat so it never reports stale state. The kernel's
-         * addrprobe.s reads it to sample CRMERR (bit 20, CAUSE_BERRINTR)
-         * during bus-error probing.
+         * CRM_HARDINT is the Hardware Interrupt Register: the live level
+         * sources plus the latched edge sources (GBE0-3), masked to
+         * 0xf0ffffff [sys/crime.h]. Refresh so it never reports stale
+         * state. The kernel's addrprobe.s reads it to sample CRMERR (bit
+         * 20, CAUSE_BERRINTR) during bus-error probing, and its retrace /
+         * HLI handlers read-clear it to ack the GBE one-shots.
          */
-        val = s->intstat & CRM_HARDINT_VIEW_MASK;
+        val = (s->intstat | s->intlatch) & CRM_HARDINT_VIEW_MASK;
         s->hardint = val;
         CRIME_DPRINTF("read  CRM_HARDINT = 0x%" PRIx64 "\n", val);
         return val;
@@ -390,6 +447,7 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
     case CRM_INTSTAT:
         CRIME_DPRINTF("write CRM_INTSTAT (clear) = 0x%" PRIx64 "\n", value);
         s->intstat &= ~value;
+        s->intlatch &= ~value;
         sgi_crime_update_irq(s);
         break;
 
@@ -421,11 +479,20 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
     case CRM_HARDINT:
         CRIME_DPRINTF("write CRM_HARDINT (clear) = 0x%" PRIx64 "\n", value);
         /*
-         * HARDINT is a read-only view of live hardware sources; accept
-         * the write (sources clear themselves by deasserting their gpio
-         * line) but do not let it clear intstat behind a live source's
-         * back. Only allow clearing bits that are no longer asserted.
+         * Clear the latched GBE edge sources: writing a 0 to an INTSTAT bit
+         * clears that latched interrupt [spec §5.7.3/§5.7.6]. Writing a 1
+         * leaves it set, so the kernel's read-modify-write (read HARDINT,
+         * clear one bit, write back) clears exactly the bit it acked without
+         * disturbing the others. Only edge sources are affected; the live
+         * level sources clear themselves by deasserting their gpio line.
+         *
+         * Spec (§5.7.6): "If the Source ... is still asserted at that time,
+         * CRIME will immediately re-interrupt." A GBE event is a one-shot
+         * set command, so once its pulse has been consumed there is nothing
+         * to re-assert; we therefore do not re-latch on the write.
          */
+        s->intlatch &= (value & CRM_EDGE_INT_MASK) | ~CRM_EDGE_INT_MASK;
+        sgi_crime_update_irq(s);
         break;
 
     case CRM_DOG:
@@ -447,6 +514,7 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
         s->time_offset = (int64_t)(value & 0xffffffffffffULL) -
                           (int64_t)sgi_crime_raw_time();
         s->last_time_read = 0;
+        s->last_raw_time = 0;
         CRIME_DPRINTF("write CRM_TIME = 0x%" PRIx64
                       " (offset = %" PRId64 ")\n",
                       value, s->time_offset);
@@ -558,6 +626,8 @@ static void sgi_crime_reset(DeviceState *dev)
     s->id = CRIME_ID_VALUE;
     s->control = CRM_CONTROL_ENDIAN_BIG;
     s->intstat = 0;
+    s->intlatch = 0;
+    s->intedge_level = 0;
     s->intmask = 0;
     s->softint = 0;
     s->hardint = 0;
@@ -574,6 +644,7 @@ static void sgi_crime_reset(DeviceState *dev)
     }
     s->time_offset = 0;
     s->last_time_read = 0;
+    s->last_raw_time = 0;
     s->cpu_error_addr = 0;
     s->cpu_error_stat = 0;
     s->cpu_error_ena = 0;
@@ -634,24 +705,41 @@ static void sgi_crime_reset(DeviceState *dev)
  *
  * Line number == INTSTAT bit position [sys/IP32.h]: 0-15 = MACE (ganged,
  * driven by the MACE device), 16-19 = GBE0-3, 20 = CRMERR, 21 = MEMERR,
- * 22-27 = RE0-5, 31 = VICE. Level-triggered: the source holds the bit
- * asserted until it deasserts its line (matches the MACE model and the
- * kernel's RE3/RE5 "level trigger" comments in IP32intr.c is_thd()).
+ * 22-27 = RE0-5, 31 = VICE.
+ *
+ * Edge sources (GBE0-3): the device raises a one-shot event pulse
+ * [CRIME 1.5 §4.1.6]; latch the rising edge into intlatch and leave it set
+ * when the pulse falls, exactly as the hardware does. Level sources (MACE,
+ * CRMERR, MEMERR, RE) hold intstat asserted until they deassert their line
+ * (matches the MACE model and the kernel's RE3/RE5 "level trigger" comments
+ * in IP32intr.c is_thd()).
  *
  * Called by the MACE device for lines 0-15 and by GBE/RE devices for
- * their own lines in later milestones.
+ * their own lines.
  */
 static void sgi_crime_set_irq(void *opaque, int irq, int level)
 {
     SGICRIMEState *s = SGI_CRIME(opaque);
+    uint64_t bit = 1ULL << irq;
 
     assert(irq >= 0 && irq < CRM_NUM_IRQS);
 
-    trace_sgi_crime_irq(irq, level, s->intstat, s->intmask);
-    if (level) {
-        s->intstat |= (1ULL << irq);
+    trace_sgi_crime_irq(irq, level, s->intstat | s->intlatch, s->intmask);
+    if (bit & CRM_EDGE_INT_MASK) {
+        if (level && !(s->intedge_level & bit)) {
+            s->intlatch |= bit;             /* rising edge: latch one-shot */
+        }
+        if (level) {
+            s->intedge_level |= bit;
+        } else {
+            s->intedge_level &= ~bit;
+        }
     } else {
-        s->intstat &= ~(1ULL << irq);
+        if (level) {
+            s->intstat |= bit;
+        } else {
+            s->intstat &= ~bit;
+        }
     }
     sgi_crime_update_irq(s);
 }
@@ -691,6 +779,8 @@ static const VMStateDescription vmstate_sgi_crime = {
         VMSTATE_UINT64(id, SGICRIMEState),
         VMSTATE_UINT64(control, SGICRIMEState),
         VMSTATE_UINT64(intstat, SGICRIMEState),
+        VMSTATE_UINT64(intlatch, SGICRIMEState),
+        VMSTATE_UINT64(intedge_level, SGICRIMEState),
         VMSTATE_UINT64(intmask, SGICRIMEState),
         VMSTATE_UINT64(softint, SGICRIMEState),
         VMSTATE_UINT64(hardint, SGICRIMEState),
@@ -698,6 +788,7 @@ static const VMStateDescription vmstate_sgi_crime = {
         VMSTATE_BOOL(dog_enabled, SGICRIMEState),
         VMSTATE_INT64(time_offset, SGICRIMEState),
         VMSTATE_UINT64(last_time_read, SGICRIMEState),
+        VMSTATE_UINT64(last_raw_time, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_addr, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_stat, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_ena, SGICRIMEState),

@@ -178,12 +178,21 @@ struct SGICRIMEState {
     uint64_t id;
     uint64_t control;
     uint64_t intstat;
+    /*
+     * Edge-latched interrupt sources (GBE0-3). The spec latches one-shot
+     * edge sources inside CRIME; intlatch remembers them after the source
+     * pulse ends, and is cleared only by a write to CRM_HARDINT.
+     */
+    uint64_t intlatch;
+    /* Previous gpio level of the edge sources, for rising-edge detect. */
+    uint64_t intedge_level;
     uint64_t intmask;
     uint64_t softint;
     uint64_t hardint;
     uint64_t watchdog;
     int64_t time_offset;    /* Guest-written offset for CRM_TIME */
     uint64_t last_time_read; /* Last value returned from CRM_TIME */
+    uint64_t last_raw_time; /* Raw CRM_TIME at the previous read (unclamped) */
     uint64_t cpu_error_addr;
     uint64_t cpu_error_stat;
     uint64_t cpu_error_ena;
