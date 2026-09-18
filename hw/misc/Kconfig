@@ -158,6 +158,13 @@ config SGI_MACE
     bool
     select PS2
 
+config SGI_VICE
+    bool
+
+config SGI_MACE_VIDEO
+    bool
+    select I2C
+
 config SGI_BOOTDISK
     bool
 

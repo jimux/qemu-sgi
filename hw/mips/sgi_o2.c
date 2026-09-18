@@ -59,6 +59,8 @@
 #include "hw/misc/sgi_crime.h"
 #include "hw/misc/sgi_crime_re.h"
 #include "hw/misc/sgi_mace.h"
+#include "hw/misc/sgi_mace_video.h"
+#include "hw/misc/sgi_vice.h"
 #include "hw/misc/unimp.h"
 #include "hw/pci/pci.h"
 #include "hw/scsi/sgi_aic7880.h"
@@ -78,6 +80,7 @@
 #define O2_CRIME_BASE 0x14000000ULL
 #define O2_CRIME_RE_BASE 0x15000000ULL
 #define O2_GBE_BASE 0x16000000ULL
+#define O2_VICE_BASE 0x17000000ULL
 #define O2_MACE_BASE 0x1F000000ULL
 #define O2_PROM_BASE 0x1FC00000ULL
 
@@ -858,7 +861,9 @@ static void sgi_o2_init(MachineState *machine) {
   MemoryRegion *prom;
   DeviceState *crime_dev;
   DeviceState *mace_dev;
+  DeviceState *video_dev;
   DeviceState *gbe_dev;
+  DeviceState *vice_dev;
   MIPSCPU *cpu = NULL;
   Clock *cpuclk;
   char *filename;
@@ -1077,6 +1082,29 @@ static void sgi_o2_init(MachineState *machine) {
   }
 
   /*
+   * MACE video block: VIN1 (0x100000), VIN2 (0x180000), VOUT
+   * (0x200000) and the I2C master (0x330000) overlaying the MACE
+   * register region at priority 1 (the same technique used for the
+   * serial_mm console above).  Its interrupt outputs are the MACE video
+   * lines 0-2 (VIN1/VIN2/VOUT) which CRIME aggregates as INTSTAT bits
+   * 0-2; the MACE itself never drives those lines in this model.
+   */
+  video_dev = qdev_new(TYPE_SGI_MACE_VIDEO);
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(video_dev), &error_fatal);
+  {
+    MemoryRegion *mace_mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(mace_dev), 0);
+
+    sgi_mace_video_map_into(SGI_MACE_VIDEO(video_dev), mace_mr);
+  }
+  {
+    int i;
+    for (i = 0; i < 3; i++) {
+      qdev_connect_gpio_out_named(video_dev, "crime-irq", i,
+                                  qdev_get_gpio_in(crime_dev, i));
+    }
+  }
+
+  /*
    * Onboard SCSI: the O2 motherboard carries two AIC-7880s on the
    * MACE PCI bus at slots 1 and 2 (= SCSI controllers 0 and 1 per
    * the kernel's get_adapter_number(slot-1) and mace_ivec INTA
@@ -1118,6 +1146,18 @@ static void sgi_o2_init(MachineState *machine) {
   }
 
   /*
+   * VICE (Video, Imaging and Compression Engine) at 0x17000000.
+   * Tier-i skeleton: register/RAM/TLB/descriptor model + boot-probe
+   * interrupt handshake. Its single interrupt output drives CRIME line 31
+   * (CRM_INT_VICE), which is what PROBE_AND_INVENTORY_VICE tests.
+   */
+  vice_dev = qdev_new(TYPE_SGI_VICE);
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(vice_dev), &error_fatal);
+  sysbus_mmio_map(SYS_BUS_DEVICE(vice_dev), 0, O2_VICE_BASE);
+  qdev_connect_gpio_out_named(vice_dev, "crime-irq", 0,
+                              qdev_get_gpio_in(crime_dev, CRM_IRQ_VICE));
+
+  /*
    * Unimplemented device stubs for memory probing.
    * The PROM probes memory by writing patterns and reading back.
    * Unmapped regions need to return 0 (pattern mismatch) instead
@@ -1139,10 +1179,10 @@ static void sgi_o2_init(MachineState *machine) {
   create_unimplemented_device("gap-crime-re", 0x14000280, 0x00FFFD80);
   /* Gap between CRIME RE and GBE */
   create_unimplemented_device("gap-re-gbe", 0x15005000, 0x00FFB000);
-  /* Gap between GBE and VICE (VICE stubbed) */
+  /* Gap between GBE and VICE */
   create_unimplemented_device("gap-gbe-vice", 0x16100000, 0x00F00000);
-  /* VICE + gap between VICE and MACE (VICE stubbed) */
-  create_unimplemented_device("gap-vice-mace", 0x17000000, 0x08000000);
+  /* Gap between the 1 MB VICE window and MACE */
+  create_unimplemented_device("gap-vice-mace", 0x17100000, 0x07F00000);
 
   /*
    * Cover the gap after MACE (0x1F400000-0x1FFFFFFF).

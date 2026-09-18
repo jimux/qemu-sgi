@@ -500,3 +500,18 @@ sgi_crime_re_draw(uint32_t op, uint32_t drawmode, uint32_t bufmode, int x1, int 
 sgi_crime_re_mte(uint32_t mode, uint64_t dst0, uint64_t dst1, uint32_t fg, uint32_t stipplemask, uint32_t bytemask) "mte mode=0x%08x dst0=0x%"PRIx64" dst1=0x%"PRIx64" fg=0x%08x stip=0x%08x bytem=0x%08x"
 sgi_crime_re_tlb_write(int bank, int entry, uint64_t val) "tlb[%d][%d] = 0x%016"PRIx64
 sgi_crime_re_bufmode(uint32_t src, uint32_t dst) "bufmode src=0x%08x dst=0x%08x"
+
+# sgi_vice.c (O2 VICE — tier-i register/DMA skeleton)
+sgi_vice_reg_read(uint64_t off, unsigned size) "VICE read off=0x%"PRIx64" size=%u"
+sgi_vice_reg_write(uint64_t off, uint64_t val, unsigned size) "VICE write off=0x%"PRIx64" val=0x%"PRIx64" size=%u"
+sgi_vice_int(uint64_t status, uint64_t en, int level) "VICE int status=0x%"PRIx64" en=0x%"PRIx64" level=%d"
+sgi_vice_sw_int(const char *which) "VICE %s software interrupt latched"
+sgi_vice_dma_go(int ch, uint32_t ctl) "VICE DMA ch%d GO ctl=0x%08x (transfer unimplemented)"
+
+# sgi_mace_video.c (O2 MACE VIN/VOUT + I2C master)
+sgi_mace_video_reg(int out, uint64_t reg, uint64_t val, unsigned size) "MVP out=%d reg 0x%02"PRIx64" = 0x%"PRIx64" (size %u)"
+sgi_mace_video_rd(int out, uint64_t reg, uint64_t val, unsigned size) "MVP rd out=%d reg 0x%02"PRIx64" = 0x%"PRIx64" (size %u)"
+sgi_mace_video_ust(int wr, uint64_t pair, uint64_t val, unsigned size) "MVP ust wr=%d pair 0x%02"PRIx64" = 0x%"PRIx64" (size %u)"
+sgi_mace_video_vin_field(int idx, unsigned fmt, unsigned stride, unsigned lines, uint64_t written, uint64_t total) "VIN%d field fmt=%u stride=%u lines=%u wrote=%"PRIu64"/%"PRIu64
+sgi_mace_i2c(int wr, uint64_t reg, uint64_t val) "I2C wr=%d reg 0x%02"PRIx64" = 0x%"PRIx64
+sgi_mace_video_frame(unsigned w, unsigned h, unsigned fourcc, uint64_t len) "video-in frame %ux%u fourcc=0x%08x len=%"PRIu64
