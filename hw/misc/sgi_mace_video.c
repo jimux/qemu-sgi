@@ -71,11 +71,16 @@ static bool mvp_fetch_pages(MVPChannelState *ch, uint16_t pages[MVP_MAX_PAGES])
     return true;
 }
 
-/* Write a frame linearly across the 32x64K descriptor pages. */
+/*
+ * Write a run of bytes across the 32x64K descriptor pages, starting at
+ * buffer byte offset @base.  @base is the MACE FIELD_OFFSET (the first
+ * pixel of the first page of the buffer); in interleaved mode successive
+ * video lines are written as separate runs, each stepping a frame line.
+ */
 static size_t mvp_pages_write(const uint16_t pages[MVP_MAX_PAGES],
-                              const uint8_t *buf, size_t len)
+                              const uint8_t *buf, size_t len, size_t base)
 {
-    size_t off = 0;
+    size_t off = base;
 
     while (len) {
         unsigned page = off >> 16;
@@ -91,7 +96,7 @@ static size_t mvp_pages_write(const uint16_t pages[MVP_MAX_PAGES],
         buf += chunk;
         len -= chunk;
     }
-    return off;
+    return off - base;
 }
 
 /* CCIR-601 8-bit YUV for the standard 8 SMPTE bars (75% white). */
@@ -302,6 +307,30 @@ static void mvp_channel_write(MVPChannelState *ch, bool is_out,
         break;
     case MVP_REG_NEXT_DESC:
         ch->next_desc = value & 0xffffffffu;
+        /*
+         * @@SEMANTICS@@ The descriptor's field-capture bits (spec TABLE
+         * 12: 10 = next odd field, 11 = next even field, 0x = either)
+         * select which field the FIELD_OFFSET programmed with it applies
+         * to.  Latch the current field_offset into the per-field slot so
+         * an interleaved capture can place each field on its own lines
+         * even though the FIELD_OFFSET register only holds the last write.
+         */
+        if (!is_out && (value & MVP_NDA_VALID)) {
+            switch (value & MVP_NDA_CAPTURE_MASK) {
+            case 0x2:      /* capture next odd field */
+                ch->flofs_odd = ch->field_offset;
+                ch->flofs_odd_valid = true;
+                break;
+            case 0x3:      /* capture next even field */
+                ch->flofs_even = ch->field_offset;
+                ch->flofs_even_valid = true;
+                break;
+            default:       /* capture next field (either type) */
+                ch->flofs_odd = ch->flofs_even = ch->field_offset;
+                ch->flofs_odd_valid = ch->flofs_even_valid = true;
+                break;
+            }
+        }
         break;
     case MVP_REG_FIELD_OFFSET:
         ch->field_offset = value;
@@ -375,7 +404,8 @@ static void mvp_capture_field(SGIMACEVideoState *s, MVPChannelState *ch,
 {
     uint16_t pages[MVP_MAX_PAGES];
     unsigned fmt, stride, lines;
-    size_t frame_size, written;
+    size_t frame_size, written, field_base = 0;
+    bool interleaved;
     uint8_t *tmp;
 
     if (!ch->dma_running) {
@@ -388,6 +418,15 @@ static void mvp_capture_field(SGIMACEVideoState *s, MVPChannelState *ch,
 
     mvp_vin_geometry(ch, &fmt, &stride, &lines);
     frame_size = (size_t)stride * lines;
+    /*
+     * @@SEMANTICS@@ Interleaved (frame) capture is a linear-memory mode
+     * only (spec 2.3.1: MEM_MODE linear vs tiled; 2.3.5.3.10 INTERLEAVED
+     * enables frame mode).  Observed guest captures are CONFIG bit 16 set
+     * with MEM_MODE 00, so the tiled case is deliberately left on the old
+     * linear field path rather than guessed.
+     */
+    interleaved = (ch->config & MVP_ICONFIG_INTERLEAVED) &&
+                  ((ch->config & MVP_ICONFIG_MEM_MODE_MASK) == 0);
 
     tmp = g_malloc(frame_size);
     if (s->frame_buf && s->frame_len && s->frame_width && s->frame_height) {
@@ -412,10 +451,41 @@ static void mvp_capture_field(SGIMACEVideoState *s, MVPChannelState *ch,
         mvp_fill_test_pattern(tmp, fmt, stride, lines);
     }
 
-    written = mvp_pages_write(pages, tmp, frame_size);
+    if (interleaved) {
+        /*
+         * @@SEMANTICS@@ Frame (interleaved) capture, MACE spec 2.3.2.2
+         * FIGURE 11 and 2.3.5.6: in linear interleave mode LINE_WIDTH is
+         * added to the current pixel address at the end of a line so an
+         * empty line is left for the other field, and FIELD_OFFSET points
+         * at the field's first line.  A field therefore occupies every
+         * other line: each captured line is written at
+         * flofs[parity] + y*2*stride, and the even/odd bases come from
+         * the FIELD_OFFSET the driver programmed with each descriptor
+         * (latched by NEXT_DESC[1:0], TABLE 12).  This is why the guest
+         * frame was previously only one 239-line field with the lower
+         * half black: both fields were written from offset 0.
+         */
+        unsigned p = ch->field_parity & 1;
+        size_t pitch = (size_t)stride * 2;
+        unsigned y;
+
+        field_base = (p == 1)
+            ? (ch->flofs_odd_valid ? ch->flofs_odd : ch->field_offset)
+            : (ch->flofs_even_valid ? ch->flofs_even : ch->field_offset);
+
+        written = 0;
+        for (y = 0; y < lines; y++) {
+            written += mvp_pages_write(pages, tmp + (size_t)y * stride,
+                                       stride, field_base + (size_t)y * pitch);
+        }
+        ch->field_parity ^= 1;
+    } else {
+        written = mvp_pages_write(pages, tmp, frame_size, 0);
+    }
     g_free(tmp);
 
-    trace_sgi_mace_video_vin_field(idx, fmt, stride, lines, written, frame_size);
+    trace_sgi_mace_video_vin_field(idx, fmt, stride, lines, written, frame_size,
+                                   interleaved ? 1 : 0, field_base);
 
     ch->status |= MVP_STATUS_DMA_COMPLETE;
 }
@@ -1054,6 +1124,11 @@ static const VMStateDescription vmstate_sgi_mace_video_chan = {
         VMSTATE_UINT64(alpha_even, MVPChannelState),
         VMSTATE_UINT64(vhw_cfg, MVPChannelState),
         VMSTATE_UINT16_ARRAY(dma_desc, MVPChannelState, MVP_MAX_PAGES),
+        VMSTATE_UINT64(flofs_odd, MVPChannelState),
+        VMSTATE_UINT64(flofs_even, MVPChannelState),
+        VMSTATE_BOOL(flofs_odd_valid, MVPChannelState),
+        VMSTATE_BOOL(flofs_even_valid, MVPChannelState),
+        VMSTATE_UINT32(field_parity, MVPChannelState),
         VMSTATE_UINT64(status, MVPChannelState),
         VMSTATE_BOOL(dma_running, MVPChannelState),
         VMSTATE_UINT32(msc, MVPChannelState),

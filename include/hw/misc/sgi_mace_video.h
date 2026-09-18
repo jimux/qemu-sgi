@@ -160,6 +160,20 @@ typedef struct MVPChannelState {
     uint64_t config;       /* RW 0x10                              */
     uint64_t next_desc;    /* RW 0x18                              */
     uint64_t field_offset; /* RW 0x20                              */
+    /*
+     * @@SEMANTICS@@ Interleaved (frame) capture state.  The MACE spec
+     * (2.3.5.4 TABLE 12) gives NEXT_DESC[1:0] as the field-capture bits:
+     * 10 selects the next odd field, 11 the next even field.  Software
+     * programs FIELD_OFFSET together with each descriptor so that the two
+     * fields land on alternating lines of one frame; latch the offset per
+     * field type when the descriptor is written, because the offset
+     * register itself only holds the most recent write.
+     */
+    uint64_t flofs_odd;    /* field base for the odd field          */
+    uint64_t flofs_even;   /* field base for the even field         */
+    bool flofs_odd_valid;
+    bool flofs_even_valid;
+    unsigned field_parity; /* toggles per captured field (0=even)   */
     uint64_t line_width;   /* RW 0x28 (input) / field_size (out)   */
     uint64_t hclip_odd;    /* RW 0x30                              */
     uint64_t vclip_odd;    /* RW 0x38                              */
