@@ -467,12 +467,18 @@ static void sgi_crime_write(void *opaque, hwaddr offset,
     case CRM_SOFTINT:
         CRIME_DPRINTF("write CRM_SOFTINT = 0x%" PRIx64 "\n", value);
         /*
-         * SOFTINT is a read/write register for software-generated interrupts.
-         * The kernel sets bits (e.g., CRM_INT_SOFT0) to trigger soft interrupts,
-         * and clears them by reading, masking off the bit, and writing back.
-         * These bits are NOT merged into intstat — they are kept separate.
+         * SOFTINT is a full 32-bit read/write software interrupt register
+         * [spec 099-0123-005 §5.7; sys/crime.h CRM_SOFTINT_MSK 0xffffffff]:
+         * its bits are the same 32 interrupt bits as INTSTAT/HARDINT, and
+         * Table 5-5 assigns bit 31 to the VICE interrupt -> R10K IP2.
+         * The O2 VICE driver forces its own ISR by setting CRM_INT_VICE
+         * (bit 31) here (vice_intr_soft: read SOFTINT, OR 0x80000000, write
+         * back) and clears it in viceintr. An earlier model masked the write
+         * to 0x70000000 (SOFT0-2), silently dropping that forced VICE
+         * interrupt, so the VICE DMS job atom was never executed and every
+         * /dev/vice consumer blocked in the DMS poll. @@SEMANTICS@@
          */
-        s->softint = value & 0x70000000ULL;
+        s->softint = value & 0xffffffffULL;
         sgi_crime_update_irq(s);
         break;
 
