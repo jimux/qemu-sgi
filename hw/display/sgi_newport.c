@@ -1901,7 +1901,13 @@ static void newport_dcb_write(SGINewportState *s, uint32_t val)
             s->ramdac_lut_index = (uint8_t)val;
             break;
         case 1: /* LUT data (RGB packed) */
-            /* IRIX Bt445SetRGB() packs as (r << 24) | (g << 16) | (b << 8) */
+            /* IRIX Bt445SetRGB() packs as (r << 24) | (g << 16) | (b << 8),
+             * so R is the MSB.  NOTE: MAME's ramdac_write() takes
+             * R = bits[15:8], G = bits[23:16], B = bits[31:24] — a different
+             * layout.  We follow IRIX's own driver packing, which was
+             * verified against the real pipeline (see
+             * progress_notes/indy/newport_display_pipeline_debug.md "Bug 2");
+             * do not "fix" this to MAME's order without a hardware capture. */
             s->ramdac_lut_r[s->ramdac_lut_index] = (uint8_t)(val >> 24);
             s->ramdac_lut_g[s->ramdac_lut_index] = (uint8_t)(val >> 16);
             s->ramdac_lut_b[s->ramdac_lut_index] = (uint8_t)(val >> 8);
@@ -2428,6 +2434,11 @@ static void newport_write32(SGINewportState *s, hwaddr addr, uint64_t val,
         s->y_end_f = val;
         newport_write_y_end(s, (int32_t)val & 0x007fff80);
         break;
+    case REX3_XENDF2:
+        /* Low half of the 0x0148 pair ("GL XEnd copy"); same decode as
+         * REX3_XENDF.  MAME ref: newport.cpp case 0x0148/8, bits 0-31. */
+        newport_write_x_end(s, (int32_t)val & 0x007fff80);
+        break;
     case REX3_XSTARTI:
         newport_write_x_start(s, ((int32_t)(int16_t)val) << 11);
         s->x_save_int = s->x_start_int;
@@ -2826,6 +2837,9 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
                 rgb = s->cmap0_palette[(popup_msb | popup_ci) & 0x1fff];
             } else if (aux_pix_mode != 0) {
                 bool overlay_hit = false;
+                if (s->xmap_config & 0x4) {
+                /* 8-bit XMAP mode (xmap_config bit 2 set): 2-bit/1-bit
+                 * overlay forms.  MAME ref: newport.cpp lines 1362-1402. */
                 switch (aux_pix_mode) {
                 case 1:
                     rgb = s->cmap0_palette[
@@ -2866,6 +2880,52 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
                 default:
                     break;
                 }
+                } else {
+                /* Non-8bpp XMAP mode (xmap_config bit 2 clear): 8-bit
+                 * overlay/underlay forms.  MAME ref: newport.cpp lines
+                 * 1404-1446 (the !is_8bpp() arm). */
+                switch (aux_pix_mode) {
+                case 1: /* 8-Bit Underlay — always drawn */
+                    rgb = s->cmap0_palette[
+                        (aux_msb | ((cidaux >> 8) & 0xff)) & 0x1fff];
+                    overlay_hit = true;
+                    break;
+                case 2: /* 8-Bit Overlay — zero is transparent */ {
+                    uint32_t ovl = ((cidaux >> 8) & 0xf) |
+                                   ((cidaux >> 16) & 0xf0);
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 6: /* 4-Bit Overlay */ {
+                    uint32_t shift = (mode_entry & 2) ? 12 : 8;
+                    uint32_t ovl = (cidaux >> shift) & 0xf;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 7: /* 4-Bit Overlay + 4-Bit Underlay */ {
+                    uint32_t ovl = (cidaux >> 8) & 0xf;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                    } else {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ((cidaux >> 12) & 0xf)) & 0x1fff];
+                    }
+                    overlay_hit = true;
+                    break;
+                }
+                default:
+                    break;
+                }
+                }
                 if (!overlay_hit) {
                     goto ppm_main_pixel;
                 }
@@ -2885,12 +2945,22 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
                  */
                 uint16_t ci;
                 switch (pix_size) {
-                case 0: ci = pixel & 0xf; break;
+                case 0: {   /* 4bpp: BIT_SEL picks the nibble (MAME :1458) */
+                    uint8_t shift = (mode_entry & 1) ? 4 : 0;
+                    ci = (pixel >> shift) & 0xf;
+                    break;
+                }
                 case 1: ci = pixel & 0xff; break;
-                case 2: ci = pixel & 0xfff; break;  /* 12bpp CI */
+                case 2: {   /* 12bpp: BIT_SEL picks the word; mask to bit12
+                             * (MAME :1468-1470) */
+                    uint8_t shift = (mode_entry & 1) ? 12 : 0;
+                    ci = (pixel >> shift) & 0xfff;
+                    break;
+                }
                 default: ci = pixel & 0xff; break;
                 }
-                rgb = s->cmap0_palette[(ci_msb | ci) & 0x1fff];
+                rgb = s->cmap0_palette[
+                    ((pix_size == 2 ? (ci_msb & 0x1000) : ci_msb) | ci) & 0x1fff];
             } else {
                 rgb = newport_rgb_unpack(pixel, pix_size, mode_entry);
             }
@@ -3254,6 +3324,9 @@ static void newport_update_display(void *opaque)
                  * MAME ref: newport.cpp lines 1350-1393
                  */
                 bool overlay_hit = false;
+                if (s->xmap_config & 0x4) {
+                /* 8-bit XMAP mode (xmap_config bit 2 set): 2-bit/1-bit
+                 * overlay forms.  MAME ref: newport.cpp lines 1362-1402. */
                 switch (aux_pix_mode) {
                 case 1: /* 2-Bit Underlay — always drawn */
                     rgb = s->cmap0_palette[
@@ -3294,6 +3367,52 @@ static void newport_update_display(void *opaque)
                 default:
                     break;
                 }
+                } else {
+                /* Non-8bpp XMAP mode (xmap_config bit 2 clear): 8-bit
+                 * overlay/underlay forms.  MAME ref: newport.cpp lines
+                 * 1404-1446 (the !is_8bpp() arm). */
+                switch (aux_pix_mode) {
+                case 1: /* 8-Bit Underlay — always drawn */
+                    rgb = s->cmap0_palette[
+                        (aux_msb | ((cidaux >> 8) & 0xff)) & 0x1fff];
+                    overlay_hit = true;
+                    break;
+                case 2: /* 8-Bit Overlay — zero is transparent */ {
+                    uint32_t ovl = ((cidaux >> 8) & 0xf) |
+                                   ((cidaux >> 16) & 0xf0);
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 6: /* 4-Bit Overlay */ {
+                    uint32_t shift = (mode_entry & 2) ? 12 : 8;
+                    uint32_t ovl = (cidaux >> shift) & 0xf;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                        overlay_hit = true;
+                    }
+                    break;
+                }
+                case 7: /* 4-Bit Overlay + 4-Bit Underlay */ {
+                    uint32_t ovl = (cidaux >> 8) & 0xf;
+                    if (ovl) {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ovl) & 0x1fff];
+                    } else {
+                        rgb = s->cmap0_palette[
+                            (aux_msb | ((cidaux >> 12) & 0xf)) & 0x1fff];
+                    }
+                    overlay_hit = true;
+                    break;
+                }
+                default:
+                    break;
+                }
+                }
                 if (!overlay_hit) {
                     goto main_pixel;
                 }
@@ -3306,12 +3425,22 @@ static void newport_update_display(void *opaque)
                  * path).  Do not route them here: it scans out gray. */
                 uint16_t ci;
                 switch (pix_size) {
-                case 0: ci = pixel & 0xf; break;
+                case 0: {   /* 4bpp: BIT_SEL picks the nibble (MAME :1458) */
+                    uint8_t shift = (mode_entry & 1) ? 4 : 0;
+                    ci = (pixel >> shift) & 0xf;
+                    break;
+                }
                 case 1: ci = pixel & 0xff; break;
-                case 2: ci = pixel & 0xfff; break;  /* 12bpp CI */
+                case 2: {   /* 12bpp: BIT_SEL picks the word; mask to bit12
+                             * (MAME :1468-1470) */
+                    uint8_t shift = (mode_entry & 1) ? 12 : 0;
+                    ci = (pixel >> shift) & 0xfff;
+                    break;
+                }
                 default: ci = pixel & 0xff; break;
                 }
-                rgb = s->cmap0_palette[(ci_msb | ci) & 0x1fff];
+                rgb = s->cmap0_palette[
+                    ((pix_size == 2 ? (ci_msb & 0x1000) : ci_msb) | ci) & 0x1fff];
             } else {
                 /* RGB mode (pm=1/2/3 "RGB map") — unpack packed BGR pixel
                  * (MAME ref: convert_{4,8,12}bpp_bgr_to_24bpp_rgb()). */
