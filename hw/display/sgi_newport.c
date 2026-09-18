@@ -2847,7 +2847,15 @@ static void newport_dump_vram_ppm(SGINewportState *s, const char *path)
                 }
             } else {
             ppm_main_pixel:
-            if (pix_mode == 0) {
+            if (pix_mode == 0 || pix_size <= 2) {
+                /*
+                 * CI (pm=0) and the "RGB map" modes (pm=1/2/3) are both
+                 * palette-indexed: the pixel selects an entry in the CMAP
+                 * page named by ci_msb.  Xsgi installs full 256-entry maps
+                 * at 0x1d00/0x1e00/0x1f00 for pm=1/2/3 (the ci_msb values
+                 * above), so those modes are lookups, not packed RGB.
+                 * Only 24bpp (unreachable on the 8-bit Indy) unpacks.
+                 */
                 uint16_t ci;
                 switch (pix_size) {
                 case 0: ci = pixel & 0xf; break;
@@ -3264,8 +3272,10 @@ static void newport_update_display(void *opaque)
                 }
             } else {
             main_pixel:
-            if (pix_mode == 0) {
-                /* CI mode — look up in CMAP palette */
+            if (pix_mode == 0 || pix_size <= 2) {
+                /* CI mode, and the palette-indexed "RGB map" modes
+                 * (pm=1/2/3 → pages 0x1d00/0x1e00/0x1f00) — look up in
+                 * the CMAP palette.  See the framebuffer-dump path. */
                 uint16_t ci;
                 switch (pix_size) {
                 case 0: ci = pixel & 0xf; break;
@@ -3275,8 +3285,9 @@ static void newport_update_display(void *opaque)
                 }
                 rgb = s->cmap0_palette[(ci_msb | ci) & 0x1fff];
             } else {
-                /* RGB mode — unpack packed BGR pixel (MAME ref:
-                 * convert_{4,8,12}bpp_bgr_to_24bpp_rgb()) */
+                /* 24bpp direct RGB (not reachable on the 8-bit Indy):
+                 * unpack packed BGR pixel (MAME ref:
+                 * convert_{4,8,12}bpp_bgr_to_24bpp_rgb()). */
                 rgb = newport_rgb_unpack(pixel, pix_size, mode_entry);
             }
             }
