@@ -549,7 +549,17 @@ static void mvp_i2c_write(SGIMACEVideoState *s, hwaddr off, uint64_t value,
 static MVPChannelState *mvp_ust_video_channel(SGIMACEVideoState *s,
                                               hwaddr off, unsigned *pair)
 {
-    *pair = off & ~7ULL;
+    /*
+     * @@SEMANTICS@@ The UST/MSC MemoryRegion is mapped at the VIN1 pair's
+     * window offset (MACE + 0x340038), so the offset the device receives is
+     * relative to VIN1 (0x00/0x08/0x10), not to the 0x1f340000 MACE base.
+     * Re-base it to the window-absolute pair offsets the constants name
+     * (0x38/0x40/0x48).  Without this the switch matched nothing, every
+     * UST/MSC read selected no channel and returned 0, and the loadable mvp
+     * driver's frontier helper (mvptransfer_interrupt -> .text+0x1908) saw a
+     * zero UST and never advanced the transfer past CONTROL=0x2.
+     */
+    *pair = (off & ~7ULL) + MVP_UST_MSC_VIN1;
     switch (*pair) {
     case MVP_UST_MSC_VIN1:
         return &s->vin[0];
@@ -574,7 +584,25 @@ static uint64_t mvp_ust_read(void *opaque, hwaddr off, unsigned size)
     }
     v = ((uint64_t)ch->msc << 32) | ch->ust;
     trace_sgi_mace_video_ust(0, pair, v, size);
-    return (size == 4 && (off & 4)) ? (v >> 32) : (v & 0xffffffffu);
+    /*
+     * @@SEMANTICS@@ The pair is a big-endian 64-bit register: the lower
+     * address (the pair base, off 0) holds the MSB word -- the media
+     * stream counter / frame count -- and the upper address (off 4)
+     * holds the UST (kernel sys/mace.h: MACE_VIN1_MSC_UST; the loadable
+     * mvp driver reads the high word as the frame counter and the low
+     * word as the UST).  The device is DEVICE_BIG_ENDIAN, so a 4-byte
+     * access at off 0 is the high word.
+     *
+     * This function also previously collapsed every access to a single
+     * 32-bit word: an 8-byte `ld` (the mvp frontier helper's
+     * pciio_pio_read64 at the pair) returned only v[31:0], so the
+     * helper's frame-counter word was always 0 and its wrap / field-id
+     * never advanced.  A 64-bit read must return the whole pair.
+     */
+    if (size == 4) {
+        return (off & 4) ? (v & 0xffffffffu) : (v >> 32);
+    }
+    return v;
 }
 
 static void mvp_ust_write(void *opaque, hwaddr off, uint64_t value,
@@ -588,10 +616,23 @@ static void mvp_ust_write(void *opaque, hwaddr off, uint64_t value,
         return;
     }
     trace_sgi_mace_video_ust(1, pair, value, size);
+    /*
+     * @@SEMANTICS@@ Big-endian register: off 0 is the frame-count (MSC)
+     * word, off 4 is the UST word.  The loadable mvp driver's ISR writes
+     * its 64-bit-extended field frontier back to the pair with a 32-bit
+     * `sw` at the pair base (mvptransfer_interrupt +0x1ec: `sw a4,56(at)`),
+     * i.e. off 0, and reads it back as the frame counter it uses for the
+     * field-id/wrap logic.  Writing it to `ust` (the old little-endian
+     * convention) left the counter the helper read unchanged and the
+     * wrap/field-id never advanced.  A full 64-bit write sets both words.
+     */
     if (size == 4 && (off & 4)) {
+        ch->ust = value;
+    } else if (size == 4) {
         ch->msc = value;
     } else {
-        ch->ust = value;
+        ch->msc = value >> 32;
+        ch->ust = value & 0xffffffffu;
     }
 }
 
