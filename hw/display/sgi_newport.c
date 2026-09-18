@@ -1151,10 +1151,18 @@ static void newport_draw_iline(SGINewportState *s)
  */
 static void newport_draw_fline(SGINewportState *s)
 {
-    int16_t x0 = (int16_t)(s->x_start >> 16);
-    int16_t y0 = (int16_t)(s->y_start >> 16);
-    int16_t x1 = (int16_t)(s->x_end >> 16);
-    int16_t y1 = (int16_t)(s->y_end >> 16);
+    /*
+     * The integer coordinate lives at bits 26:11 of the raw start/end
+     * value (fraction at 10:7), i.e. >>11 — not >>16.  The cached *_int
+     * fields already hold it (see newport_write_x_start()).  Using >>16
+     * put every FLINE 5 bits too far right, so outlines drawn with FLINE
+     * (gr_osview's bar borders and numeric boxes) landed off-screen and
+     * were dropped.  MAME ref: do_fline() uses sext(v>>7,20)>>4 == >>11.
+     */
+    int16_t x0 = s->x_start_int;
+    int16_t y0 = s->y_start_int;
+    int16_t x1 = s->x_end_int;
+    int16_t y1 = s->y_end_int;
     uint32_t color = newport_get_default_color(s);
     bool skip_first = !!(s->drawmode0 & DM0_SKIPFIRST);
     bool skip_last  = !!(s->drawmode0 & DM0_SKIPLAST);
