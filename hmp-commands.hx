@@ -1507,6 +1507,24 @@ SRST
   Inject an MCE on the given CPU (x86 only).
 ERST
 
+#if defined(TARGET_MIPS)
+
+    {
+        .name       = "mips_va",
+        .args_type  = "addr:l",
+        .params     = "addr",
+        .help       = "translate a MIPS virtual address to physical via the live TLB",
+        .cmd        = hmp_mips_va,
+    },
+
+#endif
+SRST
+``mips_va`` *addr*
+  Translate a MIPS virtual address to a physical address using the live
+  TLB/MMU state, printing the retry result for kernel/supervisor/user modes
+  (MIPS only).
+ERST
+
 #ifdef CONFIG_POSIX
     {
         .name       = "getfd",
