@@ -210,6 +210,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGINewportState, SGI_NEWPORT)
 #define VC2_DC_ENA_DIDS      (1 << 3)
 #define VC2_DC_ENA_CURSOR    (1 << 4)
 #define VC2_DC_CURSOR_DISP   (1 << 7)
+#define VC2_DC_CURSOR_MODE   (1 << 8)   /* 0 = glyph, 1 = crosshair */
 #define VC2_DC_CURSOR_SIZE64 (1 << 9)
 
 struct SGINewportState {

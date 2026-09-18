@@ -2558,6 +2558,10 @@ static void newport_write32(SGINewportState *s, hwaddr addr, uint64_t val,
         }
         break;
     case REX3_SLOPEREDCOPY:
+        /* Same sign-magnitude format as REX3_SLOPERED (0x0210).  MAME
+         * (case 0x0228/8, bits 0-31) stores this raw, but its own 0x0210
+         * converts — the raw store looks like an incomplete path, so we
+         * keep the conversion.  Revisit only with a hardware capture. */
         s->slope_red = newport_twos_to_sm((uint32_t)val, 24);
         break;
 
@@ -3127,7 +3131,11 @@ static void newport_draw_cursor(SGINewportState *s, uint32_t *dest)
     bool is_64;
     int size, gx, gy, sx, sy;
 
-    if (!(dc & VC2_DC_ENA_CURSOR) || !(dc & VC2_DC_CURSOR_DISP)) {
+    /* Glyph mode only.  Display-control bit 8 set selects crosshair mode,
+     * which we do not render here.  MAME ref: newport.h CURSOR_MODE_BIT = 8,
+     * CURSOR_MODE_GLYPH = 0. */
+    if (!(dc & VC2_DC_ENA_CURSOR) || !(dc & VC2_DC_CURSOR_DISP) ||
+        (dc & VC2_DC_CURSOR_MODE)) {
         return;
     }
 
