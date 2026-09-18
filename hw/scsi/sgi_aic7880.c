@@ -771,6 +771,25 @@ static void aic7880_post_complete(SGIAIC7880State *s)
     if (status == GOOD) {
         s->intstat |= AIC_CMDCMPLT;
     } else {
+        /*
+         * @@SEMANTICS@@ A CHECK CONDITION is a SEQUENCER PAUSE on real
+         * silicon: the microcode reaches the target's STATUS phase and
+         * executes 'MVI INTSTAT, SEQINT|CHECK_CONDX' (INTCODE 0x50),
+         * which HALTS the sequencer at that word.  The driver's
+         * Ph_CheckCondition() then reads ACTIVE_SCB to find the SCB it
+         * must convert to a REQUEST SENSE.  Posting the SEQINT here but
+         * resuming the interpreter immediately (seq_int_pause=false)
+         * let the idle loop clobber the ACTIVE_SCB scratch byte (0x3b)
+         * before the driver could read it: the ISR saw ACTIVE_SCB==
+         * INVALID_SCB_INDEX, took its early-return path (CLRINT 0x07)
+         * WITHOUT PH_UnPause()ing, and the controller wedged host-
+         * paused — every later SCB sat unselected until the 10 s/60 s
+         * adp78 timeout forced a bus reset.  That is the live media-
+         * change defect (a swapped/absent CD answers CHECK CONDITION).
+         * Hold the sequencer genuinely paused until the driver clears
+         * SEQINT (CLRINT 0x01) and PH_UnPause()s, exactly as the real
+         * SEQINT pause does.
+         */
         s->intstat |= AIC_SEQINT | 0x50;   /* INTCODE CHECK_CONDX */
     }
     /*
@@ -778,14 +797,17 @@ static void aic7880_post_complete(SGIAIC7880State *s)
      * real sequencer's word-230 'JMP 0' after posting the QOUT byte).
      * Without this the still-running microcode walks the stale bank
      * into the word-169 invalid-SCB test and pauses NO_ID_MSG (pc 73),
-     * which the driver treats as an abort path.
+     * which the driver treats as an abort path.  A non-GOOD status is
+     * the one exception: the sequencer stays paused (above), so the
+     * driver finds a valid ACTIVE_SCB; CLRINT(SEQINT)+PH_UnPause
+     * resumes it here.
      */
     trace_sgi_aic7880_bus_complete(s->scsi_bus_num, done_scb, status);
     s->last_fetched_scb = 0xff;
     s->cur_scb = 0xff;
     s->regs[AIC_SCBPTR] = 0xff;   /* no loaded SCB: re-arm selects nothing */
     s->seq_pc = 0;                /* idle loop */
-    s->seq_int_pause = false;
+    s->seq_int_pause = (status != GOOD);
     aic7880_update_irq(s);
     aic7880_kick(s);
 }
