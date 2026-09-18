@@ -75,6 +75,22 @@ static uint64_t sgi_mace_get_ust_msc(void)
 }
 
 /*
+ * @@SEMANTICS@@ MACE_UST (Timer Interface register 0x00, spec TABLE 75):
+ * the 32-bit Universal System Time master uptime counter, ticking every
+ * MACE_UST_PERIOD_NS (960ns).  The kernel's update_ust (kern/ml/ust.s)
+ * loads MACE_UST and keeps only the low 32 bits as that counter, and
+ * kdsp's rate governor converts UST ticks to time, so this register
+ * must expose the raw counter -- NOT the packed MSC|UST pair that the
+ * per-channel MSC/UST registers use (spec §3.4).
+ */
+static uint64_t sgi_mace_get_ust(void)
+{
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    return (uint32_t)(ns / MACE_UST_PERIOD_NS);
+}
+
+/*
  * Serial port helpers
  */
 
@@ -882,19 +898,25 @@ static uint64_t sgi_mace_audio_read(SGIMACEState *s, hwaddr aud_off)
         /*
          * CODEC_PRESENT always set (the codec hangs on the TDM bus),
          * reset reflects the software latch, and the three ring
-         * pointer aliases expose the hardware-owned pointers.  Alias
-         * field encodings per the kernel macros (ad1843.h
-         * GET_CH1_WRITE_ALIAS / GET_CH2_READ_ALIAS / GET_CH3_READ_
-         * ALIAS): the reconstructed byte offset = (cs >> N) & 0xfe0,
-         * so the field at bits N+11..N+5 holds byte_offset >> 4:
-         *   ch1 write ptr: (w>>4) & 0x3f at bits 7:2  (6 bits)
-         *   ch2 read  ptr: (r>>4) & 0x7f at bits 14:8 (7 bits)
-         *   ch3 read  ptr: (r>>4) & 0x7f at bits 22:16 (7 bits)
+         * pointer aliases expose the hardware-owned pointers.
+         * @@SEMANTICS@@ spec TABLE 27 ("Reset Control & Status
+         * Register Bit Fields") fixes the alias field positions:
+         *   bits  8:2  Stereo input  channel #1 ring WRITE pointer alias
+         *   bits 15:9  Stereo output channel #2 ring READ  pointer alias
+         *   bits 22:16 Stereo output channel #3 ring READ  pointer alias
+         * and each 7-bit field holds (byte_offset >> 5) -- the ring
+         * pointer register's own 32-byte granularity (TABLE 31: bits
+         * 11:5), so the kernel macros GET_CH1_WRITE_ALIAS /
+         * GET_CH2_READ_ALIAS / GET_CH3_READ_ALIAS reconstruct the byte
+         * offset.  (The earlier encoding placed ch1 at 5:0 and ch2 at
+         * 14:8 with (offset>>4) fields, which the a3/kdsp driver
+         * decoded to a wrong hardware pointer and stalled the rate
+         * governor after one ring.)
          */
         v = AUD_CODEC_PRESENT | (s->audio_cntrl_stat & AUD_CODEC_RESET);
-        v |= ((uint64_t)s->audio_ch_wptr[0] >> 4) & 0x3f;
-        v |= (((uint64_t)s->audio_ch_rptr[1] >> 4) & 0x7f) << 8;
-        v |= (((uint64_t)s->audio_ch_rptr[2] >> 4) & 0x7f) << 16;
+        v |= (((uint64_t)s->audio_ch_wptr[0] >> 5) & 0x7f) << 2;
+        v |= (((uint64_t)s->audio_ch_rptr[1] >> 5) & 0x7f) << 9;
+        v |= (((uint64_t)s->audio_ch_rptr[2] >> 5) & 0x7f) << 16;
         return v;
     case AUD_CODEC_REG_REG:
         return s->audio_codec_reg;
@@ -2686,19 +2708,30 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
     if (offset >= MACE_UST_MSC_OFFSET &&
         offset < MACE_UST_MSC_OFFSET + 0x10000) {
         hwaddr ust_off = offset - MACE_UST_MSC_OFFSET;
+        uint64_t v;
+
         switch (ust_off) {
         case UST_MSC_REG:
+            /* @@SEMANTICS@@ spec TABLE 75: 0x00 is the 32-bit UST master
+             * uptime counter (kern/ml/ust.s update_ust reads the low 32
+             * bits as the 960ns counter). */
+            v = sgi_mace_get_ust();
+            break;
         case UST_MSC_REG + 4:
-            return sgi_mace_get_ust_msc();
+            v = 0;
+            break;
         case UST_COMPARE1:
         case UST_COMPARE1 + 4:
-            return s->ust_compare[0];
+            v = s->ust_compare[0];
+            break;
         case UST_COMPARE2:
         case UST_COMPARE2 + 4:
-            return s->ust_compare[1];
+            v = s->ust_compare[1];
+            break;
         case UST_COMPARE3:
         case UST_COMPARE3 + 4:
-            return s->ust_compare[2];
+            v = s->ust_compare[2];
+            break;
         case UST_AIN_MSCUST:
         case UST_AIN_MSCUST + 4:
         case UST_AOUT1_MSCUST:
@@ -2706,15 +2739,14 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
         case UST_AOUT2_MSCUST:
         case UST_AOUT2_MSCUST + 4:
             /* per-channel sample-pair counter / UST (spec §3.4) */
-            {
-                uint64_t v = sgi_mace_audio_mscust_read(s, ust_off & ~7ULL);
-
-                trace_sgi_mace_audio_mscust(ust_off & ~7ULL, v);
-                return v;
-            }
+            v = sgi_mace_audio_mscust_read(s, ust_off & ~7ULL);
+            trace_sgi_mace_audio_mscust(ust_off & ~7ULL, v);
+            break;
         default:
-            return sgi_mace_get_ust_msc();
+            v = sgi_mace_get_ust_msc();
+            break;
         }
+        return v;
     }
 
     /*
