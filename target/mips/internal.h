@@ -241,7 +241,10 @@ static inline MemOp mo_endian_env(CPUMIPSState *env)
 
 static inline void restore_pamask(CPUMIPSState *env)
 {
-    if (env->hflags & MIPS_HFLAG_ELPA) {
+    if (env->PAMask_override) {
+        /* Machine-scoped override (e.g. SGI IP27 XKPHYS address spaces). */
+        env->PAMask = env->PAMask_override;
+    } else if (env->hflags & MIPS_HFLAG_ELPA) {
         env->PAMask = (1ULL << env->PABITS) - 1;
     } else {
         env->PAMask = PAMASK_BASE;

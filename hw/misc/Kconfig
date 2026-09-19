@@ -171,6 +171,9 @@ config SGI_BOOTDISK
 config SGI_SMP
     bool
 
+config SGI_HUB
+    bool
+
 config SGI_PVMEM
     bool
 

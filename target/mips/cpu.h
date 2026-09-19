@@ -1174,6 +1174,21 @@ typedef struct CPUArchState {
     struct {} end_reset_fields;
 
     /* Fields from here on are preserved across CPU reset. */
+
+    /*
+     * Opt-in physical-address mask override.
+     *
+     * Some machines (SGI IP27) rely on XKPHYS address bits [58:56] to select
+     * their address spaces (HSPEC/IO/MSPEC/UNCAC), so the CPU must preserve
+     * those bits when forming a physical address.  The default PAMask is
+     * derived from PABITS_BASE (36 bits) or PABITS when ELPA is in use; a
+     * machine that needs a wider physical address window can set this field
+     * (before its CPUs reset) and restore_pamask() will honour it verbatim.
+     * Zero means "use the normal derivation", so every existing machine is
+     * unaffected.
+     */
+    uint64_t PAMask_override;
+
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;

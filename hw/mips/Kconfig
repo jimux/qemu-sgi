@@ -154,6 +154,14 @@ config SGI_OCTANE
     select SGI_GLACCEL
     select SGI_PVAUDIO
 
+config SGI_IP27
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select SGI_HUB
+    select SERIAL_MM
+    select UNIMP
+
 config SGI_IP54PV
     bool
     default y
