@@ -51,7 +51,7 @@
 #define LIO0_DUART     0x20
 
 /* PIT clock: 10 MHz crystal / 10 = 1 MHz (MAME int2.cpp set_clk) */
-#define PIT_CLOCK_HZ   1000000
+#define PIT_CLOCK_HZ   10000000
 
 /* ------------------------------------------------------------------ */
 /* Z85C30 DUART                                                        */
@@ -281,6 +281,17 @@ static uint16_t hpc1_pit_remaining(SGIHPC1State *s, int ch)
         elapsed_ns = 0;
     }
     ticks = elapsed_ns / (1000000000ULL / PIT_CLOCK_HZ);
+
+    /*
+     * TCG executes the PROM's 1024-instruction calibration loop in well
+     * under one 1 MHz PIT tick, so a strict real-time counter can read the
+     * full reload and make the PROM's speed calibration compute "0 ticks".
+     * The real part always sees at least one tick over that loop, so floor
+     * the elapsed time at one tick once the counter has been started.
+     */
+    if (ticks == 0) {
+        ticks = 1;
+    }
 
     if (mode == 2 || mode == 3) {
         /* Rate generator: wrap around. */
