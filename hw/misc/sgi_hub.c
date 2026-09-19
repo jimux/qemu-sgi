@@ -67,6 +67,26 @@
 #define NI_SCRATCH_REG0 0x600100
 #define NI_SCRATCH_REG1 0x600108
 
+/* --- Hub II (I/O interface) offsets --- */
+#define IIO_WID 0x400000
+#define IIO_WSTAT 0x400008
+#define IIO_WCR 0x400020
+#define IIO_ILAPR 0x400100
+#define IIO_ILAPO 0x400108
+#define IIO_IOWA 0x400110
+#define IIO_IIWA 0x400118
+#define IIO_ILCSR 0x400128
+#define IIO_SCRATCH_REG0 0x400150
+#define IIO_SCRATCH_REG1 0x400158
+
+/* Hub widget identification: part 0xc101 (hub). */
+#define HUB_WIDGET_PART_NUM 0xc101
+#define HUB_WIDGET_REV 1
+/* IIO_ILCSR: link status field [17:16], LNK_STAT_WORKING = 2. */
+#define IIO_ILCSR_LINK_WORKING (2ULL << 16)
+/* IIO_WCR widget id field [3:0]. */
+#define HUB_XIO_WIDGET_ID 8
+
 /* NI_STATUS_REV_ID helpers */
 #define NSRI_NODEID_SHFT 8
 #define NSRI_REV_SHFT 4
@@ -305,6 +325,70 @@ static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
   }
 }
 
+static uint64_t sgi_hub_ii_read(SGIHubState *s, hwaddr off) {
+  switch (off) {
+  case IIO_WID:
+    return ((uint64_t)HUB_WIDGET_PART_NUM << 16) |
+           ((uint64_t)HUB_WIDGET_REV << 12);
+  case IIO_WSTAT:
+    return 0;
+  case IIO_WCR:
+    return s->ii_wcr;
+  case IIO_ILAPR:
+  case IIO_ILAPO:
+    return 0;
+  case IIO_IOWA:
+    return s->ii_iowa;
+  case IIO_IIWA:
+    return s->ii_iiwa;
+  case IIO_ILCSR:
+    return s->ii_ilcsr;
+  case IIO_SCRATCH_REG0:
+    return s->ii_scratch[0];
+  case IIO_SCRATCH_REG1:
+    return s->ii_scratch[1];
+  default:
+    qemu_log_mask(LOG_UNIMP, "sgi-hub: unimplemented II read @0x%" HWADDR_PRIx
+                             "\n",
+                  off);
+    return 0;
+  }
+}
+
+static void sgi_hub_ii_write(SGIHubState *s, hwaddr off, uint64_t val) {
+  switch (off) {
+  case IIO_WSTAT:
+  case IIO_WID:
+  case IIO_ILAPR:
+  case IIO_ILAPO:
+    break;
+  case IIO_WCR:
+    s->ii_wcr = val;
+    break;
+  case IIO_IOWA:
+    s->ii_iowa = val;
+    break;
+  case IIO_IIWA:
+    s->ii_iiwa = val;
+    break;
+  case IIO_ILCSR:
+    /* Keep the modelled link reported as working. */
+    s->ii_ilcsr = val | IIO_ILCSR_LINK_WORKING;
+    break;
+  case IIO_SCRATCH_REG0:
+    s->ii_scratch[0] = val;
+    break;
+  case IIO_SCRATCH_REG1:
+    s->ii_scratch[1] = val;
+    break;
+  default:
+    qemu_log_mask(LOG_UNIMP, "sgi-hub: unimplemented II write @0x%" HWADDR_PRIx
+                             " = 0x%" PRIx64 "\n",
+                  off, val);
+    break;
+  }
+}
+
 static uint64_t sgi_hub_read(void *opaque, hwaddr addr, unsigned size) {
   SGIHubState *s = opaque;
   hwaddr off = addr & (SGI_HUB_WINDOW_SIZE - 1);
@@ -318,7 +402,7 @@ static uint64_t sgi_hub_read(void *opaque, hwaddr addr, unsigned size) {
   } else if (off < SGI_HUB_II_BASE) {
     return sgi_hub_md_read(s, off);
   } else if (off < SGI_HUB_NI_BASE) {
-    return 0; /* II: I/O interface; modelled when BaseIO/XIO is added */
+    return sgi_hub_ii_read(s, off);
   } else {
     return sgi_hub_ni_read(s, off);
   }
@@ -338,7 +422,7 @@ static void sgi_hub_write(void *opaque, hwaddr addr, uint64_t val,
   } else if (off < SGI_HUB_II_BASE) {
     sgi_hub_md_write(s, off, val, size);
   } else if (off < SGI_HUB_NI_BASE) {
-    /* II */
+    sgi_hub_ii_write(s, off, val);
   } else {
     sgi_hub_ni_write(s, off, val, size);
   }
@@ -380,6 +464,14 @@ static void sgi_hub_reset(DeviceState *dev) {
 
   /* MD_SLOTID_USTAT: FPGA/flash ready, slot id 0. */
   s->slotid_ustat = 0x10;
+
+  /* II: hub widget id, working XIO link, all widgets accessible. */
+  s->ii_wcr = HUB_XIO_WIDGET_ID;
+  s->ii_iowa = 0x1ff;
+  s->ii_iiwa = 0x1ff;
+  s->ii_ilcsr = IIO_ILCSR_LINK_WORKING;
+  s->ii_scratch[0] = 0;
+  s->ii_scratch[1] = 0;
 
   sgi_hub_update_irqs(s);
 }

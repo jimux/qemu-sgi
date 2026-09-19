@@ -69,6 +69,13 @@ struct SGIHubState {
   /* NI: identity / scratch. */
   uint64_t ni_scratch[2];
 
+  /* II: I/O interface (widget identity/link/access). */
+  uint64_t ii_wcr;
+  uint64_t ii_iowa;
+  uint64_t ii_iiwa;
+  uint64_t ii_ilcsr;
+  uint64_t ii_scratch[2];
+
   /* Generic scratch for registers we only need to hold state for. */
   uint64_t calias_size;
   uint64_t region_present;

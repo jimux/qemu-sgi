@@ -277,9 +277,13 @@ static void sgi_ip27_init(MachineState *machine) {
     }
   }
 
-  /* PROM window. */
+  /*
+   * PROM window.  The IP27 PROM executes from this window and also keeps
+   * writable data/BSS there (it is RAM-backed after the flash image is
+   * copied in), so it must be writable.
+   */
   prom = g_new(MemoryRegion, 1);
-  memory_region_init_rom(prom, NULL, "sgi-ip27.prom", IP27_PROM_SIZE,
+  memory_region_init_ram(prom, NULL, "sgi-ip27.prom", IP27_PROM_SIZE,
                          &error_fatal);
   memory_region_add_subregion(system_memory, IP27_PROM_BASE, prom);
 
