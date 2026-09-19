@@ -50,7 +50,19 @@
 #define LIO0_ETHERNET  0x08
 #define LIO0_DUART     0x20
 
-/* PIT clock: 10 MHz crystal / 10 = 1 MHz (MAME int2.cpp set_clk) */
+/*
+ * PIT clock.
+ *
+ * [ASSUMPTION] The real HPC1.5 8254 runs at 1 MHz. TCG executes the PROM's
+ * 1024-instruction CPU-speed calibration loop far faster than the modeled
+ * 50 MHz CPU, so a strict 1 MHz time base measures 0-2 ticks where real
+ * hardware measures ~20, and the PROM's delay_calibrate() then divides by a
+ * zero constant and self-asserts (this is IP20-only code). Scale the PIT to
+ * 10 MHz so the calibration observes the same instruction/tick ratio real
+ * hardware would. This is a TCG time-base accommodation in the spirit of the
+ * project's clock-decoupling doctrine; the guest's wall clock comes from the
+ * DP8572 RTC (host time), NOT this PIT, so IRIX time is unaffected.
+ */
 #define PIT_CLOCK_HZ   10000000
 
 /* ------------------------------------------------------------------ */
@@ -380,6 +392,154 @@ static uint8_t hpc1_pit_read(SGIHPC1State *s, int reg)
 }
 
 /* ------------------------------------------------------------------ */
+/* DP8572 real-time clock                                              */
+/* ------------------------------------------------------------------ */
+
+/* Register indices (MAME dp8573a.cpp; DP8572A exposes 0x00-0x1f) */
+#define RTC_REG_MSR        0x00
+#define RTC_REG_RTMR       0x01
+#define RTC_REG_OMR        0x02
+#define RTC_REG_PFR        0x03
+#define RTC_REG_TSCR       0x04
+#define RTC_REG_HUNDREDTH  0x05
+#define RTC_REG_SECOND     0x06
+#define RTC_REG_MINUTE     0x07
+#define RTC_REG_HOUR       0x08
+#define RTC_REG_DAY        0x09
+#define RTC_REG_MONTH      0x0a
+#define RTC_REG_YEAR       0x0b
+#define RTC_REG_DAYOFWEEK  0x0e
+
+static uint8_t rtc_to_bcd(int v)
+{
+    return ((v / 10) << 4) | (v % 10);
+}
+
+static int rtc_from_bcd(uint8_t v)
+{
+    return ((v >> 4) & 0xf) * 10 + (v & 0xf);
+}
+
+static void rtc_guest_tm(SGIHPC1State *s, struct tm *tm)
+{
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_HOST);
+    time_t t = (time_t)((s->rtc_guest_base_ms +
+                         (now - s->rtc_host_base_ms)) / 1000);
+    gmtime_r(&t, tm);
+}
+
+static void rtc_set_from_tm(SGIHPC1State *s, struct tm *tm)
+{
+    time_t t = timegm(tm);
+    s->rtc_guest_base_ms = (int64_t)t * 1000;
+    s->rtc_host_base_ms = qemu_clock_get_ms(QEMU_CLOCK_HOST);
+}
+
+/*
+ * Time fields as the IP20 PROM maps them (derived from the access pattern
+ * of libsk/ml/dp8573.c): ck_counter[0..6] = regs 0x05..0x0b and the Time
+ * Save RAM ck_timsav[0..4] = regs 0x19..0x1d mirror seconds..month.
+ */
+static uint8_t rtc_reg_read(SGIHPC1State *s, unsigned reg)
+{
+    struct tm tm;
+
+    switch (reg) {
+    case RTC_REG_HUNDREDTH: /* ck_counter[0]: polled by counter_not_moving() */
+        return rtc_to_bcd((int)((qemu_clock_get_ms(QEMU_CLOCK_HOST) / 10) % 100));
+    case RTC_REG_SECOND:
+    case RTC_REG_MINUTE:
+    case RTC_REG_HOUR:
+    case RTC_REG_DAY:
+    case RTC_REG_MONTH:
+    case RTC_REG_YEAR:
+    case RTC_REG_DAYOFWEEK:
+    case 0x19: /* ck_timsav[0] - seconds */
+    case 0x1a: /* ck_timsav[1] - minutes */
+    case 0x1b: /* ck_timsav[2] - hours */
+    case 0x1c: /* ck_timsav[3] - day */
+    case 0x1d: /* ck_timsav[4] - month */
+        rtc_guest_tm(s, &tm);
+        switch (reg) {
+        case RTC_REG_SECOND:
+        case 0x19:
+            return rtc_to_bcd(tm.tm_sec);
+        case RTC_REG_MINUTE:
+        case 0x1a:
+            return rtc_to_bcd(tm.tm_min);
+        case RTC_REG_HOUR:
+        case 0x1b:
+            return rtc_to_bcd(tm.tm_hour);
+        case RTC_REG_DAY:
+        case 0x1c:
+            return rtc_to_bcd(tm.tm_mday);
+        case RTC_REG_MONTH:
+        case 0x1d:
+            return rtc_to_bcd(tm.tm_mon + 1);
+        case RTC_REG_YEAR:
+            return rtc_to_bcd((tm.tm_year + 1900) % 100);
+        default: /* day of week: 1-7, Sunday = 1 */
+            return rtc_to_bcd(tm.tm_wday + 1);
+        }
+    default:
+        return s->rtc[reg & 0x7f];
+    }
+}
+
+static void rtc_reg_write(SGIHPC1State *s, unsigned reg, uint8_t val)
+{
+    struct tm tm;
+
+    switch (reg) {
+    case RTC_REG_SECOND:
+    case RTC_REG_MINUTE:
+    case RTC_REG_HOUR:
+    case RTC_REG_DAY:
+    case RTC_REG_MONTH:
+    case RTC_REG_YEAR:
+        rtc_guest_tm(s, &tm);
+        switch (reg) {
+        case RTC_REG_SECOND:
+            tm.tm_sec = rtc_from_bcd(val & 0x7f);
+            break;
+        case RTC_REG_MINUTE:
+            tm.tm_min = rtc_from_bcd(val & 0x7f);
+            break;
+        case RTC_REG_HOUR:
+            tm.tm_hour = rtc_from_bcd(val & 0x3f);
+            break;
+        case RTC_REG_DAY:
+            tm.tm_mday = rtc_from_bcd(val & 0x3f);
+            break;
+        case RTC_REG_MONTH:
+            tm.tm_mon = rtc_from_bcd(val & 0x1f) - 1;
+            break;
+        default: /* year: keep the century, replace the 2 digits */
+            tm.tm_year = (tm.tm_year / 100) * 100 +
+                         rtc_from_bcd(val & 0x7f);
+            break;
+        }
+        rtc_set_from_tm(s, &tm);
+        break;
+    default:
+        s->rtc[reg & 0x7f] = val;
+        break;
+    }
+}
+
+static void rtc_reset(SGIHPC1State *s)
+{
+    struct tm tm;
+    time_t t = time(NULL);
+
+    gmtime_r(&t, &tm);
+    s->rtc_guest_base_ms = (int64_t)t * 1000;
+    s->rtc_host_base_ms = qemu_clock_get_ms(QEMU_CLOCK_HOST);
+    memset(s->rtc, 0, sizeof(s->rtc));
+    s->rtc[RTC_REG_MSR] = 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* EEPROM bit-bang via the aux register                                */
 /* ------------------------------------------------------------------ */
 
@@ -425,7 +585,7 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
     }
 
     if (addr >= HPC1_RTC_BASE && addr < HPC1_RTC_BASE + 0x80) {
-        return s->rtc[addr - HPC1_RTC_BASE];
+        return rtc_reg_read(s, (addr - HPC1_RTC_BASE) >> 2);
     }
 
     if (addr >= HPC1_INT2_BASE && addr < HPC1_INT2_BASE + 0x40) {
@@ -527,7 +687,7 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
     }
 
     if (addr >= HPC1_RTC_BASE && addr < HPC1_RTC_BASE + 0x80) {
-        s->rtc[addr - HPC1_RTC_BASE] = val8;
+        rtc_reg_write(s, (addr - HPC1_RTC_BASE) >> 2, val8);
         return;
     }
 
@@ -692,7 +852,7 @@ static void sgi_hpc1_reset(DeviceState *dev)
     int d, c, i;
 
     memset(s->core_scratch, 0, sizeof(s->core_scratch));
-    memset(s->rtc, 0, sizeof(s->rtc));
+    rtc_reset(s);
     s->miscsr = 0;
     s->scsi_ctrl = 0;
     s->scsi_bc = 0;

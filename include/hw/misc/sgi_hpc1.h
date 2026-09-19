@@ -77,8 +77,13 @@ struct SGIHPC1State {
     /* Scratch for the parallel / DSP-interface register RAM areas */
     uint8_t core_scratch[0x200];
 
-    /* DP8572 RTC register/RAM file (byte addressed, 0x00-0x7f) */
+    /* DP8572 RTC register/RAM file (32-bit spaced: reg = offset >> 2) */
     uint8_t rtc[0x80];
+
+    /* DP8572 time base: guest wall-clock = guest_base + (host - host_base) */
+    int64_t rtc_host_base_ms;
+    int64_t rtc_guest_base_ms;
+    QEMUTimer *rtc_timer;
 
     /* SEEQ 8003 registers (read side only, TX/RX DMA is a later stage) */
     uint8_t seeq_station_addr[6];
