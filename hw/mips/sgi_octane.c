@@ -186,8 +186,47 @@ static void sgi_octane_init(MachineState *machine)
         memory_region_add_subregion(system_memory, OCTANE_RAM_BASE, seg0);
     }
 
-    /* Xbow crossbar stub at widget 0 (0x10000000). */
-    create_unimplemented_device("xbow", OCTANE_XBOW_BASE, 16 * MiB);
+    /*
+     * HEART memory-probe window at 0xA0000000 ("1/2 G + 2 G"): the PROM's
+     * init_memconfig (lmem_conf.s) sizes each SDRAM bank by write/read alias
+     * tests at PROBE_MEMBASE = K1 + 0x20000000 + 0x80000000, touching offsets
+     * up to 1 GB. On real HEART the selected bank (whose address space is the
+     * DIMM size) is aliased into this window, so every probe address resolves
+     * and address bits above the bank size wrap. Model that by repeating the
+     * RAM mapping across the full 2 GB window (aliases only; no extra host
+     * RAM), so the probe never takes a data-bus error and sees the expected
+     * wrap behaviour.
+     */
+    {
+        uint64_t win = 16 * GiB;
+        uint64_t blk = (machine->ram_size >= 1 * MiB) ? machine->ram_size
+                                                      : OCTANE_RAM_BASE;
+        int i;
+
+        for (i = 0; (uint64_t)i * blk < win; i++) {
+            MemoryRegion *probe = g_new(MemoryRegion, 1);
+            char *name = g_strdup_printf("sgi.probe-ram.%d", i);
+            memory_region_init_alias(probe, NULL, name, machine->ram, 0, blk);
+            memory_region_add_subregion(system_memory,
+                                        0xA0000000ULL + (uint64_t)i * blk,
+                                        probe);
+        }
+    }
+
+    /*
+     * Xbow crossbar at widget 0 (0x10000000). The PROM's pon_xbow POST runs
+     * register read/write (walking-bit) tests before anything else and halts
+     * into the fault-LED path if a scratch register does not retain its value.
+     * A zero-initialised writable region satisfies those tests for bring-up;
+     * it is a scaffold, not the real Xbow register model (widget IDs and link
+     * status still read 0).
+     */
+    {
+        MemoryRegion *xbow = g_new(MemoryRegion, 1);
+        memory_region_init_ram(xbow, NULL, "sgi.xbow", 16 * MiB,
+                               &error_fatal);
+        memory_region_add_subregion(system_memory, OCTANE_XBOW_BASE, xbow);
+    }
 
     /* HEART XIO widget-8 window (XIO config side, not the PIU). */
     create_unimplemented_device("heart-widget", OCTANE_HEART_WIDGET, 16 * MiB);

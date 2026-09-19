@@ -184,11 +184,24 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
     case HEART_MEM_REQ_ARB:
         val = s->mem_req_arb;
         break;
-    case HEART_MEMCFG0 ... HEART_MEMCFG(3):
+    case HEART_MEMCFG0 ... HEART_MEMCFG(3) + 4:
         {
-            int idx = (offset - HEART_MEMCFG0) / 8;
-            if (idx < HEART_NUM_BANKS) {
-                val = s->memcfg[idx];
+            /*
+             * MEMCFG0..3 are four 64-bit registers holding eight 32-bit bank
+             * configs: bank 2n is the high half of register n, bank 2n+1 the
+             * low half (big-endian). The PROM writes/reads individual banks
+             * with 32-bit sw/lwu at MEMCFG0 + bank*4, so 32-bit accesses must
+             * update the correct half rather than clobber the whole register.
+             */
+            int idx = (offset - HEART_MEMCFG0) / 4; /* 0..7 */
+            if (idx < HEART_NUM_BANKS * 2) {
+                uint64_t reg = s->memcfg[idx / 2];
+                if (size == 8) {
+                    val = reg;
+                } else {
+                    val = (idx & 1) ? (reg & 0xffffffffULL)
+                                    : (reg >> 32);
+                }
             }
         }
         break;
@@ -338,11 +351,24 @@ static void sgi_heart_write(void *opaque, hwaddr offset, uint64_t val,
     case HEART_MEM_REQ_ARB:
         s->mem_req_arb = val;
         break;
-    case HEART_MEMCFG0 ... HEART_MEMCFG(3):
+    case HEART_MEMCFG0 ... HEART_MEMCFG(3) + 4:
         {
-            int idx = (offset - HEART_MEMCFG0) / 8;
-            if (idx < HEART_NUM_BANKS) {
-                s->memcfg[idx] = val;
+            /* See the read path: 32-bit accesses update one bank's half. */
+            int idx = (offset - HEART_MEMCFG0) / 4; /* 0..7 */
+            if (idx < HEART_NUM_BANKS * 2) {
+                if (size == 8) {
+                    s->memcfg[idx / 2] = val;
+                } else {
+                    uint64_t reg = s->memcfg[idx / 2];
+                    if (idx & 1) {
+                        reg = (reg & 0xffffffff00000000ULL)
+                              | (val & 0xffffffffULL);
+                    } else {
+                        reg = (reg & 0xffffffffULL)
+                              | ((val & 0xffffffffULL) << 32);
+                    }
+                    s->memcfg[idx / 2] = reg;
+                }
             }
         }
         break;

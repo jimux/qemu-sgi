@@ -67,17 +67,25 @@
  * Physical byte offset → standard 16550 register: std_reg = offset ^ 3
  * This accounts for big-endian byte ordering within 32-bit words on MIPS.
  */
+/*
+ * IOC3 SuperIO UART in 16550-compatibility mode is byte-spaced: the 16550
+ * register index equals the byte offset (RBR/THR=0, IER=1, IIR/FCR=2, LCR=3,
+ * MCR=4, LSR=5, MSR=6, SCR=7). This matches the IP27 BaseIO model, which was
+ * verified against the IRIX ARCS ioc3uart.c init and console path; the older
+ * `offset ^ 3` byte-reversal was an unverified assumption and dropped the
+ * console entirely.
+ */
 static uint64_t ioc3_uart_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIBRIDGEState *s = opaque;
-    return serial_io_ops.read(&s->ioc3_uart, addr ^ 3, size);
+    return serial_io_ops.read(&s->ioc3_uart, addr, size);
 }
 
 static void ioc3_uart_write(void *opaque, hwaddr addr, uint64_t value,
                             unsigned size)
 {
     SGIBRIDGEState *s = opaque;
-    serial_io_ops.write(&s->ioc3_uart, addr ^ 3, value, size);
+    serial_io_ops.write(&s->ioc3_uart, addr, value, size);
 }
 
 static const MemoryRegionOps ioc3_uart_ops = {
@@ -92,6 +100,7 @@ static const MemoryRegionOps ioc3_uart_ops = {
 
 static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 {
+    SGIBRIDGEState *s = opaque;
     uint64_t val = 0;
 
     switch (offset) {
@@ -99,30 +108,24 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
      * BRIDGE local registers: 0x000000-0x00FFFF
      *
      * offset 0x000: widget config (w_id etc.)
-     * offset 0x104: b_int_status (Interrupt Status register)
-     *   BRIDGE_ISR_INT(x) = bit x for device x (bits 0-7).
-     *   Bit 6 (0x40) = BRIDGE_ISR_INT(6): the PROM spins blinking the
-     *   front-panel LED until this bit is set, waiting for the XTalk link
-     *   to BRIDGE to be established.  Our emulated BRIDGE is always ready,
-     *   so return bit 6 set immediately.
+     * offset 0x104: b_int_status (Interrupt Status register).
+     *   The early POST bus-error handler at PROM 0xbfc00d40 reads this and,
+     *   if bit 6 (0x40) is SET, jumps straight into the fault-LED spin at
+     *   0xbfc178f4. Bit 6 must therefore read CLEAR on a healthy machine; the
+     *   earlier stub returned 0x40 and hung the PROM there before any console
+     *   output. All status bits read clear unless a device raises one.
+     *
+     * The PROM's pon_bridge POST walks control registers (e.g. EVEN_RESP at
+     * 0x284) with write/read tests, so the general register file must retain
+     * writes. regs[] is 0x1000 words, covering the whole 0x0000-0x3FFF span.
      */
     case 0x0104:
-        val = 0x40; /* BRIDGE_ISR_INT(6): XTalk link ready */
+        val = s->regs[offset >> 2] & ~0x40ULL;
         break;
 
     case 0x0000 ... 0x0103:
-    case 0x0105 ... 0x0FFF:
-        val = 0;
-        break;
-
-    /* XTLink control */
-    case 0x1000 ... 0x1FFF:
-        val = 0;
-        break;
-
-    /* BaseIO slot control */
-    case 0x2000 ... 0x2FFF:
-        val = 0;
+    case 0x0105 ... 0x2FFF:
+        val = s->regs[offset >> 2];
         break;
 
     case 0x600000 ... 0x61FFFF:
@@ -135,22 +138,25 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
              * always set so the kernel does not spin here.
              */
             val = 0x00400000; /* SIO_CR_ARB_DIAG_IDLE */
+        } else if (offset == 0x600030) {
+            /* IOC3 MCR: 1-wire done bit set (nothing pending). */
+            val = 0x2;
         } else {
-            qemu_log_mask(LOG_UNIMP,
-                          "BRIDGE: IOC3 read at +0x%05" HWADDR_PRIx
-                          " (IOC3+0x%05" HWADDR_PRIx ") -> 0x%08"
-                          PRIx64 "\n",
-                          offset, offset - 0x600000, val);
+            val = s->ioc3_regs[(offset - 0x600000) >> 2];
         }
         break;
 
     /*
      * IOC3 device window extended range: 0x620000-0x6FFFFF.
-     * Silently return 0 for SuperIO index/data register reads.
-     * The UART subregion at 0x620178 takes priority via subregion.
+     * SuperIO index/data pair; the UART subregion at 0x620178 takes
+     * priority over this range via its own subregion.
      */
     case 0x620000 ... 0x6FFFFF:
-        val = 0;
+        if (offset == 0x6C0000) {
+            val = s->sio_regs[s->sio_index];
+        } else {
+            val = 0;
+        }
         break;
 
     default:
@@ -166,45 +172,39 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                              unsigned size)
 {
+    SGIBRIDGEState *s = opaque;
+
     switch (offset) {
-    case 0x0000 ... 0x0FFF:
+    case 0x0104:
+        /* Interrupt status is read-only. */
         break;
 
-    case 0x1000 ... 0x1FFF:
-        break;
-
-    case 0x2000 ... 0x2FFF:
+    case 0x0000 ... 0x0103:
+    case 0x0105 ... 0x2FFF:
+        /* General register file (POST write/read tests land here). */
+        s->regs[offset >> 2] = val;
         break;
 
     case 0x600000 ... 0x61FFFF:
-        if (offset != 0x600028 && offset != 0x600034 &&
-            offset != 0x60003c && offset != 0x600040 &&
-            offset != 0x600044) {
-            /* Log unexpected IOC3 devio writes (skip known GPIO/SIO_CR) */
-            qemu_log_mask(LOG_UNIMP,
-                          "BRIDGE: IOC3 write at +0x%05" HWADDR_PRIx
-                          " (IOC3+0x%05" HWADDR_PRIx ") <- 0x%08"
-                          PRIx64 "\n",
-                          offset, offset - 0x600000, val);
+        if (offset != 0x600028) {
+            /* SIO_CR bit 22 is a live status bit; store everything else. */
+            s->ioc3_regs[(offset - 0x600000) >> 2] = val;
         }
         break;
 
     /*
-     * IOC3 device window extended range: 0x620000-0x6FFFFF
-     * (beyond the IOC3 registers at 0x600000-0x61FFFF)
-     *
-     * The PROM uses byte-sized sb/lb at:
-     *   BRIDGE+0x6A0000: SuperIO INDEX register
-     *   BRIDGE+0x6C0000: SuperIO DATA register
-     * These are index/data pairs for SuperIO chip configuration
-     * (keyboard controller, power management, etc.).
-     *
-     * We silently accept all accesses in this range — logging them
-     * would generate excessive noise during PROM POST.  The IOC3 UART
-     * at 0x620178 is handled by its own subregion (ioc3_uart_mr),
-     * which takes priority over this case.
+     * IOC3 device window extended range: 0x620000-0x6FFFFF.
+     * SuperIO index/data pair at BRIDGE+0x6A0000/+0x6C0000 (a PC-style
+     * bank of 8-bit SuperIO registers). Backed by storage so the PROM's
+     * init sequence retains its writes. The IOC3 UART at 0x620178 is
+     * handled by its own subregion (ioc3_uart_mr), which takes priority.
      */
     case 0x620000 ... 0x6FFFFF:
+        if (offset == 0x6A0000) {
+            s->sio_index = val & 0xff;
+        } else if (offset == 0x6C0000) {
+            s->sio_regs[s->sio_index] = val & 0xff;
+        }
         break;
 
     default:
@@ -240,6 +240,9 @@ static void sgi_bridge_reset(DeviceState *dev)
 {
     SGIBRIDGEState *s = SGI_BRIDGE(dev);
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->ioc3_regs, 0, sizeof(s->ioc3_regs));
+    memset(s->sio_regs, 0, sizeof(s->sio_regs));
+    s->sio_index = 0;
 }
 
 static void sgi_bridge_realize(DeviceState *dev, Error **errp)
@@ -255,10 +258,14 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
      * IOC3 UART A (serial console).
      *
      * Connect to the "ser0" socket chardev if it exists (created by the MCP
-     * launch infrastructure), otherwise the UART has no backend and output
-     * is silently discarded.
+     * launch infrastructure), otherwise fall back to "serial0" (a plain
+     * -serial stdio/file backend). Without this fallback the UART has no
+     * backend and the PROM console is silently discarded.
      */
     chr = qemu_chr_find("ser0");
+    if (!chr) {
+        chr = qemu_chr_find("serial0");
+    }
     if (chr) {
         qdev_prop_set_chr(DEVICE(&s->ioc3_uart), "chardev", chr);
     }

@@ -50,16 +50,28 @@ struct SGIBRIDGEState {
     uint32_t regs[BRIDGE_NUM_REGS];
 
     /*
+     * IOC3 devio register block (BRIDGE+0x600000-0x61FFFF). The PROM's
+     * pon_ioc3 POST write/read tests land across the whole block, so back it
+     * with storage; specific registers (SIO_CR, MCR) have real semantics on
+     * read. 0x20000 bytes = 0x8000 words.
+     */
+    uint32_t ioc3_regs[0x8000];
+
+    /*
+     * IOC3 SuperIO index/data register pair (BRIDGE+0x6A0000 index,
+     * +0x6C0000 data), a PC-style bank of 8-bit SuperIO registers.
+     */
+    uint8_t sio_index;
+    uint8_t sio_regs[256];
+
+    /*
      * IOC3 SuperIO UART A (serial console).
      *
-     * IOC3 registers are byte-accessible at 1-byte stride, but byte-reversed
-     * within 32-bit words (big-endian MIPS):
-     *   IOC3 physical offset 0 (0x20178) → 16550 reg 3 (LCR)
-     *   IOC3 physical offset 3 (0x2017B) → 16550 reg 0 (RBR/THR/DLL)
-     *   IOC3 physical offset 6 (0x2017E) → 16550 reg 5 (LSR)
-     * Formula: std_reg = offset ^ 3
+     * In 16550-compatibility mode the IOC3 UART is byte-spaced: the register
+     * index equals the byte offset (0=RBR/THR, 1=IER, 2=IIR/FCR, 3=LCR,
+     * 4=MCR, 5=LSR, 6=MSR, 7=SCR). Matches the verified IP27 BaseIO model.
      *
-     * Mapped at BRIDGE offset 0x620178 (= IOC3_BASE 0x1F600000 + SIO_UA 0x20178).
+     * Mapped at BRIDGE offset 0x620178 (= IOC3 devio 0x600000 + 0x20178).
      */
     SerialState ioc3_uart;
     MemoryRegion ioc3_uart_mr;
