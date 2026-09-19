@@ -156,6 +156,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEVideoState, SGI_MACE_VIDEO)
 
 /* Fourcc values for the chardev frame payload */
 #define MVP_FOURCC_RGBA  0x52474241u    /* "RGBA" */
+#define MVP_FOURCC_ABGR  0x41424752u    /* "ABGR" */
 #define MVP_FOURCC_UYVY  0x55595659u    /* "UYVY" */
 
 typedef struct MVPChannelState {
@@ -224,6 +225,25 @@ typedef struct MVPVideoInput {
     size_t rx_payload_len;
 } MVPVideoInput;
 
+/*
+ * The MACE video-output (VOUT) channel host sink.  VOUT is the mirror of a
+ * VIN channel: when the guest programs its descriptor DMA the device reads
+ * the guest frame out of the 32x64K page list and forwards it to a host
+ * sink (a "video-out" chardev) as the same MVPF frame protocol the VIN
+ * source uses, in the reverse direction.  The guest runs the real mvp
+ * output path (memtovid / videoout); QEMU never invents frames.
+ */
+typedef struct MVPVideoSink {
+    CharFrontend video_out;  /* host frame chardev for the output       */
+    char *video_helper;      /* property: sink helper executable path   */
+    char *video_out_path;    /* property: unix socket the helper uses   */
+    GPid helper_pid;         /* running helper, 0 when none             */
+    guint helper_watch;      /* g_child_watch source id                 */
+    char *helper_source;     /* attached destination, for describe()    */
+    bool helper_is_url;
+    uint64_t frames_sent;    /* fields forwarded to the sink            */
+} MVPVideoSink;
+
 struct SGIMACEVideoState {
     SysBusDevice parent_obj;
 
@@ -252,6 +272,8 @@ struct SGIMACEVideoState {
     /* Host video sources + field pacing */
     QEMUTimer *field_timer;
     MVPVideoInput input[MVP_NUM_VIN];
+    /* Host video-output sink (VOUT) */
+    MVPVideoSink sink;
 };
 
 /**

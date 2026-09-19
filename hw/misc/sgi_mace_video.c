@@ -102,6 +102,56 @@ static size_t mvp_pages_write(const uint16_t pages[MVP_MAX_PAGES],
     return off - base;
 }
 
+/*
+ * @@SEMANTICS@@ Read a run of bytes across the 32x64K descriptor pages,
+ * starting at buffer byte offset @base.  This is the output (VOUT) mirror
+ * of mvp_pages_write: the guest's output descriptor DMA reads the frame
+ * the driver programmed out of the same page list the input path writes
+ * into, so the device forwards the real guest bytes, not a synthetic
+ * signal.  Returns the number of bytes transferred.
+ */
+static size_t mvp_pages_read(const uint16_t pages[MVP_MAX_PAGES],
+                             uint8_t *buf, size_t len, size_t base)
+{
+    size_t off = base;
+
+    while (len) {
+        unsigned page = off >> 16;
+        unsigned poff = off & 0xffff;
+        size_t chunk;
+
+        if (page >= MVP_MAX_PAGES || pages[page] == 0) {
+            break;   /* zero descriptor mid-frame = end/overflow */
+        }
+        chunk = MIN(len, (size_t)0x10000 - poff);
+        address_space_read(&address_space_memory,
+                           ((uint64_t)pages[page] << 16) | poff,
+                           MEMTXATTRS_UNSPECIFIED, buf, chunk);
+        off += chunk;
+        buf += chunk;
+        len -= chunk;
+    }
+    return off - base;
+}
+
+static unsigned mvp_format_bpp(unsigned fmt)
+{
+    return (fmt == MVP_FORMAT_YUV422 || fmt == MVP_FORMAT_YUV422_10) ? 2 : 4;
+}
+
+static uint32_t mvp_format_fourcc(unsigned fmt)
+{
+    switch (fmt) {
+    case MVP_FORMAT_YUV422:
+    case MVP_FORMAT_YUV422_10:
+        return MVP_FOURCC_UYVY;
+    case MVP_FORMAT_ABGR32:
+        return MVP_FOURCC_ABGR;
+    default:
+        return MVP_FOURCC_RGBA;
+    }
+}
+
 /* CCIR-601 8-bit YUV for the standard 8 SMPTE bars (75% white). */
 static const uint8_t mvp_bars_y[8] = { 235, 210, 170, 145, 106,  81,  41,  16 };
 static const uint8_t mvp_bars_u[8] = { 128,  16, 166,  54, 202,  90, 240, 128 };
@@ -311,27 +361,41 @@ static void mvp_channel_write(MVPChannelState *ch, bool is_out,
     case MVP_REG_NEXT_DESC:
         ch->next_desc = value & 0xffffffffu;
         /*
-         * @@SEMANTICS@@ The descriptor's field-capture bits (spec TABLE
-         * 12: 10 = next odd field, 11 = next even field, 0x = either)
-         * select which field the FIELD_OFFSET programmed with it applies
-         * to.  Latch the current field_offset into the per-field slot so
-         * an interleaved capture can place each field on its own lines
-         * even though the FIELD_OFFSET register only holds the last write.
+         * @@SEMANTICS@@ The descriptor selects which field the
+         * FIELD_OFFSET programmed with it applies to; latch the current
+         * field_offset into the per-field slot because the FIELD_OFFSET
+         * register only holds the last write and the driver programs both
+         * descriptors back-to-back.  Input uses the 2-bit field-capture
+         * bits (spec TABLE 12: 10 = next odd, 11 = next even, 0x = either);
+         * output uses bit0 only (TABLE 13: 0 = send as next odd field,
+         * 1 = send as next even field).
          */
-        if (!is_out && (value & MVP_NDA_VALID)) {
-            switch (value & MVP_NDA_CAPTURE_MASK) {
-            case 0x2:      /* capture next odd field */
-                ch->flofs_odd = ch->field_offset;
-                ch->flofs_odd_valid = true;
-                break;
-            case 0x3:      /* capture next even field */
-                ch->flofs_even = ch->field_offset;
-                ch->flofs_even_valid = true;
-                break;
-            default:       /* capture next field (either type) */
-                ch->flofs_odd = ch->flofs_even = ch->field_offset;
-                ch->flofs_odd_valid = ch->flofs_even_valid = true;
-                break;
+        if (value & MVP_NDA_VALID) {
+            if (is_out) {
+                if (value & 1) {
+                    ch->flofs_even = ch->field_offset;
+                    ch->flofs_even_valid = true;
+                    ch->field_parity = 0;   /* even */
+                } else {
+                    ch->flofs_odd = ch->field_offset;
+                    ch->flofs_odd_valid = true;
+                    ch->field_parity = 1;   /* odd */
+                }
+            } else {
+                switch (value & MVP_NDA_CAPTURE_MASK) {
+                case 0x2:      /* capture next odd field */
+                    ch->flofs_odd = ch->field_offset;
+                    ch->flofs_odd_valid = true;
+                    break;
+                case 0x3:      /* capture next even field */
+                    ch->flofs_even = ch->field_offset;
+                    ch->flofs_even_valid = true;
+                    break;
+                default:       /* capture next field (either type) */
+                    ch->flofs_odd = ch->flofs_even = ch->field_offset;
+                    ch->flofs_odd_valid = ch->flofs_even_valid = true;
+                    break;
+                }
             }
         }
         break;
@@ -494,6 +558,109 @@ static void mvp_capture_field(SGIMACEVideoState *s, MVPChannelState *ch,
     ch->status |= MVP_STATUS_DMA_COMPLETE;
 }
 
+/*
+ * @@SEMANTICS@@ Forward one output field to the host sink.  The output
+ * (VOUT) channel is the mirror of a VIN channel: when its descriptor DMA
+ * is enabled the device reads the guest frame out of the 32x64K page list
+ * (spec TABLE 24 for video DMA) and sends it to the AV1 SAA7185 encoder.
+ * QEMU has no analog medium, so it serialises the exact bytes the guest
+ * programmed as an MVPF frame on the "video-out" chardev; an external
+ * helper records/decodes it.  No frame is ever synthesised: nothing is
+ * sent unless the guest armed NEXT_DESC and enabled the DMA.
+ *
+ * Geometry comes from the output-only FIELD_SIZE register (0x28): lines
+ * at bits[21:12], byte line width at bits[11:3]; the pixel format is
+ * output CONFIG bits[16:14], the same encoding as the input CONFIG.  The
+ * interleaved (frame) layout alternates the field base from FIELD_OFFSET
+ * (latched per field type by NEXT_DESC[1:0], exactly like the input path),
+ * so the two fields read every other frame line.
+ */
+static void mvp_output_field(SGIMACEVideoState *s)
+{
+    MVPChannelState *ch = &s->vout;
+    uint16_t pages[MVP_MAX_PAGES];
+    unsigned fmt, stride, lines, bpp;
+    size_t frame_size, field_base = 0, got;
+    bool interleaved;
+    uint8_t *tmp;
+
+    if (!ch->dma_running) {
+        return;
+    }
+    /*
+     * No valid descriptor means the next field is skipped (spec TABLE
+     * 13); leave DMA enabled and wait for the driver to arm the next one.
+     */
+    if (!mvp_fetch_pages(ch, pages)) {
+        return;
+    }
+
+    lines = (ch->line_width >> 12) & 0x3ff;
+    stride = ch->line_width & 0xff8;
+    /* Output CONFIG pixel format is bits[16:14] (MACE spec TABLE 11),
+     * not the input [12:10]; the same 3-bit encoding otherwise. */
+    fmt = (ch->config >> 14) & 7;
+    bpp = mvp_format_bpp(fmt);
+    if (stride == 0) {
+        stride = (fmt == MVP_FORMAT_YUV422) ? 1280 : 2560;
+    }
+    if (lines == 0) {
+        lines = 240;
+    }
+    frame_size = (size_t)stride * lines;
+    /* Output interleaved mode: CONFIG bit20 INTERLEAVED, MEM_MODE bit21. */
+    interleaved = (ch->config & (1u << 20)) &&
+                  (((ch->config >> 21) & 1) == 0);
+
+    tmp = g_malloc(frame_size);
+    memset(tmp, 0, frame_size);
+
+    if (interleaved) {
+        unsigned p = ch->field_parity & 1;
+        size_t pitch = (size_t)stride * 2;
+        unsigned y;
+
+        field_base = (p == 1)
+            ? (ch->flofs_odd_valid ? ch->flofs_odd : ch->field_offset)
+            : (ch->flofs_even_valid ? ch->flofs_even : ch->field_offset);
+        got = 0;
+        for (y = 0; y < lines; y++) {
+            got += mvp_pages_read(pages, tmp + (size_t)y * stride, stride,
+                                  field_base + (size_t)y * pitch);
+        }
+    } else {
+        got = mvp_pages_read(pages, tmp, frame_size, ch->field_offset);
+    }
+
+    /* Hardware zeroes the descriptor Valid bit once it has been copied. */
+    ch->next_desc &= ~(uint64_t)MVP_NDA_VALID;
+
+    if (got == 0) {
+        g_free(tmp);
+        return;
+    }
+
+    if (qemu_chr_fe_get_driver(&s->sink.video_out)) {
+        uint8_t hdr[20];
+        unsigned width = stride / bpp;
+        uint32_t fourcc = mvp_format_fourcc(fmt);
+
+        stl_be_p(hdr, MVP_FRAME_MAGIC);
+        stl_be_p(hdr + 4, width);
+        stl_be_p(hdr + 8, lines);
+        stl_be_p(hdr + 12, fourcc);
+        stl_be_p(hdr + 16, got);
+        qemu_chr_fe_write_all(&s->sink.video_out, hdr, sizeof(hdr));
+        qemu_chr_fe_write_all(&s->sink.video_out, tmp, got);
+        s->sink.frames_sent++;
+    }
+    g_free(tmp);
+
+    trace_sgi_mace_video_vout_field(fmt, stride, lines, got, frame_size,
+                                    interleaved ? 1 : 0, field_base);
+    ch->status |= MVP_STATUS_DMA_COMPLETE;
+}
+
 static void mvp_field_tick(void *opaque)
 {
     SGIMACEVideoState *s = opaque;
@@ -517,13 +684,22 @@ static void mvp_field_tick(void *opaque)
         ch->ust = mvp_ust_now();
         mvp_update_irq(s, i);
     }
-    /* VOUT raises its frame/vsync interrupt but performs no capture. */
-    if (s->vout.dma_running) {
-        s->vout.msc++;
-        s->vout.ust = mvp_ust_now();
-        s->vout.status |= MVP_STATUS_VERTICAL_SYNC;
-        mvp_update_irq(s, MVP_CRIME_IRQ_VOUT);
-    }
+    /*
+     * @@SEMANTICS@@ VOUT's timing generator free-runs exactly like the
+     * input channels: the output field boundary (VSYNC) and the VOUT
+     * frame counter/UST advance every field period whether or not output
+     * DMA is enabled.  The mvp driver arms the output channel by enabling
+     * only the VSYNC interrupt and then waits for the frontier MSC before
+     * programming the descriptor DMA, so gating the tick on ENABLE_DMA
+     * (as this used to) starved it of the handshake and the driver never
+     * armed the output transfer.  The interrupt line itself still follows
+     * CONTROL.ENABLE_VERTSYNC via mvp_update_irq.
+     */
+    mvp_output_field(s);
+    s->vout.msc++;
+    s->vout.ust = mvp_ust_now();
+    s->vout.status |= MVP_STATUS_VERTICAL_SYNC;
+    mvp_update_irq(s, MVP_CRIME_IRQ_VOUT);
 
     timer_mod(s->field_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MVP_FIELD_PERIOD_NS);
@@ -952,6 +1128,100 @@ static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
     }
 }
 
+static void mvp_video_out_helper_exit(GPid pid, gint status, gpointer opaque)
+{
+    MVPVideoSink *out = opaque;
+
+    g_spawn_close_pid(pid);
+    if (out->helper_pid == pid) {
+        out->helper_pid = 0;
+        out->helper_watch = 0;
+        g_free(out->helper_source);
+        out->helper_source = NULL;
+        out->helper_is_url = false;
+    }
+}
+
+static void mvp_video_out_detach(SGIMACEVideoState *s)
+{
+    MVPVideoSink *out = &s->sink;
+    GPid pid = out->helper_pid;
+    int i;
+
+    if (out->helper_watch) {
+        g_source_remove(out->helper_watch);
+        out->helper_watch = 0;
+    }
+    out->helper_pid = 0;
+    g_free(out->helper_source);
+    out->helper_source = NULL;
+    out->helper_is_url = false;
+
+    if (pid <= 0) {
+        return;
+    }
+    kill(pid, SIGTERM);
+    for (i = 0; i < 50; i++) {
+        if (waitpid(pid, NULL, WNOHANG) == pid) {
+            g_spawn_close_pid(pid);
+            return;
+        }
+        g_usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    g_spawn_close_pid(pid);
+}
+
+static bool mvp_video_out_attach(SGIMACEVideoState *s, const char *source,
+                                 bool is_url, Error **errp)
+{
+    MVPVideoSink *out = &s->sink;
+    char *argv[8];
+    GError *err = NULL;
+
+    if (!out->video_helper) {
+        error_setg(errp, "no helper configured for vout: pass "
+                   "-global sgi-mace-video.video-helper-out=<wrapper>");
+        return false;
+    }
+    if (!out->video_out_path) {
+        error_setg(errp, "no video-out path configured for vout: pass "
+                   "-global sgi-mace-video.video-out-path=<socket>");
+        return false;
+    }
+    if (!source || !*source) {
+        error_setg(errp, "empty video output destination");
+        return false;
+    }
+
+    mvp_video_out_detach(s);
+
+    argv[0] = out->video_helper;
+    argv[1] = (char *)"--socket";
+    argv[2] = out->video_out_path;
+    argv[3] = (char *)"--source";
+    argv[4] = (char *)source;
+    argv[5] = is_url ? (char *)"--url" : NULL;
+    argv[6] = NULL;
+
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_DO_NOT_REAP_CHILD |
+                       G_SPAWN_STDOUT_TO_DEV_NULL |
+                       G_SPAWN_STDERR_TO_DEV_NULL,
+                       NULL, NULL, &out->helper_pid, &err)) {
+        error_setg(errp, "cannot launch video sink helper '%s': %s",
+                   out->video_helper, err->message);
+        g_error_free(err);
+        return false;
+    }
+    out->helper_watch = g_child_watch_add(out->helper_pid,
+                                          mvp_video_out_helper_exit, out);
+    out->helper_source = g_strdup(source);
+    out->helper_is_url = is_url;
+    return true;
+}
+
 static void mvp_video_detach(SGIVideoSource *src, const char *input)
 {
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
@@ -960,6 +1230,10 @@ static void mvp_video_detach(SGIVideoSource *src, const char *input)
     GPid pid;
     int i;
 
+    if (input && (!strcmp(input, "vout") || !strcmp(input, "3"))) {
+        mvp_video_out_detach(s);
+        return;
+    }
     if (idx < 0) {
         return;
     }
@@ -1002,8 +1276,11 @@ static bool mvp_video_attach(SGIVideoSource *src, const char *input,
     char *argv[8];
     GError *err = NULL;
 
+    if (input && (!strcmp(input, "vout") || !strcmp(input, "3"))) {
+        return mvp_video_out_attach(s, source, is_url, errp);
+    }
     if (idx < 0) {
-        error_setg(errp, "unknown video input '%s' (use vin1 or vin2)",
+        error_setg(errp, "unknown video input '%s' (use vin1, vin2 or vout)",
                    input ? input : "");
         return false;
     }
@@ -1057,6 +1334,9 @@ static bool mvp_video_is_attached(SGIVideoSource *src, const char *input)
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
     int idx = mvp_video_input_index(input);
 
+    if (input && (!strcmp(input, "vout") || !strcmp(input, "3"))) {
+        return s->sink.helper_pid > 0;
+    }
     return idx >= 0 && s->input[idx].helper_pid > 0;
 }
 
@@ -1065,6 +1345,9 @@ static const char *mvp_video_describe(SGIVideoSource *src, const char *input)
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
     int idx = mvp_video_input_index(input);
 
+    if (input && (!strcmp(input, "vout") || !strcmp(input, "3"))) {
+        return s->sink.helper_source;
+    }
     return idx >= 0 ? s->input[idx].helper_source : NULL;
 }
 
@@ -1224,6 +1507,12 @@ static const Property sgi_mace_video_properties[] = {
                        input[1].video_helper),
     DEFINE_PROP_STRING("video-in2-path", SGIMACEVideoState,
                        input[1].video_in_path),
+    /* VOUT host sink (o2 video-out; reverse of the inputs) */
+    DEFINE_PROP_CHR("video-out", SGIMACEVideoState, sink.video_out),
+    DEFINE_PROP_STRING("video-helper-out", SGIMACEVideoState,
+                       sink.video_helper),
+    DEFINE_PROP_STRING("video-out-path", SGIMACEVideoState,
+                       sink.video_out_path),
 };
 
 static const VMStateDescription vmstate_sgi_mace_video_chan = {

@@ -2220,12 +2220,16 @@ static void gd_video_show_error(GtkDisplayState *s, Error *err)
 }
 
 /*
- * The two MACE video inputs, in channel order.  The menu is built once
- * with a group of attach/URL/detach items per input; each item carries
- * its input index so the handlers stay generic.
+ * The MACE video endpoints, in channel order: the two inputs and the
+ * output.  The menu is built once with a group of attach/detach items per
+ * endpoint; each item carries its index so the handlers stay generic.  The
+ * VOUT endpoint is a sink (record the guest's video output) rather than a
+ * source, so it has no stream-URL item and its file chooser selects an
+ * output folder.
  */
-static const char *const gd_video_inputs[2] = { "vin1", "vin2" };
-static const char *const gd_video_input_labels[2] = { "VIN1", "VIN2" };
+static const char *const gd_video_inputs[3] = { "vin1", "vin2", "vout" };
+static const char *const gd_video_input_labels[3] = { "VIN1", "VIN2", "VOUT" };
+static const bool gd_video_input_is_output[3] = { false, false, true };
 
 static int gd_video_item_input(GtkMenuItem *item)
 {
@@ -2244,7 +2248,9 @@ static void gd_video_update_input(GtkDisplayState *s, int idx)
     desc = vsc->describe(s->video_src, input);
 
     gtk_widget_set_sensitive(s->video_attach_item[idx], !attached);
-    gtk_widget_set_sensitive(s->video_url_item[idx], !attached);
+    if (s->video_url_item[idx]) {
+        gtk_widget_set_sensitive(s->video_url_item[idx], !attached);
+    }
     gtk_widget_set_sensitive(s->video_detach_item[idx], attached);
 
     if (attached) {
@@ -2252,7 +2258,8 @@ static void gd_video_update_input(GtkDisplayState *s, int idx)
                                 desc ? desc : _("attached"));
     } else {
         label = g_strdup_printf("%s: %s", gd_video_input_labels[idx],
-                                _("no source"));
+                                gd_video_input_is_output[idx] ?
+                                _("no sink") : _("no source"));
     }
     gtk_menu_item_set_label(GTK_MENU_ITEM(s->video_status_item[idx]), label);
     g_free(label);
@@ -2265,7 +2272,7 @@ static void gd_video_update(GtkDisplayState *s)
     if (!s->video_src) {
         return;
     }
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < 3; i++) {
         gd_video_update_input(s, i);
     }
 }
@@ -2275,16 +2282,21 @@ static void gd_video_attach_file(GtkMenuItem *item, void *opaque)
     GtkDisplayState *s = opaque;
     int idx = gd_video_item_input(item);
     SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
-    g_autofree char *title = g_strdup_printf(_("Attach video to %s"),
-                                             gd_video_input_labels[idx]);
+    bool is_out = gd_video_input_is_output[idx];
+    g_autofree char *title = is_out
+        ? g_strdup_printf(_("Record %s to folder"),
+                          gd_video_input_labels[idx])
+        : g_strdup_printf(_("Attach video to %s"),
+                          gd_video_input_labels[idx]);
     GtkWidget *dialog;
     Error *err = NULL;
 
     dialog = gtk_file_chooser_dialog_new(
         title, GTK_WINDOW(s->window),
-        GTK_FILE_CHOOSER_ACTION_OPEN,
+        is_out ? GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER
+               : GTK_FILE_CHOOSER_ACTION_OPEN,
         _("_Cancel"), GTK_RESPONSE_CANCEL,
-        _("_Attach"), GTK_RESPONSE_ACCEPT, NULL);
+        is_out ? _("_Record") : _("_Attach"), GTK_RESPONSE_ACCEPT, NULL);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
@@ -2361,16 +2373,19 @@ static GtkWidget *gd_create_menu_video(GtkDisplayState *s)
     video_menu = gtk_menu_new();
     gtk_menu_set_accel_group(GTK_MENU(video_menu), s->accel_group);
 
-    for (i = 0; i < 2; i++) {
-        g_autofree char *attach_label = g_strdup_printf(
-            _("Attach Video File to %s..."), gd_video_input_labels[i]);
+    for (i = 0; i < 3; i++) {
+        bool is_out = gd_video_input_is_output[i];
+        g_autofree char *attach_label = is_out
+            ? g_strdup_printf(_("Record Video Output to Folder..."))
+            : g_strdup_printf(_("Attach Video File to %s..."),
+                              gd_video_input_labels[i]);
         g_autofree char *url_label = g_strdup_printf(
             _("Attach Stream _URL to %s..."), gd_video_input_labels[i]);
+        g_autofree char *detach_label = g_strdup_printf(
+            _("_Detach %s"), gd_video_input_labels[i]);
 
-        if (i > 0) {
-            separator = gtk_separator_menu_item_new();
-            gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), separator);
-        }
+        separator = gtk_separator_menu_item_new();
+        gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), separator);
 
         s->video_status_item[i] = gtk_menu_item_new_with_label("");
         gtk_widget_set_sensitive(s->video_status_item[i], FALSE);
@@ -2381,12 +2396,15 @@ static GtkWidget *gd_create_menu_video(GtkDisplayState *s)
         gd_video_menu_item(s, video_menu, i, s->video_attach_item[i],
                            G_CALLBACK(gd_video_attach_file));
 
-        s->video_url_item[i] = gtk_menu_item_new_with_mnemonic(url_label);
-        gd_video_menu_item(s, video_menu, i, s->video_url_item[i],
-                           G_CALLBACK(gd_video_attach_url));
+        if (is_out) {
+            s->video_url_item[i] = NULL;
+        } else {
+            s->video_url_item[i] = gtk_menu_item_new_with_mnemonic(url_label);
+            gd_video_menu_item(s, video_menu, i, s->video_url_item[i],
+                               G_CALLBACK(gd_video_attach_url));
+        }
 
-        s->video_detach_item[i] = gtk_menu_item_new_with_mnemonic(
-            i == 0 ? _("_Detach VIN1") : _("_Detach VIN2"));
+        s->video_detach_item[i] = gtk_menu_item_new_with_mnemonic(detach_label);
         gd_video_menu_item(s, video_menu, i, s->video_detach_item[i],
                            G_CALLBACK(gd_video_detach));
     }

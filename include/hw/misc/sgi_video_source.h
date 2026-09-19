@@ -7,6 +7,11 @@
  * its "Video" menu without knowing which machine or device is in use;
  * machines whose devices do not implement it simply get no menu.
  *
+ * The same interface also covers a video *output* endpoint: an input name
+ * the implementation recognises as an output (the O2 uses "vout") is a
+ * sink, so @source names a host destination and the implementation records
+ * the guest's outgoing video rather than feeding an input.
+ *
  * The interface is deliberately UI-agnostic: an implementation starts and
  * stops whatever external decoder it needs, and the UI only asks it to
  * attach a named input, detach it, and report the current state.

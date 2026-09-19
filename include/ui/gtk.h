@@ -110,10 +110,10 @@ struct GtkDisplayState {
 
     GtkWidget *video_menu_item;
     GtkWidget *video_menu;
-    GtkWidget *video_attach_item[2];
-    GtkWidget *video_url_item[2];
-    GtkWidget *video_detach_item[2];
-    GtkWidget *video_status_item[2];
+    GtkWidget *video_attach_item[3];
+    GtkWidget *video_url_item[3];
+    GtkWidget *video_detach_item[3];
+    GtkWidget *video_status_item[3];
     SGIVideoSource *video_src;
 
     GtkWidget *view_menu_item;

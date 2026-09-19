@@ -1949,7 +1949,7 @@ ERST
         .name       = "video_attach",
         .args_type  = "input:s,source:s",
         .params     = "input source",
-        .help       = "attach a host video file/stream to a MACE video input through the sgi-video-source interface",
+        .help       = "attach a host source to a MACE video input, or a host destination to the video output (sgi-video-source interface)",
         .cmd        = hmp_video_attach,
     },
 
@@ -1958,23 +1958,29 @@ SRST
   Attach a host media *source* (a local file path, or a stream URL if it
   contains ``://``) to the MACE video input named *input* (``vin1`` or
   ``vin2``), spawning the external decoder helper configured with
-  ``-global sgi-mace-video.video-helper[N]``.  Arguments are positional
-  (HMP style), e.g. ``video_attach vin2 /path/clip.mkv``.  Works headless
-  (``-display none``); reaches the guest through the same device logic the
-  GTK *Video* menu uses.
+  ``-global sgi-mace-video.video-helper[N]``.  For ``input`` = ``vout``
+  the semantics are reversed: *source* is a host destination
+  (file/directory) and the helper configured with
+  ``-global sgi-mace-video.video-helper-out`` records the frames the guest
+  sends to the O2 video-output (SAA7185) path.  Arguments are positional
+  (HMP style), e.g. ``video_attach vin2 /path/clip.mkv`` or
+  ``video_attach vout /path/outdir``.  Works headless (``-display none``);
+  reaches the guest through the same device logic the GTK *Video* menu
+  uses.
 ERST
 
     {
         .name       = "video_detach",
         .args_type  = "input:s",
         .params     = "input",
-        .help       = "detach the host video source from a MACE video input",
+        .help       = "detach the host source/sink from a MACE video input or the video output",
         .cmd        = hmp_video_detach,
     },
 
 SRST
 ``video_detach`` *input*
-  Stop the decoder helper attached to the MACE video input named *input*
+  Stop the helper attached to the MACE video input named *input*
   (``vin1`` or ``vin2``); the guest reverts to the internal test pattern.
+  For ``input`` = ``vout`` it stops the video-output sink helper.
 ERST
 #endif
