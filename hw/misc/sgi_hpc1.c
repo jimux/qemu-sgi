@@ -30,6 +30,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "system/address-spaces.h"
 
 #define HPC1_MMIO_SIZE 0x10000
 
@@ -245,6 +246,151 @@ static void hpc1_scsi_irq(void *opaque, int n, int level)
         s->lio_status[0] &= ~LIO0_SCSI;
     }
     int2_update(s);
+}
+
+/* ------------------------------------------------------------------ */
+/* HPC1 SCSI DMA engine (WD33C93 <-> memory descriptor chains)         */
+/* ------------------------------------------------------------------ */
+
+#define HPC1_SCSI_BUFADDR 0x0fffffffU
+#define HPC1_SCSI_EOX     0x80000000U
+#define HPC1_SCSI_BC_MASK 0x1fffU
+
+#define SCSI_CTRL_RESET   0x01
+#define SCSI_CTRL_FLUSH   0x02
+#define SCSI_CTRL_TO_MEM  0x10
+#define SCSI_CTRL_START   0x80
+
+static void hpc1_scsi_chain(SGIHPC1State *s)
+{
+    uint32_t bdp = s->scsi_nbdp & HPC1_SCSI_BUFADDR;
+
+    s->scsi_bc = address_space_ldl_be(&address_space_memory, bdp,
+                                      MEMTXATTRS_UNSPECIFIED, NULL) &
+                 HPC1_SCSI_BC_MASK;
+    s->scsi_cbp = address_space_ldl_be(&address_space_memory, bdp + 4,
+                                       MEMTXATTRS_UNSPECIFIED, NULL) &
+                  (HPC1_SCSI_EOX | HPC1_SCSI_BUFADDR);
+    s->scsi_nbdp = address_space_ldl_be(&address_space_memory, bdp + 8,
+                                        MEMTXATTRS_UNSPECIFIED, NULL) &
+                   HPC1_SCSI_BUFADDR;
+    s->scsi_dma_count = s->scsi_bc;
+}
+
+static void hpc1_scsi_dma_run(SGIHPC1State *s)
+{
+    WD33C93State *wdc = s->scsi;
+
+    while (wdc && wdc->async_len > 0 && s->scsi_dma_active) {
+        uint32_t chunk;
+
+        if (s->scsi_dma_count == 0) {
+            if (s->scsi_cbp & HPC1_SCSI_EOX) {
+                s->scsi_dma_active = false;
+                s->scsi_ctrl &= ~SCSI_CTRL_START;
+                break;
+            }
+            hpc1_scsi_chain(s);
+            if (s->scsi_dma_count == 0) {
+                break;
+            }
+        }
+
+        chunk = MIN(wdc->async_len, s->scsi_dma_count);
+        if (wdc->transfer_count > 0) {
+            chunk = MIN(chunk, wdc->transfer_count);
+        }
+        if (chunk == 0) {
+            break;
+        }
+
+        if (s->scsi_dma_to_device) {
+            address_space_read(&address_space_memory,
+                               s->scsi_cbp & HPC1_SCSI_BUFADDR,
+                               MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
+        } else {
+            address_space_write(&address_space_memory,
+                                s->scsi_cbp & HPC1_SCSI_BUFADDR,
+                                MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
+        }
+        s->scsi_cbp += chunk;
+        wdc->async_buf += chunk;
+        wdc->async_len -= chunk;
+        s->scsi_dma_count -= chunk;
+        if (wdc->transfer_count > 0) {
+            wdc->transfer_count -= chunk;
+            wd33c93_set_transfer_count(wdc, wdc->transfer_count);
+        }
+
+        if (s->scsi_dma_count == 0) {
+            if (s->scsi_cbp & HPC1_SCSI_EOX) {
+                s->scsi_dma_active = false;
+                s->scsi_ctrl &= ~SCSI_CTRL_START;
+            } else {
+                hpc1_scsi_chain(s);
+            }
+        }
+    }
+
+    if (wdc && wdc->current_req &&
+        (wdc->async_len == 0 || wdc->transfer_count == 0)) {
+        wd33c93_set_drq(wdc, false);
+        s->scsi_drq = false;
+        if (wdc->transfer_count == 0 && wdc->pending_len > 0) {
+            wdc->async_len = 0;
+            wdc->async_buf = NULL;
+            wdc->aux_status &= ~(ASR_DBR | ASR_CIP | ASR_BSY);
+            wdc->regs[WD_COMMAND_PHASE] = 0x46;
+            wdc->scsi_status = s->scsi_dma_to_device
+                               ? SCSI_STATUS_UNEX_RDATA
+                               : SCSI_STATUS_UNEX_SDATA;
+            wdc->aux_status |= ASR_INT;
+            qemu_irq_raise(wdc->irq);
+        } else {
+            if (wdc->async_len > 0) {
+                wdc->async_len = 0;
+                wdc->async_buf = NULL;
+            }
+            scsi_req_continue(wdc->current_req);
+        }
+    }
+}
+
+static void hpc1_scsi_drq(void *opaque, int n, int level)
+{
+    SGIHPC1State *s = SGI_HPC1(opaque);
+
+    s->scsi_drq = !!level;
+    if (level && s->scsi_dma_active) {
+        hpc1_scsi_dma_run(s);
+    }
+}
+
+static void hpc1_scsi_ctrl_write(SGIHPC1State *s, uint32_t val)
+{
+    if (val & SCSI_CTRL_RESET) {
+        s->scsi_ctrl = val & ~(SCSI_CTRL_RESET | SCSI_CTRL_FLUSH);
+        s->scsi_dma_active = false;
+        return;
+    }
+
+    s->scsi_ctrl = val & ~SCSI_CTRL_FLUSH;
+    s->scsi_dma_active = !!(val & SCSI_CTRL_START);
+    s->scsi_dma_to_device = !!(val & SCSI_CTRL_TO_MEM);
+
+    /*
+     * Do NOT re-fetch the chain here: the descriptor is loaded when the
+     * PROM writes NBDP (matching MAME hpc1 scsi_nbdp_w -> scsi_chain).
+     */
+    if (s->scsi_dma_active && s->scsi_drq) {
+        hpc1_scsi_dma_run(s);
+    }
+
+    if (val & SCSI_CTRL_FLUSH) {
+        s->scsi_dma_count = 0;
+        s->scsi_dma_active = false;
+        s->scsi_ctrl &= ~(SCSI_CTRL_START | SCSI_CTRL_FLUSH);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -802,8 +948,17 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
     if (addr >= HPC1_AUX && addr < HPC1_AUX + 4) {
         return hpc1_aux_read(s);
     }
-    if (addr >= HPC1_SCSI_CTRL && addr < HPC1_SCSI_CTRL + 4) {
-        return s->scsi_ctrl;
+    if (addr >= 0x88 && addr < 0x98) {
+        switch (addr & ~3ULL) {
+        case 0x88:
+            return s->scsi_dma_count & HPC1_SCSI_BC_MASK;
+        case 0x8c:
+            return s->scsi_cbp;
+        case 0x90:
+            return s->scsi_nbdp;
+        default: /* 0x94 */
+            return s->scsi_ctrl;
+        }
     }
 
     if (addr + size <= sizeof(s->core_scratch)) {
@@ -924,8 +1079,23 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
         hpc1_aux_write(s, val8);
         return;
     }
-    if (addr >= HPC1_SCSI_CTRL && addr < HPC1_SCSI_CTRL + 4) {
-        s->scsi_ctrl = value;
+    if (addr >= 0x88 && addr < 0x98) {
+        switch (addr & ~3ULL) {
+        case 0x88:
+            s->scsi_bc = value & HPC1_SCSI_BC_MASK;
+            s->scsi_dma_count = s->scsi_bc;
+            break;
+        case 0x8c:
+            s->scsi_cbp = value;
+            break;
+        case 0x90:
+            s->scsi_nbdp = value & HPC1_SCSI_BUFADDR;
+            hpc1_scsi_chain(s);
+            break;
+        default: /* 0x94 */
+            hpc1_scsi_ctrl_write(s, value);
+            break;
+        }
         return;
     }
     if (addr >= 0x188 && addr < 0x18c) {
@@ -1020,6 +1190,10 @@ static void sgi_hpc1_reset(DeviceState *dev)
     s->scsi_bc = 0;
     s->scsi_cbp = 0;
     s->scsi_nbdp = 0;
+    s->scsi_dma_count = 0;
+    s->scsi_dma_active = false;
+    s->scsi_dma_to_device = false;
+    s->scsi_drq = false;
     s->dsp_bc = 0;
     s->seeq_rx_cmd = 0;
     s->seeq_tx_cmd = 0;
@@ -1073,12 +1247,15 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_out_named(dev, s->cpu_irq, "cpu-irq", 2);
     qdev_init_gpio_out_named(dev, s->timer_irq, "timer-irq", 2);
     qdev_init_gpio_in_named(dev, hpc1_scsi_irq, "scsi-irq", 1);
+    qdev_init_gpio_in_named(dev, hpc1_scsi_drq, "scsi-drq", 1);
 
     /* WD33C93 SCSI controller */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
     qdev_realize(DEVICE(s->scsi), NULL, &error_fatal);
     qdev_connect_gpio_out_named(DEVICE(s->scsi), "irq", 0,
                                 qdev_get_gpio_in_named(dev, "scsi-irq", 0));
+    qdev_connect_gpio_out_named(DEVICE(s->scsi), "drq", 0,
+                                qdev_get_gpio_in_named(dev, "scsi-drq", 0));
 
     /* 93C56 NVRAM (128 x 16-bit words) */
     hpc1_nvram_load(s);

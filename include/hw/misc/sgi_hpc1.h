@@ -71,6 +71,10 @@ struct SGIHPC1State {
     uint32_t scsi_bc;
     uint32_t scsi_cbp;
     uint32_t scsi_nbdp;
+    uint32_t scsi_dma_count;
+    bool scsi_dma_active;
+    bool scsi_dma_to_device;
+    bool scsi_drq;
     uint32_t dsp_bc;
 
     /* Scratch for the parallel / DSP-interface register RAM areas */
