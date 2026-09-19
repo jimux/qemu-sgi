@@ -82,8 +82,13 @@
 /* Hub widget identification: part 0xc101 (hub). */
 #define HUB_WIDGET_PART_NUM 0xc101
 #define HUB_WIDGET_REV 1
-/* IIO_ILCSR: link status field [17:16], LNK_STAT_WORKING = 2. */
-#define IIO_ILCSR_LINK_WORKING (2ULL << 16)
+/*
+ * IIO_ILCSR.  FUN_bfc56ac0 (the PROM's IOC3 finder) selects the IOC3 console
+ * only if, for the local node, (ILCSR >> 12) & 2 (bit13, LLP status "up") and
+ * the sign of (ILCSR << 53) (bit10, LLP enable) are both set.  Also set the
+ * hub's own lnk_stat field (bits 17:16) since other paths read it.
+ */
+#define IIO_ILCSR_LINK_WORKING ((2ULL << 16) | (1ULL << 13) | (1ULL << 10))
 /* IIO_WCR widget id field [3:0]. */
 #define HUB_XIO_WIDGET_ID 8
 
@@ -389,14 +394,13 @@ static void sgi_hub_ii_write(SGIHubState *s, hwaddr off, uint64_t val) {
   }
 }
 
-static uint64_t sgi_hub_read(void *opaque, hwaddr addr, unsigned size) {
-  SGIHubState *s = opaque;
-  hwaddr off = addr & (SGI_HUB_WINDOW_SIZE - 1);
-
-  if (off >= SGI_HUB_REMOTE_ALIAS) {
-    off -= SGI_HUB_REMOTE_ALIAS;
-  }
-
+/*
+ * Hub registers are 64-bit but the PROM and kernel also access them as 32-bit
+ * halves (big-endian: base+0 is the high word, base+4 the low word).  We model
+ * the 64-bit register and fold 32-bit accesses onto it, otherwise a low-word
+ * read (e.g. IIO_ILCSR's link status) silently returns 0.
+ */
+static uint64_t sgi_hub_read_off(SGIHubState *s, hwaddr off) {
   if (off < SGI_HUB_MD_BASE) {
     return sgi_hub_pi_read(s, off - SGI_HUB_PI_BASE);
   } else if (off < SGI_HUB_II_BASE) {
@@ -408,6 +412,32 @@ static uint64_t sgi_hub_read(void *opaque, hwaddr addr, unsigned size) {
   }
 }
 
+static void sgi_hub_write_off(SGIHubState *s, hwaddr off, uint64_t val) {
+  if (off < SGI_HUB_MD_BASE) {
+    sgi_hub_pi_write(s, off - SGI_HUB_PI_BASE, val, 8);
+  } else if (off < SGI_HUB_II_BASE) {
+    sgi_hub_md_write(s, off, val, 8);
+  } else if (off < SGI_HUB_NI_BASE) {
+    sgi_hub_ii_write(s, off, val);
+  } else {
+    sgi_hub_ni_write(s, off, val, 8);
+  }
+}
+
+static uint64_t sgi_hub_read(void *opaque, hwaddr addr, unsigned size) {
+  SGIHubState *s = opaque;
+  hwaddr off = addr & (SGI_HUB_WINDOW_SIZE - 1);
+
+  if (off >= SGI_HUB_REMOTE_ALIAS) {
+    off -= SGI_HUB_REMOTE_ALIAS;
+  }
+  if (size == 4) {
+    uint64_t full = sgi_hub_read_off(s, off & ~7ULL);
+    return (off & 4) ? (full & 0xffffffffULL) : (full >> 32);
+  }
+  return sgi_hub_read_off(s, off);
+}
+
 static void sgi_hub_write(void *opaque, hwaddr addr, uint64_t val,
                           unsigned size) {
   SGIHubState *s = opaque;
@@ -416,16 +446,17 @@ static void sgi_hub_write(void *opaque, hwaddr addr, uint64_t val,
   if (off >= SGI_HUB_REMOTE_ALIAS) {
     off -= SGI_HUB_REMOTE_ALIAS;
   }
-
-  if (off < SGI_HUB_MD_BASE) {
-    sgi_hub_pi_write(s, off - SGI_HUB_PI_BASE, val, size);
-  } else if (off < SGI_HUB_II_BASE) {
-    sgi_hub_md_write(s, off, val, size);
-  } else if (off < SGI_HUB_NI_BASE) {
-    sgi_hub_ii_write(s, off, val);
-  } else {
-    sgi_hub_ni_write(s, off, val, size);
+  if (size == 4) {
+    uint64_t cur = sgi_hub_read_off(s, off & ~7ULL);
+    if (off & 4) {
+      cur = (cur & 0xffffffff00000000ULL) | (val & 0xffffffffULL);
+    } else {
+      cur = (cur & 0xffffffffULL) | ((val & 0xffffffffULL) << 32);
+    }
+    sgi_hub_write_off(s, off & ~7ULL, cur);
+    return;
   }
+  sgi_hub_write_off(s, off, val);
 }
 
 static const MemoryRegionOps sgi_hub_ops = {
