@@ -252,12 +252,18 @@ static void sgi_ip27_init(MachineState *machine) {
                            0, machine->ram_size);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_UNCAC_BASE),
                               ram_uncac);
+  create_unimplemented_device("ip27-uncac-high",
+                              ip27_phys(IP27_UNCAC_BASE) + machine->ram_size,
+                              IP27_NODE_SIZE - machine->ram_size);
 
   ram_mspec = g_new(MemoryRegion, 1);
   memory_region_init_alias(ram_mspec, NULL, "sgi-ip27.ram.mspec", ram, 0,
                            machine->ram_size);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_MSPEC_BASE),
                               ram_mspec);
+  create_unimplemented_device("ip27-mspec-high",
+                              ip27_phys(IP27_MSPEC_BASE) + machine->ram_size,
+                              IP27_NODE_SIZE - machine->ram_size);
 
   /* Hub ASIC in the node's widget-1 small window. */
   hub = qdev_new(TYPE_SGI_HUB);
@@ -303,6 +309,21 @@ static void sgi_ip27_init(MachineState *machine) {
   create_unimplemented_device("ip27-rboot",
                               ip27_phys(IP27_HSPEC_BASE + 0x30000000ULL),
                               0x10000000ULL);
+
+  /*
+   * Hub back-door space (HSPEC + 0x80000000: BDDIR/BDPRT/BDECC directory,
+   * protection and ECC byte arrays).  The PROM initialises and tests the
+   * memory directory through it; back it with RAM so the pattern writes
+   * round-trip.
+   */
+  {
+    MemoryRegion *bdoor = g_new(MemoryRegion, 1);
+    memory_region_init_ram(bdoor, NULL, "sgi-ip27.bdoor", 0x80000000ULL,
+                           &error_fatal);
+    memory_region_add_subregion(system_memory,
+                                ip27_phys(IP27_HSPEC_BASE + 0x80000000ULL),
+                                bdoor);
+  }
 
   hub_state = SGI_HUB(hub);
   {
