@@ -741,6 +741,60 @@ static void hpc1_nvram_load(SGIHPC1State *s)
     fclose(f);
 }
 
+/* SGI NVRAM checksum: seed 0xa5, XOR each non-zero byte, rotate on odd. */
+static uint8_t hpc1_nvram_checksum(const uint8_t *table, int len)
+{
+    int8_t checksum = (int8_t)0xa5;
+    int i;
+
+    for (i = 0; i < len; i++) {
+        if (i != 0) {
+            checksum ^= (int8_t)table[i];
+        }
+        if (i & 1) {
+            checksum = (checksum << 1) | ((uint8_t)checksum >> 7);
+        }
+    }
+    return (uint8_t)checksum;
+}
+
+/*
+ * IP20 NVRAM layout (sys/IP20nvram.h) -- offsets match the HPC3 family.
+ * AutoLoad is set to 'N' so a diskless/blank system lands on the System
+ * Maintenance Menu instead of looping through an autoboot that fails.
+ */
+static void hpc1_nvram_init_defaults(SGIHPC1State *s)
+{
+    uint8_t t[256];
+    int i;
+
+    memset(t, 0, sizeof(t));
+    t[1] = 6;                    /* NV_CURRENT_REV */
+    t[2] = 'd';                  /* console = serial */
+    memcpy(&t[4], "scsi(0)disk(4)rdisk(0)partition(8)", 32);  /* SystemPartition: CD */
+    memcpy(&t[52], "sashARCS", 8);   /* OSLoader */
+    memcpy(&t[130], "scsi(0)disk(4)rdisk(0)partition(8)", 32); /* OSLoadPartition */
+    memcpy(&t[116], "9600", 4);  /* dbaud */
+    memcpy(&t[128], "PST8PDT", 7); /* timezone */
+    t[121] = '0';                /* diskless */
+    t[178] = 'Y';                /* autoload */
+    t[232] = '8';
+    t[233] = '0';                /* volume */
+    t[236] = 'y';                /* sgilogo */
+    t[240] = 'h';                /* monitor */
+    t[250] = 0x08;
+    t[251] = 0x00;
+    t[252] = 0x69;               /* SGI OUI */
+    t[253] = 0x12;
+    t[254] = 0x34;
+    t[255] = 0x56;
+    t[0] = hpc1_nvram_checksum(t, sizeof(t));
+
+    for (i = 0; i < 128; i++) {
+        s->nvram[i] = (t[i * 2] << 8) | t[i * 2 + 1];
+    }
+}
+
 /*
  * 93C56 Microwire bit engine.
  *
@@ -1140,18 +1194,23 @@ static const MemoryRegionOps sgi_hpc1_ops = {
 static int sgi_hpc1_serial_can_receive(void *opaque)
 {
     SGIHPC1State *s = opaque;
-    return HPC1_RX_FIFO_SIZE - s->uart[2][0].rx_count;
+    return HPC1_RX_FIFO_SIZE - s->uart[1][1].rx_count;
 }
 
 static void sgi_hpc1_serial_receive(void *opaque, const uint8_t *buf, int size)
 {
     SGIHPC1State *s = opaque;
     int i, d, c;
-    const int targets[][2] = { { 2, 0 }, { 0, 0 } };
+    /*
+     * The IP20 PROM's console input is DUART1 channel B (it polls that
+     * channel's RR0); DUART0A/2A also carry early output. Feed them all so
+     * the console works regardless of which the PROM reads.
+     */
+    const int targets[][2] = { { 1, 1 }, { 2, 0 }, { 0, 0 } };
 
     for (i = 0; i < size; i++) {
         int t;
-        for (t = 0; t < 2; t++) {
+        for (t = 0; t < 3; t++) {
             SGIHPC1Uart *u;
             d = targets[t][0];
             c = targets[t][1];
@@ -1258,6 +1317,7 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(dev, "scsi-drq", 0));
 
     /* 93C56 NVRAM (128 x 16-bit words) */
+    hpc1_nvram_init_defaults(s);
     hpc1_nvram_load(s);
 
     /* PIT interrupt timers (timer0 -> IP4, timer1 -> IP5) */
