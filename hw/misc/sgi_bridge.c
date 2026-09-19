@@ -242,12 +242,12 @@ static const MemoryRegionOps sgi_bridge_ops = {
          * memory_region_access_valid() returns MEMTX_ERROR for any sb/lb,
          * causing an infinite DBE exception loop at the faulting instruction.
          *
-         * Control registers (0x0000-0x2FFF) still only respond meaningfully
-         * to 4-byte accesses; byte accesses to them just return 0 / are
-         * silently ignored by the handler.
+         * Allow 8-byte accesses too (max=8): the PROM scans the flash window
+         * (BRIDGE+0xC00000.., mapped by this region) with 64-bit ld/sd, and
+         * max=4 turned every such access into a data-bus error.
          */
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 8,
     },
 };
 

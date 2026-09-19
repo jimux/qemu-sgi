@@ -371,7 +371,12 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
         val = s->mlan_clk_div;
         break;
     case HEART_MLAN_CTL:
-        val = s->mlan_ctl;
+        /* MicroLAN/1-wire control: report the transaction-done bit set. */
+        val = s->mlan_ctl | HEART_MLAN_DONE;
+        break;
+    case HEART_MLAN_CTL + 4:
+        /* Low 32-bit half (the PROM polls done bit 1 here at 0x0FF000BC). */
+        val = (s->mlan_ctl & 0xffffffffULL) | HEART_MLAN_DONE;
         break;
 
     case HEART_REALTIME_CTR:
@@ -539,6 +544,10 @@ static void sgi_heart_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case HEART_MLAN_CTL:
         s->mlan_ctl = val;
+        break;
+    case HEART_MLAN_CTL + 4:
+        s->mlan_ctl = (s->mlan_ctl & 0xffffffff00000000ULL)
+                      | (val & 0xffffffffULL);
         break;
 
     case HEART_REALTIME_CTR:

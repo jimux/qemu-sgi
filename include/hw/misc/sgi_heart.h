@@ -130,6 +130,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHEARTState, SGI_HEART)
 #define HEART_MEMCFG_SIZE        (0x3fU << 16)
 #define HEART_MEMCFG_BASE        (0x1ffU)
 
+/* HEART MicroLAN (1-wire) control: bit 1 = transaction done, bit 0 = data. */
+#define HEART_MLAN_DONE          (1U << 1)
+
 /* Status register bits */
 #define HEART_STAT_HSTL_SDRV     (1ULL << 14)
 #define HEART_STAT_FC_CR_OUT(x)  (1ULL << ((x) + 12))
@@ -162,7 +165,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHEARTState, SGI_HEART)
 
 /* Number of HEART interrupt vectors (input lines from devices) */
 #define HEART_NUM_IRQS 64
-
 /*
  * HEART memory-probe window. The PROM's init_memconfig (lmem_conf.s) sizes the
  * SDRAM banks by address-alias tests at PROBE_MEMBASE = K1 + 0x20000000 +
