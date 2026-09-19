@@ -1116,6 +1116,7 @@ static const char *mvp_video_input_name(int idx)
 static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
 {
     MVPVideoInput *in = opaque;
+    char *src = g_strdup(in->helper_source);
 
     g_spawn_close_pid(pid);
     if (in->helper_pid == pid) {
@@ -1125,7 +1126,28 @@ static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
         in->helper_source = NULL;
         in->helper_is_url = false;
         in->frame_len = 0;   /* fall back to the internal test pattern */
+        /*
+         * @@SEMANTICS@@ A helper that exits non-zero means the source could
+         * not be opened (unreachable URL, missing ffmpeg, bad path): the
+         * helper validates the source before it ever connects, so this is a
+         * real error, not a transient EOF.  Report it (QEMU stderr + -D log)
+         * rather than silently showing the internal pattern.
+         */
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "video: helper for %s exited (code %d); source "
+                          "'%s' unavailable, reverting to internal pattern\n",
+                          mvp_video_input_name(in->index),
+                          WEXITSTATUS(status), src ? src : "(none)");
+        } else if (WIFSIGNALED(status)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "video: helper for %s killed by signal %d; source "
+                          "'%s' stopped\n",
+                          mvp_video_input_name(in->index),
+                          WTERMSIG(status), src ? src : "(none)");
+        }
     }
+    g_free(src);
 }
 
 static void mvp_video_out_helper_exit(GPid pid, gint status, gpointer opaque)
@@ -1312,10 +1334,13 @@ static bool mvp_video_attach(SGIVideoSource *src, const char *input,
     argv[5] = is_url ? (char *)"--url" : NULL;
     argv[6] = NULL;
 
+    /*
+     * Keep the helper's stderr: its preflight prints a clear one-line
+     * reason when ffmpeg is missing or the source/URL cannot be opened.
+     */
     if (!g_spawn_async(NULL, argv, NULL,
                        G_SPAWN_DO_NOT_REAP_CHILD |
-                       G_SPAWN_STDOUT_TO_DEV_NULL |
-                       G_SPAWN_STDERR_TO_DEV_NULL,
+                       G_SPAWN_STDOUT_TO_DEV_NULL,
                        NULL, NULL, &in->helper_pid, &err)) {
         error_setg(errp, "cannot launch video helper '%s': %s",
                    in->video_helper, err->message);
