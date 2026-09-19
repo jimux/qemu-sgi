@@ -192,6 +192,9 @@ config SGI_HEART
 config SGI_BRIDGE
     bool
 
+config SGI_BASEIO
+    bool
+
 config SGI_PVTIMER
     bool
 

@@ -30,6 +30,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/mips/mips.h"
+#include "hw/misc/sgi_baseio.h"
 #include "hw/misc/sgi_hub.h"
 #include "hw/misc/unimp.h"
 #include "qapi/error.h"
@@ -186,6 +187,7 @@ static void sgi_ip27_init(MachineState *machine) {
   MemoryRegion *ram = machine->ram;
   MemoryRegion *ram_uncac, *ram_mspec;
   DeviceState *hub;
+  DeviceState *baseio;
   SGIHubState *hub_state;
   int ncpus = machine->smp.cpus;
   int i;
@@ -251,15 +253,32 @@ static void sgi_ip27_init(MachineState *machine) {
   sysbus_mmio_map(SYS_BUS_DEVICE(hub), 0, ip27_swin_phys(0, IP27_HUB_WIDGET));
 
   /*
-   * XIO widget space of the node (excluding the hub's widget-1 window).  The
-   * PROM probes widget 0 for a BaseIO bridge once the hub link reads up; until
-   * the BaseIO/IOC3 model lands, cover the widget windows so probes read 0
-   * instead of raising a data bus error.
+   * BaseIO board as XIO widget 0 (Bridge part 0xc002 + IOC3).  The PROM
+   * probes this widget's ID once the hub link reads up and then targets the
+   * node's IO widget (widget 8) for the Bridge registers/config.
    */
-  create_unimplemented_device("ip27-xio-w0", ip27_phys(IP27_IO_BASE),
-                              0x1000000ULL);
-  create_unimplemented_device("ip27-xio", ip27_phys(IP27_IO_BASE) + 0x2000000ULL,
-                              0x100000000ULL - 0x2000000ULL);
+  baseio = qdev_new(TYPE_SGI_BASEIO);
+  qdev_prop_set_uint32(baseio, "nasid", 0);
+  qdev_prop_set_uint32(baseio, "widget", 0);
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(baseio), &error_fatal);
+  sysbus_mmio_map(SYS_BUS_DEVICE(baseio), 0, ip27_swin_phys(0, 0));
+
+  {
+    DeviceState *baseio8 = qdev_new(TYPE_SGI_BASEIO);
+    qdev_prop_set_uint32(baseio8, "nasid", 0);
+    qdev_prop_set_uint32(baseio8, "widget", 8);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(baseio8), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(baseio8), 0, ip27_swin_phys(0, 8));
+  }
+
+  /*
+   * Remaining XIO widget space of the node (widgets 2..7, 9..), so stray
+   * probes read 0 instead of raising a data bus error.
+   */
+  create_unimplemented_device("ip27-xio-low", ip27_phys(IP27_IO_BASE) + 0x2000000ULL,
+                              0x6000000ULL);
+  create_unimplemented_device("ip27-xio-high", ip27_phys(IP27_IO_BASE) + 0x9000000ULL,
+                              0x100000000ULL - 0x9000000ULL);
 
   hub_state = SGI_HUB(hub);
   {

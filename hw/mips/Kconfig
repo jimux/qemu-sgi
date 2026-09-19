@@ -159,6 +159,7 @@ config SGI_IP27
     default y
     depends on MIPS64 && TCG
     select SGI_HUB
+    select SGI_BASEIO
     select SERIAL_MM
     select UNIMP
 
