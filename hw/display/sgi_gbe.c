@@ -274,8 +274,10 @@ static void sgi_gbe_composite_cursor(SGIGBEState *s, DisplaySurface *surface)
     if (!(s->crs_ctrl & 1) || !surface) {
         return;
     }
-    int posx = (s->crs_pos >> 16) & 0xfff;
-    int posy = s->crs_pos & 0xfff;
+    /* CRS_POS packs X in [11:0] and Y in [27:16] (the O2 Xsgi/PROM write
+     * order); reading them the other way transposes the cursor. */
+    int posx = s->crs_pos & 0xfff;
+    int posy = (s->crs_pos >> 16) & 0xfff;
     int sw = surface_width(surface);
     int sh = surface_height(surface);
     int stride = surface_stride(surface) / sizeof(uint32_t);
