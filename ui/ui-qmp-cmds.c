@@ -15,12 +15,14 @@
 
 #include "qemu/osdep.h"
 
+#include "hw/misc/sgi_video_source.h"
 #include "io/channel-file.h"
 #include "monitor/qmp-helpers.h"
 #include "qapi/qapi-commands-ui.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/coroutine.h"
 #include "qemu/cutils.h"
+#include "qom/object.h"
 #include "trace.h"
 #include "ui/console.h"
 #include "ui/dbus-display.h"
@@ -392,3 +394,83 @@ qmp_screendump(const char *filename, const char *device,
     }
 }
 #endif /* CONFIG_PIXMAN */
+
+/*
+ * SGI video-source attach/detach.
+ *
+ * The shared implementation behind both the HMP (video_attach / video_detach)
+ * and the QMP (video-attach / video-detach) commands.  The device is located
+ * generically through the sgi-video-source interface, exactly as the GTK
+ * "Video" menu does, so this works with -display none and on any machine:
+ * one that has no implementor simply gets an error, never a fabricated
+ * success.  There is no per-machine code here.
+ */
+static SGIVideoSource *sgi_video_source_lookup(Error **errp)
+{
+    Object *obj = object_resolve_path_type("", TYPE_SGI_VIDEO_SOURCE, NULL);
+
+    if (!obj) {
+        error_setg(errp, "no video-source device on this machine");
+        return NULL;
+    }
+    return SGI_VIDEO_SOURCE(obj);
+}
+
+bool sgi_video_source_attach(const char *input, const char *source,
+                             Error **errp)
+{
+    SGIVideoSource *src = sgi_video_source_lookup(errp);
+    SGIVideoSourceClass *vsc;
+
+    if (!src) {
+        return false;
+    }
+    vsc = SGI_VIDEO_SOURCE_GET_CLASS(src);
+    return vsc->attach(src, input, source, strstr(source, "://") != NULL,
+                       errp);
+}
+
+bool sgi_video_source_detach(const char *input, Error **errp)
+{
+    SGIVideoSource *src = sgi_video_source_lookup(errp);
+    SGIVideoSourceClass *vsc;
+
+    if (!src) {
+        return false;
+    }
+    vsc = SGI_VIDEO_SOURCE_GET_CLASS(src);
+    if (!vsc->is_attached(src, input)) {
+        error_setg(errp, "%s has no source attached", input);
+        return false;
+    }
+    vsc->detach(src, input);
+    return true;
+}
+
+VideoAttachResult *qmp_video_attach(const char *input, const char *source,
+                                    Error **errp)
+{
+    VideoAttachResult *res;
+
+    if (!sgi_video_source_attach(input, source, errp)) {
+        return NULL;
+    }
+    res = g_new0(VideoAttachResult, 1);
+    res->input = g_strdup(input);
+    res->source = g_strdup(source);
+    res->url = strstr(source, "://") != NULL;
+    return res;
+}
+
+VideoDetachResult *qmp_video_detach(const char *input, Error **errp)
+{
+    VideoDetachResult *res;
+
+    if (!sgi_video_source_detach(input, errp)) {
+        return NULL;
+    }
+    res = g_new0(VideoDetachResult, 1);
+    res->input = g_strdup(input);
+    res->detached = true;
+    return res;
+}

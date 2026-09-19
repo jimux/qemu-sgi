@@ -62,4 +62,20 @@ struct SGIVideoSourceClass {
  * itself is registered by the device that implements it.
  */
 
+/*
+ * Shared front-end helpers.  Both the HMP (video_attach / video_detach) and
+ * the QMP (video-attach / video-detach) commands go through these, so the
+ * two monitor front-ends share exactly one implementation.  They locate the
+ * device generically, exactly as the GTK menu does, so they work headless
+ * (-display none) and need no machine-specific code.
+ *
+ * @sgi_video_source_attach: attach @source to @input; @source containing
+ *     "://" is treated as a URL.  Returns false and sets @errp on failure.
+ * @sgi_video_source_detach: detach @input; returns false and sets @errp if
+ *     nothing is attached.
+ */
+bool sgi_video_source_attach(const char *input, const char *source,
+                             Error **errp);
+bool sgi_video_source_detach(const char *input, Error **errp);
+
 #endif /* HW_MISC_SGI_VIDEO_SOURCE_H */

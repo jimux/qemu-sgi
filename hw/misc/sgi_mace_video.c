@@ -1377,60 +1377,37 @@ static const char *mvp_video_describe(SGIVideoSource *src, const char *input)
 }
 
 /*
- * Scriptable attach/detach path (HMP; reachable from QMP via
- * human-monitor-command).  It reuses exactly the same sgi-video-source
- * methods the GTK menu calls, so headless (-display none) use needs no
- * GTK.  The device is found generically, like the menu does.
+ * Scriptable attach/detach path (HMP).  It reuses exactly the same
+ * sgi_video_source_* helpers the QMP video-attach / video-detach commands
+ * call (defined in ui/ui-qmp-cmds.c), which in turn call the same
+ * sgi-video-source methods the GTK menu uses.  One implementation, three
+ * front-ends; headless (-display none) use needs no GTK.
  */
-static SGIVideoSource *mvp_video_source_lookup(Monitor *mon)
-{
-    Object *obj = object_resolve_path_type("", TYPE_SGI_VIDEO_SOURCE, NULL);
-
-    if (!obj) {
-        monitor_printf(mon, "video: no video-source device on this machine\n");
-        return NULL;
-    }
-    return SGI_VIDEO_SOURCE(obj);
-}
-
 void hmp_video_attach(Monitor *mon, const QDict *qdict)
 {
-    SGIVideoSource *src = mvp_video_source_lookup(mon);
     const char *input = qdict_get_str(qdict, "input");
     const char *source = qdict_get_str(qdict, "source");
-    bool is_url = strstr(source, "://") != NULL;
-    SGIVideoSourceClass *vsc;
     Error *err = NULL;
 
-    if (!src) {
-        return;
-    }
-    vsc = SGI_VIDEO_SOURCE_GET_CLASS(src);
-    if (!vsc->attach(src, input, source, is_url, &err)) {
+    if (!sgi_video_source_attach(input, source, &err)) {
         monitor_printf(mon, "video_attach: %s\n", error_get_pretty(err));
         error_free(err);
         return;
     }
     monitor_printf(mon, "video_attach: %s <- %s%s\n", input, source,
-                   is_url ? " (url)" : "");
+                   strstr(source, "://") ? " (url)" : "");
 }
 
 void hmp_video_detach(Monitor *mon, const QDict *qdict)
 {
-    SGIVideoSource *src = mvp_video_source_lookup(mon);
     const char *input = qdict_get_str(qdict, "input");
-    SGIVideoSourceClass *vsc;
+    Error *err = NULL;
 
-    if (!src) {
+    if (!sgi_video_source_detach(input, &err)) {
+        monitor_printf(mon, "video_detach: %s\n", error_get_pretty(err));
+        error_free(err);
         return;
     }
-    vsc = SGI_VIDEO_SOURCE_GET_CLASS(src);
-    if (!vsc->is_attached(src, input)) {
-        monitor_printf(mon, "video_detach: %s has no source attached\n",
-                       input);
-        return;
-    }
-    vsc->detach(src, input);
     monitor_printf(mon, "video_detach: %s detached\n", input);
 }
 

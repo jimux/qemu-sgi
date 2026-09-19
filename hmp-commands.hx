@@ -1966,7 +1966,8 @@ SRST
   (HMP style), e.g. ``video_attach vin2 /path/clip.mkv`` or
   ``video_attach vout /path/outdir``.  Works headless (``-display none``);
   reaches the guest through the same device logic the GTK *Video* menu
-  uses.
+  uses.  A native QMP equivalent, ``video-attach``, shares this exact
+  implementation (see ``query-qmp-schema`` / the QEMU QMP reference).
 ERST
 
     {
@@ -1982,5 +1983,6 @@ SRST
   Stop the helper attached to the MACE video input named *input*
   (``vin1`` or ``vin2``); the guest reverts to the internal test pattern.
   For ``input`` = ``vout`` it stops the video-output sink helper.
+  The native QMP equivalent is ``video-detach``.
 ERST
 #endif

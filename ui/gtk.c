@@ -2332,6 +2332,14 @@ static void gd_video_attach_url(GtkMenuItem *item, void *opaque)
     entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "rtsp://host/stream");
     gtk_box_pack_start(GTK_BOX(content), entry, TRUE, TRUE, 6);
+    /*
+     * Make Enter in the URL entry activate Attach: set the accept response
+     * as the dialog default and let the entry trigger it.  Without this the
+     * dialog had no default button, so the keyboard alone could not confirm
+     * the attach (the menu automation relies on this deterministic path).
+     */
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
     gtk_widget_show_all(dialog);
 
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {

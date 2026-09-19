@@ -202,6 +202,106 @@
   'if': 'CONFIG_PIXMAN' }
 
 ##
+# @VideoAttachResult:
+#
+# Result of a successful ``video-attach`` command.
+#
+# @input: the video endpoint the source was attached to (e.g.
+#     ``vin1``)
+#
+# @source: the source that was attached (a local path or a URL)
+#
+# @url: true if @source is a URL rather than a local file path
+#
+# Since: 10.2
+##
+{ 'struct': 'VideoAttachResult',
+  'data': { 'input': 'str', 'source': 'str', 'url': 'bool' } }
+
+##
+# @video-attach:
+#
+# Attach a host video source to one of the machine's video endpoints.
+# On a machine whose video device implements the ``sgi-video-source``
+# interface (the SGI O2 MACE video block) this routes a local video
+# file or a stream URL to a video input, or names a host destination
+# for the video output.  The actual decoding or encoding is done by an
+# external helper process outside QEMU; this command only starts or
+# stops it.
+#
+# @input: the video endpoint to attach to.  The O2 accepts ``vin1``
+#     and ``vin2`` (video inputs) and ``vout`` (video output sink).
+#
+# @source: the host source to attach: a local file path, a ``file://``
+#     or stream URL for an input, or an output directory for ``vout``.
+#     Any source containing ``://`` is treated as a URL.
+#
+# Returns: a #VideoAttachResult on success.
+#
+# Errors:
+#     - if the machine has no ``sgi-video-source`` device
+#     - if @input is not a known endpoint
+#     - if the device has no helper configured, or it cannot start
+#
+# Since: 10.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "video-attach",
+#          "arguments": { "input": "vin1",
+#                         "source": "file:///media/clip.mkv" } }
+#     <- { "return": { "input": "vin1",
+#                      "source": "file:///media/clip.mkv",
+#                      "url": true } }
+##
+{ 'command': 'video-attach',
+  'data': { 'input': 'str', 'source': 'str' },
+  'returns': 'VideoAttachResult' }
+
+##
+# @VideoDetachResult:
+#
+# Result of a successful ``video-detach`` command.
+#
+# @input: the video endpoint that was detached
+#
+# @detached: true if a source was attached and has now been detached
+#
+# Since: 10.2
+##
+{ 'struct': 'VideoDetachResult',
+  'data': { 'input': 'str', 'detached': 'bool' } }
+
+##
+# @video-detach:
+#
+# Detach the host video source currently attached to a video endpoint.
+# The external decoder or sink helper is stopped.  Detaching an
+# endpoint that has no source attached is an error.
+#
+# @input: the video endpoint to detach (``vin1``, ``vin2`` or
+#     ``vout``)
+#
+# Returns: a #VideoDetachResult on success.
+#
+# Errors:
+#     - if the machine has no ``sgi-video-source`` device
+#     - if @input is not a known endpoint
+#     - if no source is attached to @input
+#
+# Since: 10.2
+#
+# .. qmp-example::
+#
+#     -> { "execute": "video-detach",
+#          "arguments": { "input": "vin1" } }
+#     <- { "return": { "input": "vin1", "detached": true } }
+##
+{ 'command': 'video-detach',
+  'data': { 'input': 'str' },
+  'returns': 'VideoDetachResult' }
+
+##
 # Spice
 # =====
 ##
