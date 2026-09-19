@@ -57,6 +57,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEVideoState, SGI_MACE_VIDEO)
 #define MVP_REG_DMA_DESC      0x80   /* 32 x 16-bit page pointers           */
 #define MVP_MAX_PAGES         32
 
+/* Number of independent MACE video-input channels / host sources */
+#define MVP_NUM_VIN           2
+
 /* CONTROL register bits (mvpregs.h control_reg_s) */
 #define MVP_CONTROL_ENABLE_DMA        0x001
 #define MVP_CONTROL_ENABLE_VERTSYNC   0x002
@@ -192,6 +195,35 @@ typedef struct MVPChannelState {
     uint64_t ust;          /* MACE uptime at start of last field    */
 } MVPChannelState;
 
+/*
+ * One MACE video-input host-source channel.  There are two (VIN1 and
+ * VIN2), each with its own "video-in" chardev, decoder helper process and
+ * last-decoded frame buffer, so a distinct host source can be routed to
+ * each input independently.  The GTK "Video" menu and the video_attach /
+ * video_detach monitor commands both drive this through the
+ * sgi-video-source interface.
+ */
+typedef struct MVPVideoInput {
+    unsigned index;         /* 0 = VIN1, 1 = VIN2 (for traces)         */
+    CharFrontend video_in;  /* host frame chardev for this input       */
+    char *video_helper;     /* property: helper executable path        */
+    char *video_in_path;    /* property: unix socket the helper uses   */
+    GPid helper_pid;        /* running helper, 0 when none             */
+    guint helper_watch;     /* g_child_watch source id                 */
+    char *helper_source;    /* attached source, for describe()         */
+    bool helper_is_url;     /* source is a URL rather than a file      */
+
+    /* Last decoded host frame (host order) + receive assembly buffer */
+    uint8_t *frame_buf;
+    size_t frame_len;
+    uint32_t frame_width;
+    uint32_t frame_height;
+    uint32_t frame_fourcc;
+    uint8_t *rx_buf;
+    size_t rx_len;
+    size_t rx_payload_len;
+} MVPVideoInput;
+
 struct SGIMACEVideoState {
     SysBusDevice parent_obj;
 
@@ -217,32 +249,9 @@ struct SGIMACEVideoState {
     bool nack;             /* last byte was not acknowledged         */
     bool bus_err;
 
-    /* Host video source + field pacing */
-    CharFrontend video_in;
-    bool video_in_connected;
+    /* Host video sources + field pacing */
     QEMUTimer *field_timer;
-    uint8_t *frame_buf;    /* last decoded host frame (host order)   */
-    size_t frame_len;
-    uint32_t frame_width;
-    uint32_t frame_height;
-    uint32_t frame_fourcc;
-    uint8_t *rx_buf;       /* header assembly buffer                 */
-    size_t rx_len;
-    uint8_t *rx_payload;
-    size_t rx_payload_len;
-
-    /*
-     * Host decoder helper driven by the GTK "Video" menu (the
-     * sgi-video-source interface).  QEMU itself never decodes video: the
-     * helper is an external process (ffmpeg) that connects to the
-     * video-in chardev and streams MVPF frames.
-     */
-    char *video_helper;    /* property: helper executable path       */
-    char *video_in_path;   /* property: unix socket the helper uses  */
-    GPid helper_pid;       /* running helper, 0 when none            */
-    guint helper_watch;    /* g_child_watch source id                */
-    char *helper_source;   /* attached source, for describe()        */
-    bool helper_is_url;
+    MVPVideoInput input[MVP_NUM_VIN];
 };
 
 /**

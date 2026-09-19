@@ -29,7 +29,10 @@
 #include "hw/display/saa7185.h"
 #include "hw/misc/sgi_mace_video.h"
 #include "hw/misc/sgi_video_source.h"
+#include "monitor/monitor.h"
+#include "monitor/hmp.h"
 #include "migration/vmstate.h"
+#include "qobject/qdict.h"
 #include "trace.h"
 
 #include <signal.h>
@@ -402,6 +405,7 @@ static void mvp_vin_geometry(const MVPChannelState *ch, unsigned *fmt,
 static void mvp_capture_field(SGIMACEVideoState *s, MVPChannelState *ch,
                               int idx)
 {
+    MVPVideoInput *in = &s->input[idx];
     uint16_t pages[MVP_MAX_PAGES];
     unsigned fmt, stride, lines;
     size_t frame_size, written, field_base = 0;
@@ -429,23 +433,23 @@ static void mvp_capture_field(SGIMACEVideoState *s, MVPChannelState *ch,
                   ((ch->config & MVP_ICONFIG_MEM_MODE_MASK) == 0);
 
     tmp = g_malloc(frame_size);
-    if (s->frame_buf && s->frame_len && s->frame_width && s->frame_height) {
+    if (in->frame_buf && in->frame_len && in->frame_width && in->frame_height) {
         /* copy the host frame (top-left aligned, clamped) in place */
         unsigned bpp = (fmt == MVP_FORMAT_YUV422) ? 2 : 4;
-        unsigned src_stride = s->frame_width * bpp;
-        unsigned copy_lines = MIN(lines, s->frame_height);
+        unsigned src_stride = in->frame_width * bpp;
+        unsigned copy_lines = MIN(lines, in->frame_height);
         unsigned y;
 
         memset(tmp, 0, frame_size);
         for (y = 0; y < copy_lines; y++) {
             size_t n = MIN((size_t)stride,
-                           MIN((size_t)src_stride, s->frame_len -
+                           MIN((size_t)src_stride, in->frame_len -
                                (size_t)y * src_stride));
-            if ((size_t)y * src_stride >= s->frame_len) {
+            if ((size_t)y * src_stride >= in->frame_len) {
                 break;
             }
             memcpy(tmp + (size_t)y * stride,
-                   s->frame_buf + (size_t)y * src_stride, n);
+                   in->frame_buf + (size_t)y * src_stride, n);
         }
     } else {
         mvp_fill_test_pattern(tmp, fmt, stride, lines);
@@ -838,61 +842,62 @@ void sgi_mace_video_map_into(SGIMACEVideoState *s, MemoryRegion *mace_mr)
 
 static int mvp_video_in_can_receive(void *opaque)
 {
-    SGIMACEVideoState *s = opaque;
+    MVPVideoInput *in = opaque;
 
-    return MVP_FRAME_MAX - s->rx_len;
+    return MVP_FRAME_MAX - in->rx_len;
 }
 
-static void mvp_video_in_reset_frame(SGIMACEVideoState *s)
+static void mvp_video_in_reset_frame(MVPVideoInput *in)
 {
-    s->rx_len = 0;
-    s->rx_payload_len = 0;
+    in->rx_len = 0;
+    in->rx_payload_len = 0;
 }
 
 static void mvp_video_in_receive(void *opaque, const uint8_t *buf, int size)
 {
-    SGIMACEVideoState *s = opaque;
+    MVPVideoInput *in = opaque;
 
     while (size > 0) {
-        size_t space = MVP_FRAME_MAX - s->rx_len;
+        size_t space = MVP_FRAME_MAX - in->rx_len;
         size_t n = MIN((size_t)size, space);
 
-        memcpy(s->rx_buf + s->rx_len, buf, n);
-        s->rx_len += n;
+        memcpy(in->rx_buf + in->rx_len, buf, n);
+        in->rx_len += n;
         buf += n;
         size -= n;
 
-        if (s->rx_len >= 20 && s->rx_payload_len == 0) {
-            uint32_t magic = ldl_be_p(s->rx_buf);
-            uint32_t w = ldl_be_p(s->rx_buf + 4);
-            uint32_t h = ldl_be_p(s->rx_buf + 8);
-            uint32_t fourcc = ldl_be_p(s->rx_buf + 12);
-            uint32_t plen = ldl_be_p(s->rx_buf + 16);
+        if (in->rx_len >= 20 && in->rx_payload_len == 0) {
+            uint32_t magic = ldl_be_p(in->rx_buf);
+            uint32_t w = ldl_be_p(in->rx_buf + 4);
+            uint32_t h = ldl_be_p(in->rx_buf + 8);
+            uint32_t fourcc = ldl_be_p(in->rx_buf + 12);
+            uint32_t plen = ldl_be_p(in->rx_buf + 16);
 
             if (magic != MVP_FRAME_MAGIC || plen > MVP_FRAME_MAX - 20) {
-                mvp_video_in_reset_frame(s);
+                mvp_video_in_reset_frame(in);
                 continue;
             }
-            s->rx_payload_len = plen;
-            s->frame_width = w;
-            s->frame_height = h;
-            s->frame_fourcc = fourcc;
+            in->rx_payload_len = plen;
+            in->frame_width = w;
+            in->frame_height = h;
+            in->frame_fourcc = fourcc;
         }
 
-        if (s->rx_payload_len && s->rx_len >= 20 + s->rx_payload_len) {
-            size_t plen = s->rx_payload_len;
+        if (in->rx_payload_len && in->rx_len >= 20 + in->rx_payload_len) {
+            size_t plen = in->rx_payload_len;
 
-            memcpy(s->frame_buf, s->rx_buf + 20, plen);
-            s->frame_len = plen;
-            trace_sgi_mace_video_frame(s->frame_width, s->frame_height,
-                                       s->frame_fourcc, plen);
+            memcpy(in->frame_buf, in->rx_buf + 20, plen);
+            in->frame_len = plen;
+            trace_sgi_mace_video_frame(in->index, in->frame_width,
+                                       in->frame_height, in->frame_fourcc,
+                                       plen);
             /* keep any trailing bytes for the next frame */
-            memmove(s->rx_buf, s->rx_buf + 20 + plen,
-                    s->rx_len - 20 - plen);
-            s->rx_len -= 20 + plen;
-            s->rx_payload_len = 0;
-        } else if (s->rx_len == MVP_FRAME_MAX) {
-            mvp_video_in_reset_frame(s);
+            memmove(in->rx_buf, in->rx_buf + 20 + plen,
+                    in->rx_len - 20 - plen);
+            in->rx_len -= 20 + plen;
+            in->rx_payload_len = 0;
+        } else if (in->rx_len == MVP_FRAME_MAX) {
+            mvp_video_in_reset_frame(in);
         }
     }
 }
@@ -908,36 +913,68 @@ static void mvp_video_in_receive(void *opaque, const uint8_t *buf, int size)
  * delivered, so an attach is visible to the guest on the next field.
  */
 
+/*
+ * Map an input name to its channel index.  Accepts the documented
+ * "vin1"/"vin2" names and, for the monitor command, the bare "1"/"2"
+ * spelling.  Returns -1 for anything else.
+ */
+static int mvp_video_input_index(const char *input)
+{
+    if (!input) {
+        return -1;
+    }
+    if (!strcmp(input, "vin1") || !strcmp(input, "1")) {
+        return 0;
+    }
+    if (!strcmp(input, "vin2") || !strcmp(input, "2")) {
+        return 1;
+    }
+    return -1;
+}
+
+static const char *mvp_video_input_name(int idx)
+{
+    return idx == 0 ? "vin1" : "vin2";
+}
+
 static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
 {
-    SGIMACEVideoState *s = opaque;
+    MVPVideoInput *in = opaque;
 
     g_spawn_close_pid(pid);
-    if (s->helper_pid == pid) {
-        s->helper_pid = 0;
-        s->helper_watch = 0;
-        g_free(s->helper_source);
-        s->helper_source = NULL;
-        s->helper_is_url = false;
-        s->frame_len = 0;   /* fall back to the internal test pattern */
+    if (in->helper_pid == pid) {
+        in->helper_pid = 0;
+        in->helper_watch = 0;
+        g_free(in->helper_source);
+        in->helper_source = NULL;
+        in->helper_is_url = false;
+        in->frame_len = 0;   /* fall back to the internal test pattern */
     }
 }
 
 static void mvp_video_detach(SGIVideoSource *src, const char *input)
 {
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
-    GPid pid = s->helper_pid;
+    int idx = mvp_video_input_index(input);
+    MVPVideoInput *in;
+    GPid pid;
     int i;
 
-    if (s->helper_watch) {
-        g_source_remove(s->helper_watch);
-        s->helper_watch = 0;
+    if (idx < 0) {
+        return;
     }
-    s->helper_pid = 0;
-    g_free(s->helper_source);
-    s->helper_source = NULL;
-    s->helper_is_url = false;
-    s->frame_len = 0;
+    in = &s->input[idx];
+    pid = in->helper_pid;
+
+    if (in->helper_watch) {
+        g_source_remove(in->helper_watch);
+        in->helper_watch = 0;
+    }
+    in->helper_pid = 0;
+    g_free(in->helper_source);
+    in->helper_source = NULL;
+    in->helper_is_url = false;
+    in->frame_len = 0;
 
     if (pid <= 0) {
         return;
@@ -960,21 +997,27 @@ static bool mvp_video_attach(SGIVideoSource *src, const char *input,
                              const char *source, bool is_url, Error **errp)
 {
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+    int idx = mvp_video_input_index(input);
+    MVPVideoInput *in;
     char *argv[8];
     GError *err = NULL;
 
-    if (strcmp(input, "vin1") != 0) {
-        error_setg(errp, "only the VIN1 input is wired in this build");
+    if (idx < 0) {
+        error_setg(errp, "unknown video input '%s' (use vin1 or vin2)",
+                   input ? input : "");
         return false;
     }
-    if (!s->video_helper) {
-        error_setg(errp, "no video-helper configured: pass "
-                   "-global sgi-mace-video.video-helper=<wrapper>");
+    in = &s->input[idx];
+    if (!in->video_helper) {
+        error_setg(errp, "no helper configured for %s: pass "
+                   "-global sgi-mace-video.video-helper%s=<wrapper>",
+                   mvp_video_input_name(idx), idx == 0 ? "" : "2");
         return false;
     }
-    if (!s->video_in_path) {
-        error_setg(errp, "no video-in-path configured: pass "
-                   "-global sgi-mace-video.video-in-path=<socket>");
+    if (!in->video_in_path) {
+        error_setg(errp, "no video-in path configured for %s: pass "
+                   "-global sgi-mace-video.video-in-path%s=<socket>",
+                   mvp_video_input_name(idx), idx == 0 ? "" : "2");
         return false;
     }
     if (!source || !*source) {
@@ -984,9 +1027,9 @@ static bool mvp_video_attach(SGIVideoSource *src, const char *input,
 
     mvp_video_detach(src, input);
 
-    argv[0] = s->video_helper;
+    argv[0] = in->video_helper;
     argv[1] = (char *)"--socket";
-    argv[2] = s->video_in_path;
+    argv[2] = in->video_in_path;
     argv[3] = (char *)"--source";
     argv[4] = (char *)source;
     argv[5] = is_url ? (char *)"--url" : NULL;
@@ -996,31 +1039,91 @@ static bool mvp_video_attach(SGIVideoSource *src, const char *input,
                        G_SPAWN_DO_NOT_REAP_CHILD |
                        G_SPAWN_STDOUT_TO_DEV_NULL |
                        G_SPAWN_STDERR_TO_DEV_NULL,
-                       NULL, NULL, &s->helper_pid, &err)) {
+                       NULL, NULL, &in->helper_pid, &err)) {
         error_setg(errp, "cannot launch video helper '%s': %s",
-                   s->video_helper, err->message);
+                   in->video_helper, err->message);
         g_error_free(err);
         return false;
     }
-    s->helper_watch = g_child_watch_add(s->helper_pid,
-                                        mvp_video_helper_exit, s);
-    s->helper_source = g_strdup(source);
-    s->helper_is_url = is_url;
+    in->helper_watch = g_child_watch_add(in->helper_pid,
+                                         mvp_video_helper_exit, in);
+    in->helper_source = g_strdup(source);
+    in->helper_is_url = is_url;
     return true;
 }
 
 static bool mvp_video_is_attached(SGIVideoSource *src, const char *input)
 {
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+    int idx = mvp_video_input_index(input);
 
-    return s->helper_pid > 0;
+    return idx >= 0 && s->input[idx].helper_pid > 0;
 }
 
 static const char *mvp_video_describe(SGIVideoSource *src, const char *input)
 {
     SGIMACEVideoState *s = SGI_MACE_VIDEO(src);
+    int idx = mvp_video_input_index(input);
 
-    return s->helper_source;
+    return idx >= 0 ? s->input[idx].helper_source : NULL;
+}
+
+/*
+ * Scriptable attach/detach path (HMP; reachable from QMP via
+ * human-monitor-command).  It reuses exactly the same sgi-video-source
+ * methods the GTK menu calls, so headless (-display none) use needs no
+ * GTK.  The device is found generically, like the menu does.
+ */
+static SGIVideoSource *mvp_video_source_lookup(Monitor *mon)
+{
+    Object *obj = object_resolve_path_type("", TYPE_SGI_VIDEO_SOURCE, NULL);
+
+    if (!obj) {
+        monitor_printf(mon, "video: no video-source device on this machine\n");
+        return NULL;
+    }
+    return SGI_VIDEO_SOURCE(obj);
+}
+
+void hmp_video_attach(Monitor *mon, const QDict *qdict)
+{
+    SGIVideoSource *src = mvp_video_source_lookup(mon);
+    const char *input = qdict_get_str(qdict, "input");
+    const char *source = qdict_get_str(qdict, "source");
+    bool is_url = strstr(source, "://") != NULL;
+    SGIVideoSourceClass *vsc;
+    Error *err = NULL;
+
+    if (!src) {
+        return;
+    }
+    vsc = SGI_VIDEO_SOURCE_GET_CLASS(src);
+    if (!vsc->attach(src, input, source, is_url, &err)) {
+        monitor_printf(mon, "video_attach: %s\n", error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    monitor_printf(mon, "video_attach: %s <- %s%s\n", input, source,
+                   is_url ? " (url)" : "");
+}
+
+void hmp_video_detach(Monitor *mon, const QDict *qdict)
+{
+    SGIVideoSource *src = mvp_video_source_lookup(mon);
+    const char *input = qdict_get_str(qdict, "input");
+    SGIVideoSourceClass *vsc;
+
+    if (!src) {
+        return;
+    }
+    vsc = SGI_VIDEO_SOURCE_GET_CLASS(src);
+    if (!vsc->is_attached(src, input)) {
+        monitor_printf(mon, "video_detach: %s has no source attached\n",
+                       input);
+        return;
+    }
+    vsc->detach(src, input);
+    monitor_printf(mon, "video_detach: %s detached\n", input);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1048,8 +1151,10 @@ static void sgi_mace_video_reset(DeviceState *dev)
     s->nack = false;
     s->bus_err = false;
 
-    mvp_video_in_reset_frame(s);
-    s->frame_len = 0;
+    for (int i = 0; i < MVP_NUM_VIN; i++) {
+        mvp_video_in_reset_frame(&s->input[i]);
+        s->input[i].frame_len = 0;
+    }
 
     timer_mod(s->field_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MVP_FIELD_PERIOD_NS);
@@ -1083,27 +1188,42 @@ static void sgi_mace_video_realize(DeviceState *dev, Error **errp)
     i2c_slave_create_simple(s->i2c_bus, TYPE_SAA7111, MACE_I2C_ADDR_SAA7111);
     i2c_slave_create_simple(s->i2c_bus, TYPE_SAA7185, MACE_I2C_ADDR_SAA7185);
 
-    s->frame_buf = g_malloc(MVP_FRAME_MAX);
-    s->rx_buf = g_malloc(MVP_FRAME_MAX);
+    for (int i = 0; i < MVP_NUM_VIN; i++) {
+        s->input[i].index = i;
+        s->input[i].frame_buf = g_malloc(MVP_FRAME_MAX);
+        s->input[i].rx_buf = g_malloc(MVP_FRAME_MAX);
+    }
 
     s->field_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mvp_field_tick, s);
 
     /*
      * Install the chardev receive handlers unconditionally: the backend
      * (e.g. a Unix socket helper) normally connects after realize, and
-     * qemu_chr_fe_set_handlers starts delivery whenever it does.
+     * qemu_chr_fe_set_handlers starts delivery whenever it does.  Each
+     * input has its own chardev and its own frame assembly, so the two
+     * VIN channels can carry independent host sources.
      */
-    qemu_chr_fe_set_handlers(&s->video_in,
-                             mvp_video_in_can_receive,
-                             mvp_video_in_receive,
-                             NULL, NULL, s, NULL, true);
+    for (int i = 0; i < MVP_NUM_VIN; i++) {
+        qemu_chr_fe_set_handlers(&s->input[i].video_in,
+                                 mvp_video_in_can_receive,
+                                 mvp_video_in_receive,
+                                 NULL, NULL, &s->input[i], NULL, true);
+    }
 }
 
 static const Property sgi_mace_video_properties[] = {
-    DEFINE_PROP_CHR("video-in", SGIMACEVideoState, video_in),
-    /* GTK "Video" menu: external decoder helper + its chardev socket. */
-    DEFINE_PROP_STRING("video-helper", SGIMACEVideoState, video_helper),
-    DEFINE_PROP_STRING("video-in-path", SGIMACEVideoState, video_in_path),
+    /* VIN1 host source */
+    DEFINE_PROP_CHR("video-in", SGIMACEVideoState, input[0].video_in),
+    DEFINE_PROP_STRING("video-helper", SGIMACEVideoState,
+                       input[0].video_helper),
+    DEFINE_PROP_STRING("video-in-path", SGIMACEVideoState,
+                       input[0].video_in_path),
+    /* VIN2 host source (independent chardev + helper) */
+    DEFINE_PROP_CHR("video-in2", SGIMACEVideoState, input[1].video_in),
+    DEFINE_PROP_STRING("video-helper2", SGIMACEVideoState,
+                       input[1].video_helper),
+    DEFINE_PROP_STRING("video-in2-path", SGIMACEVideoState,
+                       input[1].video_in_path),
 };
 
 static const VMStateDescription vmstate_sgi_mace_video_chan = {

@@ -2219,42 +2219,69 @@ static void gd_video_show_error(GtkDisplayState *s, Error *err)
     error_free(err);
 }
 
-static void gd_video_update(GtkDisplayState *s)
+/*
+ * The two MACE video inputs, in channel order.  The menu is built once
+ * with a group of attach/URL/detach items per input; each item carries
+ * its input index so the handlers stay generic.
+ */
+static const char *const gd_video_inputs[2] = { "vin1", "vin2" };
+static const char *const gd_video_input_labels[2] = { "VIN1", "VIN2" };
+
+static int gd_video_item_input(GtkMenuItem *item)
 {
-    SGIVideoSourceClass *vsc;
+    return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "video-input"));
+}
+
+static void gd_video_update_input(GtkDisplayState *s, int idx)
+{
+    SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+    const char *input = gd_video_inputs[idx];
     const char *desc;
     bool attached;
     char *label;
 
+    attached = vsc->is_attached(s->video_src, input);
+    desc = vsc->describe(s->video_src, input);
+
+    gtk_widget_set_sensitive(s->video_attach_item[idx], !attached);
+    gtk_widget_set_sensitive(s->video_url_item[idx], !attached);
+    gtk_widget_set_sensitive(s->video_detach_item[idx], attached);
+
+    if (attached) {
+        label = g_strdup_printf("%s: %s", gd_video_input_labels[idx],
+                                desc ? desc : _("attached"));
+    } else {
+        label = g_strdup_printf("%s: %s", gd_video_input_labels[idx],
+                                _("no source"));
+    }
+    gtk_menu_item_set_label(GTK_MENU_ITEM(s->video_status_item[idx]), label);
+    g_free(label);
+}
+
+static void gd_video_update(GtkDisplayState *s)
+{
+    int i;
+
     if (!s->video_src) {
         return;
     }
-    vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
-    attached = vsc->is_attached(s->video_src, "vin1");
-    desc = vsc->describe(s->video_src, "vin1");
-
-    gtk_widget_set_sensitive(s->video_attach_item, !attached);
-    gtk_widget_set_sensitive(s->video_url_item, !attached);
-    gtk_widget_set_sensitive(s->video_detach_item, attached);
-
-    if (attached) {
-        label = g_strdup_printf(_("VIN1: %s"), desc ? desc : _("attached"));
-    } else {
-        label = g_strdup(_("VIN1: no source"));
+    for (i = 0; i < 2; i++) {
+        gd_video_update_input(s, i);
     }
-    gtk_menu_item_set_label(GTK_MENU_ITEM(s->video_status_item), label);
-    g_free(label);
 }
 
 static void gd_video_attach_file(GtkMenuItem *item, void *opaque)
 {
     GtkDisplayState *s = opaque;
+    int idx = gd_video_item_input(item);
     SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+    g_autofree char *title = g_strdup_printf(_("Attach video to %s"),
+                                             gd_video_input_labels[idx]);
     GtkWidget *dialog;
     Error *err = NULL;
 
     dialog = gtk_file_chooser_dialog_new(
-        _("Attach video to VIN1"), GTK_WINDOW(s->window),
+        title, GTK_WINDOW(s->window),
         GTK_FILE_CHOOSER_ACTION_OPEN,
         _("_Cancel"), GTK_RESPONSE_CANCEL,
         _("_Attach"), GTK_RESPONSE_ACCEPT, NULL);
@@ -2262,7 +2289,8 @@ static void gd_video_attach_file(GtkMenuItem *item, void *opaque)
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
 
-        if (!vsc->attach(s->video_src, "vin1", fn, false, &err)) {
+        if (!vsc->attach(s->video_src, gd_video_inputs[idx], fn, false,
+                         &err)) {
             gd_video_show_error(s, err);
         }
         g_free(fn);
@@ -2274,14 +2302,17 @@ static void gd_video_attach_file(GtkMenuItem *item, void *opaque)
 static void gd_video_attach_url(GtkMenuItem *item, void *opaque)
 {
     GtkDisplayState *s = opaque;
+    int idx = gd_video_item_input(item);
     SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
+    g_autofree char *title = g_strdup_printf(_("Attach stream URL to %s"),
+                                             gd_video_input_labels[idx]);
     GtkWidget *dialog;
     GtkWidget *entry;
     GtkWidget *content;
     Error *err = NULL;
 
     dialog = gtk_dialog_new_with_buttons(
-        _("Attach stream URL to VIN1"), GTK_WINDOW(s->window),
+        title, GTK_WINDOW(s->window),
         GTK_DIALOG_MODAL,
         _("_Cancel"), GTK_RESPONSE_CANCEL,
         _("_Attach"), GTK_RESPONSE_ACCEPT, NULL);
@@ -2294,7 +2325,8 @@ static void gd_video_attach_url(GtkMenuItem *item, void *opaque)
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         const char *url = gtk_entry_get_text(GTK_ENTRY(entry));
 
-        if (!vsc->attach(s->video_src, "vin1", url, true, &err)) {
+        if (!vsc->attach(s->video_src, gd_video_inputs[idx], url, true,
+                         &err)) {
             gd_video_show_error(s, err);
         }
     }
@@ -2305,45 +2337,59 @@ static void gd_video_attach_url(GtkMenuItem *item, void *opaque)
 static void gd_video_detach(GtkMenuItem *item, void *opaque)
 {
     GtkDisplayState *s = opaque;
+    int idx = gd_video_item_input(item);
     SGIVideoSourceClass *vsc = SGI_VIDEO_SOURCE_GET_CLASS(s->video_src);
 
-    vsc->detach(s->video_src, "vin1");
+    vsc->detach(s->video_src, gd_video_inputs[idx]);
     gd_video_update(s);
+}
+
+static void gd_video_menu_item(GtkDisplayState *s, GtkWidget *menu, int idx,
+                               GtkWidget *item, GCallback cb)
+{
+    g_object_set_data(G_OBJECT(item), "video-input", GINT_TO_POINTER(idx));
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    g_signal_connect(item, "activate", cb, s);
 }
 
 static GtkWidget *gd_create_menu_video(GtkDisplayState *s)
 {
     GtkWidget *video_menu;
     GtkWidget *separator;
+    int i;
 
     video_menu = gtk_menu_new();
     gtk_menu_set_accel_group(GTK_MENU(video_menu), s->accel_group);
 
-    s->video_status_item = gtk_menu_item_new_with_label("");
-    gtk_widget_set_sensitive(s->video_status_item, FALSE);
-    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_status_item);
+    for (i = 0; i < 2; i++) {
+        g_autofree char *attach_label = g_strdup_printf(
+            _("Attach Video File to %s..."), gd_video_input_labels[i]);
+        g_autofree char *url_label = g_strdup_printf(
+            _("Attach Stream _URL to %s..."), gd_video_input_labels[i]);
 
-    separator = gtk_separator_menu_item_new();
-    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), separator);
+        if (i > 0) {
+            separator = gtk_separator_menu_item_new();
+            gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), separator);
+        }
 
-    s->video_attach_item =
-        gtk_menu_item_new_with_mnemonic(_("_Attach Video File to VIN1..."));
-    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_attach_item);
+        s->video_status_item[i] = gtk_menu_item_new_with_label("");
+        gtk_widget_set_sensitive(s->video_status_item[i], FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(video_menu),
+                              s->video_status_item[i]);
 
-    s->video_url_item =
-        gtk_menu_item_new_with_mnemonic(_("Attach Stream _URL to VIN1..."));
-    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_url_item);
+        s->video_attach_item[i] = gtk_menu_item_new_with_mnemonic(attach_label);
+        gd_video_menu_item(s, video_menu, i, s->video_attach_item[i],
+                           G_CALLBACK(gd_video_attach_file));
 
-    s->video_detach_item =
-        gtk_menu_item_new_with_mnemonic(_("_Detach VIN1"));
-    gtk_menu_shell_append(GTK_MENU_SHELL(video_menu), s->video_detach_item);
+        s->video_url_item[i] = gtk_menu_item_new_with_mnemonic(url_label);
+        gd_video_menu_item(s, video_menu, i, s->video_url_item[i],
+                           G_CALLBACK(gd_video_attach_url));
 
-    g_signal_connect(s->video_attach_item, "activate",
-                     G_CALLBACK(gd_video_attach_file), s);
-    g_signal_connect(s->video_url_item, "activate",
-                     G_CALLBACK(gd_video_attach_url), s);
-    g_signal_connect(s->video_detach_item, "activate",
-                     G_CALLBACK(gd_video_detach), s);
+        s->video_detach_item[i] = gtk_menu_item_new_with_mnemonic(
+            i == 0 ? _("_Detach VIN1") : _("_Detach VIN2"));
+        gd_video_menu_item(s, video_menu, i, s->video_detach_item[i],
+                           G_CALLBACK(gd_video_detach));
+    }
 
     gd_video_update(s);
     return video_menu;

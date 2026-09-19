@@ -1944,4 +1944,37 @@ SRST
   ``-global sgi-pvchan.clipboard=on``).  clipset simulates a host-side copy so
   the guest agent receives it; clipget shows text the guest grabbed.
 ERST
+
+    {
+        .name       = "video_attach",
+        .args_type  = "input:s,source:s",
+        .params     = "input source",
+        .help       = "attach a host video file/stream to a MACE video input through the sgi-video-source interface",
+        .cmd        = hmp_video_attach,
+    },
+
+SRST
+``video_attach`` *input* *source*
+  Attach a host media *source* (a local file path, or a stream URL if it
+  contains ``://``) to the MACE video input named *input* (``vin1`` or
+  ``vin2``), spawning the external decoder helper configured with
+  ``-global sgi-mace-video.video-helper[N]``.  Arguments are positional
+  (HMP style), e.g. ``video_attach vin2 /path/clip.mkv``.  Works headless
+  (``-display none``); reaches the guest through the same device logic the
+  GTK *Video* menu uses.
+ERST
+
+    {
+        .name       = "video_detach",
+        .args_type  = "input:s",
+        .params     = "input",
+        .help       = "detach the host video source from a MACE video input",
+        .cmd        = hmp_video_detach,
+    },
+
+SRST
+``video_detach`` *input*
+  Stop the decoder helper attached to the MACE video input named *input*
+  (``vin1`` or ``vin2``); the guest reverts to the internal test pattern.
+ERST
 #endif
