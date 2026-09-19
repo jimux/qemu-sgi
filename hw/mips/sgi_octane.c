@@ -1,40 +1,29 @@
 /*
- * ============================ DIRTY / KNOWN-WRONG ============================
- * DO NOT TRUST THIS FILE AS A CLEAN OCTANE (IP30) REFERENCE.
- *
- * Besides the real "octane" machine, this file also hosts a bogus "sgi-ip55"
- * machine (description "SGI IP54 Paravirtual Workstation") and instantiates
- * IP54 paravirtual devices (SGI_SMP, SGI_PVMEM, SGI_PVNET, SGI_GLACCEL) that do
- * not exist on real Octane hardware. The "sgi-ip55" type is stale and collides
- * with the project's invented IP55/virtuix machine name.
- *
- * Treat the IP54/paravirtual residue here as suspect, and verify how much of it
- * bleeds into the "octane" machine init vs. the bogus sgi-ip55 one. Authoritative
- * real-Octane facts live in the wiki / resolved-notes (platform/ip30-octane).
- *
- * TODO (separate cleanup, intentionally NOT done here): remove the sgi-ip55
- * type and the IP54 paravirtual residue; keep the octane machine faithful.
- * ===========================================================================
- *
  * QEMU SGI Octane (IP30) machine emulation
  *
- * The SGI Octane is a uniprocessor/dual-CPU workstation based on the
+ * The SGI Octane is a uniprocessor (dual-CPU-capable) workstation based on the
  * HEART/BRIDGE/XIO chipset. It supports R10000/R12000 CPUs at 250-400MHz.
  *
- * XIO widget bus (MAIN_IO_SPACE = 0x10000000, 16MB per widget):
- *   0x10000000-0x17FFFFFF  Xbow crossbar (widget 0)
+ * XIO widget bus (16MB per widget):
+ *   0x10000000-0x10FFFFFF  Xbow crossbar (widget 0)
+ *   0x18000000-0x18FFFFFF  HEART XIO widget window (widget 8)
+ *   0x1F000000-0x1FBFFFFF  BRIDGE (widget 0xF; PCI/IOC3/flash window)
  *   0x0FF00000-0x0FF6FFFF  HEART PIU (processor-side registers)
- *   0x1F000000-0x1FBFFFFF  BRIDGE (widget 0xF, covers PCI/IOC3/flash window)
  *   0x1FC00000-0x1FCFFFFF  PROM flash (BRIDGE+0xC00000, standard MIPS vector)
- *   0x20000000-...         System RAM (XKPHYS for >512MB)
+ *   0x20000000-...         System RAM (SEG0)
  *
  * Interrupt routing:
- *   BRIDGE peripherals → HEART ISR bits → CPU IP3-IP7
+ *   BRIDGE peripherals -> HEART ISR bits -> CPU IP3-IP7
+ *
+ * The `octane` machine below is the authentic IP30 bring-up. The bogus
+ * `sgi-ip55` type (an IP54-era paravirtual carrier) is kept isolated in
+ * sgi_ip54pv_init() and must not leak into the authentic machine.
  *
  * References:
  *   - MAME src/mame/sgi/octane.cpp
  *   - Linux arch/mips/sgi-ip30/
- *   - IRIX sys/heart.h, sys/bridge.h
+ *   - IRIX sys/RACER/heart.h, sys/RACER/bridge.h, sys/PCI/ioc3.h
+ *   - resolved-notes/platform/ip30-octane.md
  *
  * Copyright (c) 2024 the QEMU project
  *
@@ -71,34 +60,149 @@
 #include "system/reset.h"
 #include "system/system.h"
 
-/* Octane physical address map (XIO widget bus, MAIN_IO_SPACE=0x10000000) */
+/* Octane physical address map (XIO widget bus) */
 #define OCTANE_RAM_BASE    0x20000000ULL   /* System RAM (SEG0) */
 #define OCTANE_HEART_BASE  0x0FF00000ULL   /* HEART PIU (processor regs) */
-#define OCTANE_BRIDGE_BASE 0x1F000000ULL   /* BRIDGE widget 0xF (MAIN_WIDGET(0xF)) */
+#define OCTANE_HEART_WIDGET 0x18000000ULL  /* HEART XIO widget 8 window */
+#define OCTANE_BRIDGE_BASE 0x1F000000ULL   /* BRIDGE widget 0xF */
 #define OCTANE_XBOW_BASE   0x10000000ULL   /* Xbow crossbar widget 0 */
 #define OCTANE_PROM_BASE   0x1FC00000ULL   /* PROM (BRIDGE+0xC00000) */
 #define OCTANE_PROM_SIZE   (1 * MiB)       /* IP30 PROM is 1MB */
 #define OCTANE_RAM_MAX     (128ULL * GiB)
 
-/* Paravirtual device base addresses in GIO64 expansion space */
-#define OCTANE_PV_BASE     0x1F480000ULL   /* PV device region */
-#define OCTANE_PV_SMP      (OCTANE_PV_BASE + 0x000)  /* sgi-smp */
-#define OCTANE_PV_MEM      (OCTANE_PV_BASE + 0x100)  /* sgi-pvmem */
-#define OCTANE_PV_NET      (OCTANE_PV_BASE + 0x200)  /* sgi-pvnet */
-#define OCTANE_PV_GLACCEL  (OCTANE_PV_BASE + 0x300)  /* sgi-glaccel */
-#define OCTANE_PV_AUDIO    (OCTANE_PV_BASE + 0x400)  /* sgi-pvaudio */
+/* Paravirtual device base addresses in GIO64 expansion space (sgi-ip55) */
+#define OCTANE_PV_BASE     0x1F480000ULL
+#define OCTANE_PV_SMP      (OCTANE_PV_BASE + 0x000)
+#define OCTANE_PV_MEM      (OCTANE_PV_BASE + 0x100)
+#define OCTANE_PV_NET      (OCTANE_PV_BASE + 0x200)
+#define OCTANE_PV_GLACCEL  (OCTANE_PV_BASE + 0x300)
+#define OCTANE_PV_AUDIO    (OCTANE_PV_BASE + 0x400)
 
-/* HEART ISR bits for PV device IRQs */
-#define OCTANE_PV_NET_IRQ_BIT     20   /* Level 1 (IP4) */
-#define OCTANE_PV_GLACCEL_IRQ_BIT 21   /* Level 1 (IP4) */
-#define OCTANE_PV_AUDIO_IRQ_BIT   22   /* Level 1 (IP4) */
+#define OCTANE_PV_NET_IRQ_BIT     20
+#define OCTANE_PV_GLACCEL_IRQ_BIT 21
+#define OCTANE_PV_AUDIO_IRQ_BIT   22
 
-static void main_cpu_reset(void *opaque) {
+static void main_cpu_reset(void *opaque)
+{
     MIPSCPU *cpu = opaque;
     cpu_reset(CPU(cpu));
 }
 
-static void sgi_octane_init(MachineState *machine) {
+/* Load the PROM image into the ROM region. */
+static void sgi_octane_load_prom(MachineState *machine, MemoryRegion *prom)
+{
+    char *filename = NULL;
+    int bios_size;
+
+    if (machine->kernel_filename) {
+        return; /* Direct kernel boot: no PROM needed */
+    } else if (machine->firmware) {
+        filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
+        if (!filename) {
+            error_report("Could not find firmware '%s'", machine->firmware);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, "ip30prom.bin");
+        if (!filename) {
+            warn_report("No firmware specified, use -bios to specify Octane PROM");
+            return;
+        }
+    }
+
+    bios_size = load_image_targphys(filename, OCTANE_PROM_BASE,
+                                    OCTANE_PROM_SIZE, NULL);
+    g_free(filename);
+    if (bios_size < 0) {
+        error_report("Could not load PROM image");
+        exit(EXIT_FAILURE);
+    }
+}
+
+/*
+ * Authentic IP30 (Octane) bring-up: HEART + Xbow + BRIDGE, uniprocessor.
+ */
+static void sgi_octane_init(MachineState *machine)
+{
+    MemoryRegion *system_memory = get_system_memory();
+    MemoryRegion *prom;
+    DeviceState *heart_dev;
+    DeviceState *bridge_dev;
+    Clock *cpuclk;
+
+    if (machine->ram_size > OCTANE_RAM_MAX) {
+        error_report("RAM size more than 128GB is not supported");
+        exit(EXIT_FAILURE);
+    }
+
+    /* R10000 @ 300MHz default. */
+    cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
+    clock_set_hz(cpuclk, 300000000);
+
+    machine->smp.cpus = 1;
+    MIPSCPU *cpu = mips_cpu_create_with_clock(MIPS_CPU_TYPE_NAME("R10000"),
+                                              cpuclk, true);
+    cpu_mips_irq_init_cpu(cpu);
+    cpu_mips_clock_init(cpu);
+    qemu_register_reset(main_cpu_reset, cpu);
+
+    /* HEART PIU at 0x0FF00000. */
+    heart_dev = qdev_new(TYPE_SGI_HEART);
+    qdev_prop_set_uint32(heart_dev, "ram-size", machine->ram_size);
+    qdev_prop_set_uint32(heart_dev, "num-cpus", 1);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(heart_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(heart_dev), 0, OCTANE_HEART_BASE);
+
+    /*
+     * HEART interrupt outputs -> CPU IP3-IP7. Level 4 (errors/widget) -> IP7,
+     * level 3 (timer) -> IP6, level 2 -> IP5, level 1 -> IP4, level 0 -> IP3.
+     */
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpu->env.irq[7]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpu->env.irq[6]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpu->env.irq[5]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpu->env.irq[4]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpu->env.irq[3]);
+
+    /* BRIDGE (widget 0xF) at 0x1F000000, 12MB covering PCI/IOC3/devio. */
+    bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(bridge_dev), 0, OCTANE_BRIDGE_BASE);
+
+    /* PROM at 0x1FC00000 (1MB). */
+    prom = g_new(MemoryRegion, 1);
+    memory_region_init_rom(prom, NULL, "sgi.prom", OCTANE_PROM_SIZE,
+                           &error_fatal);
+    memory_region_add_subregion(system_memory, OCTANE_PROM_BASE, prom);
+    sgi_octane_load_prom(machine, prom);
+
+    /* System RAM at 0x20000000 (SEG0; first 512MB). */
+    if (machine->ram_size <= (512 * MiB)) {
+        memory_region_add_subregion(system_memory, OCTANE_RAM_BASE,
+                                    machine->ram);
+    } else {
+        MemoryRegion *seg0 = g_new(MemoryRegion, 1);
+        memory_region_init_alias(seg0, OBJECT(machine), "seg0-ram",
+                                 machine->ram, 0, 512 * MiB);
+        memory_region_add_subregion(system_memory, OCTANE_RAM_BASE, seg0);
+    }
+
+    /* Xbow crossbar stub at widget 0 (0x10000000). */
+    create_unimplemented_device("xbow", OCTANE_XBOW_BASE, 16 * MiB);
+
+    /* HEART XIO widget-8 window (XIO config side, not the PIU). */
+    create_unimplemented_device("heart-widget", OCTANE_HEART_WIDGET, 16 * MiB);
+
+    /* Catch null-pointer accesses in early boot. */
+    create_unimplemented_device("mem-probe", 0x00000000, 512 * KiB);
+}
+
+/*
+ * Legacy IP54-era paravirtual carrier, registered as the bogus `sgi-ip55`
+ * machine type. Not authentic IP30 silicon; kept only so the old type keeps
+ * launching. Do not add IP54 devices to the authentic `octane` machine.
+ */
+static void sgi_ip54pv_init(MachineState *machine)
+{
     MemoryRegion *system_memory = get_system_memory();
     MemoryRegion *prom;
     DeviceState *heart_dev;
@@ -112,21 +216,18 @@ static void sgi_octane_init(MachineState *machine) {
     int bios_size;
     int ncpus = machine->smp.cpus;
 
-    /* Validate RAM size */
     if (machine->ram_size > OCTANE_RAM_MAX) {
         error_report("RAM size more than 128GB is not supported");
         exit(EXIT_FAILURE);
     }
 
-    /* Create CPU clock (R10000 @ 300MHz default) */
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, 300000000);
 
-    /* Create N CPUs */
     MIPSCPU **cpus = g_new0(MIPSCPU *, ncpus);
     for (int i = 0; i < ncpus; i++) {
         cpus[i] = mips_cpu_create_with_clock(MIPS_CPU_TYPE_NAME("R10000"),
-                                              cpuclk, true);
+                                             cpuclk, true);
         cpu_mips_irq_init_cpu(cpus[i]);
         cpu_mips_clock_init(cpus[i]);
 
@@ -139,37 +240,23 @@ static void sgi_octane_init(MachineState *machine) {
         }
     }
 
-    /* Create HEART device */
     heart_dev = qdev_new(TYPE_SGI_HEART);
     qdev_prop_set_uint32(heart_dev, "ram-size", machine->ram_size);
     qdev_prop_set_uint32(heart_dev, "num-cpus", ncpus);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(heart_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(heart_dev), 0, OCTANE_HEART_BASE);
 
-    /*
-     * Wire all 5 HEART CPU IRQ outputs to CPU0 interrupt pins:
-     *   cpu_irq[0] → CPU0 IP7 (level 4: errors/widget)
-     *   cpu_irq[1] → CPU0 IP6 (level 3: timer)
-     *   cpu_irq[2] → CPU0 IP5 (level 2: IPI/local)
-     *   cpu_irq[3] → CPU0 IP4 (level 1: local)
-     *   cpu_irq[4] → CPU0 IP3 (level 0: local)
-     */
     sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpus[0]->env.irq[7]);
     sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpus[0]->env.irq[6]);
     sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpus[0]->env.irq[5]);
     sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpus[0]->env.irq[4]);
     sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpus[0]->env.irq[3]);
 
-    /* Create BRIDGE device */
     bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bridge_dev), 0, OCTANE_BRIDGE_BASE);
 
-    /*
-     * Paravirtual device bank (0x1f480000-0x1f4807ff)
-     */
-
-    /* SMP controller at PV_BASE+0x000 */
+    /* Paravirtual device bank (0x1f480000-0x1f4807ff). */
     smp_dev = qdev_new(TYPE_SGI_SMP);
     qdev_prop_set_uint32(smp_dev, "num-cpus", ncpus);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(smp_dev), &error_fatal);
@@ -181,12 +268,10 @@ static void sgi_octane_init(MachineState *machine) {
         }
     }
 
-    /* PV memory info at PV_BASE+0x100 */
     pvmem_dev = qdev_new(TYPE_SGI_PVMEM);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pvmem_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(pvmem_dev), 0, OCTANE_PV_MEM);
 
-    /* PV network at PV_BASE+0x200, IRQ → HEART ISR bit 20 */
     pvnet_dev = qdev_new(TYPE_SGI_PVNET);
     qemu_configure_nic_device(pvnet_dev, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pvnet_dev), &error_fatal);
@@ -194,14 +279,12 @@ static void sgi_octane_init(MachineState *machine) {
     sysbus_connect_irq(SYS_BUS_DEVICE(pvnet_dev), 0,
                        qdev_get_gpio_in(heart_dev, OCTANE_PV_NET_IRQ_BIT));
 
-    /* GL accelerator at PV_BASE+0x300, IRQ → HEART ISR bit 21 */
     glaccel_dev = qdev_new(TYPE_SGI_GLACCEL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(glaccel_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(glaccel_dev), 0, OCTANE_PV_GLACCEL);
     sysbus_connect_irq(SYS_BUS_DEVICE(glaccel_dev), 0,
                        qdev_get_gpio_in(heart_dev, OCTANE_PV_GLACCEL_IRQ_BIT));
 
-    /* PV audio at PV_BASE+0x400, IRQ → HEART ISR bit 22 */
     {
         DeviceState *pvaudio_dev = qdev_new(TYPE_SGI_PVAUDIO);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pvaudio_dev), &error_fatal);
@@ -210,19 +293,17 @@ static void sgi_octane_init(MachineState *machine) {
                            qdev_get_gpio_in(heart_dev, OCTANE_PV_AUDIO_IRQ_BIT));
     }
 
-    /* Cover the rest of the PV expansion window beyond audio */
     create_unimplemented_device("pv-expansion",
                                 OCTANE_PV_AUDIO + SGI_PVAUDIO_MMIO_SIZE,
                                 0x8000 - 0x500);
 
     /* PROM at 0x1fc00000 */
     prom = g_new(MemoryRegion, 1);
-    memory_region_init_rom(prom, NULL, "sgi.prom", OCTANE_PROM_SIZE, &error_fatal);
+    memory_region_init_rom(prom, NULL, "sgi.prom", OCTANE_PROM_SIZE,
+                           &error_fatal);
     memory_region_add_subregion(system_memory, OCTANE_PROM_BASE, prom);
 
-    /* Load PROM/BIOS */
     if (machine->kernel_filename) {
-        /* Direct kernel boot: no PROM needed */
         filename = NULL;
     } else if (machine->firmware) {
         filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
@@ -248,47 +329,42 @@ static void sgi_octane_init(MachineState *machine) {
         }
     }
 
-    /* RAM at physical 0x20000000 (SEG0) */
     if (machine->ram_size <= (512 * MiB)) {
-        memory_region_add_subregion(system_memory, OCTANE_RAM_BASE, machine->ram);
+        memory_region_add_subregion(system_memory, OCTANE_RAM_BASE,
+                                    machine->ram);
     } else {
-        /* For >512MB RAM, map first 512MB at SEG0 */
         MemoryRegion *seg0 = g_new(MemoryRegion, 1);
         memory_region_init_alias(seg0, OBJECT(machine), "seg0-ram",
                                  machine->ram, 0, 512 * MiB);
         memory_region_add_subregion(system_memory, OCTANE_RAM_BASE, seg0);
     }
 
-    /*
-     * Xbow crossbar stub at widget 0 (0x10000000). The PROM enumerates
-     * widgets via Xbow registers early in POST. Return 0 on reads to
-     * prevent bus errors during widget discovery.
-     */
     create_unimplemented_device("xbow", OCTANE_XBOW_BASE, 16 * MiB);
-
-    /* Catch null-pointer accesses in early boot */
     create_unimplemented_device("mem-probe", 0x00000000, 512 * KiB);
 }
 
-static void sgi_octane_class_init(ObjectClass *oc, const void *data) {
+static void sgi_octane_class_init(ObjectClass *oc, const void *data)
+{
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->desc = "SGI Octane (IP30)";
     mc->init = sgi_octane_init;
     mc->block_default_type = IF_SCSI;
-    mc->default_ram_size = 64 * MiB;
+    mc->default_ram_size = 256 * MiB;
     mc->default_ram_id = "sgi.ram";
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R10000");
     mc->default_cpus = 1;
+    mc->max_cpus = 1;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
 }
 
-static void sgi_ip54_class_init(ObjectClass *oc, const void *data) {
+static void sgi_ip54_class_init(ObjectClass *oc, const void *data)
+{
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->desc = "SGI IP54 Paravirtual Workstation";
-    mc->init = sgi_octane_init;
+    mc->init = sgi_ip54pv_init;
     mc->block_default_type = IF_SCSI;
     mc->default_ram_size = 64 * MiB;
     mc->default_ram_id = "sgi.ram";
@@ -311,7 +387,8 @@ static const TypeInfo sgi_ip55_type = {
     .class_init = sgi_ip54_class_init,
 };
 
-static void sgi_octane_machine_init(void) {
+static void sgi_octane_machine_init(void)
+{
     type_register_static(&sgi_octane_type);
     type_register_static(&sgi_ip55_type);
 }
