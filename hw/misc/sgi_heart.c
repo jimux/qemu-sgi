@@ -166,6 +166,123 @@ static void sgi_heart_update_irq(SGIHEARTState *s)
     }
 }
 
+/*
+ * Read a single 32-bit bank config from the MEMCFG registers. Bank 2n is the
+ * high half of memcfg[n], bank 2n+1 the low half (big-endian).
+ */
+static uint32_t sgi_heart_memcfg32(SGIHEARTState *s, int bank)
+{
+    uint64_t reg = s->memcfg[bank / 2];
+
+    return (bank & 1) ? (uint32_t)reg : (uint32_t)(reg >> 32);
+}
+
+/*
+ * HEART memory-probe window.
+ *
+ * The PROM sizes each SDRAM bank by write/read alias tests at PROBE_MEMBASE
+ * with the bank temporarily configured as base 0x80000000 / size 2GB. On real
+ * HEART the access is decoded by the bank's MEMCFG base/size and reaches the
+ * installed DIMMs; address bits above the DIMM size alias. We decode MEMCFG to
+ * pick the bank and forward within that bank's slice of the installed RAM.
+ *
+ * Accesses past a bank's installed slice read zero and discard writes (the
+ * high address bits of a smaller DIMM do not reach storage); this is what the
+ * PROM's alias tests observe as "no aliasing" for the tested lines.
+ */
+static bool sgi_heart_probe_decode(SGIHEARTState *s, hwaddr off,
+                                   int *bank_out, uint64_t *within_out)
+{
+    uint64_t heart_off = (HEART_PROBE_BASE + off) - HEART_MEM_BASE;
+    int i;
+
+    for (i = 0; i < HEART_NUM_BANKS * 2; i++) {
+        uint32_t cfg = sgi_heart_memcfg32(s, i);
+        uint64_t base, size;
+
+        if (!(cfg & HEART_MEMCFG_VALID)) {
+            continue;
+        }
+        base = (uint64_t)(cfg & HEART_MEMCFG_BASE) << 25;
+        size = ((uint64_t)((cfg & HEART_MEMCFG_SIZE) >> 16) + 1) << 25;
+        if (heart_off >= base && heart_off < base + size) {
+            *bank_out = i;
+            *within_out = heart_off - base;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t sgi_heart_probe_read(void *opaque, hwaddr off, unsigned size)
+{
+    SGIHEARTState *s = opaque;
+    int bank;
+    uint64_t within, slice, val = 0;
+    uint8_t *p;
+    unsigned i;
+
+    if (!s->ram || !sgi_heart_probe_decode(s, off, &bank, &within)) {
+        return 0;
+    }
+    if (bank >= HEART_NUM_BANKS) {
+        return 0;
+    }
+    slice = s->ram_size / HEART_NUM_BANKS;
+    if (within + size > slice) {
+        return 0; /* beyond the installed slice: aliases to nothing */
+    }
+    p = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
+        (uint64_t)bank * slice + within;
+    for (i = 0; i < size; i++) {
+        val = (val << 8) | p[i];
+    }
+    return val;
+}
+
+static void sgi_heart_probe_write(void *opaque, hwaddr off, uint64_t val,
+                                  unsigned size)
+{
+    SGIHEARTState *s = opaque;
+    int bank;
+    uint64_t within, slice;
+    uint8_t *p;
+    int i;
+
+    if (!s->ram || !sgi_heart_probe_decode(s, off, &bank, &within)) {
+        return;
+    }
+    slice = s->ram_size / HEART_NUM_BANKS;
+    if (within + size > slice) {
+        return;
+    }
+    p = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
+        (uint64_t)bank * slice + within;
+    if (bank >= HEART_NUM_BANKS) {
+        return;
+    }
+    slice = s->ram_size / HEART_NUM_BANKS;
+    if (within + size > slice) {
+        return;
+    }
+    p = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
+        (uint64_t)bank * slice + within;
+    for (i = size - 1; i >= 0; i--) {
+        p[i] = val & 0xff;
+        val >>= 8;
+    }
+}
+
+static const MemoryRegionOps sgi_heart_probe_ops = {
+    .read = sgi_heart_probe_read,
+    .write = sgi_heart_probe_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
 static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIHEARTState *s = opaque;
@@ -566,6 +683,11 @@ static void sgi_heart_realize(DeviceState *dev, Error **errp)
                           "sgi-heart", HEART_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 
+    /* MEMCFG-decoded memory-probe window (mapped by the machine). */
+    memory_region_init_io(&s->probe_iomem, OBJECT(dev), &sgi_heart_probe_ops,
+                          s, "sgi-heart-probe", HEART_PROBE_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->probe_iomem);
+
     /* Output IRQs to CPU (IP7, IP6, IP5, IP4, IP3) */
     for (int i = 0; i < 5; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cpu_irq[i]);
@@ -582,6 +704,8 @@ static void sgi_heart_realize(DeviceState *dev, Error **errp)
 static const Property sgi_heart_properties[] = {
     DEFINE_PROP_UINT32("ram-size", SGIHEARTState, ram_size, 64 * 1024 * 1024),
     DEFINE_PROP_UINT32("num-cpus", SGIHEARTState, num_cpus, 1),
+    DEFINE_PROP_LINK("mem", SGIHEARTState, ram, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
 };
 
 static int sgi_heart_post_load(void *opaque, int version_id)

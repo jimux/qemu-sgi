@@ -21,7 +21,9 @@
 
 #include "hw/core/sysbus.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "qom/object.h"
+#include "system/memory.h"
 
 #define TYPE_SGI_HEART "sgi-heart"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIHEARTState, SGI_HEART)
@@ -161,10 +163,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHEARTState, SGI_HEART)
 /* Number of HEART interrupt vectors (input lines from devices) */
 #define HEART_NUM_IRQS 64
 
+/*
+ * HEART memory-probe window. The PROM's init_memconfig (lmem_conf.s) sizes the
+ * SDRAM banks by address-alias tests at PROBE_MEMBASE = K1 + 0x20000000 +
+ * 0x80000000 = 0xA0000000, with each bank temporarily configured (MEMCFG) with
+ * base 0x80000000 and size 2GB. The HEART decodes these accesses through the
+ * per-bank MEMCFG base/size; the probe window is that decode.
+ */
+#define HEART_PROBE_BASE 0xA0000000ULL
+#define HEART_PROBE_SIZE (2 * GiB)
+
+/* HEART SEG0 memory base (Linux IP30_MEMORY_BASE). */
+#define HEART_MEM_BASE 0x20000000ULL
+
 struct SGIHEARTState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+
+    /* MEMCFG-decoded memory-probe window (see HEART_PROBE_BASE). */
+    MemoryRegion probe_iomem;
+
+    /*
+     * Installed-RAM link (machine RAM), used only to back the probe window.
+     * The normal SEG0 RAM mapping stays owned by the machine.
+     */
+    MemoryRegion *ram;
 
     /* CPU interrupt output (HEART -> CPU IP7/IP6/IP5/IP4/IP3) */
     qemu_irq cpu_irq[5];

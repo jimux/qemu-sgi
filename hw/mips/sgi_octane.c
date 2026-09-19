@@ -150,8 +150,12 @@ static void sgi_octane_init(MachineState *machine)
     heart_dev = qdev_new(TYPE_SGI_HEART);
     qdev_prop_set_uint32(heart_dev, "ram-size", machine->ram_size);
     qdev_prop_set_uint32(heart_dev, "num-cpus", 1);
+    object_property_set_link(OBJECT(heart_dev), "mem", OBJECT(machine->ram),
+                             &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(heart_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(heart_dev), 0, OCTANE_HEART_BASE);
+    /* MEMCFG-decoded memory-probe window at 0xA0000000 (sysbus region 1). */
+    sysbus_mmio_map(SYS_BUS_DEVICE(heart_dev), 1, HEART_PROBE_BASE);
 
     /*
      * HEART interrupt outputs -> CPU IP3-IP7. Level 4 (errors/widget) -> IP7,
@@ -187,31 +191,10 @@ static void sgi_octane_init(MachineState *machine)
     }
 
     /*
-     * HEART memory-probe window at 0xA0000000 ("1/2 G + 2 G"): the PROM's
-     * init_memconfig (lmem_conf.s) sizes each SDRAM bank by write/read alias
-     * tests at PROBE_MEMBASE = K1 + 0x20000000 + 0x80000000, touching offsets
-     * up to 1 GB. On real HEART the selected bank (whose address space is the
-     * DIMM size) is aliased into this window, so every probe address resolves
-     * and address bits above the bank size wrap. Model that by repeating the
-     * RAM mapping across the full 2 GB window (aliases only; no extra host
-     * RAM), so the probe never takes a data-bus error and sees the expected
-     * wrap behaviour.
+     * The HEART memory-probe window at 0xA0000000 is owned by the HEART device
+     * (see sgi_heart.c): it decodes the per-bank MEMCFG base/size and forwards
+     * to the installed RAM. SEG0 RAM is mapped flat above for normal operation.
      */
-    {
-        uint64_t win = 16 * GiB;
-        uint64_t blk = (machine->ram_size >= 1 * MiB) ? machine->ram_size
-                                                      : OCTANE_RAM_BASE;
-        int i;
-
-        for (i = 0; (uint64_t)i * blk < win; i++) {
-            MemoryRegion *probe = g_new(MemoryRegion, 1);
-            char *name = g_strdup_printf("sgi.probe-ram.%d", i);
-            memory_region_init_alias(probe, NULL, name, machine->ram, 0, blk);
-            memory_region_add_subregion(system_memory,
-                                        0xA0000000ULL + (uint64_t)i * blk,
-                                        probe);
-        }
-    }
 
     /*
      * Xbow crossbar at widget 0 (0x10000000). The PROM's pon_xbow POST runs
