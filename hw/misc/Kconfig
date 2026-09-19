@@ -189,6 +189,9 @@ config SGI_HEART
 config SGI_BRIDGE
     bool
 
+config SGI_SFLASH
+    bool
+
 config SGI_PVTIMER
     bool
 

@@ -45,6 +45,7 @@
 #include "hw/display/sgi_glaccel.h"
 #include "hw/misc/sgi_heart.h"
 #include "hw/misc/sgi_bridge.h"
+#include "hw/misc/sgi_sflash.h"
 #include "hw/misc/sgi_pvaudio.h"
 #include "hw/misc/sgi_pvmem.h"
 #include "hw/misc/sgi_pvnet.h"
@@ -67,6 +68,7 @@
 #define OCTANE_BRIDGE_BASE 0x1F000000ULL   /* BRIDGE widget 0xF */
 #define OCTANE_XBOW_BASE   0x10000000ULL   /* Xbow crossbar widget 0 */
 #define OCTANE_PROM_BASE   0x1FC00000ULL   /* PROM (BRIDGE+0xC00000) */
+#define OCTANE_FLASH_ALT_BASE 0x1FE00000ULL /* alt flash window (BRIDGE+0xE00000) */
 #define OCTANE_PROM_SIZE   (1 * MiB)       /* IP30 PROM is 1MB */
 #define OCTANE_RAM_MAX     (128ULL * GiB)
 
@@ -178,6 +180,31 @@ static void sgi_octane_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(system_memory, OCTANE_PROM_BASE, prom);
     sgi_octane_load_prom(machine, prom);
+
+    /*
+     * The PROM is the BRIDGE serial flash. The primary flash window is the
+     * read-only ROM the CPU executes from; the flash command interface and the
+     * writable PDS (NVRAM) segment live in the ALTERNATE flash window
+     * (0x1FE00000), which flash_init falls back to when the primary part-ID
+     * read does not answer. Alias the PROM image there so FPROM/RPROM header
+     * reads resolve, then overlay the command window and PDS segment.
+     */
+    {
+        MemoryRegion *alt = g_new(MemoryRegion, 1);
+        DeviceState *sflash = qdev_new(TYPE_SGI_SFLASH);
+
+        memory_region_init_alias(alt, NULL, "sgi.prom.alt", prom, 0,
+                                 OCTANE_PROM_SIZE);
+        memory_region_add_subregion(system_memory, OCTANE_FLASH_ALT_BASE, alt);
+
+        object_property_set_link(OBJECT(sflash), "rom", OBJECT(prom),
+                                 &error_abort);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sflash), &error_fatal);
+        /* Alternate-base command window + PDS segment (segment 15). */
+        sysbus_mmio_map(SYS_BUS_DEVICE(sflash), 0, OCTANE_FLASH_ALT_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sflash), 1,
+                        OCTANE_FLASH_ALT_BASE + 0xF0000);
+    }
 
     /* System RAM at 0x20000000 (SEG0; first 512MB). */
     if (machine->ram_size <= (512 * MiB)) {
