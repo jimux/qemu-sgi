@@ -53,6 +53,13 @@ struct SGIBRIDGEState {
      */
     uint8_t nic_data_bit;
 
+    /*
+     * IOC3 PCI configuration (BRIDGE type-0 config, device 2 at +0x22000):
+     * vendor/device 0x10A9/0x0003 and the writable command/BAR registers.
+     */
+    uint32_t pci_cmd;
+    uint32_t pci_bar[2];
+
     /* Register storage */
     uint32_t regs[BRIDGE_NUM_REGS];
 

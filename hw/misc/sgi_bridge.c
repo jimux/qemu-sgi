@@ -143,6 +143,44 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         val = s->regs[offset >> 2];
         break;
 
+    /*
+     * BRIDGE type-0 PCI configuration windows (one 4KB slot per device).
+     * The IOC3 is device 2 with vendor 0x10A9 / device 0x0003. Absent devices
+     * read all-ones. The PROM's device graph / SAIO install needs this to
+     * register the IOC3 serial console.
+     */
+    case 0x20000 ... 0x2FFFF:
+        {
+            unsigned dev = (offset - 0x20000) >> 12;
+            hwaddr cfg = offset & 0xfff;
+
+            if (dev != 2) {
+                val = 0xffffffff;
+                break;
+            }
+            switch (cfg) {
+            case 0x00:
+                val = 0x000310a9; /* IOC3 vendor/device */
+                break;
+            case 0x04:
+                val = s->pci_cmd;
+                break;
+            case 0x08:
+                val = 0x00000001; /* class/revision */
+                break;
+            case 0x10:
+                val = s->pci_bar[0];
+                break;
+            case 0x14:
+                val = s->pci_bar[1];
+                break;
+            default:
+                val = 0;
+                break;
+            }
+        }
+        break;
+
     case 0x600000 ... 0x61FFFF:
         if (offset == 0x600028) {
             /*
@@ -198,6 +236,29 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
     case 0x0105 ... 0x2FFF:
         /* General register file (POST write/read tests land here). */
         s->regs[offset >> 2] = val;
+        break;
+
+    case 0x20000 ... 0x2FFFF:
+        {
+            unsigned dev = (offset - 0x20000) >> 12;
+            hwaddr cfg = offset & 0xfff;
+
+            if (dev == 2) {
+                switch (cfg) {
+                case 0x04:
+                    s->pci_cmd = val;
+                    break;
+                case 0x10:
+                    s->pci_bar[0] = val;
+                    break;
+                case 0x14:
+                    s->pci_bar[1] = val;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
         break;
 
     case 0x600000 ... 0x61FFFF:
