@@ -1309,7 +1309,7 @@ static uint32_t sgi_mace_ec_ip_cksum(const uint8_t *buf, int len)
 }
 
 /*
- * Net-backend receive: stash the frame and deliver it after a short
+ * Net-backend receive: queue the frame and deliver it after a short
  * virtual-time wire delay (below).  Real wire latency means a reply
  * never lands in the same guest PIO window as the transmit that
  * provoked it; delivering synchronously (inside the guest's TX-ring
@@ -1318,36 +1318,66 @@ static uint32_t sgi_mace_ec_ip_cksum(const uint8_t *buf, int len)
  * thread still holds the socket locks it needs — observed as the
  * IRIX raw-socket layer discarding the reply between m_copy and
  * sbappendaddr.
+ *
+ * @@SEMANTICS@@  This used to hold one pending frame and overwrite it
+ * when a second arrived inside the 200us window; the measured peak burst
+ * is 20 back-to-back frames (tmp/o2-qemu/o2eth2/REPORT.md), so TCP
+ * data/ACKs were silently dropped and the session crawled or stalled.
+ * Queue every frame in a bounded ring and keep its arrival deadline so
+ * each frame keeps its own 200us deferral.  Frames are dropped (traced)
+ * only when the ring is genuinely full.
  */
 static ssize_t sgi_mace_ec_receive(NetClientState *nc, const uint8_t *buf,
                                    size_t size)
 {
     SGIMACEState *s = qemu_get_nic_opaque(nc);
+    int slot;
 
     if (size < 14 || size > MAC_MAX_FRAME) {
         return size;
     }
-    if (s->ec_rx_pending_len >= 0) {
-        /* one pending frame: overwrite (last arrival wins) */
-        trace_sgi_mace_ec_rx_overwrite(s->ec_rx_pending_len, (int)size);
+    if (s->ec_rxq_count >= MACE_EC_RX_FIFO_LEN) {
+        /* Ring full: last-resort drop (was the silent overwrite). */
+        trace_sgi_mace_ec_rx_overwrite((int)size, s->ec_rxq_count);
+        return size;
     }
-    memcpy(s->ec_rx_pending, buf, size);
-    s->ec_rx_pending_len = size;
-    timer_mod_ns(s->ec_rx_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
-                 + 200000);   /* 200us wire delay */
+    slot = (s->ec_rxq_head + s->ec_rxq_count) % MACE_EC_RX_FIFO_LEN;
+    memcpy(s->ec_rxq[slot].data, buf, size);
+    s->ec_rxq[slot].len = size;
+    s->ec_rxq[slot].deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                                  + MACE_EC_RX_WIRE_DELAY_NS;
+    s->ec_rxq_count++;
+    trace_sgi_mace_ec_rx_enqueue((int)size, s->ec_rxq_count);
+    /*
+     * Arm delivery on the oldest frame's deadline.  Deadlines are
+     * monotonic in arrival order, so this only ever re-arms to the same
+     * (head) value while later frames arrive: a sustained burst cannot
+     * push delivery out indefinitely (unlike the old overwrite model).
+     */
+    timer_mod_ns(s->ec_rx_timer, s->ec_rxq[s->ec_rxq_head].deadline_ns);
     return size;
 }
 
 static void sgi_mace_ec_rx_timer_cb(void *opaque)
 {
     SGIMACEState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (s->ec_rx_pending_len >= 0) {
+    /* Deliver every frame whose own 200us wire delay has elapsed. */
+    while (s->ec_rxq_count > 0) {
+        int slot = s->ec_rxq_head;
         uint8_t pkt[MAC_MAX_FRAME];
-        int len = s->ec_rx_pending_len;
+        int len;
 
-        memcpy(pkt, s->ec_rx_pending, len);
-        s->ec_rx_pending_len = -1;
+        if (s->ec_rxq[slot].deadline_ns > now) {
+            /* Head is not yet due: wait for its own deadline. */
+            timer_mod_ns(s->ec_rx_timer, s->ec_rxq[slot].deadline_ns);
+            return;
+        }
+        len = s->ec_rxq[slot].len;
+        memcpy(pkt, s->ec_rxq[slot].data, len);
+        s->ec_rxq_head = (s->ec_rxq_head + 1) % MACE_EC_RX_FIFO_LEN;
+        s->ec_rxq_count--;
         sgi_mace_ec_rx_deliver(s, pkt, len);
     }
 }
@@ -3334,7 +3364,8 @@ static void sgi_mace_reset(DeviceState *dev)
     s->ec_phy_addr = 0;
     s->ec_phy_busy = false;
     s->ec_force_off = false;
-    s->ec_rx_pending_len = -1;
+    s->ec_rxq_head = 0;
+    s->ec_rxq_count = 0;
     if (s->ec_rx_timer) {
         timer_del(s->ec_rx_timer);
     }
@@ -3457,7 +3488,8 @@ static void sgi_mace_realize(DeviceState *dev, Error **errp)
         s->nic = NULL;
     }
     s->ec_rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_mace_ec_rx_timer_cb, s);
-    s->ec_rx_pending_len = -1;
+    s->ec_rxq_head = 0;
+    s->ec_rxq_count = 0;
 
     /*
      * PCI root bus.  Devices live on PCI slots 1..5 (the kernel scans

@@ -479,7 +479,8 @@ sgi_mace_ec_rx_fifo_push(uint32_t addr, int count, int wptr, int rptr) "RX mcl p
 sgi_mace_ec_rx_packet(uint32_t addr, int len, int skipped, uint32_t rptr) "RX packet mcl=0x%08x len=%d skipped=%d rptr=%d"
 sgi_mace_ec_frame(int is_tx, uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3, uint64_t v0, int len) "frame is_tx=%d %08x %08x %08x %08x v0=0x%016"PRIx64" len=%d"
 sgi_mace_ec_rx_drop(int reason) "RX dropped reason=%d"
-sgi_mace_ec_rx_overwrite(int old_len, int new_len) "RX pending overwritten old=%d new=%d (frames within the 200us wire delay)"
+sgi_mace_ec_rx_enqueue(int len, int depth) "RX enqueue len=%d depth=%d (deferred 200us per frame)"
+sgi_mace_ec_rx_overwrite(int len, int depth) "RX FIFO full: dropped %d-byte frame depth=%d"
 sgi_mace_ec_irq(uint32_t status, int level) "EC int status=0x%02x level=%d"
 sgi_mace_ec_mdio(int rw, uint32_t addr, uint32_t val) "MDIO rw=%d addr=0x%03x val=0x%04x"
 

@@ -578,6 +578,33 @@ enum {
 #define MAC_RX_MCL_CNT_MASK     0x1f
 #define MAC_RX_MCL_SIZE         4096
 
+/*
+ * Deferred-delivery RX staging FIFO (net backend -> mcl clusters).
+ *
+ * @@SEMANTICS@@  The M9 fix requires RX frames from the net backend to be
+ * delivered asynchronously, ~200us after arrival, never inside the guest's
+ * TX PIO window (synchronous delivery there lands in the same syscall's
+ * socket locks and the IRIX raw-socket path discards the reply).  The old
+ * model held exactly one pending frame and silently overwrote it when a
+ * second frame arrived inside that window; the measured peak burst is 20
+ * back-to-back frames (three concurrent slirp downloads + a system-telnet
+ * upload; tmp/o2-qemu/o2eth2/REPORT.md), so the single slot was dropping
+ * most of every burst and TCP connections crawled or stalled.
+ *
+ * This is a bounded ring of MACE_EC_RX_FIFO_LEN whole frames.  A burst is
+ * one slirp delivery batch, bounded in the worst case by a full 64 KB TCP
+ * window in MSS-sized (1514 B) frames (~43), so the ring is 64 slots
+ * (100 KB) -- comfortably above both the measured peak and that bound.
+ * Each frame keeps its own arrival timestamp so it is delivered
+ * ~MACE_EC_RX_WIRE_DELAY_NS after *its own* arrival (exactly the old
+ * per-frame deferral, generalised to N frames); the timer is armed on the
+ * head and never extended by later arrivals, so a sustained burst cannot
+ * starve delivery.  A frame is dropped (with a trace) only when the ring
+ * is genuinely full.
+ */
+#define MACE_EC_RX_FIFO_LEN     64
+#define MACE_EC_RX_WIRE_DELAY_NS 200000  /* 200us wire latency per frame */
+
 /* TX command header (spec §4.4.2) */
 #define TX_CMD_LENGTH_MASK      0x00007fffULL  /* length-1             */
 #define TX_CMD_OFFSET_MASK      0x007f0000ULL  /* ring data start byte */
@@ -782,9 +809,20 @@ struct SGIMACEState {
     NICState *nic;                 /* QEMU net frontend (slirp &c)     */
     NICConf nic_conf;              /* macaddr + netdev link            */
     bool nic_present;              /* a NIC backend was instantiated   */
-    QEMUTimer *ec_rx_timer;        /* wire-delay RX delivery timer     */
-    uint8_t ec_rx_pending[MAC_MAX_FRAME];
-    int ec_rx_pending_len;        /* -1 = no packet pending            */
+    QEMUTimer *ec_rx_timer;        /* per-frame wire-delay delivery timer */
+    /*
+     * Deferred-delivery staging ring: whole frames queued from the net
+     * backend, each with its own arrival deadline.  head/count index a
+     * bounded ring of MACE_EC_RX_FIFO_LEN slots (see the @@SEMANTICS@@
+     * note above MAC_RX_MCL_ENTRIES).
+     */
+    struct {
+        uint16_t len;
+        int64_t deadline_ns;
+        uint8_t data[MAC_MAX_FRAME];
+    } ec_rxq[MACE_EC_RX_FIFO_LEN];
+    int ec_rxq_head;               /* index of oldest queued frame      */
+    int ec_rxq_count;              /* frames queued (0..LEN)            */
 
     uint32_t ec_mac_control;       /* MAC_CONTROL + RO rev bits        */
     bool ec_force_off;              /* 0x58 write parked the CRIME line */
