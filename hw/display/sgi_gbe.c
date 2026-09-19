@@ -697,13 +697,23 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
                             b = (ent >> 8) & 0xff;
-                        } else if (typ == 0) {
+                        } else if (typ == 0 || typ == 2) {
                             /*
                              * I8 WID on a 16/32-bit fetch (the 8+8 / 16+16
                              * split): the pixel index is the 8bpp byte in
                              * the WID-selected half of the fetched word.
                              * Lane per buf: 01 = lower half (byte 0 of the
                              * half), 10 = upper half, 11 = both -> byte 0.
+                             *
+                             * typ 2 is documented RG3B2, but the O2 X server
+                             * drives its 8bpp PseudoColor desktop content
+                             * (icons, chrome) through WID 0x0b = typ 2 / cm 0
+                             * with a plain colormap index in the byte lane:
+                             * falling through to the raw 32bpp-RGB default
+                             * read the index byte as the green channel and
+                             * rendered the grey Console icon saturated
+                             * green.  Decode typ 2 as the same 8-bit cmap
+                             * index as I8.
                              */
                             int lane;
                             /*
