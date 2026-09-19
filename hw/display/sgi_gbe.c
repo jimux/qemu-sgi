@@ -262,12 +262,19 @@ static void sgi_gbe_irq_pulse_end(void *opaque)
 /*
  * Composite the hardware cursor over the scanned-out frame (spec
  * §2.10 Cursor): 32x32 glyph, 2 bits/pixel packed 16-per-u32 in
- * crs_glyph[64], position from crs_pos with the (31,31) offset —
- * "the lower right pixel of the cursor glyph corresponds to the upper
- * left corner of the active raster", i.e. screen pixel (sx,sy) samples
- * glyph pixel (sx - posx + 31, sy - posy + 31). Glyph value 0 is
- * transparent; 1-3 index crs_cmap[0..2] (packed RGB). crs_ctrl bit 0
- * = enable, bit 1 = crosshair mode (crosshair uses color 1).
+ * crs_glyph[64], position from crs_pos.
+ *
+ * @@SEMANTICS@@ crs_pos is the glyph's upper-left (hotspot) pixel, so
+ * screen pixel (sx,sy) samples glyph pixel (sx - posx, sy - posy).
+ * The old code instead placed the glyph's LOWER-RIGHT at crs_pos
+ * (draw at pos-31): the drawn cursor then sat 31px up-left of where the
+ * guest thinks it is, so it could not be pushed into the bottom-right of
+ * the screen (observed max ~1254,1004 at 1280x1024) and went fully
+ * off-screen past the top-left. Drawing at pos makes the arrow tip track
+ * the guest position and reach all four corners.
+ *
+ * Glyph value 0 is transparent; 1-3 index crs_cmap[0..2] (packed RGB).
+ * crs_ctrl bit 0 = enable, bit 1 = crosshair mode (crosshair uses color 1).
  */
 static void sgi_gbe_composite_cursor(SGIGBEState *s, DisplaySurface *surface)
 {
@@ -303,12 +310,12 @@ static void sgi_gbe_composite_cursor(SGIGBEState *s, DisplaySurface *surface)
     }
 
     for (int gy = 0; gy < 32; gy++) {
-        int sy = posy - 31 + gy;
+        int sy = posy + gy;
         if (sy < 0 || sy >= sh) {
             continue;
         }
         for (int gx = 0; gx < 32; gx++) {
-            int sx = posx - 31 + gx;
+            int sx = posx + gx;
             if (sx < 0 || sx >= sw) {
                 continue;
             }
