@@ -1329,6 +1329,7 @@ static ssize_t sgi_mace_ec_receive(NetClientState *nc, const uint8_t *buf,
     }
     if (s->ec_rx_pending_len >= 0) {
         /* one pending frame: overwrite (last arrival wins) */
+        trace_sgi_mace_ec_rx_overwrite(s->ec_rx_pending_len, (int)size);
     }
     memcpy(s->ec_rx_pending, buf, size);
     s->ec_rx_pending_len = size;
@@ -2512,6 +2513,267 @@ static void sgi_mace_isa_rx_arm(SGIMACEState *s)
 }
 
 /*
+ * ============================================================
+ * DS2502 1-wire eaddr EEPROM (ISA_FLASH_NIC_REG bits 2/3)
+ *
+ * The O2's station address is not in a MAC110 register: the real
+ * machine reads a Dallas DS2502 add-only 1-wire memory through the
+ * MACE ISA NIC lines.  The PROM bit-bangs it (lib/libsk/ml/ds2502.c:
+ * presence pulse, read-ROM 0x33 with a CRC-8, then read-memory 0xF0
+ * with a command/address CRC and a memory CRC) and publishes the
+ * result as the ARCS "eaddr" env, which the IRIX kernel copies into
+ * its eaddr[] global (IP32init.c init_sysid) and programs into the
+ * MAC110 at if_me attach.  Without a part the PROM fills eaddr with
+ * 0xff:ff:ff:ff:ff:ff, whose group bit makes the kernel log
+ * "ec0: invalid ethernet station address" and leave ec0 down.
+ *
+ * The model is a register-level slave: the master's DEASSERT bit is
+ * the 1-wire clock (low = drive low, high = release), and each falling
+ * edge opens a slot whose width the part samples on the rising edge.
+ * A >480us low is a reset, 8/90us lows are write-1/write-0, and the
+ * short reads pull the next output bit onto the DQ line.  The memory
+ * is programmed from the MACE station address (the NIC "mac"
+ * property, a valid unicast default), so the guest and the host-side
+ * NIC agree on the MAC.
+ *
+ * @@SEMANTICS@@ The station address is sourced the way the real
+ * machine sources it (the DS2502 the PROM reads into ARCS "eaddr"),
+ * not from a fabricated register.  Two emulation-only points are
+ * marked here: (1) the 48-bit serial is programmed from the QEMU NIC
+ * "mac" property so the guest and slirp share one MAC; (2) pulse
+ * widths are read from CRIME CRM_TIME rather than the virtual clock,
+ * because the guest's usecwait waits on CRM_TIME (whose model forces
+ * a 300-tick/read floor), so the counter -- not QEMU_CLOCK_VIRTUAL --
+ * is what actually carries the 8us/90us/500us pulse.  The DS2502
+ * failure path is preserved: with no part the PROM would publish
+ * 0xff:ff:ff:ff:ff:ff and the kernel would reject it exactly as before.
+ * ============================================================
+ */
+
+/* Dallas/Maxim CRC-8 (reflected 0x8C), identical to the PROM's table */
+static const uint8_t sgi_mace_ds_crc8[256] = {
+    0, 94,188,226, 97, 63,221,131,194,156,126, 32,163,253, 31, 65,
+    157,195, 33,127,252,162, 64, 30, 95,  1,227,189, 62, 96,130,220,
+    35,125,159,193, 66, 28,254,160,225,191, 93,  3,128,222, 60, 98,
+    190,224,  2, 92,223,129, 99, 61,124, 34,192,158, 29, 67,161,255,
+    70, 24,250,164, 39,121,155,197,132,218, 56,102,229,187, 89,  7,
+    219,133,103, 57,186,228,  6, 88, 25, 71,165,251,120, 38,196,154,
+    101, 59,217,135,  4, 90,184,230,167,249, 27, 69,198,152,122, 36,
+    248,166, 68, 26,153,199, 37,123, 58,100,134,216, 91,  5,231,185,
+    140,210, 48,110,237,179, 81, 15, 78, 16,242,172, 47,113,147,205,
+    17, 79,173,243,112, 46,204,146,211,141,111, 49,178,236, 14, 80,
+    175,241, 19, 77,206,144,114, 44,109, 51,209,143, 12, 82,176,238,
+    50,108,142,208, 83, 13,239,177,240,174, 76, 18,145,207, 45,115,
+    202,148,118, 40,171,245, 23, 73,  8, 86,180,234,105, 55,213,139,
+    87,  9,235,181, 54,104,138,212,149,203, 41,119,244,170, 72, 22,
+    233,183, 85, 11,136,214, 52,106, 43,117,151,201, 74, 20,246,168,
+    116, 42,200,150, 21, 75,169,247,182,232, 10, 84,215,137,107, 53
+};
+
+static uint8_t sgi_mace_ds_crc(uint8_t crc, uint8_t byte)
+{
+    return sgi_mace_ds_crc8[crc ^ byte];
+}
+
+/*
+ * Program the 1Kbit memory from a 48-bit station address.  The PROM's
+ * read-memory returns memory[0..5] LSB-first and reverses it into the
+ * eaddr, so the MAC is stored low byte first.  The unused tail reads
+ * as erased 0xff.  The three CRC bytes the driver checks (read-ROM,
+ * read-memory command/address, and the 128-byte memory) are derived
+ * here so the part always verifies clean.
+ */
+static void sgi_mace_ds_program(SGIMACEState *s, const uint8_t mac[6])
+{
+    uint8_t crc = 0;
+    int i;
+
+    memset(s->ds_mem, 0xff, sizeof(s->ds_mem));
+    for (i = 0; i < 6; i++) {
+        s->ds_mem[i] = mac[5 - i];
+    }
+
+    /* read-ROM: family, then the 6 serial bytes */
+    crc = sgi_mace_ds_crc(crc, MACE_DS2502_FAMILY);
+    for (i = 0; i < 6; i++) {
+        crc = sgi_mace_ds_crc(crc, s->ds_mem[i]);
+    }
+    s->ds_rom_crc = crc;
+
+    /* read-memory command/address: 0xf0, addr lo, addr hi */
+    crc = 0;
+    crc = sgi_mace_ds_crc(crc, MACE_DS2502_MEM_CMD);
+    crc = sgi_mace_ds_crc(crc, 0x00);
+    crc = sgi_mace_ds_crc(crc, 0x00);
+    s->ds_cmd_crc = crc;
+
+    /* the 128 memory bytes; the driver appends this byte and wants 0 */
+    crc = 0;
+    for (i = 0; i < MACE_DS2502_MEM_SIZE; i++) {
+        crc = sgi_mace_ds_crc(crc, s->ds_mem[i]);
+    }
+    s->ds_ram_crc = crc;
+}
+
+static void sgi_mace_ds_reset(SGIMACEState *s)
+{
+    s->ds_phase = MACE_DS_IDLE;
+    s->ds_rx = 0;
+    s->ds_rxbits = 0;
+    s->ds_addrbytes = 0;
+    s->ds_outlen = 0;
+    s->ds_outidx = 0;
+    s->ds_outbit = 0;
+    s->ds_data = 1;                    /* idle: pulled high */
+}
+
+/*
+ * Width of the low pulse that just ended, in guest-visible time.  The
+ * PROM's deassert() zeroes CRM_TIME and waits `usecs` before releasing
+ * the line, so the counter read back now is that pulse width (the
+ * virtual clock cannot see the counter's forced 300-tick/read floor).
+ */
+static int64_t sgi_mace_ds_pulse_ns(void)
+{
+    uint64_t ticks = address_space_ldq_be(&address_space_memory,
+                                          MACE_CRIME_TIME_PHYS,
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+    return (int64_t)ticks * MACE_CRIME_NS_PER_TICK;
+}
+
+/* Load the shift-out buffer for the phase that just finished. */
+static void sgi_mace_ds_load_output(SGIMACEState *s)
+{
+    switch (s->ds_phase) {
+    case MACE_DS_OUT_ROM:
+        s->ds_out[0] = MACE_DS2502_FAMILY;
+        memcpy(&s->ds_out[1], s->ds_mem, 6);
+        s->ds_out[7] = s->ds_rom_crc;
+        s->ds_outlen = 8;
+        break;
+    case MACE_DS_OUT_CMDCRC:
+        s->ds_out[0] = s->ds_cmd_crc;
+        s->ds_outlen = 1;
+        break;
+    case MACE_DS_OUT_MEM:
+        memcpy(s->ds_out, s->ds_mem, MACE_DS2502_MEM_SIZE);
+        s->ds_outlen = MACE_DS2502_MEM_SIZE;
+        break;
+    case MACE_DS_OUT_CKSUM:
+        s->ds_out[0] = s->ds_ram_crc;
+        s->ds_outlen = 1;
+        break;
+    default:
+        s->ds_outlen = 0;
+        break;
+    }
+    s->ds_outidx = 0;
+    s->ds_outbit = 0;
+}
+
+/* Move to the phase that follows a completed shift-out buffer. */
+static void sgi_mace_ds_next_output_phase(SGIMACEState *s)
+{
+    switch (s->ds_phase) {
+    case MACE_DS_OUT_ROM:
+        s->ds_phase = MACE_DS_CMD;      /* read_ram re-commands w/o reset */
+        break;
+    case MACE_DS_OUT_CMDCRC:
+        s->ds_phase = MACE_DS_OUT_MEM;
+        break;
+    case MACE_DS_OUT_MEM:
+        s->ds_phase = MACE_DS_OUT_CKSUM;
+        break;
+    case MACE_DS_OUT_CKSUM:
+    default:
+        s->ds_phase = MACE_DS_CMD;
+        break;
+    }
+    if (s->ds_phase != MACE_DS_CMD) {
+        sgi_mace_ds_load_output(s);
+    }
+}
+
+static void sgi_mace_ds_reset_pulse(SGIMACEState *s)
+{
+    s->ds_phase = MACE_DS_CMD;
+    s->ds_rx = 0;
+    s->ds_rxbits = 0;
+    s->ds_addrbytes = 0;
+    /*
+     * The DS2502 answers a reset with a presence pulse a few us after
+     * the master releases the line.  Hold DQ low until the first
+     * output bit is clocked out: the PROM polls for the low and then
+     * never samples DQ again until it is reading the family byte, so
+     * there is no host-time timer to race against the guest's own
+     * (CRM_TIME-based) delay loop.
+     */
+    s->ds_data = 0;
+}
+
+/*
+ * One 1-wire slot ended (DEASSERT rose).  In command/address phases the
+ * master is writing and the 8us/90us pulse width is the bit value; in
+ * an output phase the master is reading and the short slot clocks out
+ * the next bit.  A long low is a reset regardless of phase.
+ */
+static void sgi_mace_ds_slot(SGIMACEState *s, int64_t width_ns)
+{
+    trace_sgi_mace_ds_slot(s->ds_phase, width_ns);
+    if (width_ns >= MACE_DS2502_RESET_NS) {
+        sgi_mace_ds_reset_pulse(s);
+        return;
+    }
+
+    switch (s->ds_phase) {
+    case MACE_DS_CMD:
+        s->ds_rx |= (width_ns < MACE_DS2502_ZERO_NS ? 1 : 0) << s->ds_rxbits;
+        if (++s->ds_rxbits == 8) {
+            trace_sgi_mace_ds_state(0, s->ds_rx, 8);
+            if (s->ds_rx == MACE_DS2502_ROM_CMD) {
+                s->ds_phase = MACE_DS_OUT_ROM;
+                sgi_mace_ds_load_output(s);
+            } else if (s->ds_rx == MACE_DS2502_MEM_CMD) {
+                s->ds_phase = MACE_DS_ADDR;
+                s->ds_addrbytes = 0;
+            } else {
+                s->ds_phase = MACE_DS_IDLE;
+            }
+            s->ds_rx = 0;
+            s->ds_rxbits = 0;
+        }
+        break;
+    case MACE_DS_ADDR:
+        s->ds_rx |= (width_ns < MACE_DS2502_ZERO_NS ? 1 : 0) << s->ds_rxbits;
+        if (++s->ds_rxbits == 8) {
+            s->ds_addr[s->ds_addrbytes++] = s->ds_rx;
+            s->ds_rx = 0;
+            s->ds_rxbits = 0;
+            if (s->ds_addrbytes == 2) {
+                /* only address 0 is ever used; the CRC is the same */
+                s->ds_phase = MACE_DS_OUT_CMDCRC;
+                sgi_mace_ds_load_output(s);
+            }
+        }
+        break;
+    default:
+        /* output phase: clock out the next bit on this rising edge */
+        if (s->ds_outidx < s->ds_outlen) {
+            s->ds_data = (s->ds_out[s->ds_outidx] >> s->ds_outbit) & 1;
+            if (++s->ds_outbit == 8) {
+                s->ds_outbit = 0;
+                if (++s->ds_outidx == s->ds_outlen) {
+                    sgi_mace_ds_next_output_phase(s);
+                }
+            }
+        } else {
+            s->ds_data = 1;
+        }
+        break;
+    }
+}
+
+/*
  * ISA register space read (offset relative to MACE_ISA_OFFSET).
  * Four 16KB pages (spec §5.1 TABLE 52): page 0 = interrupt/ring
  * base, page 1 = parallel DMA (unmodeled), pages 2/3 = the two
@@ -2555,7 +2817,13 @@ static uint64_t sgi_mace_isa_read(SGIMACEState *s, hwaddr isa_off,
         return s->isa_ringbase;
     case ISA_FLASH_NIC_REG:
     case ISA_FLASH_NIC_REG + 4:
-        return s->isa_flash_nic;
+        /*
+         * ISA_NIC_DATA is the DS2502 DQ line: the master's register
+         * store never drives it, so reads return the level the part
+         * is currently holding (idle high / presence / output bit).
+         */
+        return (s->isa_flash_nic & ~ISA_NIC_DATA)
+             | (s->ds_data ? ISA_NIC_DATA : 0);
     case ISA_INT_STS_REG:
     case ISA_INT_STS_REG + 4:
         return s->isa_int_status;
@@ -2636,8 +2904,23 @@ static void sgi_mace_isa_write(SGIMACEState *s, hwaddr isa_off,
         break;
     case ISA_FLASH_NIC_REG:
     case ISA_FLASH_NIC_REG + 4:
+    {
+        /*
+         * ISA_NIC_DEASSERT is the 1-wire clock the PROM bit-bangs.
+         * The 0->1 edge that ends a low pulse presents one slot to
+         * the DS2502; the pulse width is read from CRM_TIME, which
+         * the PROM's delay routine just counted up to that width.
+         */
+        uint64_t old = s->isa_flash_nic;
+        bool old_de = (old & ISA_NIC_DEASSERT) != 0;
+        bool new_de = (value & ISA_NIC_DEASSERT) != 0;
+
         s->isa_flash_nic = value;
+        if (!old_de && new_de) {
+            sgi_mace_ds_slot(s, sgi_mace_ds_pulse_ns());
+        }
         break;
+    }
     case ISA_INT_STS_REG:
     case ISA_INT_STS_REG + 4:
         /*
@@ -3061,6 +3344,20 @@ static void sgi_mace_reset(DeviceState *dev)
     }
 
     /*
+     * The DS2502 eaddr EEPROM is the station-address source the PROM
+     * reads: program it from the MACE NIC MAC (the QEMU "mac"
+     * property, defaulted to a valid unicast by the net layer; the
+     * same fallback the MAC110 register preload uses otherwise).
+     */
+    {
+        const uint8_t defmac[6] = { 0x08, 0x00, 0x69, 0xde, 0xad, 0x01 };
+        const uint8_t *mac = s->nic_present ? s->nic_conf.macaddr.a : defmac;
+
+        sgi_mace_ds_program(s, mac);
+    }
+    sgi_mace_ds_reset(s);
+
+    /*
      * DS17287 RTC reset values:
      *   Reg A (10): 0x20 = oscillator running, divider chain on
      *   Reg B (11): 0x06 = binary mode (bit 2), 24-hour (bit 1)
@@ -3305,8 +3602,8 @@ static const VMStateDescription vmstate_sgi_mace_audio = {
 
 static const VMStateDescription vmstate_sgi_mace = {
     .name = "sgi-mace",
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(isa_ringbase, SGIMACEState),
         VMSTATE_UINT64(isa_flash_nic, SGIMACEState),
@@ -3316,6 +3613,21 @@ static const VMStateDescription vmstate_sgi_mace = {
         VMSTATE_UINT32_2DARRAY(isa_dma_rptr, SGIMACEState, MACE_NUM_SERIAL, 2),
         VMSTATE_UINT32_2DARRAY(isa_dma_wptr, SGIMACEState, MACE_NUM_SERIAL, 2),
         VMSTATE_BOOL_ARRAY(isa_dma_preq, SGIMACEState, MACE_NUM_SERIAL),
+        VMSTATE_UINT8_ARRAY(ds_mem, SGIMACEState, MACE_DS2502_MEM_SIZE),
+        VMSTATE_UINT8(ds_rom_crc, SGIMACEState),
+        VMSTATE_UINT8(ds_cmd_crc, SGIMACEState),
+        VMSTATE_UINT8(ds_ram_crc, SGIMACEState),
+        VMSTATE_INT32(ds_phase, SGIMACEState),
+        VMSTATE_UINT8(ds_rx, SGIMACEState),
+        VMSTATE_INT32(ds_rxbits, SGIMACEState),
+        VMSTATE_UINT8_ARRAY(ds_addr, SGIMACEState, 2),
+        VMSTATE_INT32(ds_addrbytes, SGIMACEState),
+        VMSTATE_UINT8_ARRAY(ds_out, SGIMACEState,
+                            1 + MACE_DS2502_MEM_SIZE + 1),
+        VMSTATE_INT32(ds_outlen, SGIMACEState),
+        VMSTATE_INT32(ds_outidx, SGIMACEState),
+        VMSTATE_INT32(ds_outbit, SGIMACEState),
+        VMSTATE_INT32(ds_data, SGIMACEState),
         VMSTATE_UINT32(pci_error_addr, SGIMACEState),
         VMSTATE_UINT32(pci_error_flags, SGIMACEState),
         VMSTATE_UINT32(pci_control, SGIMACEState),

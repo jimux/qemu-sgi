@@ -75,6 +75,51 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEState, SGI_MACE)
 #define ISA_INT_RTC_IRQ         0x00000100
 
 /*
+ * ISA_FLASH_NIC_REG NIC control/data bits (kernel sys/mace.h: the
+ * DS2502 1-wire eaddr EEPROM is bit-banged through these two lines).
+ */
+#define ISA_NIC_DEASSERT        0x00000004ULL /* bit2: drive the 1-wire low */
+#define ISA_NIC_DATA            0x00000008ULL /* bit3: DQ read-back level  */
+
+/*
+ * DS2502 1-wire EEPROM (the O2's "NIC" serial-number/eaddr chip).
+ * 1Kbit = 128 bytes; the PROM reads the 48-bit station address from
+ * read-memory address 0 and expects read-ROM family 0x09.  The driver
+ * bit-bangs it through ISA_NIC_DEASSERT/ISA_NIC_DATA; timing constants
+ * below mirror the PROM driver (lib/libsk/ml/ds2502.c).
+ */
+#define MACE_DS2502_MEM_SIZE    128
+#define MACE_DS2502_FAMILY      0x09
+#define MACE_DS2502_ROM_CMD     0x33  /* read ROM                        */
+#define MACE_DS2502_MEM_CMD     0xf0  /* read memory                     */
+#define MACE_DS2502_RESET_NS    300000  /* >480us reset => treat as reset */
+#define MACE_DS2502_ZERO_NS     50000   /* write-zero window (>60us)      */
+
+/*
+ * CRIME CRM_TIME (0x14000038 on the O2) as seen by the guest.  The
+ * PROM's usecwait zeroes this counter and spins until it reaches
+ * usecs*66 ticks, and CRIME's model forces a realistic floor of 300
+ * ticks per read, so the register value at the end of a 1-wire low
+ * pulse *is* the pulse width in guest time (8us/90us/500us), which
+ * QEMU's virtual clock does not reproduce.  The DS2502 model reads it
+ * through the system memory bus, the same way the ISA serial DMA
+ * engine reaches its UART.
+ */
+#define MACE_CRIME_TIME_PHYS    0x14000038ULL
+#define MACE_CRIME_NS_PER_TICK  15      /* 66.67MHz */
+
+/* DS2502 protocol phase (master and part share the slot clock) */
+enum {
+    MACE_DS_IDLE = 0,     /* waiting for a reset pulse                 */
+    MACE_DS_CMD,          /* receiving one ROM-function command byte   */
+    MACE_DS_ADDR,         /* receiving the 16-bit read-memory address  */
+    MACE_DS_OUT_ROM,      /* shifting out family+serial+CRC            */
+    MACE_DS_OUT_CMDCRC,   /* shifting out the command/address CRC      */
+    MACE_DS_OUT_MEM,      /* shifting out the 128 memory bytes         */
+    MACE_DS_OUT_CKSUM,    /* shifting out the memory CRC               */
+};
+
+/*
  * ISA interrupt groups -> MACE vector / CRIME INTSTAT bit
  * (kernel sys/mace.h: MACE_PERIPH_AUDIO 6, MACE_PERIPH_MISC 5,
  *  MACE_PERIPH_SERIAL 4 == MACE_PERIPH_PARALLEL)
@@ -606,6 +651,28 @@ struct SGIMACEState {
     uint64_t isa_flash_nic;
     uint64_t isa_int_status;
     uint64_t isa_int_mask;
+
+    /*
+     * DS2502 1-wire eaddr EEPROM, bit-banged through
+     * ISA_FLASH_NIC_REG bits 2/3.  The part drives the DQ line low
+     * for its presence pulse and for output zeros; reads of
+     * ISA_NIC_DATA return ds_data.  ds_mem[0..5] holds the 48-bit
+     * station address LSB-first, exactly as the PROM reverses it.
+     */
+    uint8_t ds_mem[MACE_DS2502_MEM_SIZE];
+    uint8_t ds_rom_crc;               /* CRC of family+serial            */
+    uint8_t ds_cmd_crc;               /* CRC of read-memory cmd+addr     */
+    uint8_t ds_ram_crc;               /* CRC of the 128 memory bytes     */
+    int ds_phase;
+    uint8_t ds_rx;                    /* command/address shift register  */
+    int ds_rxbits;
+    uint8_t ds_addr[2];
+    int ds_addrbytes;
+    uint8_t ds_out[1 + MACE_DS2502_MEM_SIZE + 1];
+    int ds_outlen;
+    int ds_outidx;
+    int ds_outbit;
+    int ds_data;                      /* DQ level driven by the part     */
 
     /*
      * ISA serial DMA channels (spec §5.1.5), [port][dir] with dir
