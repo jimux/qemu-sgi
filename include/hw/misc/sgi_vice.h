@@ -26,6 +26,7 @@
 #ifndef HW_MISC_SGI_VICE_H
 #define HW_MISC_SGI_VICE_H
 
+#include "chardev/char-fe.h"
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 
@@ -183,6 +184,19 @@ struct SGIViceState {
     uint32_t int_enable;
     uint32_t int_status;
     uint32_t bsp_ctl_stat;
+
+    /*
+     * @@SEMANTICS@@ tier-ii host-codec offload transport.  The external
+     * JPEG helper is spawned once (codec-helper) and spoken to over the
+     * "vice-codec" chardev, exactly as the O2 video seam drives its decoder
+     * helpers.  codec-path is the Unix socket path the helper connects to
+     * (the chardev property does not expose the backend path).
+     */
+    CharFrontend codec_chr;
+    char *codec_helper;
+    char *codec_path;
+    GPid helper_pid;
+    guint helper_watch;
 };
 
 #endif /* HW_MISC_SGI_VICE_H */

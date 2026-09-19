@@ -41,12 +41,15 @@
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/misc/sgi_vice.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
 #include "trace.h"
 
+#include <signal.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /*
@@ -199,12 +202,13 @@ static uint32_t sgi_vice_tlb_phys(const SGIViceState *s, unsigned entry)
  * 0..15, which erased the count and is why the round-trip stayed empty.
  *
  * QEMU never interprets MSP/BSP microcode.  The bytes come from the external
- * host-codec helper named by the VICE_HOST_CODEC environment variable (the
- * vice7_encoder.py contract: <helper> <intile.bin> <out.jpg> <w> <h> <q>
- * <mode>, the DMS input tile dumped to intile.bin).  If no helper is
- * configured we do NOT fabricate an output: the count stays 0 (the driver's
- * empty-output case) and an UNIMP is logged.  Change this seam to a chardev
- * transport if QEMU must stay free of any exec().
+ * host-codec helper spoken to over the "vice-codec" chardev: the helper
+ * (codec-helper, normally sgi-irix-re/o2helpers/vice_codec.py) is spawned
+ * once and connects to the QEMU-owned socket; the DMS input tile is described
+ * on the channel and the framed JPEG returned the same way.  There is no
+ * exec()/temp-file in the job path.  If no helper is configured or the
+ * backend is not connected we do NOT fabricate an output: the count stays 0
+ * (the driver's empty-output case) and an UNIMP is logged.
  *
  * @@SEMANTICS@@ the produced stream is a VICE-framed JPEG, not a bare JFIF:
  * the guest wrapper overwrites the first 408 (grayscale) or 704 (4:2:2 colour)
@@ -219,59 +223,196 @@ static uint32_t sgi_vice_tlb_phys(const SGIViceState *s, unsigned entry)
 #define VICE_JPEG_HDR_GRAY  408
 #define VICE_JPEG_HDR_COLOR 704
 
+/*
+ * @@SEMANTICS@@ host-codec chardev transport ("VCC1", all fields big-endian):
+ *
+ *     magic   u32   0x56434331 ("VCC1")
+ *     op      u32   1 = encode a VICE-framed JPEG from a DMS packed tile
+ *     mode    u32   0 = grayscale (408-byte header), 1 = colour 4:2:2 (704)
+ *     width   u32   pixels
+ *     height  u32   pixels
+ *     quality u32   JPEG quality (100 for the VICE tables)
+ *     length  u32   request payload bytes / produced bytes in the reply
+ *     payload ...   the DMS input tile, then the framed JPEG in the reply
+ *
+ * The request is sent on the "vice-codec" chardev and the reply read back
+ * synchronously, so the produced bytes and the MSP DRAM count are in place
+ * before the MSP completion interrupt is raised -- byte-identical behaviour
+ * to the former shell-exec seam, but with no exec() in QEMU (the helper is
+ * spawned once from codec-helper and connects to the QEMU-owned socket).
+ *
+ * The reply reading is synchronous and therefore holds the BQL for the
+ * duration of a job, exactly as the old g_spawn_command_line_sync path did.
+ * A disconnected/absent backend yields no completion bytes (count 0), never a
+ * fabricated frame.
+ */
+#define VICE_CODEC_MAGIC      0x56434331u   /* "VCC1" */
+#define VICE_CODEC_OP_ENCODE  1u
+#define VICE_CODEC_HDR_WORDS  7
+#define VICE_CODEC_HDR_BYTES  (VICE_CODEC_HDR_WORDS * 4)
+
+/* Block dimensions of the DMS JPEG tile (unchanged from the vice6/7 seam). */
+#define VICE_JPEG_DIM        128
+#define VICE_JPEG_QUALITY    100
+
+static void sgi_vice_codec_exit(GPid pid, gint status, gpointer opaque)
+{
+    SGIViceState *s = opaque;
+
+    g_spawn_close_pid(pid);
+    if (s->helper_pid == pid) {
+        s->helper_pid = 0;
+        s->helper_watch = 0;
+    }
+}
+
+static void sgi_vice_codec_kill(SGIViceState *s)
+{
+    GPid pid = s->helper_pid;
+    int i;
+
+    if (s->helper_watch) {
+        g_source_remove(s->helper_watch);
+        s->helper_watch = 0;
+    }
+    s->helper_pid = 0;
+    if (pid <= 0) {
+        return;
+    }
+    kill(pid, SIGTERM);
+    for (i = 0; i < 50; i++) {
+        if (waitpid(pid, NULL, WNOHANG) == pid) {
+            g_spawn_close_pid(pid);
+            return;
+        }
+        g_usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    g_spawn_close_pid(pid);
+}
+
+/*
+ * @@SEMANTICS@@ Spawn the host-codec helper once, pointing it at the
+ * QEMU-owned socket.  It connects and then serves encode requests until a
+ * reset or VM exit closes the socket or kills it.  One long-lived process
+ * amortises the Python/Pillow start-up across jobs and matches the video
+ * seam's helper model.
+ */
+static void sgi_vice_codec_spawn(SGIViceState *s)
+{
+    char *argv[4];
+    GError *err = NULL;
+
+    if (!s->codec_helper || !s->codec_path || s->helper_pid > 0) {
+        return;
+    }
+    argv[0] = s->codec_helper;
+    argv[1] = (char *)"--socket";
+    argv[2] = s->codec_path;
+    argv[3] = NULL;
+    if (!g_spawn_async(NULL, argv, NULL,
+                       G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
+                       NULL, NULL, &s->helper_pid, &err)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: cannot launch codec helper '%s': %s\n",
+                      s->codec_helper, err->message);
+        g_error_free(err);
+        return;
+    }
+    s->helper_watch = g_child_watch_add(s->helper_pid, sgi_vice_codec_exit, s);
+}
+
+/*
+ * Send one encode request and read the framed reply.  False on any transport
+ * error (backend not connected, short write/read, bad magic, zero/oversize
+ * reply), in which case the caller leaves the produced count at zero rather
+ * than fabricating output.
+ */
+static bool sgi_vice_codec_encode(SGIViceState *s, const char *codec,
+                                  const uint8_t *tile, gsize tile_len,
+                                  uint8_t **out, gsize *out_len)
+{
+    uint8_t hdr[VICE_CODEC_HDR_BYTES];
+    uint32_t mode = (strstr(codec, "luma") == NULL) ? 1 : 0;
+    uint32_t rlen;
+
+    if (!qemu_chr_fe_backend_connected(&s->codec_chr)) {
+        return false;
+    }
+    stl_be_p(hdr + 0, VICE_CODEC_MAGIC);
+    stl_be_p(hdr + 4, VICE_CODEC_OP_ENCODE);
+    stl_be_p(hdr + 8, mode);
+    stl_be_p(hdr + 12, VICE_JPEG_DIM);
+    stl_be_p(hdr + 16, VICE_JPEG_DIM);
+    stl_be_p(hdr + 20, VICE_JPEG_QUALITY);
+    stl_be_p(hdr + 24, (uint32_t)tile_len);
+
+    if (qemu_chr_fe_write_all(&s->codec_chr, hdr, sizeof(hdr))
+        != (int)sizeof(hdr)) {
+        return false;
+    }
+    if (qemu_chr_fe_write_all(&s->codec_chr, tile, (int)tile_len)
+        != (int)tile_len) {
+        return false;
+    }
+    if (qemu_chr_fe_read_all(&s->codec_chr, hdr, sizeof(hdr))
+        != (int)sizeof(hdr)) {
+        return false;
+    }
+    if (ldl_be_p(hdr + 0) != VICE_CODEC_MAGIC ||
+        ldl_be_p(hdr + 4) != VICE_CODEC_OP_ENCODE) {
+        return false;
+    }
+    rlen = ldl_be_p(hdr + 24);
+    if (rlen == 0 || rlen > VICE_TILE_SIZE) {
+        return false;
+    }
+    *out = g_malloc(rlen);
+    if (qemu_chr_fe_read_all(&s->codec_chr, *out, (int)rlen) != (int)rlen) {
+        g_free(*out);
+        *out = NULL;
+        return false;
+    }
+    *out_len = rlen;
+    return true;
+}
+
 static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
 {
-    const char *helper = getenv("VICE_HOST_CODEC");
     uint32_t in_phys = sgi_vice_tlb_phys(s, VICE_DMS_IN);
     uint32_t out_phys = sgi_vice_tlb_phys(s, VICE_DMS_OUT);
-    const unsigned w = 128, h = 128;
-    const gsize tile = (gsize)w * h * 4;   /* dmedia packed 32-bit pixels */
+    const gsize tile = (gsize)VICE_JPEG_DIM * VICE_JPEG_DIM * 4;
     const gboolean color = strstr(codec, "luma") == NULL;
-    const char *mode = color ? "color" : "gray";
     const uint32_t hdr_len = color ? VICE_JPEG_HDR_COLOR : VICE_JPEG_HDR_GRAY;
-    gchar *in_tmp = NULL, *out_tmp = NULL, *cmd = NULL;
-    gchar *out_data = NULL;
-    GError *err = NULL;
+    uint8_t *in_buf, *out_data = NULL;
     gsize out_len = 0;
-    gint status = 0;
-    gchar *in_buf;
-    int fd;
 
-    if (!helper || !in_phys || !out_phys) {
+    if (!in_phys || !out_phys) {
+        return;
+    }
+    if (!qemu_chr_fe_backend_connected(&s->codec_chr)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: no host-codec chardev connected; "
+                      "leaving empty output\n");
         return;
     }
     in_buf = g_malloc(tile);
     address_space_read(&address_space_memory, in_phys,
                        MEMTXATTRS_UNSPECIFIED, in_buf, tile);
-
-    fd = g_file_open_tmp("vice6-in-XXXXXX", &in_tmp, &err);
-    if (fd < 0) {
-        g_clear_error(&err);
+    if (!sgi_vice_codec_encode(s, codec, in_buf, tile, &out_data, &out_len)) {
+        qemu_log_mask(LOG_UNIMP, "sgi_vice: host-codec exchange failed\n");
         g_free(in_buf);
         return;
     }
-    if (write(fd, in_buf, tile) != (ssize_t)tile) {
-        close(fd);
-        qemu_log_mask(LOG_UNIMP, "sgi_vice: host-codec input write failed\n");
-        goto out;
-    }
-    close(fd);
-    out_tmp = g_strdup_printf("%s.jpg", in_tmp);
-    cmd = g_strdup_printf("%s %s %s %u %u 100 %s",
-                          helper, in_tmp, out_tmp, w, h, mode);
-    if (!g_spawn_command_line_sync(cmd, NULL, NULL, &status, &err) ||
-        status != 0 || !g_file_get_contents(out_tmp, &out_data, &out_len, &err)) {
-        qemu_log_mask(LOG_UNIMP,
-                      "sgi_vice: host-codec helper failed: %s\n",
-                      err && err->message ? err->message : "?");
-        goto out;
-    }
+    g_free(in_buf);
     if (out_len < hdr_len || out_len > VICE_TILE_SIZE) {
         qemu_log_mask(LOG_UNIMP,
                       "sgi_vice: host-codec produced %zu bytes "
                       "(header %u, tile %u)\n",
                       out_len, hdr_len, VICE_TILE_SIZE);
-        goto out;
+        g_free(out_data);
+        return;
     }
     /* Place the produced bytes in the OUT tile ... */
     address_space_write(&address_space_memory, out_phys,
@@ -295,19 +436,7 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
         s->msp_dram[11] = (VICE_JPEG_HDR_COLOR >> 0) & 0xff;
     }
     trace_sgi_vice_offload(codec, out_len, out_phys);
-out:
-    if (in_tmp) {
-        unlink(in_tmp);
-    }
-    if (out_tmp) {
-        unlink(out_tmp);
-        g_free(out_tmp);
-    }
-    g_free(in_tmp);
-    g_free(in_buf);
     g_free(out_data);
-    g_free(cmd);
-    g_clear_error(&err);
 }
 
 static void sgi_vice_msp_go(SGIViceState *s, uint32_t ctl)
@@ -585,6 +714,14 @@ static void sgi_vice_reset(DeviceState *dev)
      * HALT|HALT_ACK, spec 2.6.1) is modelled on top of this.
      */
     s->bsp_ctl_stat = VICEBSPCS_HALT | VICEBSPCS_HALT_ACK;
+
+    /*
+     * @@SEMANTICS@@ reset hygiene: a guest reset must not leave the old
+     * codec helper streaming to a reused socket.  Kill it and start a fresh
+     * one so the seam is live again after reset.
+     */
+    sgi_vice_codec_kill(s);
+    sgi_vice_codec_spawn(s);
 }
 
 static void sgi_vice_realize(DeviceState *dev, Error **errp)
@@ -597,7 +734,22 @@ static void sgi_vice_realize(DeviceState *dev, Error **errp)
 
     /* Single interrupt output -> CRIME line 31 (CRM_INT_VICE). */
     qdev_init_gpio_out_named(dev, s->crime_irq, "crime-irq", 1);
+
+    /* Start the external host-codec helper if one was configured. */
+    sgi_vice_codec_spawn(s);
 }
+
+static const Property sgi_vice_properties[] = {
+    /*
+     * @@SEMANTICS@@ host-codec transport (see sgi_vice_host_offload):
+     *   vice-codec  : the chardev the helper connects to
+     *   codec-helper: executable spawned once at realize/reset
+     *   codec-path  : Unix socket path the helper connects to
+     */
+    DEFINE_PROP_CHR("vice-codec", SGIViceState, codec_chr),
+    DEFINE_PROP_STRING("codec-helper", SGIViceState, codec_helper),
+    DEFINE_PROP_STRING("codec-path", SGIViceState, codec_path),
+};
 
 static const VMStateDescription vmstate_sgi_vice = {
     .name = "sgi-vice",
@@ -628,6 +780,7 @@ static void sgi_vice_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = sgi_vice_realize;
     device_class_set_legacy_reset(dc, sgi_vice_reset);
+    device_class_set_props(dc, sgi_vice_properties);
     dc->vmsd = &vmstate_sgi_vice;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }

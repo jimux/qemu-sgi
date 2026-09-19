@@ -1464,6 +1464,18 @@ static void sgi_mace_video_reset(DeviceState *dev)
         s->input[i].frame_len = 0;
     }
 
+    /*
+     * @@SEMANTICS@@ reset hygiene: a guest reset must not leave a decoder
+     * helper streaming into a chardev the machine is about to reinitialise.
+     * Detach every endpoint (a no-op when nothing is attached), which SIGTERMs
+     * and reaps any running helper.  A re-attach after reset starts a fresh
+     * one.
+     */
+    for (int i = 0; i < MVP_NUM_VIN; i++) {
+        mvp_video_detach(SGI_VIDEO_SOURCE(s), mvp_video_input_name(i));
+    }
+    mvp_video_detach(SGI_VIDEO_SOURCE(s), "vout");
+
     timer_mod(s->field_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MVP_FIELD_PERIOD_NS);
 }
