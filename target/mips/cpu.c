@@ -753,3 +753,29 @@ bool cpu_type_supports_cps_smp(const char *cpu_type)
     const MIPSCPUClass *mcc = MIPS_CPU_CLASS(object_class_by_name(cpu_type));
     return (mcc->cpu_def->CP0_Config3 & (1 << CP0C3_CMGCR)) != 0;
 }
+
+/*
+ * Install a wired TLB mapping, modelling a boot loader that maps firmware
+ * before transferring control (SGI IP27's flash sloader maps the PROM's 1 MB
+ * XKSEG image with ASID 1).  Machine-scoped: only machines that call this are
+ * affected.  `pagemask` uses the MIPS PageMask encoding (page size per
+ * EntryLo is (pagemask + 0x2000) / 2); EntryLo1 maps the following page.
+ */
+void mips_cpu_install_mapping(MIPSCPU *cpu, uint64_t vaddr, uint64_t paddr,
+                              uint32_t pagemask, uint32_t asid, uint32_t flags)
+{
+    CPUMIPSState *env = &cpu->env;
+    uint64_t page = pagemask ? ((uint64_t)pagemask + 0x2000) / 2 : 0x1000;
+
+    env->CP0_EntryHi = (vaddr & ~0x1fffULL) | (asid & 0xff);
+    env->CP0_PageMask = pagemask;
+    env->CP0_EntryLo0 = ((paddr >> 12) << 6) | flags;
+    env->CP0_EntryLo1 = (((paddr + page) >> 12) << 6) | flags;
+    env->CP0_Index = 62;   /* the PROM's wired entry slot */
+    env->CP0_Wired = 63;
+    if (env->tlb->helper_tlbwi) {
+        env->tlb->helper_tlbwi(env);
+    }
+    /* Run with the mapped ASID. */
+    env->CP0_EntryHi = (env->CP0_EntryHi & ~0xffULL) | (asid & 0xff);
+}

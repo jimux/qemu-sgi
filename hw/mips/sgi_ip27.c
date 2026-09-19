@@ -93,10 +93,18 @@ static void main_cpu_reset(void *opaque) {
   cpu_reset(CPU(cpu));
   /*
    * The SN0 PROM is entered from the flash sloader, which leaves gp set to
-   * the PROM's data pointer; early PROM routines call gp-relative code before
-   * the PROM sets gp itself.  Model that handoff.
+   * the PROM's data pointer and has already mapped the PROM's 1 MB XKSEG
+   * image (vaddr 0xc00000001fc00000 -> phys 0x1fc00000, ASID 1, uncached,
+   * read-only) via a wired TLB entry.  Model that handoff so early
+   * gp-relative PROM accesses resolve; the PROM later re-wires the same entry
+   * itself.
    */
   cpu->env.active_tc.gpr[28] = 0xc00000001fce4fd0ULL;
+  cpu->env.active_tc.gpr[29] = 0xa800000000100000ULL; /* PROMDATA stack */
+  /* Default console-device descriptor ($f3), as left by the sloader. */
+  cpu->env.active_fpu.fpr[3].d = 0xc00000001fc74ce0ULL;
+  mips_cpu_install_mapping(cpu, 0xc00000001fc00000ULL, 0x1fc00000ULL,
+                           0x001fe000, 1, 0x12);
 }
 
 /*
@@ -287,6 +295,14 @@ static void sgi_ip27_init(MachineState *machine) {
                               0x6000000ULL);
   create_unimplemented_device("ip27-xio-high", ip27_phys(IP27_IO_BASE) + 0x9000000ULL,
                               0x100000000ULL - 0x9000000ULL);
+
+  /*
+   * Hub RBOOT window (HSPEC + 0x30000000): the PROM reads its reboot/status
+   * word there.  Model as zero-returning until a hub detail is needed.
+   */
+  create_unimplemented_device("ip27-rboot",
+                              ip27_phys(IP27_HSPEC_BASE + 0x30000000ULL),
+                              0x10000000ULL);
 
   hub_state = SGI_HUB(hub);
   {

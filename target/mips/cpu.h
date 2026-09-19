@@ -1411,4 +1411,11 @@ target_ulong exception_resume_pc(CPUMIPSState *env);
 MIPSCPU *mips_cpu_create_with_clock(const char *cpu_type, Clock *cpu_refclk,
                                     bool is_big_endian);
 
+/*
+ * Install a wired TLB mapping (used by machines to model a boot loader that
+ * maps firmware before entry, e.g. the SGI IP27 flash sloader).
+ */
+void mips_cpu_install_mapping(MIPSCPU *cpu, uint64_t vaddr, uint64_t paddr,
+                              uint32_t pagemask, uint32_t asid, uint32_t flags);
+
 #endif /* MIPS_CPU_H */
