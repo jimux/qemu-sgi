@@ -543,22 +543,176 @@ static void rtc_reset(SGIHPC1State *s)
 /* EEPROM bit-bang via the aux register                                */
 /* ------------------------------------------------------------------ */
 
+/* Aux register field positions (MAME ip20.cpp) */
+#define EE_BIT_CS   1
+#define EE_BIT_CLK  2
+#define EE_BIT_DI   3
+#define EE_BIT_DO   4
+
+/*
+ * Persist the 93C56 (128 x 16-bit words) to the NVRAM backing file.
+ * Bytes are stored big-endian within each word, matching the HPC3/IP22
+ * convention so the file layout is consistent across machines.
+ */
+static void hpc1_nvram_save(SGIHPC1State *s)
+{
+    uint8_t table[256];
+    FILE *f;
+    int i;
+
+    if (!s->nvram_filename) {
+        return;
+    }
+    for (i = 0; i < 128; i++) {
+        table[i * 2] = s->nvram[i] >> 8;
+        table[i * 2 + 1] = s->nvram[i] & 0xff;
+    }
+    f = fopen(s->nvram_filename, "wb");
+    if (f) {
+        fwrite(table, sizeof(table), 1, f);
+        fclose(f);
+    }
+}
+
+static void hpc1_nvram_load(SGIHPC1State *s)
+{
+    uint8_t table[256];
+    FILE *f;
+    int i;
+
+    if (!s->nvram_filename) {
+        return;
+    }
+    f = fopen(s->nvram_filename, "rb");
+    if (!f) {
+        return;
+    }
+    if (fread(table, sizeof(table), 1, f) == 1) {
+        for (i = 0; i < 128; i++) {
+            s->nvram[i] = (table[i * 2] << 8) | table[i * 2 + 1];
+        }
+    }
+    fclose(f);
+}
+
+/*
+ * 93C56 Microwire bit engine.
+ *
+ * The PROM drives 0 (start), 1 (start), 2 opcode bits, 7 address bits,
+ * then 16 data bits: opcode 10=READ, 01=WRITE, 11=ERASE, 00=EWEN/EWDS
+ * (selected by address bits [6:5] = 3/0).
+ */
+static void hpc1_eeprom_bit(SGIHPC1State *s, int cs, int clk, int di)
+{
+    bool rising = cs && clk && !s->nv_clk;
+    bool falling = s->nv_cs && !cs;
+    int i;
+
+    if (!s->nv_cs && cs) {
+        s->nv_tick = 0;
+        s->nv_opcode = 0;
+        s->nv_addr = 0;
+        s->nv_data = 0;
+        s->nv_do = 1;
+    }
+
+    if (rising) {
+        if (s->nv_tick == 0) {
+            if (di == 0) {
+                s->nv_tick = 1;
+            }
+        } else if (s->nv_tick == 1) {
+            if (di) {
+                s->nv_tick = 2;
+            }
+        } else if (s->nv_tick < 4) {
+            s->nv_opcode = (s->nv_opcode << 1) | di;
+            s->nv_tick++;
+        } else if (s->nv_tick < 4 + 7) {
+            s->nv_addr = (s->nv_addr << 1) | di;
+            s->nv_tick++;
+            if (s->nv_tick == 4 + 7) {
+                if (s->nv_opcode == 0) {
+                    switch (s->nv_addr >> 5) {
+                    case 0: /* EWDS */
+                        s->nv_writable = 0;
+                        break;
+                    case 3: /* EWEN */
+                        s->nv_writable = 1;
+                        break;
+                    default:
+                        break;
+                    }
+                } else if (s->nv_opcode == 2) { /* READ: load, shift out on SK low */
+                    s->nv_data = s->nvram[s->nv_addr & 0x7f];
+                }
+            }
+        } else if (s->nv_tick < 4 + 7 + 16) { /* 16 data bits */
+            if (s->nv_opcode != 2) {
+                s->nv_data = (s->nv_data << 1) | di;
+            }
+            s->nv_tick++;
+        } else {
+            /* Trailing bit(s) after the 16th data bit are ignored. */
+        }
+    }
+
+    /*
+     * READ shifts data out on the falling edge of SK (microwire); the host
+     * samples DO on the following rising edge.
+     */
+    if (cs && !clk && s->nv_clk && s->nv_opcode == 2 &&
+        s->nv_tick >= 4 + 7 && s->nv_tick <= 4 + 7 + 16) {
+        s->nv_do = (s->nv_data >> 15) & 1;
+        s->nv_data <<= 1;
+    }
+
+    if (falling && s->nv_writable) {
+        bool changed = false;
+        switch (s->nv_opcode) {
+        case 1: /* WRITE word */
+            s->nvram[s->nv_addr & 0x7f] = s->nv_data;
+            changed = true;
+            break;
+        case 3: /* ERASE word */
+            s->nvram[s->nv_addr & 0x7f] = 0xffff;
+            changed = true;
+            break;
+        case 0:
+            if ((s->nv_addr >> 5) == 1) { /* WRAL */
+                for (i = 0; i < 128; i++) {
+                    s->nvram[i] = s->nv_data;
+                }
+                changed = true;
+            } else if ((s->nv_addr >> 5) == 2) { /* ERAL */
+                for (i = 0; i < 128; i++) {
+                    s->nvram[i] = 0xffff;
+                }
+                changed = true;
+            }
+            break;
+        default:
+            break;
+        }
+        if (changed) {
+            hpc1_nvram_save(s);
+        }
+    }
+
+    s->nv_cs = cs;
+    s->nv_clk = clk;
+    s->nv_di = di;
+}
+
 static uint8_t hpc1_aux_read(SGIHPC1State *s)
 {
-    uint8_t val = s->aux & ~0x10;
-    if (s->eeprom && (eeprom93xx_read(s->eeprom) & 1)) {
-        val |= 0x10;
-    }
-    return val;
+    return (s->aux & ~(1 << EE_BIT_DO)) | (s->nv_do << EE_BIT_DO);
 }
 
 static void hpc1_aux_write(SGIHPC1State *s, uint8_t val)
 {
-    if (s->eeprom) {
-        /* bit1 = CS, bit2 = CLK, bit3 = DI (MAME ip20.cpp) */
-        eeprom93xx_write(s->eeprom, (val >> 1) & 1, (val >> 2) & 1,
-                         (val >> 3) & 1);
-    }
+    hpc1_eeprom_bit(s, (val >> EE_BIT_CS) & 1, (val >> EE_BIT_CLK) & 1,
+                    (val >> EE_BIT_DI) & 1);
     s->aux = val;
 }
 
@@ -640,13 +794,19 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
         return val8;
     }
 
-    switch (addr) {
-    case HPC1_MISCSR:
+    /*
+     * These core registers are 32-bit spaced; the PROM accesses them via
+     * byte lane 3 (e.g. the EEPROM bit-bang at 0x1bf), so match the whole
+     * 4-byte slot rather than the base address.
+     */
+    if (addr >= HPC1_MISCSR && addr < HPC1_MISCSR + 4) {
         return s->miscsr;
-    case HPC1_AUX:
+    }
+    if (addr >= HPC1_AUX && addr < HPC1_AUX + 4) {
         return hpc1_aux_read(s);
-    default:
-        break;
+    }
+    if (addr >= HPC1_SCSI_CTRL && addr < HPC1_SCSI_CTRL + 4) {
+        return s->scsi_ctrl;
     }
 
     if (addr + size <= sizeof(s->core_scratch)) {
@@ -759,19 +919,24 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
 
-    switch (addr) {
-    case HPC1_MISCSR:
+    if (addr >= HPC1_MISCSR && addr < HPC1_MISCSR + 4) {
         s->miscsr = value;
-        break;
-    case HPC1_AUX:
+        return;
+    }
+    if (addr >= HPC1_AUX && addr < HPC1_AUX + 4) {
         hpc1_aux_write(s, val8);
-        break;
-    case HPC1_SCSI_CTRL:
+        return;
+    }
+    if (addr >= HPC1_SCSI_CTRL && addr < HPC1_SCSI_CTRL + 4) {
         s->scsi_ctrl = value;
-        break;
-    case 0x188:
+        return;
+    }
+    if (addr >= 0x188 && addr < 0x18c) {
         s->dsp_bc = value;
-        break;
+        return;
+    }
+
+    switch (addr) {
     default:
         if (addr + size <= sizeof(s->core_scratch)) {
             unsigned i;
@@ -864,6 +1029,15 @@ static void sgi_hpc1_reset(DeviceState *dev)
     s->seeq_rx_status = 0;
     s->seeq_tx_status = 0;
     s->aux = 0;
+    s->nv_cs = 0;
+    s->nv_clk = 0;
+    s->nv_di = 0;
+    s->nv_do = 1;
+    s->nv_tick = 0;
+    s->nv_opcode = 0;
+    s->nv_addr = 0;
+    s->nv_data = 0;
+    s->nv_writable = 0;
     for (i = 0; i < 6; i++) {
         s->seeq_station_addr[i] = 0;
     }
@@ -910,7 +1084,7 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(dev, "scsi-irq", 0));
 
     /* 93C56 NVRAM (128 x 16-bit words) */
-    s->eeprom = eeprom93xx_new(dev, 128);
+    hpc1_nvram_load(s);
 
     /* PIT interrupt timers (timer0 -> IP4, timer1 -> IP5) */
     s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer_cb, s);

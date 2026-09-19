@@ -27,7 +27,6 @@
 
 #include "chardev/char-fe.h"
 #include "hw/core/sysbus.h"
-#include "hw/nvram/eeprom93xx.h"
 #include "hw/scsi/wd33c93.h"
 #include "qom/object.h"
 
@@ -95,9 +94,25 @@ struct SGIHPC1State {
     /* WD33C93 SCSI controller */
     WD33C93State *scsi;
 
-    /* Aux / EEPROM bit-bang */
-    eeprom_t *eeprom;
+    /*
+     * Aux / 93C56 serial EEPROM bit-bang.
+     *
+     * QEMU's generic eeprom93xx model uses 8 address bits for 128 words,
+     * but the 93C56 has 7; that one-bit mismatch makes the PROM's EWEN
+     * command decode as a WRITE-ALL. Model the 93C56 here instead, with
+     * the exact 7-bit protocol the PROM drives.
+     */
     uint8_t aux;
+    uint16_t nvram[128];
+    uint8_t nv_cs;
+    uint8_t nv_clk;
+    uint8_t nv_di;
+    uint8_t nv_do;
+    uint8_t nv_tick;
+    uint8_t nv_opcode;
+    uint8_t nv_addr;
+    uint8_t nv_writable;
+    uint16_t nv_data;
 
     /* INT2 interrupt multiplexor */
     uint8_t lio_status[2];
