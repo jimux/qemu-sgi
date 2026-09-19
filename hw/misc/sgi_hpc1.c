@@ -616,24 +616,26 @@ static void hpc1_eeprom_bit(SGIHPC1State *s, int cs, int clk, int di)
         s->nv_do = 1;
     }
 
+    /*
+     * Command frame, MSB first, per the PROM's OP20prom/r4k_eerom.s and
+     * SER_* constants in sys/IP20nvram.h:
+     *   1 start bit (1), 2 opcode bits, 8 address bits, then 16 data bits.
+     *   opcode 10=READ, 01=WRITE, 11=ERASE, 00=EWEN/EWDS (addr[7:6]=3/0).
+     */
     if (rising) {
         if (s->nv_tick == 0) {
-            if (di == 0) {
+            if (di) {                      /* start bit */
                 s->nv_tick = 1;
             }
-        } else if (s->nv_tick == 1) {
-            if (di) {
-                s->nv_tick = 2;
-            }
-        } else if (s->nv_tick < 4) {
+        } else if (s->nv_tick < 3) {       /* opcode bits */
             s->nv_opcode = (s->nv_opcode << 1) | di;
             s->nv_tick++;
-        } else if (s->nv_tick < 4 + 7) {
+        } else if (s->nv_tick < 11) {      /* 8 address bits (ticks 3..10) */
             s->nv_addr = (s->nv_addr << 1) | di;
             s->nv_tick++;
-            if (s->nv_tick == 4 + 7) {
+            if (s->nv_tick == 11) {
                 if (s->nv_opcode == 0) {
-                    switch (s->nv_addr >> 5) {
+                    switch (s->nv_addr >> 6) {
                     case 0: /* EWDS */
                         s->nv_writable = 0;
                         break;
@@ -643,28 +645,23 @@ static void hpc1_eeprom_bit(SGIHPC1State *s, int cs, int clk, int di)
                     default:
                         break;
                     }
-                } else if (s->nv_opcode == 2) { /* READ: load, shift out on SK low */
+                } else if (s->nv_opcode == 2) { /* READ: latch word */
                     s->nv_data = s->nvram[s->nv_addr & 0x7f];
                 }
             }
-        } else if (s->nv_tick < 4 + 7 + 16) { /* 16 data bits */
-            if (s->nv_opcode != 2) {
+        } else if (s->nv_tick < 11 + 16) { /* 16 data bits (ticks 11..26) */
+            if (s->nv_opcode == 2) {
+                /* DO presents the current bit; the PROM samples SI on the
+                 * rising edge it just produced. */
+                s->nv_do = (s->nv_data >> 15) & 1;
+                s->nv_data <<= 1;
+            } else {
                 s->nv_data = (s->nv_data << 1) | di;
             }
             s->nv_tick++;
         } else {
-            /* Trailing bit(s) after the 16th data bit are ignored. */
+            /* Trailing bit(s) are ignored. */
         }
-    }
-
-    /*
-     * READ shifts data out on the falling edge of SK (microwire); the host
-     * samples DO on the following rising edge.
-     */
-    if (cs && !clk && s->nv_clk && s->nv_opcode == 2 &&
-        s->nv_tick >= 4 + 7 && s->nv_tick <= 4 + 7 + 16) {
-        s->nv_do = (s->nv_data >> 15) & 1;
-        s->nv_data <<= 1;
     }
 
     if (falling && s->nv_writable) {
@@ -679,12 +676,12 @@ static void hpc1_eeprom_bit(SGIHPC1State *s, int cs, int clk, int di)
             changed = true;
             break;
         case 0:
-            if ((s->nv_addr >> 5) == 1) { /* WRAL */
+            if ((s->nv_addr >> 6) == 1) { /* WRAL */
                 for (i = 0; i < 128; i++) {
                     s->nvram[i] = s->nv_data;
                 }
                 changed = true;
-            } else if ((s->nv_addr >> 5) == 2) { /* ERAL */
+            } else if ((s->nv_addr >> 6) == 2) { /* ERAL */
                 for (i = 0; i < 128; i++) {
                     s->nvram[i] = 0xffff;
                 }
