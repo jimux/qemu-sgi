@@ -10,7 +10,7 @@ if 'CONFIG_TCG' in config_all_accel
 mips_ss.add(when: 'CONFIG_JAZZ', if_true: files('jazz.c'))
 mips_ss.add(when: 'CONFIG_FULOONG', if_true: files('fuloong2e.c'))
 mips_ss.add(when: 'CONFIG_MIPS_BOSTON', if_true: files('boston.c'))
-mips_ss.add(when: 'CONFIG_SGI_INDY', if_true: files('sgi_indy.c'))
+mips_ss.add(when: 'CONFIG_SGI_INDY', if_true: files('sgi_indy.c', 'sgi_indigo.c'))
 mips_ss.add(when: 'CONFIG_SGI_VIRTUIX', if_true: files('sgi_virtuix.c', 'sgi_xfs.c', 'sgi_efs.c'))
 mips_ss.add(when: 'CONFIG_SGI_O2', if_true: files('sgi_o2.c'))
 mips_ss.add(when: 'CONFIG_SGI_OCTANE', if_true: files('sgi_octane.c'))

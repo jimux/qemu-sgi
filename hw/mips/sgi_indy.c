@@ -45,7 +45,6 @@
 #include "hw/display/sgi_newport.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/sgi_arcs.h"
-#include "hw/misc/sgi_hpc1.h"
 #include "hw/misc/sgi_hpc3.h"
 #include "hw/misc/sgi_mc.h"
 #include "hw/misc/unimp.h"
@@ -81,7 +80,6 @@
 static void write_kernel_trampoline(uint32_t kernel_entry_32);
 
 enum sgi_ip2x_model {
-  SGI_IP20, /* Indigo */
   SGI_IP22, /* Indigo2 */
   SGI_IP24, /* Indy */
   SGI_IP26, /* Indigo2 Power (R8000) */
@@ -266,8 +264,6 @@ static void write_kernel_trampoline(uint32_t kernel_entry_32) {
  */
 static const char *sgi_default_prom_name(enum sgi_ip2x_model model) {
   switch (model) {
-  case SGI_IP20:
-    return "ip20prom.bin";
   case SGI_IP22:
     return "ip22prom.bin";
   case SGI_IP24:
@@ -296,8 +292,6 @@ static const char *sgi_nvram_name(enum sgi_ip2x_model model) {
     return "sgi_indigo2_r10k_nvram.bin";
   case SGI_IP26:
     return "sgi_indigo2_r8k_nvram.bin";
-  case SGI_IP20:
-    return "sgi_indigo_nvram.bin";
   default:
     return "sgi_nvram.bin";
   }
@@ -305,8 +299,6 @@ static const char *sgi_nvram_name(enum sgi_ip2x_model model) {
 
 static const char *sgi_model_name(enum sgi_ip2x_model model) {
   switch (model) {
-  case SGI_IP20:
-    return "IP20";
   case SGI_IP22:
     return "IP22";
   case SGI_IP24:
@@ -325,14 +317,12 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   MemoryRegion *prom;
   DeviceState *mc_dev;
   DeviceState *hpc3_dev = NULL;
-  DeviceState *hpc1_dev = NULL;
   MIPSCPU *cpu;
   Clock *cpuclk;
   char *filename;
   int bios_size;
   bool is_fullhouse =
       (model == SGI_IP22 || model == SGI_IP26 || model == SGI_IP28);
-  bool is_ip20 = (model == SGI_IP20);
 
   /* Validate RAM size */
   if (machine->ram_size > SGI_RAM_MAX) {
@@ -431,60 +421,7 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   sysbus_realize_and_unref(SYS_BUS_DEVICE(mc_dev), &error_fatal);
   sysbus_mmio_map(SYS_BUS_DEVICE(mc_dev), 0, SGI_MC_BASE);
 
-  if (is_ip20) {
-    /*
-     * IP20 (Indigo): HPC1 + INT2 at 0x1fb80000
-     *
-     * HPC1 is the predecessor to HPC3 with a different register layout.
-     * INT2 is integrated within the HPC1 device (at offset 0x1c0).
-     * The same sub-devices (WD33C93, Z85C30, Seeq 8003) are present
-     * but at HPC1 register offsets instead of HPC3 offsets.
-     */
-    hpc1_dev = qdev_new(TYPE_SGI_HPC1);
-    qdev_prop_set_chr(hpc1_dev, "chardev", serial_hd(0));
-    qdev_prop_set_string(hpc1_dev, "nvram", sgi_nvram_name(model));
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(hpc1_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(hpc1_dev), 0, SGI_HPC3_BASE);
-
-    /* Attach SCSI drives from command line */
-    {
-      SGIHPC1State *hpc1 = SGI_HPC1(hpc1_dev);
-      scsi_bus_legacy_handle_cmdline(&hpc1->scsi->bus);
-    }
-
-    /*
-     * DSP RAM at 0x1fbe0000-0x1fbfffff (128KB)
-     * Used by the PROM for temporary storage during CPU speed detection
-     * and by the DSP56001 audio processor. We model it as plain RAM.
-     * Reference: MAME ip20.cpp maps this as "dsp_ram" (3xTC55328J-35).
-     */
-    {
-      MemoryRegion *dsp_ram = g_new(MemoryRegion, 1);
-      memory_region_init_ram(dsp_ram, NULL, "ip20-dsp-ram", 128 * KiB,
-                             &error_fatal);
-      memory_region_add_subregion(get_system_memory(), 0x1fbe0000, dsp_ram);
-    }
-
-    /*
-     * Board revision register at 0x1fbd0000 and other misc I/O.
-     * Use unimplemented-device to prevent bus errors.
-     * The board rev value (0x8000) is returned by the HPC1 device
-     * if the region is extended, but for now we just prevent DBE.
-     */
-    create_unimplemented_device("ip20-misc-io", 0x1fb90000, 0x50000);
-
-    /*
-     * Wire HPC1/INT2 interrupts to MIPS CPU IRQ lines:
-     *   INT2 LIO0 → IP2 (env.irq[2])
-     *   INT2 LIO1 → IP3 (env.irq[3])
-     *   Timer 0   → IP4 (env.irq[4])
-     *   Timer 1   → IP5 (env.irq[5])
-     */
-    qdev_connect_gpio_out_named(hpc1_dev, "cpu-irq", 0, cpu->env.irq[2]);
-    qdev_connect_gpio_out_named(hpc1_dev, "cpu-irq", 1, cpu->env.irq[3]);
-    qdev_connect_gpio_out_named(hpc1_dev, "timer-irq", 0, cpu->env.irq[4]);
-    qdev_connect_gpio_out_named(hpc1_dev, "timer-irq", 1, cpu->env.irq[5]);
-  } else {
+  {
     /* IP22/IP24/IP26/IP28: HPC3 + IOC2/INT3 at 0x1fb80000 */
     hpc3_dev = qdev_new(TYPE_SGI_HPC3);
     /* Connect serial port 0 to the first serial device */
@@ -564,12 +501,9 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     sysbus_mmio_map(SYS_BUS_DEVICE(newport_dev), 0,
                     SGI_GIO_GFX_BASE + REX3_REG_OFFSET);
 
-    /* Wire Newport VRINT → INT2/INT3 retrace interrupt */
-    {
-      DeviceState *irq_target = is_ip20 ? hpc1_dev : hpc3_dev;
-      sysbus_connect_irq(SYS_BUS_DEVICE(newport_dev), 0,
-                         qdev_get_gpio_in_named(irq_target, "gio-retrace", 0));
-    }
+    /* Wire Newport VRINT → INT3 retrace interrupt */
+    sysbus_connect_irq(SYS_BUS_DEVICE(newport_dev), 0,
+                       qdev_get_gpio_in_named(hpc3_dev, "gio-retrace", 0));
 
     /* Cover GIO slot area after Newport REX3 (0x1f0f2000-0x1f3fffff) */
     create_gio_empty_slot(system_memory, "gio-gfx-high",
@@ -706,10 +640,6 @@ static void sgi_indigo2_r10k_init(MachineState *machine) {
   sgi_ip2x_init(machine, SGI_IP28);
 }
 
-static void sgi_indigo_init(MachineState *machine) {
-  sgi_ip2x_init(machine, SGI_IP20);
-}
-
 /*
  * NOTE: Virtuix (IP55) is NOT defined here. It is a separate, virtualization-
  * native machine with its OWN device copies, in hw/mips/sgi_virtuix.c. Keep
@@ -778,20 +708,6 @@ static void sgi_indigo2_r10k_class_init(ObjectClass *oc, const void *data) {
   mc->no_cdrom = 1;
 }
 
-static void sgi_indigo_class_init(ObjectClass *oc, const void *data) {
-  MachineClass *mc = MACHINE_CLASS(oc);
-
-  mc->desc = "SGI Indigo (IP20)";
-  mc->init = sgi_indigo_init;
-  mc->block_default_type = IF_SCSI;
-  mc->default_ram_size = 64 * MiB;
-  mc->default_ram_id = "sgi.ram";
-  mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R4000");
-  mc->default_cpus = 1;
-  mc->no_floppy = 1;
-  mc->no_cdrom = 1;
-}
-
 /* Machine type registration */
 
 static const TypeInfo sgi_indy_type = {
@@ -818,18 +734,11 @@ static const TypeInfo sgi_indigo2_r10k_type = {
     .class_init = sgi_indigo2_r10k_class_init,
 };
 
-static const TypeInfo sgi_indigo_type = {
-    .name = MACHINE_TYPE_NAME("indigo"),
-    .parent = TYPE_MACHINE,
-    .class_init = sgi_indigo_class_init,
-};
-
 static void sgi_machine_init(void) {
   type_register_static(&sgi_indy_type);
   type_register_static(&sgi_indigo2_type);
   type_register_static(&sgi_indigo2_r8k_type);
   type_register_static(&sgi_indigo2_r10k_type);
-  type_register_static(&sgi_indigo_type);
 }
 
 type_init(sgi_machine_init)
