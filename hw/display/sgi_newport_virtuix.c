@@ -340,6 +340,33 @@ static uint32_t newport_get_default_color(SGINewportVirtuixState *s)
 
     if (s->dm1_fastclear) {
         color = s->color_vram;
+        /*
+         * In RGB mode COLORVRAM holds the colour as 8-bit-per-channel BGR
+         * bytes (R in the low byte).  The hardware reduces each channel to
+         * the draw depth's width and packs B..R; truncating to the low byte
+         * keeps only red and loses the colour.  Proven by the fm canvas:
+         * the guest writes the depth-expanded scheme teal (0xaa926d = the
+         * 3-3-2 value 0xa3 expanded to bytes) and the hardware must yield
+         * the packed 0xa3, not the low byte 0x6d (which scanned out pale
+         * yellow).  Kept byte-equivalent with sgi_newport.c.
+         * MAME ref: get_default_color()'s 12bpp RGB branch does the same
+         * per-channel reduction (newport.cpp:3302-3303).
+         */
+        if (s->dm1_rgbmode) {
+            uint32_t r = color & 0xff;
+            uint32_t g = (color >> 8) & 0xff;
+            uint32_t b = (color >> 16) & 0xff;
+            switch (s->dm1_drawdepth) {
+            case 1: /* 8bpp: 3-3-2, B high */
+                color = ((b >> 6) << 6) | ((g >> 5) << 3) | (r >> 5);
+                break;
+            case 2: /* 12bpp: 4-4-4, B high */
+                color = ((b >> 4) << 8) | ((g >> 4) << 4) | (r >> 4);
+                break;
+            default: /* 4/24bpp: already the right form */
+                break;
+            }
+        }
     } else {
         color = s->color_i;
     }
