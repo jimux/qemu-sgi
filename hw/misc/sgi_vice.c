@@ -248,6 +248,7 @@ static uint32_t sgi_vice_tlb_phys(const SGIViceState *s, unsigned entry)
  */
 #define VICE_CODEC_MAGIC      0x56434331u   /* "VCC1" */
 #define VICE_CODEC_OP_ENCODE  1u
+#define VICE_CODEC_OP_DECODE  2u
 #define VICE_CODEC_HDR_WORDS  7
 #define VICE_CODEC_HDR_BYTES  (VICE_CODEC_HDR_WORDS * 4)
 
@@ -329,19 +330,18 @@ static void sgi_vice_codec_spawn(SGIViceState *s)
  * reply), in which case the caller leaves the produced count at zero rather
  * than fabricating output.
  */
-static bool sgi_vice_codec_encode(SGIViceState *s, const char *codec,
-                                  const uint8_t *tile, gsize tile_len,
-                                  uint8_t **out, gsize *out_len)
+static bool sgi_vice_codec_xchg(SGIViceState *s, uint32_t op, uint32_t mode,
+                                const uint8_t *tile, gsize tile_len,
+                                uint8_t **out, gsize *out_len)
 {
     uint8_t hdr[VICE_CODEC_HDR_BYTES];
-    uint32_t mode = (strstr(codec, "luma") == NULL) ? 1 : 0;
     uint32_t rlen;
 
     if (!qemu_chr_fe_backend_connected(&s->codec_chr)) {
         return false;
     }
     stl_be_p(hdr + 0, VICE_CODEC_MAGIC);
-    stl_be_p(hdr + 4, VICE_CODEC_OP_ENCODE);
+    stl_be_p(hdr + 4, op);
     stl_be_p(hdr + 8, mode);
     stl_be_p(hdr + 12, VICE_JPEG_DIM);
     stl_be_p(hdr + 16, VICE_JPEG_DIM);
@@ -361,7 +361,7 @@ static bool sgi_vice_codec_encode(SGIViceState *s, const char *codec,
         return false;
     }
     if (ldl_be_p(hdr + 0) != VICE_CODEC_MAGIC ||
-        ldl_be_p(hdr + 4) != VICE_CODEC_OP_ENCODE) {
+        ldl_be_p(hdr + 4) != op) {
         return false;
     }
     rlen = ldl_be_p(hdr + 24);
@@ -386,7 +386,7 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
     const gboolean color = strstr(codec, "luma") == NULL;
     const uint32_t hdr_len = color ? VICE_JPEG_HDR_COLOR : VICE_JPEG_HDR_GRAY;
     uint8_t *in_buf, *out_data = NULL;
-    gsize out_len = 0;
+    gsize out_len = 0, count;
 
     if (!in_phys || !out_phys) {
         return;
@@ -400,7 +400,8 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
     in_buf = g_malloc(tile);
     address_space_read(&address_space_memory, in_phys,
                        MEMTXATTRS_UNSPECIFIED, in_buf, tile);
-    if (!sgi_vice_codec_encode(s, codec, in_buf, tile, &out_data, &out_len)) {
+    if (!sgi_vice_codec_xchg(s, VICE_CODEC_OP_ENCODE, color ? 1 : 0,
+                             in_buf, tile, &out_data, &out_len)) {
         qemu_log_mask(LOG_UNIMP, "sgi_vice: host-codec exchange failed\n");
         g_free(in_buf);
         return;
@@ -414,14 +415,26 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
         g_free(out_data);
         return;
     }
-    /* Place the produced bytes in the OUT tile ... */
+    /*
+     * @@SEMANTICS@@ the produced count the wrapper wants in vr_stat[0] is the
+     * HEADERLESS payload length, not the whole framed stream.  Traced on the
+     * guest (tmp/o2-qemu/vidsec/REPORT.md): the wrapper builds the movie
+     * sample as <its header> + <count> bytes and sets the sample size to
+     * header_len + count.  With the whole framed length reported (5959) it
+     * declared 704+5959=6663 and zero-padded the sample, which the VICE decoder
+     * then rejects ("bad length/data" -- its FFD9 probe lands in the padding).
+     * Reporting framed_len - header_len makes sample size == framed_len and the
+     * OUT tile's framed bytes are exactly what is read back.
+     */
+    count = out_len - hdr_len;
+    /* Place the produced bytes (framed stream) in the OUT tile ... */
     address_space_write(&address_space_memory, out_phys,
                         MEMTXATTRS_UNSPECIFIED, out_data, out_len);
-    /* ... and report the produced count in MSP Data RAM word 0 (vr_stat[0]). */
-    s->msp_dram[0] = (out_len >> 24) & 0xff;
-    s->msp_dram[1] = (out_len >> 16) & 0xff;
-    s->msp_dram[2] = (out_len >> 8) & 0xff;
-    s->msp_dram[3] = (out_len >> 0) & 0xff;
+    /* ... and report the headerless payload count in MSP DRAM word 0. */
+    s->msp_dram[0] = (count >> 24) & 0xff;
+    s->msp_dram[1] = (count >> 16) & 0xff;
+    s->msp_dram[2] = (count >> 8) & 0xff;
+    s->msp_dram[3] = (count >> 0) & 0xff;
     /*
      * @@SEMANTICS@@ vr_stat[2] (MSP DRAM 0x8008, big-endian) selects the
      * wrapper's colour/grayscale header variant: non-zero = the 704-byte
@@ -435,6 +448,66 @@ static void sgi_vice_host_offload(SGIViceState *s, const char *codec)
         s->msp_dram[10] = (VICE_JPEG_HDR_COLOR >> 8) & 0xff;
         s->msp_dram[11] = (VICE_JPEG_HDR_COLOR >> 0) & 0xff;
     }
+    trace_sgi_vice_offload(codec, count, out_phys);
+    g_free(out_data);
+}
+
+/*
+ * @@SEMANTICS@@ tier-ii host-codec DECODE seam (RE'd from a live dmplay movie
+ * decode; tmp/o2-qemu/vidsec/REPORT.md).  The stock movie player dmplay uses
+ * the VICE engine (`-p video,device=mvp,engine=ice`) and the driver uploads
+ * dfjpeg.mex; the job maps the VICE-framed JPEG in the IN tile (VICE_DMS_IN)
+ * and the decoded DMS-packed frame in the OUT tile (VICE_DMS_OUT).  The decoder
+ * output packing is the movie's own uncompressed packing (the same 32-bit DMS
+ * packing the encoder reads), so the host helper decodes the JPEG and re-packs
+ * it.  The decoded byte count is reported in MSP DRAM word 0, exactly as the
+ * encode path reports the headerless payload count.
+ *
+ * The input is the full VICE-framed JPEG (SOI..EOI) at tile offset 0; the
+ * helper locates the SOI and lets libjpeg run to EOI, so the exact compressed
+ * length need not be plumbed separately.  A missing helper or exchange failure
+ * leaves the count at 0 and logs UNIMP -- no frame is fabricated.
+ */
+static void sgi_vice_host_decode(SGIViceState *s, const char *codec)
+{
+    uint32_t in_phys = sgi_vice_tlb_phys(s, VICE_DMS_IN);
+    uint32_t out_phys = sgi_vice_tlb_phys(s, VICE_DMS_OUT);
+    const gboolean color = strstr(codec, "luma") == NULL;
+    uint8_t *in_buf, *out_data = NULL;
+    gsize out_len = 0;
+
+    if (!in_phys || !out_phys) {
+        return;
+    }
+    if (!qemu_chr_fe_backend_connected(&s->codec_chr)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: no host-codec chardev connected; "
+                      "leaving empty decode output\n");
+        return;
+    }
+    in_buf = g_malloc(VICE_TILE_SIZE);
+    address_space_read(&address_space_memory, in_phys,
+                       MEMTXATTRS_UNSPECIFIED, in_buf, VICE_TILE_SIZE);
+    if (!sgi_vice_codec_xchg(s, VICE_CODEC_OP_DECODE, color ? 1 : 0,
+                             in_buf, VICE_TILE_SIZE, &out_data, &out_len)) {
+        qemu_log_mask(LOG_UNIMP, "sgi_vice: host-codec decode failed\n");
+        g_free(in_buf);
+        return;
+    }
+    g_free(in_buf);
+    if (out_len == 0 || out_len > VICE_TILE_SIZE) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi_vice: host-codec decoded %zu bytes (tile %u)\n",
+                      out_len, VICE_TILE_SIZE);
+        g_free(out_data);
+        return;
+    }
+    address_space_write(&address_space_memory, out_phys,
+                        MEMTXATTRS_UNSPECIFIED, out_data, out_len);
+    s->msp_dram[0] = (out_len >> 24) & 0xff;
+    s->msp_dram[1] = (out_len >> 16) & 0xff;
+    s->msp_dram[2] = (out_len >> 8) & 0xff;
+    s->msp_dram[3] = (out_len >> 0) & 0xff;
     trace_sgi_vice_offload(codec, out_len, out_phys);
     g_free(out_data);
 }
@@ -461,8 +534,13 @@ static void sgi_vice_msp_go(SGIViceState *s, uint32_t ctl)
      * seam fill in the produced count and bytes.
      */
     memset(s->msp_dram, 0, 16);
-    if (strstr(codec, "jpeg")) {
+    if (strstr(codec, "cjpeg") || strstr(codec, "cjfif")) {
+        /* encode: DMS packed tile -> VICE-framed JPEG */
         sgi_vice_host_offload(s, codec);
+    } else if (strstr(codec, "djpeg") || strstr(codec, "dfjpeg") ||
+               strstr(codec, "djfif")) {
+        /* decode: VICE-framed JPEG -> DMS packed frame */
+        sgi_vice_host_decode(s, codec);
     }
     s->int_status |= VICE_INT_MSP_INTR;
     sgi_vice_update_irq(s);
