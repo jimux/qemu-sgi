@@ -123,7 +123,17 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         val = s->regs[offset >> 2] & ~0x40ULL;
         break;
 
-    case 0x0000 ... 0x0103:
+    /*
+     * BRIDGE_NIC (MicroLAN/1-wire line control) at 0xb4. The PROM polls bit 1
+     * (0x2) as the "transaction done" flag; without it the board-config read
+     * spins forever. Bit 0 is the 1-wire data line.
+     */
+    case 0x00b4:
+        val = 0x2 | (s->nic_data_bit & 1);
+        break;
+
+    case 0x0000 ... 0x00b3:
+    case 0x00b5 ... 0x0103:
     case 0x0105 ... 0x2FFF:
         val = s->regs[offset >> 2];
         break;

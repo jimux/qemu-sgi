@@ -214,26 +214,41 @@ static bool sgi_heart_probe_decode(SGIHEARTState *s, hwaddr off,
     return false;
 }
 
-static uint64_t sgi_heart_probe_read(void *opaque, hwaddr off, unsigned size)
+/*
+ * Probe-window address translation. Each HEART bank is backed by its slice of
+ * installed RAM; within a bank the DIMM address lines alias, so an access at
+ * bank offset X reaches storage at X modulo the emulated DIMM size. We take the
+ * DIMM size as half the bank slice (a bank holds two ranks), which reproduces
+ * the PROM's expected RA12/RA14/CA9 aliasing.
+ */
+static bool sgi_heart_probe_xlate(SGIHEARTState *s, hwaddr off,
+                                  uint8_t **ptr_out)
 {
-    SGIHEARTState *s = opaque;
     int bank;
-    uint64_t within, slice, val = 0;
-    uint8_t *p;
-    unsigned i;
+    uint64_t within, slice, dimm;
 
     if (!s->ram || !sgi_heart_probe_decode(s, off, &bank, &within)) {
-        return 0;
+        return false;
     }
     if (bank >= HEART_NUM_BANKS) {
-        return 0;
+        return false;
     }
     slice = s->ram_size / HEART_NUM_BANKS;
-    if (within + size > slice) {
-        return 0; /* beyond the installed slice: aliases to nothing */
+    dimm = (slice / 2) ? (slice / 2) : slice;
+    *ptr_out = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
+               (uint64_t)bank * dimm + (within % dimm);
+    return true;
+}
+
+static uint64_t sgi_heart_probe_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint8_t *p;
+    uint64_t val = 0;
+    unsigned i;
+
+    if (!sgi_heart_probe_xlate(opaque, off, &p)) {
+        return 0;
     }
-    p = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
-        (uint64_t)bank * slice + within;
     for (i = 0; i < size; i++) {
         val = (val << 8) | p[i];
     }
@@ -243,30 +258,12 @@ static uint64_t sgi_heart_probe_read(void *opaque, hwaddr off, unsigned size)
 static void sgi_heart_probe_write(void *opaque, hwaddr off, uint64_t val,
                                   unsigned size)
 {
-    SGIHEARTState *s = opaque;
-    int bank;
-    uint64_t within, slice;
     uint8_t *p;
     int i;
 
-    if (!s->ram || !sgi_heart_probe_decode(s, off, &bank, &within)) {
+    if (!sgi_heart_probe_xlate(opaque, off, &p)) {
         return;
     }
-    slice = s->ram_size / HEART_NUM_BANKS;
-    if (within + size > slice) {
-        return;
-    }
-    p = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
-        (uint64_t)bank * slice + within;
-    if (bank >= HEART_NUM_BANKS) {
-        return;
-    }
-    slice = s->ram_size / HEART_NUM_BANKS;
-    if (within + size > slice) {
-        return;
-    }
-    p = (uint8_t *)memory_region_get_ram_ptr(s->ram) +
-        (uint64_t)bank * slice + within;
     for (i = size - 1; i >= 0; i--) {
         p[i] = val & 0xff;
         val >>= 8;

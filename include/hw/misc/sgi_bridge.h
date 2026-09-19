@@ -46,6 +46,13 @@ struct SGIBRIDGEState {
     /* CPU interrupt output (BRIDGE -> CPU IP3) */
     qemu_irq cpu_irq;
 
+    /*
+     * BRIDGE MicroLAN/1-wire line state (BRIDGE_NIC at +0xb4). The PROM reads
+     * the board-config EEPROM through this; bit 0 is the data line and the
+     * transaction-done bit is reported as set.
+     */
+    uint8_t nic_data_bit;
+
     /* Register storage */
     uint32_t regs[BRIDGE_NUM_REGS];
 
