@@ -82,6 +82,7 @@ struct SGIBRIDGEState {
      */
     SerialState ioc3_uart;
     MemoryRegion ioc3_uart_mr;
+    MemoryRegion ioc3_uart_mr2;
 };
 
 #endif /* HW_MISC_SGI_BRIDGE_H */

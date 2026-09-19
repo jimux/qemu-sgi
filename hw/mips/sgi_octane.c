@@ -214,8 +214,21 @@ static void sgi_octane_init(MachineState *machine)
     /* HEART XIO widget-8 window (XIO config side, not the PIU). */
     create_unimplemented_device("heart-widget", OCTANE_HEART_WIDGET, 16 * MiB);
 
-    /* Catch null-pointer accesses in early boot. */
-    create_unimplemented_device("mem-probe", 0x00000000, 512 * KiB);
+    /*
+     * Low physical alias of RAM. The PROM copies its resident code/data to the
+     * RAM "physical" base, which on this machine resolves to physical 0 (the
+     * KSEG0/K1 view), and then executes it there via the fixed KSEG0 mapping.
+     * Without this alias those writes land in the void and the CPU fetches
+     * zeros. Sized to stop below the HEART PIU at 0x0FF00000.
+     */
+    {
+        MemoryRegion *low = g_new(MemoryRegion, 1);
+        uint64_t low_size = MIN(machine->ram_size, (uint64_t)0x0FF00000ULL);
+
+        memory_region_init_alias(low, NULL, "sgi.seg0-low", machine->ram, 0,
+                                 low_size);
+        memory_region_add_subregion(system_memory, 0x00000000ULL, low);
+    }
 }
 
 /*

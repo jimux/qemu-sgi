@@ -46,20 +46,25 @@
 #include "qemu/log.h"
 
 /*
- * BRIDGE covers widget 0xF: physical 0x1F000000-0x1FBFFFFF (12MB).
+ * BRIDGE covers widget 0xF: physical 0x1F000000-0x1FFFFFFF (16MB XIO widget).
  *   +0x000000: BRIDGE control registers
  *   +0x022000: IOC3 PCI config space
  *   +0x600000: IOC3 devio window (serial, kbd, mouse, ethernet)
  *   +0xC00000: PROM flash (mapped separately as ROM)
+ *   +0xE00000: extended flash/status window (addressed by the PROM)
  */
-#define BRIDGE_REG_SIZE 0xC00000
+#define BRIDGE_REG_SIZE 0x1000000
 
 /*
- * IOC3 UART A (SuperIO/legacy mode):
- *   Base within BRIDGE: 0x620178 (= IOC3_devio 0x600000 + SIO_UA 0x20178)
- *   8 bytes, stride 1, byte-reversed within 32-bit words.
+ * IOC3 SuperIO UART console, byte-spaced 16550.
+ *
+ * The IP30 PROM uses UART B at BRIDGE+0x620170 for its console struct (LSR at
+ * base+5; a live poll loops there). The earlier pon_initio path and the IP27
+ * model use UART A at BRIDGE+0x620178. Both are mapped to the same 16550 so
+ * either base works.
  */
-#define IOC3_UART_A_OFFSET  0x620178
+#define IOC3_UART_A_OFFSET  0x620170
+#define IOC3_UART_B_OFFSET  0x620178
 
 /*
  * IOC3 UART custom MemoryRegion ops.
@@ -285,14 +290,19 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
     }
 
     /*
-     * Map the IOC3 UART at BRIDGE offset 0x620178.
-     * This subregion takes priority over the parent sgi_bridge_ops for
-     * that address range, routing byte accesses to our custom handler.
+     * Map the IOC3 UART at BRIDGE offsets 0x620170 (UART B; the PROM console)
+     * and 0x620178 (UART A; the early pon_initio path). Both subregions take
+     * priority over the parent sgi_bridge_ops and share one 16550 state.
      */
     memory_region_init_io(&s->ioc3_uart_mr, OBJECT(dev), &ioc3_uart_ops, s,
-                          "ioc3-uart", 8);
+                          "ioc3-uart-b", 8);
     memory_region_add_subregion(&s->iomem, IOC3_UART_A_OFFSET,
                                 &s->ioc3_uart_mr);
+
+    memory_region_init_io(&s->ioc3_uart_mr2, OBJECT(dev), &ioc3_uart_ops, s,
+                          "ioc3-uart-a", 8);
+    memory_region_add_subregion(&s->iomem, IOC3_UART_B_OFFSET,
+                                &s->ioc3_uart_mr2);
 }
 
 static void sgi_bridge_instance_init(Object *obj)
