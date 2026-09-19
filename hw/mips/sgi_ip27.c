@@ -91,6 +91,12 @@ static uint64_t ip27_swin_phys(uint32_t nasid, uint32_t wid) {
 static void main_cpu_reset(void *opaque) {
   MIPSCPU *cpu = opaque;
   cpu_reset(CPU(cpu));
+  /*
+   * The SN0 PROM is entered from the flash sloader, which leaves gp set to
+   * the PROM's data pointer; early PROM routines call gp-relative code before
+   * the PROM sets gp itself.  Model that handoff.
+   */
+  cpu->env.active_tc.gpr[28] = 0xc00000001fce4fd0ULL;
 }
 
 /*
@@ -219,6 +225,8 @@ static void sgi_ip27_init(MachineState *machine) {
     env = &c->env;
     env->PAMask_override = IP27_PAMASK;
     env->PAMask = IP27_PAMASK;
+    /* Model a cold reset (ErrorEPC clear) for the PROM's reset dispatch. */
+    env->cold_erre_clear = true;
 
     cpu_mips_irq_init_cpu(c);
     cpu_mips_clock_init(c);

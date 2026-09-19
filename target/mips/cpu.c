@@ -297,6 +297,9 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
     } else {
         env->CP0_ErrorEPC = env->active_tc.PC;
     }
+    if (env->cold_erre_clear) {
+        env->CP0_ErrorEPC = 0;
+    }
     env->active_tc.PC = env->exception_base;
     env->CP0_Random = env->tlb->nb_tlb - 1;
     env->tlb->tlb_in_use = env->tlb->nb_tlb;

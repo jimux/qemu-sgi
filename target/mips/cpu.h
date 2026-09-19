@@ -1189,6 +1189,15 @@ typedef struct CPUArchState {
      */
     uint64_t PAMask_override;
 
+    /*
+     * Machine-scoped cold-reset marker: some machines' firmware (SGI IP27)
+     * distinguishes a cold reset from a warm re-entry by ErrorEPC and would
+     * otherwise mis-read QEMU's reset-PC value as a warm reset.  When set,
+     * the reset path clears ErrorEPC to model a cold reset.  Preserved across
+     * reset; zero for every other machine.
+     */
+    bool cold_erre_clear;
+
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;
