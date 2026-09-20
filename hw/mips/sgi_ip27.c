@@ -311,6 +311,20 @@ static void sgi_ip27_init(MachineState *machine) {
                               ip27_phys(IP27_MSPEC_BASE) + machine->ram_size,
                               IP27_NODE_SIZE - machine->ram_size);
 
+  /*
+   * Diagnostic: the PROM's tlb_ram_cac_node() maps its window to
+   * K0_TO_PHYS(IP27PROM_BASE) + (nasid << NASID_SHFT) and is currently using
+   * node offset 1 on this single node.  Alias node-0 RAM into the node-1
+   * cached window so the RAM-resident PROM copy is reachable at that address.
+   * TODO: determine why the PROM uses nasid 1 (should be 0) and remove this.
+   */
+  {
+    MemoryRegion *ram_node1 = g_new(MemoryRegion, 1);
+    memory_region_init_alias(ram_node1, NULL, "sgi-ip27.ram.node1", ram, 0,
+                             machine->ram_size);
+    memory_region_add_subregion(system_memory, 0x100000000ULL, ram_node1);
+  }
+
   /* Hub ASIC in the node's widget-1 small window. */
   hub = qdev_new(TYPE_SGI_HUB);
   qdev_prop_set_uint32(hub, "nasid", 0);
