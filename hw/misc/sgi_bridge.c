@@ -463,18 +463,59 @@ static void sgi_bridge_ds_line_write(SGIDS *ds, uint64_t val)
 #define IOC3_TXDSZ 128
 #define IOC3_RX_RING_BYTES (IOC3_NRXD * IOC3_RXDSZ)
 
+/*
+ * The ARCS ef driver programs the ring base and buffer pointers with
+ * kv_to_bridge32_dirmap() addresses, which on IP30 come out as K1-segment
+ * addresses (0xa0xxxxxx). The PROM runs from the low RAM alias at physical 0,
+ * so translate those to physical addresses for DMA.
+ */
+static uint64_t ioc3_dma_addr(uint64_t a)
+{
+    if ((a & 0xf0000000ULL) == 0xa0000000ULL) {
+        return a & 0x0fffffffULL;
+    }
+    return a;
+}
+
+/* MII management interface (IOC3 MICR/MIDR) and IEEE 802.3 PHY bits. */
+#define IOC3_MICR_REGADDR_MASK   0x0000001f
+#define IOC3_MICR_PHYADDR_MASK   0x000003e0
+#define IOC3_MICR_PHYADDR_SHIFT  5
+#define IOC3_MICR_READTRIG       0x00000400
+#define IOC3_MICR_BUSY           0x00000800
+#define IOC3_MIDR_DATA_MASK      0x0000ffff
+
+#define MII_R0_AUTOEN            0x1000
+#define MII_R1_AUTODONE          0x0020
+#define MII_R1_LINKSTAT          0x0004
+#define MII_R6_LPNWABLE          0x0001
+
+static void sgi_bridge_phy_init(SGIBRIDGEState *s)
+{
+    memset(s->phy_regs, 0, sizeof(s->phy_regs));
+    s->phy_regs[0] = 0x1000;  /* BMCR: auto-negotiation enabled */
+    s->phy_regs[1] = 0x7824;  /* BMSR: caps + autoneg done + link up */
+    s->phy_regs[2] = 0x0015;  /* PHY ID 1: ICS1890 OUI */
+    s->phy_regs[3] = 0xf400;  /* PHY ID 2 */
+    s->phy_regs[4] = 0x01e0;  /* ANAR: 10/10FD/100/100FD */
+    s->phy_regs[5] = 0x01e0;  /* ANLPAR: same */
+    s->phy_regs[6] = 0x0001;  /* ANER: link partner auto-neg able */
+    s->phy_write_data = 0;
+    s->phy_read_data = 0;
+}
+
 static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
                                    size_t len)
 {
     uint32_t emcr = s->eth_regs[IOC3_EMCR];
     uint32_t rxoff = ((emcr & IOC3_EMCR_RXOFF_MASK) >> IOC3_EMCR_RXOFF_SHIFT) * 2;
-    uint64_t erbr = ((uint64_t)s->eth_regs[IOC3_ERBR_H] << 32) |
-                    s->eth_regs[IOC3_ERBR_L];
-    uint64_t slot;
+    uint64_t erbr = ioc3_dma_addr(((uint64_t)s->eth_regs[IOC3_ERBR_H] << 32) |
+                                  s->eth_regs[IOC3_ERBR_L]);
+    uint64_t slot = 0;
     uint32_t w0, err;
     uint8_t frame[2048];
 
-    if (!(emcr & IOC3_EMCR_RXEN) || len > sizeof(frame)) {
+    if (!(emcr & IOC3_EMCR_RXEN) || erbr == 0 || len > sizeof(frame)) {
         return;
     }
 
@@ -484,6 +525,7 @@ static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
         slot == 0) {
         return;
     }
+    slot = ioc3_dma_addr(be64_to_cpu(slot));
 
     w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
     err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
@@ -496,8 +538,9 @@ static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
     }
 
     memcpy(frame, buf, len);
-    stl_p(&w0, cpu_to_be32(w0));
-    stl_p(&err, cpu_to_be32(err));
+    /* stl_p()/stq_p() already store in target (big-endian) order. */
+    stl_p(&w0, w0);
+    stl_p(&err, err);
 
     dma_memory_write(&address_space_memory, slot, &w0, 4,
                      MEMTXATTRS_UNSPECIFIED);
@@ -515,8 +558,8 @@ static void sgi_bridge_eth_tx_drain(SGIBRIDGEState *s)
 {
     uint32_t etpir = s->eth_regs[IOC3_ETPIR] & IOC3_ETPIR_TXPRODUCE_MASK;
     uint32_t etbr_l = s->eth_regs[IOC3_ETBR_L];
-    uint64_t base = ((uint64_t)s->eth_regs[IOC3_ETBR_H] << 32) |
-                    (etbr_l & IOC3_ETBR_L_TXRINGBASE_MASK);
+    uint64_t base = ioc3_dma_addr(((uint64_t)s->eth_regs[IOC3_ETBR_H] << 32) |
+                    (etbr_l & IOC3_ETBR_L_TXRINGBASE_MASK));
     int ntxd = (etbr_l & IOC3_ETBR_L_RINGSZ_MASK) ? 512 : 128;
     uint32_t ring_bytes = ntxd * IOC3_TXDSZ;
     uint32_t emcr = s->eth_regs[IOC3_EMCR];
@@ -535,8 +578,8 @@ static void sgi_bridge_eth_tx_drain(SGIBRIDGEState *s)
         }
         cmd = ldl_be_p(desc);
         bufcnt = ldl_be_p(desc + 4);
-        p1 = ldq_be_p(desc + 8);
-        p2 = ldq_be_p(desc + 16);
+        p1 = ioc3_dma_addr(ldq_be_p(desc + 8));
+        p2 = ioc3_dma_addr(ldq_be_p(desc + 16));
         d0cnt = bufcnt & 0x7f;
         b1cnt = (bufcnt >> 8) & 0x7ff;
         b2cnt = (bufcnt >> 20) & 0x7ff;
@@ -719,6 +762,10 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
             if (idx == IOC3_EMCR) {
                 /* The driver spins on ARB_DIAG_IDLE after asserting RST. */
                 val |= IOC3_EMCR_ARB_DIAG_IDLE;
+            } else if (idx == IOC3_MICR) {
+                val &= ~IOC3_MICR_BUSY; /* management ops complete instantly */
+            } else if (idx == IOC3_MIDR_R) {
+                val = s->phy_read_data & IOC3_MIDR_DATA_MASK;
             }
         } else {
             val = s->ioc3_regs[(offset - 0x600000) >> 2];
@@ -817,6 +864,21 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                 } else if (idx == IOC3_ETPIR) {
                     s->eth_regs[idx] = val;
                     sgi_bridge_eth_tx_drain(s);
+                } else if (idx == IOC3_MIDR_W) {
+                    s->phy_write_data = val & IOC3_MIDR_DATA_MASK;
+                    s->eth_regs[idx] = val;
+                } else if (idx == IOC3_MICR) {
+                    unsigned reg = val & IOC3_MICR_REGADDR_MASK;
+                    unsigned phyaddr = (val & IOC3_MICR_PHYADDR_MASK) >>
+                                       IOC3_MICR_PHYADDR_SHIFT;
+
+                    if (val & IOC3_MICR_READTRIG) {
+                        s->phy_read_data = s->phy_regs[reg];
+                    } else if (phyaddr == 0) {
+                        s->phy_regs[reg] = s->phy_write_data;
+                    }
+                    /* Management ops complete instantly (BUSY stays clear). */
+                    s->eth_regs[idx] = val & ~IOC3_MICR_BUSY;
                 } else {
                     s->eth_regs[idx] = val;
                 }
@@ -886,6 +948,7 @@ static void sgi_bridge_reset(DeviceState *dev)
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
     s->eth_rxprod = 0;
     s->eth_txcons = 0;
+    sgi_bridge_phy_init(s);
 }
 
 static void sgi_bridge_realize(DeviceState *dev, Error **errp)

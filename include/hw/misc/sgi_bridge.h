@@ -152,6 +152,15 @@ struct SGIBRIDGEState {
     uint32_t eth_regs[SGI_BRIDGE_ETH_NREGS];
     uint32_t eth_rxprod;  /* hardware RX produce, byte offset into the ring */
     uint32_t eth_txcons;  /* hardware TX consume, byte offset into the ring */
+
+    /*
+     * MII management PHY (IOC3 MICR/MIDR). A single IEEE 802.3 PHY at
+     * address 0; the ARCS ef driver's phyprobe/phyget/phyput use it to
+     * identify the PHY and determine link speed/duplex.
+     */
+    uint16_t phy_regs[32];
+    uint32_t phy_write_data;
+    uint32_t phy_read_data;
 };
 
 #endif /* HW_MISC_SGI_BRIDGE_H */
