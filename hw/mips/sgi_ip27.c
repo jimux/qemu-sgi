@@ -324,7 +324,7 @@ static void sgi_ip27_init(MachineState *machine) {
   MemoryRegion *flash;
   MemoryRegion *system_memory = get_system_memory();
   MemoryRegion *ram = machine->ram;
-  MemoryRegion *ram_uncac, *ram_mspec;
+  MemoryRegion *ram_uncac, *ram_mspec, *ram_cac;
   DeviceState *hub;
   DeviceState *baseio;
   SGIHubState *hub_state;
@@ -388,6 +388,20 @@ static void sgi_ip27_init(MachineState *machine) {
                               ram_mspec);
   create_unimplemented_device("ip27-mspec-high",
                               ip27_phys(IP27_MSPEC_BASE) + machine->ram_size,
+                              IP27_NODE_SIZE - machine->ram_size);
+
+  /*
+   * Node-local memory aliased cached (CAC).  The PROM's memory_init_all()
+   * tests configured banks at TO_NODE_CAC addresses, so this window must be
+   * backed or the memory bring-up fails (ip27_die FLED_NOMEM).
+   */
+  ram_cac = g_new(MemoryRegion, 1);
+  memory_region_init_alias(ram_cac, NULL, "sgi-ip27.ram.cac", ram, 0,
+                           machine->ram_size);
+  memory_region_add_subregion(system_memory, ip27_phys(IP27_CAC_BASE),
+                              ram_cac);
+  create_unimplemented_device("ip27-cac-high",
+                              ip27_phys(IP27_CAC_BASE) + machine->ram_size,
                               IP27_NODE_SIZE - machine->ram_size);
 
   /*
