@@ -73,6 +73,8 @@ static void sgi_hub_reset_bh(void *opaque);
 #define MD_UREG0_0 0x220000
 #define MD_UREG0_7 0x220038
 #define MD_SLOTID_USTAT 0x220048
+/* Front-panel LED (hubmd.h MD_LED0): read/write, low 8 bits. */
+#define MD_LED0 0x220050
 #define MD_UREG1_0 0x220080
 #define MD_UREG1_15 0x2200f8
 
@@ -585,6 +587,10 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
   if (off == MD_SLOTID_USTAT) {
     return s->slotid_ustat;
   }
+  /* MD_LED0 (0x220050): 8-bit front-panel LED; the PROM blinks/polls it. */
+  if (off == MD_LED0) {
+    return s->md_led0 & 0xff;
+  }
   if (off == MD_MLAN_CTL) {
     /* DONE (bit1) always set; RD_DATA (bit0) is the latched 1-wire line. */
     return 0x2 | (s->ds_data_bit & 1);
@@ -612,6 +618,10 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
   }
   if (off == MD_MLAN_CTL) {
     sgi_hub_mlan_write(s, val);
+    return;
+  }
+  if (off == MD_LED0) {
+    s->md_led0 = val & 0xff;
     return;
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||

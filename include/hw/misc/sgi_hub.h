@@ -70,6 +70,8 @@ struct SGIHubState {
   uint64_t mem_config;
   uint64_t refresh_ctl;
   uint64_t slotid_ustat;
+  /* MD_LED0 (0x220050): front-panel LED, read/write. */
+  uint64_t md_led0;
 
   /* NI: identity / scratch. */
   uint64_t ni_scratch[2];

@@ -467,26 +467,17 @@ static uint64_t ip27_bdoor_bank0_size;
  */
 static uint8_t *ip27_bdoor_sel(hwaddr off, uint64_t *idx) {
   const uint64_t dirbase = IP27_BDDIR_PHYS - IP27_BDOOR_PHYS; /* BDDIR/BDPRT */
+  uint64_t mask = (ip27_bdoor_bank0_size >> 2) - 1;
 
   if (off >= dirbase && off < dirbase + IP27_BDDIR_WINSZ) {
-    /*
-     * BDDIR_UPPER_MASK is bits [29:10], so every 4 KB page has a DISTINCT
-     * directory/protection entry -- there is no folding/aliasing at the bank
-     * or slot boundary.  Populate only the installed RAM and report the rest
-     * unpopulated (bd_type reads back -1), which is what size_back_door()
-     * needs and what makes the hole ranges genuinely holes.
-     */
-    uint64_t i = off - dirbase;
-
-    if (i >= (ip27_bdoor_bank0_size >> 2)) {
-      return NULL; /* above the installed size: unpopulated */
-    }
-    *idx = i;
+    /* Alias within bank0 (period = bank size): the hole dir/PRT entries map
+     * onto the bank start, so mtest_dir passes there and size_back_door's
+     * bd_alias() settles on the true bank size. */
+    *idx = (off - dirbase) & mask;
     return ip27_bdoor_dir;
   }
-  /* BDECC (ECC byte array), likewise per page, unpopulated above RAM. */
-  if (off < (ip27_bdoor_bank0_size >> 2)) {
-    *idx = off;
+  if (off < IP27_BDDIR_STORE) {
+    *idx = off & mask;
     return ip27_bdecc_dir;
   }
   return NULL;
@@ -531,13 +522,27 @@ static const MemoryRegionOps ip27_bdoor_ops = {
 
 #define IP27_BANK_SIZE 0x20000000ULL /* MD_BANK_SHFT=29: 512 MB per bank slot */
 
+static void ip27_add_ram_mirror(MemoryRegion *sysmem, uint64_t base,
+                                MemoryRegion *ram, uint64_t ram_size,
+                                const char *name) {
+  MemoryRegion *c = g_new(MemoryRegion, 1);
+  uint64_t off;
+  memory_region_init(c, NULL, name, IP27_BANK_SIZE);
+  for (off = 0; off < IP27_BANK_SIZE; off += ram_size) {
+    MemoryRegion *a = g_new(MemoryRegion, 1);
+    uint64_t sz = MIN(ram_size, IP27_BANK_SIZE - off);
+    memory_region_init_alias(a, NULL, name, ram, 0, sz);
+    memory_region_add_subregion(c, off, a);
+  }
+  memory_region_add_subregion(sysmem, ip27_phys(base), c);
+}
+
 static void sgi_ip27_init(MachineState *machine) {
   Clock *cpuclk;
   MemoryRegion *prom;
   MemoryRegion *flash;
   MemoryRegion *system_memory = get_system_memory();
   MemoryRegion *ram = machine->ram;
-  MemoryRegion *ram_uncac, *ram_mspec, *ram_cac;
   DeviceState *hub;
   DeviceState *baseio;
   SGIHubState *hub_state;
@@ -585,40 +590,18 @@ static void sgi_ip27_init(MachineState *machine) {
   /* Node-local memory at physical 0, aliased uncached (UNCAC/MSPEC spaces). */
   memory_region_add_subregion(system_memory, 0, ram);
 
-  /*
-   * Node-local memory aliases.  The PROM's memory_init_all() tests configured
-   * banks at these addresses, so they must be backed up to the installed size.
-   * The back-door arrays (BDDIR/BDPRT/BDECC) carry the aliasing that makes the
-   * size probe settle on the bank size; the RAM windows themselves are linear.
-   */
-  ram_uncac = g_new(MemoryRegion, 1);
-  memory_region_init_alias(ram_uncac, NULL, "sgi-ip27.ram.uncac", ram, 0,
-                           machine->ram_size);
-  memory_region_add_subregion(system_memory, ip27_phys(IP27_UNCAC_BASE),
-                              ram_uncac);
+  ip27_add_ram_mirror(system_memory, IP27_UNCAC_BASE, ram, machine->ram_size,
+                      "sgi-ip27.ram.uncac");
   create_unimplemented_device("ip27-uncac-high",
-                              ip27_phys(IP27_UNCAC_BASE) + machine->ram_size,
-                              IP27_NODE_SIZE - machine->ram_size);
-
-  ram_mspec = g_new(MemoryRegion, 1);
-  memory_region_init_alias(ram_mspec, NULL, "sgi-ip27.ram.mspec", ram, 0,
-                           machine->ram_size);
-  memory_region_add_subregion(system_memory, ip27_phys(IP27_MSPEC_BASE),
-                              ram_mspec);
+                              ip27_phys(IP27_UNCAC_BASE) + IP27_BANK_SIZE,
+                              IP27_NODE_SIZE - IP27_BANK_SIZE);
+  ip27_add_ram_mirror(system_memory, IP27_MSPEC_BASE, ram, machine->ram_size,
+                      "sgi-ip27.ram.mspec");
   create_unimplemented_device("ip27-mspec-high",
-                              ip27_phys(IP27_MSPEC_BASE) + machine->ram_size,
-                              IP27_NODE_SIZE - machine->ram_size);
-
-  /*
-   * Node-local memory aliased cached (CAC).  The PROM's memory_init_all()
-   * tests configured banks at TO_NODE_CAC addresses, so this window must be
-   * backed or the memory bring-up fails (ip27_die FLED_NOMEM).
-   */
-  ram_cac = g_new(MemoryRegion, 1);
-  memory_region_init_alias(ram_cac, NULL, "sgi-ip27.ram.cac", ram, 0,
-                           machine->ram_size);
-  memory_region_add_subregion(system_memory, ip27_phys(IP27_CAC_BASE),
-                              ram_cac);
+                              ip27_phys(IP27_MSPEC_BASE) + IP27_BANK_SIZE,
+                              IP27_NODE_SIZE - IP27_BANK_SIZE);
+  ip27_add_ram_mirror(system_memory, IP27_CAC_BASE, ram, machine->ram_size,
+                      "sgi-ip27.ram.cac");
 
 
   /* Hub ASIC in the node's widget-1 small window. */
