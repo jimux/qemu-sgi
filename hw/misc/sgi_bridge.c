@@ -827,6 +827,33 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         }
         break;
 
+    /*
+     * Bridge internal ATE RAM (0x10000..0x103ff) and external SSRAM
+     * (0x80000..0xfffff). The ARCS size_bridge_ssram() probe writes an
+     * SSRAM size marker at [0], [64k] and [128k] and reads it back; the
+     * value retained at [0] selects the fitted size. Back both as plain
+     * storage so writes persist and the probe sizes them correctly.
+     */
+    case 0x10000 ... 0x103ff:
+        {
+            unsigned n;
+
+            for (n = 0; n < size; n++) {
+                val |= (uint64_t)s->ate_ram[(offset - 0x10000) + n] << (8 * n);
+            }
+        }
+        break;
+
+    case 0x80000 ... 0xfffff:
+        {
+            unsigned n;
+
+            for (n = 0; n < size; n++) {
+                val |= (uint64_t)s->ext_ssram[(offset - 0x80000) + n] << (8 * n);
+            }
+        }
+        break;
+
     default:
         qemu_log_mask(LOG_UNIMP,
                       "BRIDGE: unimplemented read at offset 0x%05"
@@ -961,6 +988,30 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             s->sio_index = val & 0xff;
         } else if (offset == 0x6C0000) {
             s->sio_regs[s->sio_index] = val & 0xff;
+        }
+        break;
+
+    /*
+     * Bridge internal ATE RAM (0x10000..0x103ff) and external SSRAM
+     * (0x80000..0xfffff); see the read side for why they are backed.
+     */
+    case 0x10000 ... 0x103ff:
+        {
+            unsigned n;
+
+            for (n = 0; n < size; n++) {
+                s->ate_ram[(offset - 0x10000) + n] = (val >> (8 * n)) & 0xff;
+            }
+        }
+        break;
+
+    case 0x80000 ... 0xfffff:
+        {
+            unsigned n;
+
+            for (n = 0; n < size; n++) {
+                s->ext_ssram[(offset - 0x80000) + n] = (val >> (8 * n)) & 0xff;
+            }
         }
         break;
 

@@ -124,6 +124,16 @@ struct SGIBRIDGEState {
     uint32_t regs[BRIDGE_NUM_REGS];
 
     /*
+     * Bridge internal address-translation RAM (BRIDGE+0x10000, 1kB) and
+     * external SSRAM (BRIDGE+0x80000, up to 512kB). The SSRAM is the
+     * bridge's PCI/GIO read-response buffer; the ARCS size_bridge_ssram()
+     * probe writes/reads it to determine the fitted size (512k/128k/64k)
+     * and then zeroes it. Back both with storage so those accesses behave.
+     */
+    uint8_t ate_ram[0x400];
+    uint8_t ext_ssram[0x80000];
+
+    /*
      * IOC3 devio register block (BRIDGE+0x600000-0x61FFFF). The PROM's
      * pon_ioc3 POST write/read tests land across the whole block, so back it
      * with storage; specific registers (SIO_CR, MCR) have real semantics on
