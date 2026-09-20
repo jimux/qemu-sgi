@@ -54,7 +54,15 @@
 #define IP27_CAC_BASE 0xa800000000000000ULL
 
 /* Preserve bits [58:0]; bits [58:56] carry the address-space selector. */
-#define IP27_PAMASK 0x07FFFFFFFFFFFFFFULL
+/*
+ * Physical-address mask for XKPHYS.  Must retain the XKPHYS region
+ * discriminator (bit 60), otherwise HSPEC (0x9...) and CAC (0xa8...) fold to
+ * the same physical address and, e.g., the LBOOT flash at HSPEC+0x10000000
+ * collides with node RAM at CAC+0x10000000.  With bit 60 retained: CAC -> 0
+ * (node RAM), and HSPEC/IO/MSPEC/UNCAC map to distinct phys ranges.  KSEG
+ * (reset vector) uses a fixed 0x1fffffff mask and is unaffected.
+ */
+#define IP27_PAMASK 0x17FFFFFFFFFFFFFFULL
 
 /* M-mode: 4 GB per node, nasid at bits [39:32], 16 MB small window. */
 #define IP27_NODE_SIZE 0x100000000ULL
