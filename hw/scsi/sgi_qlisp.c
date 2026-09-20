@@ -76,8 +76,21 @@ static uint16_t ql_ld16(const uint8_t *p)
 }
 
 /* Bridge 32-bit direct-mapped DMA address -> host physical address. */
+/*
+ * Translate a QLogic DMA address to host physical memory.
+ *
+ * IP30 (and the SN0 non-PCI64 path) use the Bridge 32-bit direct map, so the
+ * address is phys + BRIDGE_DMA_DIRECT_BASE (0x80000000) and the high word is
+ * zero. IP27's 64-bit SN0_PCI_64 get_pci64_dma_addr() instead returns a dirmap
+ * address whose HIGH word is a PCI64 window selector (e.g. 0x15000000) and
+ * whose LOW 32 bits are the physical address; with <=4GB RAM the low word is
+ * the physical address, so mask it off distinguishably by the high word.
+ */
 static uint64_t ql_dma_to_phys(uint64_t a)
 {
+    if (a >> 32) {
+        return a & 0xffffffffULL;
+    }
     return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
 }
 
@@ -232,6 +245,18 @@ static const SCSIBusInfo qlisp_scsi_info = {
 static void ql_process_requests(SGIQLispState *s)
 {
     uint32_t in;
+    static unsigned dbg;
+
+    if (dbg < 16) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-qlisp: process fw=%d cnt=%u base=0x%llx out=%u "
+                      "in=%u cur=%p\n",
+                      s->firmware_running, s->req.count,
+                      (unsigned long long)s->req.base, s->req.out,
+                      s->req.count ? ql_mbox_get(s, 4) % s->req.count : 0,
+                      (void *)s->cur_req);
+        dbg++;
+    }
 
     if (!s->firmware_running || s->cur_req || !s->req.count) {
         return;
@@ -561,6 +586,18 @@ static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
              * requests here (unless a mailbox command is in flight, whose
              * own poll also reads this register).
              */
+            {
+                static unsigned dbg_isr;
+                if (s->firmware_running && dbg_isr < 16) {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-qlisp: rd bus_isr pending=%d fw=%d "
+                                  "cnt=%u out=%u mbox4=%u\n",
+                                  s->cmd_pending, s->firmware_running,
+                                  s->req.count, s->req.out,
+                                  ql_mbox_get(s, 4));
+                    dbg_isr++;
+                }
+            }
             if (!s->cmd_pending) {
                 ql_process_requests(s);
             }
