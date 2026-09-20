@@ -5733,33 +5733,33 @@ static void gen_mfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             register_name = "Performance0";
             break;
         case CP0_REG25__PERFCNT0:
-            /* gen_helper_mfc0_performance1(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance1));
             register_name = "Performance1";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL1:
-            /* gen_helper_mfc0_performance2(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance2));
             register_name = "Performance2";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT1:
-            /* gen_helper_mfc0_performance3(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance3));
             register_name = "Performance3";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL2:
-            /* gen_helper_mfc0_performance4(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance4));
             register_name = "Performance4";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT2:
-            /* gen_helper_mfc0_performance5(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance5));
             register_name = "Performance5";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL3:
-            /* gen_helper_mfc0_performance6(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance6));
             register_name = "Performance6";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT3:
-            /* gen_helper_mfc0_performance7(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance7));
             register_name = "Performance7";
-            goto cp0_unimplemented;
+            break;
         default:
             goto cp0_unimplemented;
         }
@@ -6483,33 +6483,33 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             register_name = "Performance0";
             break;
         case CP0_REG25__PERFCNT0:
-            /* gen_helper_mtc0_performance1(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance1));
             register_name = "Performance1";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL1:
-            /* gen_helper_mtc0_performance2(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance2));
             register_name = "Performance2";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT1:
-            /* gen_helper_mtc0_performance3(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance3));
             register_name = "Performance3";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL2:
-            /* gen_helper_mtc0_performance4(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance4));
             register_name = "Performance4";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT2:
-            /* gen_helper_mtc0_performance5(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance5));
             register_name = "Performance5";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL3:
-            /* gen_helper_mtc0_performance6(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance6));
             register_name = "Performance6";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT3:
-            /* gen_helper_mtc0_performance7(arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance7));
             register_name = "Performance7";
-            goto cp0_unimplemented;
+            break;
         default:
             goto cp0_unimplemented;
         }
@@ -7208,33 +7208,33 @@ static void gen_dmfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             register_name = "Performance0";
             break;
         case CP0_REG25__PERFCNT0:
-            /* gen_helper_dmfc0_performance1(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance1));
             register_name = "Performance1";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL1:
-            /* gen_helper_dmfc0_performance2(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance2));
             register_name = "Performance2";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT1:
-            /* gen_helper_dmfc0_performance3(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance3));
             register_name = "Performance3";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL2:
-            /* gen_helper_dmfc0_performance4(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance4));
             register_name = "Performance4";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT2:
-            /* gen_helper_dmfc0_performance5(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance5));
             register_name = "Performance5";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL3:
-            /* gen_helper_dmfc0_performance6(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance6));
             register_name = "Performance6";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT3:
-            /* gen_helper_dmfc0_performance7(arg); */
+            gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance7));
             register_name = "Performance7";
-            goto cp0_unimplemented;
+            break;
         default:
             goto cp0_unimplemented;
         }
@@ -7942,33 +7942,33 @@ static void gen_dmtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             register_name = "Performance0";
             break;
         case CP0_REG25__PERFCNT0:
-            /* gen_helper_mtc0_performance1(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance1));
             register_name = "Performance1";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL1:
-            /* gen_helper_mtc0_performance2(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance2));
             register_name = "Performance2";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT1:
-            /* gen_helper_mtc0_performance3(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance3));
             register_name = "Performance3";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL2:
-            /* gen_helper_mtc0_performance4(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance4));
             register_name = "Performance4";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT2:
-            /* gen_helper_mtc0_performance5(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance5));
             register_name = "Performance5";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCTL3:
-            /* gen_helper_mtc0_performance6(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance6));
             register_name = "Performance6";
-            goto cp0_unimplemented;
+            break;
         case CP0_REG25__PERFCNT3:
-            /* gen_helper_mtc0_performance7(tcg_env, arg); */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_Performance7));
             register_name = "Performance7";
-            goto cp0_unimplemented;
+            break;
         default:
             goto cp0_unimplemented;
         }

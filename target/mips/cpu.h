@@ -1040,6 +1040,13 @@ typedef struct CPUArchState {
  * CP0 Register 25
  */
     int32_t CP0_Performance0;
+    int32_t CP0_Performance1;
+    int32_t CP0_Performance2;
+    int32_t CP0_Performance3;
+    int32_t CP0_Performance4;
+    int32_t CP0_Performance5;
+    int32_t CP0_Performance6;
+    int32_t CP0_Performance7;
 /*
  * CP0 Register 26
  */
