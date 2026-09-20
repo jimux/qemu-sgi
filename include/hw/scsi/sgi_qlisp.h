@@ -123,6 +123,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 /* Host memory queue state */
 #define QL_MAX_QUEUE_ENTRIES 4096
 
+/* RISC instruction RAM base (firmware load/verify addresses are based here) */
+#define QL_RISC_RAMBASE   0x1000
+
 typedef struct QLQueue {
     uint64_t base;      /* host physical base address */
     uint32_t count;     /* entries */
@@ -146,7 +149,8 @@ struct SGIQLispState {
     /* RISC / firmware state */
     bool firmware_running;
     bool cmd_pending;          /* mailbox command completed, host to ack */
-    uint16_t risc_ram[4096];   /* sparse-ish; word addressable */
+    uint16_t risc_ram[0x4000]; /* word addressable, 0x1000-based */
+    uint32_t risc_loaded;      /* words loaded by LOAD_RAM (for checksum) */
 
     /* request/response queues */
     QLQueue req;
