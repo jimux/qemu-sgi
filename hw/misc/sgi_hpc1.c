@@ -52,21 +52,19 @@
 #define LIO0_DUART     0x20
 
 /*
- * PIT clocking (matches MAME int2.cpp).
+ * PIT clocking.
  *
- * The INT2 is clocked at 10 MHz and programs only counter 2 of its 8254 with
- * clock()/10 = 1 MHz. Counters 0 and 1 are not clocked directly: counter 2's
- * output is wired to their clock inputs (a cascade). IRIX arms counter 2 as a
- * 200-count divider (1 MHz / 200 = 5 kHz), then counter 0 with 50 (=> 100 Hz,
- * the scheduler "clock" on IP4) and counter 1 with 5 (=> 1 kHz, the "kgclock"
- * on IP5).
- *
- * Modelling counters 0/1 directly at the 1 MHz input clock made every tick
- * 2000x too fast; under -icount that storm overflowed the kernel's semaphore
- * counts (sema.c assertion) before the mount could run. Counter 2 gets the
- * 1 MHz base here and counters 0/1 are derived from it.
+ * The 8254 sits in the INT2. Counter 2 is clocked at 10 MHz; counters 0 and 1
+ * are clocked by counter 2's output (a cascade), so IRIX's counter-2 divider
+ * controls the slow scheduler tick. Counter 2 itself MUST stay at 10 MHz: the
+ * PROM's power-on calibration programs it and reads it back after a fixed
+ * delay, and clocking it at INT2_clock/10 = 1 MHz (as MAME's int2.cpp does) is
+ * slow enough that the counter appears stalled and the PROM trips a
+ * divide-by-zero assert at 0xbfc0aaac (break 0x7). Keeping counter 2 fast and
+ * only dividing counters 0/1 boots the PROM and still lets IRIX reach the
+ * scheduler idle loop.
  */
-#define PIT_BASE_CLK_HZ  1000000
+#define PIT_BASE_CLK_HZ  10000000
 
 /* ------------------------------------------------------------------ */
 /* Z85C30 DUART                                                        */
@@ -438,9 +436,11 @@ static uint32_t hpc1_pit_reload(const SGIHPC1State *s, int ch)
 }
 
 /*
- * Counters 0/1 are clocked by counter 2's output; its rate is the 1 MHz base
- * divided by counter 2's reload (a cascade). With IRIX's divisor of 200 this
- * yields 5 kHz, so counter 0 ticks at 100 Hz and counter 1 at 1 kHz.
+ * Counters 0/1 are clocked by counter 2's output: its 10 MHz input divided by
+ * counter 2's reload. Counter 2 itself must stay clocked at 10 MHz (the PROM's
+ * power-on timer calibration reads it back and asserts on a stalled counter);
+ * only counters 0/1 are divided. IRIX arms counter 2 as a divider, so counter 0
+ * then ticks slowly enough for the scheduler.
  */
 static uint32_t hpc1_pit_ch01_clk_hz(const SGIHPC1State *s)
 {
