@@ -19,6 +19,21 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 
+/*
+ * Optional device-side trace of the request/status entries, for cross-checking
+ * a driver's own request/sr_status on another platform.  Enable with
+ * QLISP_DEBUG=1 and -d unimp.  Off by default.
+ */
+static bool qlisp_dbg(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("QLISP_DEBUG") != NULL;
+    }
+    return on;
+}
+
 /* mailbox register byte offsets indexed by number (mbox0..mbox7) */
 static const uint8_t ql_mbox_off[8] = {
     QL_MBOX0, QL_MBOX1, QL_MBOX2, QL_MBOX3, QL_MBOX4, QL_MBOX5, QL_MBOX6,
@@ -197,6 +212,15 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
     ql_mbox_put(s, 5, s->rsp.in);
     ql_reg_put(s, QL_BUS_ISR,
                ql_reg_get(s, QL_BUS_ISR) | BUS_ISR_RISC_INT);
+
+    if (qlisp_dbg()) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-qlisp: STS handle=%u comp=0x%x scsi=0x%x resid=%u "
+                      "sense=%u slot=%u rsp_base=0x%llx mbox5=%u\n",
+                      s->cur_handle, completion, scsi_status, residual,
+                      sense_len, (s->rsp.in + s->rsp.count - 1) % s->rsp.count,
+                      (unsigned long long)s->rsp.base, s->rsp.in);
+    }
 }
 
 static void ql_process_requests(SGIQLispState *s);
@@ -321,6 +345,16 @@ static void ql_process_requests(SGIQLispState *s)
         seg_cnt = ql_ld16(e + 0x10);
 
         s->cur_handle = ql_ld32(e + 0x04);
+
+        if (qlisp_dbg()) {
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: CMD out=%u in=%u etype=0x%x handle=%u "
+                          "tgt=%u lun=%u cdb_len=%u seg=%u cdb=%02x%02x%02x%02x"
+                          "%02x%02x\n",
+                          s->req.out, in, etype, s->cur_handle, e[0x0a],
+                          e[0x0b], cdb_len, seg_cnt, cdb[0], cdb[1], cdb[2],
+                          cdb[3], cdb[4], cdb[5]);
+        }
         s->nsg = 0;
         s->sg_idx = 0;
         s->sg_off = 0;
