@@ -104,7 +104,9 @@ static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
         return false;
     }
     memcpy(e, raw, QL_ENTRY_SIZE);
-    ql_munge(e, QL_ENTRY_SIZE);
+    if (s->control_munge) {
+        ql_munge(e, QL_ENTRY_SIZE);
+    }
     return true;
 }
 
@@ -183,7 +185,9 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
         memcpy(st + 0x20, sense, MIN(sense_len, 32));
     }
 
-    ql_munge(st, sizeof(st));
+    if (s->control_munge) {
+        ql_munge(st, sizeof(st));
+    }
     dma_memory_write(&address_space_memory,
                      ql_dma_to_phys(s->rsp.base) +
                          (uint64_t)s->rsp.in * QL_ENTRY_SIZE,
@@ -723,6 +727,11 @@ static const Property qlisp_props[] = {
     DEFINE_PROP_DRIVE("drive", SGIQLispState, blk),
     DEFINE_PROP_UINT8("revision", SGIQLispState, pci_rev, QLISP_REV),
     DEFINE_PROP_UINT32("scsi-bus-num", SGIQLispState, busnr, 0),
+    /*
+     * True for machines whose ARCS driver munges control entries (IP30);
+     * false (default) for SN0/IP27, which leave them in natural order.
+     */
+    DEFINE_PROP_BOOL("control-munge", SGIQLispState, control_munge, false),
 };
 
 static void qlisp_class_init(ObjectClass *klass, const void *data)

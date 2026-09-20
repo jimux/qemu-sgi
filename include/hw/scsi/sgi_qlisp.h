@@ -205,6 +205,14 @@ struct SGIQLispState {
     uint16_t risc_ram[0x4000]; /* word addressable, 0x1000-based */
     uint32_t risc_loaded;      /* words loaded by LOAD_RAM (for checksum) */
 
+    /*
+     * Control entries (command/continuation/status/marker) are byte-reversed
+     * per 32-bit word by the driver's munge() only on IP30 (ql.c gates every
+     * call on `#if defined(IP30)`); SN0/IP27 leave them in natural order. The
+     * machine that runs an IP30 driver opts in via the "control-munge" prop.
+     */
+    bool control_munge;
+
     /* request/response queues */
     QLQueue req;
     QLQueue rsp;
