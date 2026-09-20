@@ -76,8 +76,21 @@ static uint16_t ql_ld16(const uint8_t *p)
 }
 
 /* Bridge 32-bit direct-mapped DMA address -> host physical address. */
+/*
+ * Translate a QLogic DMA address to host physical memory.
+ *
+ * IP30 (and the SN0 non-PCI64 path) use the Bridge 32-bit direct map, so the
+ * address is phys + BRIDGE_DMA_DIRECT_BASE (0x80000000) and the high word is
+ * zero. IP27's 64-bit SN0_PCI_64 get_pci64_dma_addr() instead returns a dirmap
+ * address whose HIGH word is a PCI64 window selector (e.g. 0x15000000) and
+ * whose LOW 32 bits are the physical address; with <=4GB RAM the low word is
+ * the physical address, so mask it off distinguishably by the high word.
+ */
 static uint64_t ql_dma_to_phys(uint64_t a)
 {
+    if (a >> 32) {
+        return a & 0xffffffffULL;
+    }
     return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
 }
 
