@@ -239,10 +239,16 @@ static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
     return;
   }
   if (ip27_flash_erase) {
-    /* Chip erase (0x10@0x5555) / sector erase (0x30@addr): set to 0xff. */
-    if ((faddr == 0x5555 && b == 0x10) || b == 0x30) {
+    /* Chip erase (0x10@0x5555) or sector erase (0x30@addr): set to 0xff. */
+    if (faddr == 0x5555 && b == 0x10) {
       ip27_flash_erase = 0;
       memset(ip27_flash_mem, 0xff, sizeof(ip27_flash_mem));
+    } else if (b == 0x30) {
+      uint64_t sec = off & ~(uint64_t)0xffff; /* 64 KiB sector */
+      ip27_flash_erase = 0;
+      if (sec + 0x10000 <= sizeof(ip27_flash_mem)) {
+        memset(ip27_flash_mem + sec, 0xff, 0x10000);
+      }
     }
     return;
   }
