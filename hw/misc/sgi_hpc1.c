@@ -399,41 +399,72 @@ static void hpc1_scsi_ctrl_write(SGIHPC1State *s, uint32_t val)
 /* 8254 PIT inside INT2                                                */
 /* ------------------------------------------------------------------ */
 
-static void hpc1_pit_timer_cb(void *opaque)
+/*
+ * The 8254 reload value 0 means 65536, not "stopped".  IRIX 6.2 arms its
+ * kernel clock with a divisor of 0, so treating 0 as stopped leaves the
+ * system with no timer tick (no scheduling, permanent idle).  Keep the
+ * explicit pit_programmed gate to distinguish "never armed".
+ */
+static uint32_t hpc1_pit_reload(const SGIHPC1State *s, int ch)
 {
-    SGIHPC1State *s = opaque;
-    int ch;
+    return s->pit_count[ch] ? s->pit_count[ch] : 65536u;
+}
+
+/*
+ * Fire one PIT channel.  Per-channel callbacks are used because a shared
+ * callback cannot tell which channel fired: QEMU clears a timer's pending
+ * flag before invoking its callback, so polling timer_pending() inside the
+ * handler always sees false and the channel is never re-armed (the original
+ * bug: the PIT fired at most once, so IRIX never got a periodic tick).
+ */
+static void hpc1_pit_fire(SGIHPC1State *s, int ch)
+{
+    unsigned mode = (s->pit_control[ch] >> 1) & 0x7;
     int64_t period_ns;
 
-    for (ch = 0; ch < 2; ch++) {
-        if (!timer_pending(s->pit_timer[ch])) {
-            continue;
-        }
-        /*
-         * Assert the corresponding CPU interrupt via the dedicated
-         * timer lines (timer0 -> IP4, timer1 -> IP5).
-         */
-        if (s->pit_programmed[ch] && s->pit_count[ch] > 0) {
-            qemu_irq_pulse(s->timer_irq[ch]);
-            period_ns = (int64_t)s->pit_count[ch] * (1000000000LL / PIT_CLOCK_HZ);
-            if (period_ns < 1000) {
-                period_ns = 1000;
-            }
-            timer_mod(s->pit_timer[ch],
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
-        }
+    if (!s->pit_programmed[ch]) {
+        return;
     }
+
+    /*
+     * Assert the corresponding CPU interrupt via the dedicated timer lines
+     * (timer0 -> IP4, timer1 -> IP5).  Raise and HOLD: the CPU latches the
+     * interrupt from the line level, so a momentary pulse is lost; the line
+     * is lowered when the guest acks via INT2_TIMER_ACK.
+     */
+    qemu_irq_raise(s->timer_irq[ch]);
+
+    /* Rate generator (mode 2/3) repeats; one-shot modes fire once. */
+    if (mode == 2 || mode == 3) {
+        period_ns = (int64_t)hpc1_pit_reload(s, ch) *
+                    (1000000000LL / PIT_CLOCK_HZ);
+        if (period_ns < 1000) {
+            period_ns = 1000;
+        }
+        timer_mod(s->pit_timer[ch],
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
+    }
+}
+
+static void hpc1_pit_timer0_cb(void *opaque)
+{
+    hpc1_pit_fire(opaque, 0);
+}
+
+static void hpc1_pit_timer1_cb(void *opaque)
+{
+    hpc1_pit_fire(opaque, 1);
 }
 
 static uint16_t hpc1_pit_remaining(SGIHPC1State *s, int ch)
 {
-    uint16_t reload = s->pit_count[ch];
+    uint32_t reload = hpc1_pit_reload(s, ch);
     int64_t elapsed_ns;
     uint64_t ticks;
     unsigned mode = (s->pit_control[ch] >> 1) & 0x7;
 
-    if (!s->pit_programmed[ch] || reload == 0) {
-        return reload;
+    if (!s->pit_programmed[ch]) {
+        return s->pit_count[ch];
     }
 
     elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->pit_load_ns[ch];
@@ -456,13 +487,13 @@ static uint16_t hpc1_pit_remaining(SGIHPC1State *s, int ch)
     if (mode == 2 || mode == 3) {
         /* Rate generator: wrap around. */
         ticks %= reload;
-        return reload - ticks;
+        return (uint16_t)(reload - ticks);
     }
     /* One-shot modes: stop at zero. */
     if (ticks >= reload) {
         return 0;
     }
-    return reload - ticks;
+    return (uint16_t)(reload - ticks);
 }
 
 static void hpc1_pit_write(SGIHPC1State *s, int reg, uint8_t val)
@@ -506,6 +537,24 @@ static void hpc1_pit_write(SGIHPC1State *s, int reg, uint8_t val)
     }
     s->pit_programmed[ch] = true;
     s->pit_load_ns[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /*
+     * Arm the modelled timer on (re)programming.  The callback re-arms
+     * itself, but nothing else starts it, so without this the PIT never
+     * fires.  IRIX 6.2 uses the HPC1 PIT for its kernel clock, so a dead
+     * PIT leaves the system with no tick (permanent idle, no init).
+     */
+    {
+        int64_t period_ns = (int64_t)hpc1_pit_reload(s, ch) *
+                            (1000000000LL / PIT_CLOCK_HZ);
+        if (period_ns < 1000) {
+            period_ns = 1000;
+        }
+        /* Only channels 0 and 1 have interrupt lines modelled. */
+        if (ch < 2) {
+            timer_mod(s->pit_timer[ch], s->pit_load_ns[ch] + period_ns);
+        }
+    }
 }
 
 static uint8_t hpc1_pit_read(SGIHPC1State *s, int reg)
@@ -1079,9 +1128,11 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
         case INT2_TIMER_ACK:
             if (val8 & 0x1) {
                 s->timer_pending[0] = false;
+                qemu_irq_lower(s->timer_irq[0]);
             }
             if (val8 & 0x2) {
                 s->timer_pending[1] = false;
+                qemu_irq_lower(s->timer_irq[1]);
             }
             break;
         default:
@@ -1320,8 +1371,8 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     hpc1_nvram_load(s);
 
     /* PIT interrupt timers (timer0 -> IP4, timer1 -> IP5) */
-    s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer_cb, s);
-    s->pit_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer_cb, s);
+    s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer0_cb, s);
+    s->pit_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer1_cb, s);
 
     if (qemu_chr_fe_backend_connected(&s->serial)) {
         qemu_chr_fe_set_handlers(&s->serial,
