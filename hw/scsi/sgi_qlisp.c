@@ -96,13 +96,20 @@ static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
 }
 
 /* base/count of dseg[i] from an un-munged command entry (A64 layout). */
-static void ql_get_dseg(const uint8_t *e, unsigned i, QLSG *sg)
+static void ql_get_dseg(const uint8_t *e, unsigned base, unsigned i,
+                        bool a64, QLSG *sg)
 {
-    uint32_t lo = ql_ld32(e + 0x28 + i * 12);
-    uint32_t hi = ql_ld32(e + 0x2c + i * 12);
+    if (a64) {
+        unsigned off = base + i * 12;
 
-    sg->addr = ((uint64_t)hi << 32) | lo;
-    sg->len = ql_ld32(e + 0x30 + i * 12);
+        sg->addr = ((uint64_t)ql_ld32(e + off + 4) << 32) | ql_ld32(e + off);
+        sg->len = ql_ld32(e + off + 8);
+    } else {
+        unsigned off = base + i * 8;
+
+        sg->addr = ql_ld32(e + off);
+        sg->len = ql_ld32(e + off + 4);
+    }
 }
 
 static bool ql_sg_move(SGIQLispState *s, uint8_t *buf, uint32_t len,
@@ -238,6 +245,8 @@ static void ql_process_requests(SGIQLispState *s)
         uint8_t cdb[16];
         uint32_t i, cdb_len, seg_cnt, ncont;
         uint8_t etype;
+        bool a64;
+        unsigned iocb_segs, cont_segs, cmd_dseg, cont_dseg;
         SCSIDevice *sdev;
         int datalen;
 
@@ -256,6 +265,11 @@ static void ql_process_requests(SGIQLispState *s)
                           etype, s->req.out, in);
             return;
         }
+        a64 = (etype == QL_ET_COMMAND);
+        iocb_segs = a64 ? QL_IOCB_SEGS_A64 : QL_IOCB_SEGS_LEGACY;
+        cont_segs = a64 ? QL_CONT_SEGS_A64 : QL_CONT_SEGS_LEGACY;
+        cmd_dseg = a64 ? 0x28 : 0x20;
+        cont_dseg = a64 ? 0x04 : 0x08;
 
         cdb_len = ql_ld16(e + 0x08);
         if (cdb_len == 0 || cdb_len > sizeof(cdb)) {
@@ -271,11 +285,11 @@ static void ql_process_requests(SGIQLispState *s)
         s->sg_idx = 0;
         s->sg_off = 0;
         for (i = 0; i < seg_cnt && s->nsg < QL_MAX_SG; i++) {
-            if (i < QL_IOCB_SEGS) {
-                ql_get_dseg(e, i, &s->sg[s->nsg++]);
+            if (i < iocb_segs) {
+                ql_get_dseg(e, cmd_dseg, i, a64, &s->sg[s->nsg++]);
             } else {
-                uint32_t ci = (i - QL_IOCB_SEGS) / QL_CONT_SEGS;
-                uint32_t cj = (i - QL_IOCB_SEGS) % QL_CONT_SEGS;
+                uint32_t ci = (i - iocb_segs) / cont_segs;
+                uint32_t cj = (i - iocb_segs) % cont_segs;
                 uint32_t slot = (s->req.out + 1 + ci) % s->req.count;
                 uint8_t craw[QL_ENTRY_SIZE], ce[QL_ENTRY_SIZE];
                 if (!ql_get_entry(s, s->req.base +
@@ -283,12 +297,12 @@ static void ql_process_requests(SGIQLispState *s)
                                   craw, ce)) {
                     break;
                 }
-                ql_get_dseg(ce, QL_IOCB_SEGS + cj, &s->sg[s->nsg++]);
+                ql_get_dseg(ce, cont_dseg, cj, a64, &s->sg[s->nsg++]);
             }
         }
-        /* A64: continuation entries hold QL_CONT_SEGS dsegs each. */
-        ncont = seg_cnt > QL_IOCB_SEGS ?
-                (seg_cnt - QL_IOCB_SEGS + QL_CONT_SEGS - 1) / QL_CONT_SEGS : 0;
+        /* Each continuation entry holds cont_segs dsegs. */
+        ncont = seg_cnt > iocb_segs ?
+                (seg_cnt - iocb_segs + cont_segs - 1) / cont_segs : 0;
         s->req.out = (s->req.out + 1 + ncont) % s->req.count;
 
         sdev = scsi_device_find(&s->bus, 0, e[0x0a], e[0x0b]);
@@ -430,6 +444,28 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
         s->rsp.count = depth;
         s->rsp.out = idx;
         s->rsp.in = 0;
+        ql_mbox_put(s, 5, idx);
+        sts = MBOX_STS_COMMAND_COMPLETE;
+        break;
+
+    case MBOX_CMD_INIT_REQUEST_QUEUE_64:
+    case MBOX_CMD_INIT_RESPONSE_QUEUE_64:
+        depth = ql_mbox_get(s, 1);
+        base = ((uint64_t)ql_mbox_get(s, 6) << 48) |
+               ((uint64_t)ql_mbox_get(s, 7) << 32) |
+               ((uint64_t)ql_mbox_get(s, 2) << 16) | ql_mbox_get(s, 3);
+        idx = ql_mbox_get(s, 5);
+        if (cmd == MBOX_CMD_INIT_REQUEST_QUEUE_64) {
+            s->req.base = base;
+            s->req.count = depth;
+            s->req.in = idx;
+            s->req.out = idx;
+        } else {
+            s->rsp.base = base;
+            s->rsp.count = depth;
+            s->rsp.out = idx;
+            s->rsp.in = 0;
+        }
         ql_mbox_put(s, 5, idx);
         sts = MBOX_STS_COMMAND_COMPLETE;
         break;

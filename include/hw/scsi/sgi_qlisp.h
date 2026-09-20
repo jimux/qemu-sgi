@@ -82,6 +82,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 #define MBOX_CMD_ABOUT_FIRMWARE         0x0008
 #define MBOX_CMD_INIT_REQUEST_QUEUE     0x0010
 #define MBOX_CMD_INIT_RESPONSE_QUEUE    0x0011
+/*
+ * 64-bit queue-init commands, used by the SN0 (Origin/IP27) build of the
+ * driver instead of 0x10/0x11. The base is assembled from four mailboxes:
+ *   mbox2 = base>>16, mbox3 = base&0xffff, mbox7 = base>>32, mbox6 = base>>48
+ * and the in/out pointer is in mbox5 for both directions.
+ */
+#define MBOX_CMD_INIT_REQUEST_QUEUE_64  0x0052
+#define MBOX_CMD_INIT_RESPONSE_QUEUE_64 0x0053
 #define MBOX_CMD_WAKE_UP                0x0013
 #define MBOX_CMD_STOP_FIRMWARE          0x0014
 #define MBOX_CMD_ABORT                  0x0015
@@ -129,12 +137,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 
 /* A64 command/continuation entry geometry (ql_standalone.h) */
 #define QL_ENTRY_SIZE        64
-#define QL_IOCB_SEGS         2
-#define QL_CONT_SEGS         5
+/*
+ * The A64 ioctl request-entry format is only used by SN0 (Origin/IP27)
+ * builds of the driver; IP30 compiles it out (ql.c gates A64_BIT_OPERATION
+ * on "#if SN0"). The two differ in the data-segment layout and in how many
+ * segments fit per command/continuation entry:
+ *
+ *              command dseg   stride  IOCB_SEGS  continuation dseg  CONT_SEGS
+ *   legacy         0x20         8         4            0x08           7
+ *   A64            0x28        12         2            0x04           5
+ *
+ * Select per entry from entry_type (ET_COMMAND 0x1 legacy / 0x9 A64).
+ */
+#define QL_IOCB_SEGS_LEGACY  4
+#define QL_CONT_SEGS_LEGACY  7
+#define QL_IOCB_SEGS_A64     2
+#define QL_CONT_SEGS_A64     5
 #define QL_MAX_SG            64
 #define QL_ET_COMMAND        0x9
 #define QL_ET_COMMAND_LEGACY 0x1
 #define QL_ET_CONTINUATION   0xa
+#define QL_ET_CONT_LEGACY    0x2
 #define QL_ET_STATUS         0x3
 #define QL_ET_MARKER         0x4
 
