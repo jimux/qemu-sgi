@@ -54,6 +54,14 @@
 /* --- Hub MD (memory/directory) offsets --- */
 #define MD_MEMORY_CONFIG 0x200018
 #define MD_REFRESH_CONTROL 0x200020
+/*
+ * MicroLAN (1-wire) control.  The PROM bit-bangs the hub NIC EEPROM through
+ * this register: it writes PULSE<19:10>/SAMPLE<9:2>, then spins on DONE
+ * (bit1), returning RD_DATA (bit0).  With no EEPROM device present the line
+ * floats high, so RD_DATA reads 1 and the PROM's part search reports
+ * "not present" instead of hanging.
+ */
+#define MD_MLAN_CTL 0x2000a8
 #define MD_UREG0_0 0x220000
 #define MD_UREG0_7 0x220038
 #define MD_SLOTID_USTAT 0x220048
@@ -260,6 +268,10 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
   if (off == MD_SLOTID_USTAT) {
     return s->slotid_ustat;
   }
+  if (off == MD_MLAN_CTL) {
+    /* DONE (bit1) always set; RD_DATA (bit0) idle high (no EEPROM). */
+    return 0x3;
+  }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
       (off >= MD_UREG1_0 && off <= MD_UREG1_15)) {
     /* uController/UART and MLAN registers: state held, semantic model later. */
@@ -279,6 +291,10 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
   }
   if (off == MD_REFRESH_CONTROL) {
     s->refresh_ctl = val;
+    return;
+  }
+  if (off == MD_MLAN_CTL) {
+    /* PULSE/SAMPLE command; the line model is stateless for now. */
     return;
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
