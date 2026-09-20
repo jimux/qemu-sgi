@@ -686,6 +686,10 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
         /* Write cycle.  The PROM diag and the ef driver address the PHY at
          * 0x1f (SGI_PHY_ADDR); accept writes at any address. */
         s->phy_regs[reg] = s->phy_write_data;
+        /* BMCR (reg 0) bit 15 is a self-clearing soft reset. */
+        if (reg == 0) {
+          s->phy_regs[0] &= ~0x8000;
+        }
       }
       s->eth_regs[idx] = val & ~0x800u; /* BUSY stays clear */
     } else {
