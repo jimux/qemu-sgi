@@ -183,8 +183,12 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
 
   memcpy(dst, data + code_off, code_size);
 
-  /* The flash holds the whole container image (header + code). */
-  memcpy(flash_dst, data, MIN((gsize)IP27_FLASH_SIZE, len));
+  /*
+   * The boot flash / LBOOT window (HSPEC+0x10000000) presents the PROM code
+   * at offset 0: the PROM reads its checksum source at LBOOT+0 for code_size
+   * bytes, so the SN0 container header must not be in the window.
+   */
+  memcpy(flash_dst, data + code_off, MIN((gsize)IP27_FLASH_SIZE, code_size));
 
   qemu_log_mask(LOG_GUEST_ERROR,
                 "sgi-ip27: loaded SN0 PROM '%s': load=0x%" PRIx64
