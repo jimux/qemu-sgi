@@ -467,22 +467,26 @@ static uint64_t ip27_bdoor_bank0_size;
  */
 static uint8_t *ip27_bdoor_sel(hwaddr off, uint64_t *idx) {
   const uint64_t dirbase = IP27_BDDIR_PHYS - IP27_BDOOR_PHYS; /* BDDIR/BDPRT */
-  uint64_t mask = (ip27_bdoor_bank0_size >> 2) - 1;
 
   if (off >= dirbase && off < dirbase + IP27_BDDIR_WINSZ) {
     /*
-     * The array aliases within bank 0 with period = bank size, so the entry
-     * for pa == bank0_size maps onto the entry for pa == 0.  That is what
-     * size_back_door's bd_alias() needs to settle on the true size (rather
-     * than the whole 512 MB slot), and it also lets the memory test write and
-     * read back a pattern at the bank boundary (pa = 256 MB).
+     * BDDIR_UPPER_MASK is bits [29:10], so every 4 KB page has a DISTINCT
+     * directory/protection entry -- there is no folding/aliasing at the bank
+     * or slot boundary.  Populate only the installed RAM and report the rest
+     * unpopulated (bd_type reads back -1), which is what size_back_door()
+     * needs and what makes the hole ranges genuinely holes.
      */
-    *idx = (off - dirbase) & mask;
+    uint64_t i = off - dirbase;
+
+    if (i >= (ip27_bdoor_bank0_size >> 2)) {
+      return NULL; /* above the installed size: unpopulated */
+    }
+    *idx = i;
     return ip27_bdoor_dir;
   }
-  /* BDECC (ECC byte array), likewise aliased within bank 0. */
-  if (off < IP27_BDDIR_STORE) {
-    *idx = off & mask;
+  /* BDECC (ECC byte array), likewise per page, unpopulated above RAM. */
+  if (off < (ip27_bdoor_bank0_size >> 2)) {
+    *idx = off;
     return ip27_bdecc_dir;
   }
   return NULL;
