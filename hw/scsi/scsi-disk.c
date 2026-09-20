@@ -122,6 +122,13 @@ struct SCSIDiskState {
      * 0xffff        - reserved
      */
     uint16_t rotation_rate;
+    /*
+     * CD-ROM logical block size override. Real SGI CD-ROMs present
+     * 512-byte blocks; the SGI PROMs (IP20/IP27/IP30) compute EFS sector
+     * addresses in 512-byte units, so a 2048-byte CD makes the LBA math
+     * overrun. 0 keeps the default (2048).
+     */
+    uint32_t cd_block_size;
     bool migrate_emulated_scsi_request;
 };
 
@@ -2686,6 +2693,11 @@ static void scsi_cd_realize(SCSIDevice *dev, Error **errp)
         blocksize = dev->conf.physical_block_size;
     }
 
+    /* SGI CD-ROMs use 512-byte logical blocks (see property comment). */
+    if (s->cd_block_size != 0) {
+        blocksize = s->cd_block_size;
+    }
+
     s->qdev.blocksize = blocksize;
     s->qdev.type = TYPE_ROM;
     s->features |= 1 << SCSI_DISK_F_REMOVABLE;
@@ -3303,6 +3315,7 @@ static const TypeInfo scsi_hd_info = {
 
 static const Property scsi_cd_properties[] = {
     DEFINE_SCSI_DISK_PROPERTIES(),
+    DEFINE_PROP_UINT32("block_size", SCSIDiskState, cd_block_size, 0),
     DEFINE_PROP_UINT64("wwn", SCSIDiskState, qdev.wwn, 0),
     DEFINE_PROP_UINT64("port_wwn", SCSIDiskState, qdev.port_wwn, 0),
     DEFINE_PROP_UINT16("port_index", SCSIDiskState, port_index, 0),
