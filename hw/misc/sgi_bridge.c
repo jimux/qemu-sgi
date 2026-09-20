@@ -103,6 +103,269 @@ static const MemoryRegionOps ioc3_uart_ops = {
     },
 };
 
+/* --- DS2502 1-wire board-config EEPROM (bridge NIC line) ------------- */
+
+/* Dallas/Maxim 1-wire CRC-8 (poly 0x8C, reflected). */
+static uint8_t sgi_bridge_crc8(const uint8_t *p, int n)
+{
+    uint8_t crc = 0;
+    int i, j;
+
+    for (i = 0; i < n; i++) {
+        uint8_t c = p[i];
+        for (j = 0; j < 8; j++) {
+            if ((crc ^ c) & 1) {
+                crc = (crc >> 1) ^ 0x8C;
+            } else {
+                crc >>= 1;
+            }
+            c >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* NIC 16-bit CRC (poly 0xC001), from libsk/ml/nic.c. */
+static const int sgi_bridge_oddparity[16] = {0, 1, 1, 0, 1, 0, 0, 1,
+                                             1, 0, 0, 1, 0, 1, 1, 0};
+
+static uint16_t sgi_bridge_crc16_step(uint16_t crc, uint8_t in)
+{
+    uint16_t data = in;
+
+    data = (data ^ (crc & 0xff)) & 0xff;
+    crc >>= 8;
+    if (sgi_bridge_oddparity[data & 0xf] ^ sgi_bridge_oddparity[data >> 4]) {
+        crc ^= 0xc001;
+    }
+    data <<= 6;
+    crc ^= data;
+    data <<= 1;
+    crc ^= data;
+    return crc;
+}
+
+static uint16_t sgi_bridge_crc16(const uint8_t *p, int n)
+{
+    uint16_t crc = 0;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        crc = sgi_bridge_crc16_step(crc, p[i]);
+    }
+    return crc;
+}
+
+static void sgi_bridge_put(uint8_t *dst, const char *s, int n)
+{
+    int i;
+
+    for (i = 0; i < n; i++) {
+        dst[i] = s[i] ? (uint8_t)s[i] : ' ';
+    }
+}
+
+/*
+ * Build the DS2502 image: an IP30 board manufacturing record. Page 0 holds the
+ * serial and part number, page 1 the revision/group/name; each 32-byte page
+ * carries a trailing 16-bit CRC so crc16(page) == 0xb001.
+ */
+static void sgi_bridge_ds_init(SGIBRIDGEState *s)
+{
+    static const char part[] = "030-1457-001"; /* IP30 system board */
+    static const char name[] = "IP30";
+    int a, b;
+
+    memset(s->ds_mem, 0xff, sizeof(s->ds_mem));
+
+    s->ds_mem[0] = 0x01;
+    sgi_bridge_put(&s->ds_mem[1], "1234567890", 10);
+    sgi_bridge_put(&s->ds_mem[11], part, 19);
+
+    sgi_bridge_put(&s->ds_mem[32 + 0], "", 6);
+    sgi_bridge_put(&s->ds_mem[32 + 6], "0001", 4);
+    s->ds_mem[32 + 10] = 0x00;
+    memset(&s->ds_mem[32 + 11], 0x00, 4);
+    s->ds_mem[32 + 15] = 0x00;
+    sgi_bridge_put(&s->ds_mem[32 + 16], name, 14);
+
+    for (int page = 0; page < 2; page++) {
+        uint8_t *pg = &s->ds_mem[page * 32];
+
+        pg[30] = 0;
+        pg[31] = 0;
+        for (a = 0; a < 256; a++) {
+            for (b = 0; b < 256; b++) {
+                pg[30] = a;
+                pg[31] = b;
+                if (sgi_bridge_crc16(pg, 32) == 0xb001) {
+                    goto done;
+                }
+            }
+        }
+    done:;
+    }
+
+    s->ds_rom[0] = 0x09;
+    s->ds_rom[1] = 0x01;
+    s->ds_rom[2] = 0x02;
+    s->ds_rom[3] = 0x03;
+    s->ds_rom[4] = 0x04;
+    s->ds_rom[5] = 0x05;
+    s->ds_rom[6] = 0x06;
+    s->ds_rom[7] = sgi_bridge_crc8(s->ds_rom, 7);
+}
+
+static void sgi_bridge_ds_reset(SGIBRIDGEState *s)
+{
+    s->ds_state = 1; /* SGI_DS_CMD */
+    s->ds_cmd = 0;
+    s->ds_cmd_bits = 0;
+    s->ds_in = 0;
+    s->ds_in_bits = 0;
+    s->ds_out_index = 0;
+    s->ds_search_phase = 0;
+    s->ds_addr = 0;
+    s->ds_extra = 0;
+    s->nic_data_bit = 0;
+}
+
+static void sgi_bridge_ds_decode(SGIBRIDGEState *s)
+{
+    switch (s->ds_cmd) {
+    case 0x33: /* READ ROM */
+        s->ds_state = 2;
+        s->ds_out_index = 0;
+        break;
+    case 0x55: /* MATCH ROM */
+        s->ds_state = 3;
+        s->ds_in = 0;
+        s->ds_in_bits = 0;
+        break;
+    case 0xcc: /* SKIP ROM */
+        s->ds_state = 1;
+        break;
+    case 0xf0: /* read-memory (or search-ROM) */
+        s->ds_state = 5;
+        break;
+    default:
+        s->ds_state = 1;
+        break;
+    }
+    s->ds_cmd = 0;
+    s->ds_cmd_bits = 0;
+}
+
+static void sgi_bridge_ds_write_bit(SGIBRIDGEState *s, int bit)
+{
+    switch (s->ds_state) {
+    case 1: /* CMD */
+        s->ds_cmd |= (bit & 1) << s->ds_cmd_bits;
+        if (++s->ds_cmd_bits == 8) {
+            sgi_bridge_ds_decode(s);
+        }
+        break;
+    case 3: /* MATCHROM */
+        s->ds_in |= (bit & 1) << s->ds_in_bits;
+        if (++s->ds_in_bits == 64) {
+            s->ds_state = 1;
+        }
+        break;
+    case 4: /* SEARCH */
+        if (s->ds_search_phase == 2) {
+            s->ds_search_phase = 0;
+            if (++s->ds_out_index == 64) {
+                s->ds_state = 1;
+            }
+        }
+        break;
+    case 5: /* F0_PENDING: a write means the 16-bit address follows */
+        s->ds_state = 6;
+        s->ds_addr = 0;
+        s->ds_in_bits = 0;
+        /* fall through */
+    case 6: /* RMEM_ADDR */
+        s->ds_addr |= (bit & 1) << s->ds_in_bits;
+        if (++s->ds_in_bits == 16) {
+            s->ds_state = 7;
+            s->ds_out_index = 0;
+            s->ds_extra = (s->ds_rom[0] == 0x09) ? 8 : 0;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static int sgi_bridge_ds_read_bit(SGIBRIDGEState *s)
+{
+    int bit;
+
+    switch (s->ds_state) {
+    case 2: /* READROM */
+        bit = (s->ds_rom[s->ds_out_index / 8] >> (s->ds_out_index % 8)) & 1;
+        if (++s->ds_out_index == 64) {
+            s->ds_state = 1;
+        }
+        return bit;
+    case 4: /* SEARCH */
+        bit = (s->ds_rom[s->ds_out_index / 8] >> (s->ds_out_index % 8)) & 1;
+        if (s->ds_search_phase == 0) {
+            s->ds_search_phase = 1;
+            return bit;
+        }
+        s->ds_search_phase = 2;
+        return bit ^ 1;
+    case 5: /* F0_PENDING: a read starts a ROM search */
+        s->ds_state = 4;
+        s->ds_out_index = 0;
+        s->ds_search_phase = 0;
+        return sgi_bridge_ds_read_bit(s);
+    case 7: /* RMEM_DATA */
+        if (s->ds_extra > 0) {
+            bit = (0xff >> (8 - s->ds_extra)) & 1;
+            s->ds_extra--;
+            return bit;
+        }
+        bit = (s->ds_mem[s->ds_addr + s->ds_out_index / 8] >>
+               (s->ds_out_index % 8)) & 1;
+        if (++s->ds_out_index == 32 * 8) {
+            s->ds_state = 1;
+        }
+        return bit;
+    default:
+        return 0;
+    }
+}
+
+/* MCR line state: returns DATA bit; DONE is always set for the host poll. */
+static uint64_t sgi_bridge_nic_read(SGIBRIDGEState *s)
+{
+    return 0x2 | (s->nic_data_bit & 1);
+}
+
+static void sgi_bridge_nic_write(SGIBRIDGEState *s, uint64_t val)
+{
+    unsigned pulse = (val >> 10) & 0x3ff;
+    unsigned sample = (val >> 2) & 0xff;
+
+    if (pulse >= 480) {
+        /* reset/presence pulse; single device => presence bit 0 */
+        sgi_bridge_ds_reset(s);
+        s->nic_data_bit = 0;
+    } else if (sample == 30) {
+        sgi_bridge_ds_write_bit(s, 0);
+        s->nic_data_bit = 0;
+    } else if (sample == 110) {
+        sgi_bridge_ds_write_bit(s, 1);
+        s->nic_data_bit = 0;
+    } else if (sample == 13) {
+        s->nic_data_bit = sgi_bridge_ds_read_bit(s);
+    } else {
+        s->nic_data_bit = 0;
+    }
+}
+
 static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIBRIDGEState *s = opaque;
@@ -134,7 +397,7 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
      * spins forever. Bit 0 is the 1-wire data line.
      */
     case 0x00b4:
-        val = 0x2 | (s->nic_data_bit & 1);
+        val = sgi_bridge_nic_read(s);
         break;
 
     case 0x0000 ... 0x00b3:
@@ -232,7 +495,12 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         /* Interrupt status is read-only. */
         break;
 
-    case 0x0000 ... 0x0103:
+    case 0x00b4:
+        sgi_bridge_nic_write(s, val);
+        break;
+
+    case 0x0000 ... 0x00b3:
+    case 0x00b5 ... 0x0103:
     case 0x0105 ... 0x2FFF:
         /* General register file (POST write/read tests land here). */
         s->regs[offset >> 2] = val;
@@ -319,6 +587,8 @@ static void sgi_bridge_reset(DeviceState *dev)
     memset(s->ioc3_regs, 0, sizeof(s->ioc3_regs));
     memset(s->sio_regs, 0, sizeof(s->sio_regs));
     s->sio_index = 0;
+    sgi_bridge_ds_init(s);
+    sgi_bridge_ds_reset(s);
 }
 
 static void sgi_bridge_realize(DeviceState *dev, Error **errp)

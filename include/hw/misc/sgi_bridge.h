@@ -53,6 +53,19 @@ struct SGIBRIDGEState {
      */
     uint8_t nic_data_bit;
 
+    /* DS2502 1-wire board-config EEPROM on the bridge NIC line. */
+    uint8_t ds_rom[8];
+    uint8_t ds_mem[128];
+    uint8_t ds_state;
+    uint8_t ds_cmd;
+    int ds_cmd_bits;
+    uint8_t ds_in;
+    int ds_in_bits;
+    int ds_out_index;
+    int ds_search_phase;
+    int ds_addr;
+    int ds_extra;
+
     /*
      * IOC3 PCI configuration (BRIDGE type-0 config, device 2 at +0x22000):
      * vendor/device 0x10A9/0x0003 and the writable command/BAR registers.
