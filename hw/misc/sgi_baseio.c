@@ -599,7 +599,8 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
       return 0x000310a9; /* IOC3 */
     }
     if (slot == 1 || slot == 2) {
-      return 0x10201077; /* QLogic ISP1020 */
+      /* QLogic ISP1020: the SGI_QLISP device on PCI slots 1,2. */
+      return (QLISP_DEVICE << 16) | QLISP_VENDOR;
     }
     return 0xffffffff;
   }
@@ -723,6 +724,7 @@ static void sgi_baseio_reset(DeviceState *dev) {
 static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
   SGIBaseIOState *s = SGI_BASEIO(dev);
   Chardev *chr;
+  int i;
 
   memory_region_init_io(&s->iomem, OBJECT(s), &sgi_baseio_ops, s, "sgi-baseio",
                         SGI_BASEIO_WINDOW_SIZE);
@@ -749,6 +751,26 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
                               &s->ioc3_uart_mr);
 
   /*
+   * On-board QLogic ISP1020 SCSI channels.  The children must always be
+   * realized (qdev asserts on unrealized children); their register windows are
+   * exposed only on the node's IO widget (8) -- the widget-0 instance is the
+   * discovery alias.  At BaseIO QLogic DevIO offsets (mem_base 0x08400000 /
+   * 0x08600000).  Firmware/drive binding is the SGI_QLISP device's (shared with
+   * octane).
+   */
+  for (i = 0; i < 2; i++) {
+    if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
+      return;
+    }
+  }
+  if (s->widget == 8) {
+    memory_region_add_subregion(&s->iomem, SGI_BASEIO_QLISP0_OFF,
+                                &s->isp[0].regs);
+    memory_region_add_subregion(&s->iomem, SGI_BASEIO_QLISP1_OFF,
+                                &s->isp[1].regs);
+  }
+
+  /*
    * IOC3 Ethernet NIC.  The machine claims the default -nic/-netdev backend
    * before realize; if none was given we still model the register file and DMA
    * engines, just without a transport.  The MAC the driver programs into EMAR
@@ -767,6 +789,8 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
 static void sgi_baseio_instance_init(Object *obj) {
   SGIBaseIOState *s = SGI_BASEIO(obj);
   object_initialize_child(obj, "ioc3-uart", &s->ioc3_uart, TYPE_SERIAL);
+  object_initialize_child(obj, "qlisp0", &s->isp[0], TYPE_SGI_QLISP);
+  object_initialize_child(obj, "qlisp1", &s->isp[1], TYPE_SGI_QLISP);
 }
 
 static const Property sgi_baseio_properties[] = {

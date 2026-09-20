@@ -21,6 +21,7 @@
 
 #include "hw/char/serial.h"
 #include "hw/core/sysbus.h"
+#include "hw/scsi/sgi_qlisp.h"
 #include "net/net.h"
 #include "qom/object.h"
 
@@ -39,6 +40,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 #define SGI_BASEIO_IOC3_MCR 0x200030ULL
 #define SGI_BASEIO_IOC3_UART 0x220178ULL
 #define SGI_BASEIO_IOC3_UART_SIZE 8
+
+/*
+ * BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 1 and 2).  Register
+ * (DevIO) windows at mem_base 0x08400000 / 0x08600000 for the node's IO widget
+ * (widget 8), i.e. offsets 0x400000 / 0x600000 within the 16 MB widget window
+ * (see ip27_swin_phys + pci_mem_base in the ARCS bridge code).
+ */
+#define SGI_BASEIO_QLISP0_OFF 0x400000ULL
+#define SGI_BASEIO_QLISP1_OFF 0x600000ULL
 
 /* DS2502 (family 0x09) example ROM id and 1 Kbit memory. */
 #define SGI_BASEIO_DS_ROM_SIZE 8
@@ -117,6 +127,9 @@ struct SGIBaseIOState {
   /* IOC3 SuperIO 16550-compatible UART A (serial console). */
   SerialState ioc3_uart;
   MemoryRegion ioc3_uart_mr;
+
+  /* On-board QLogic ISP1020 SCSI channels (PCI slots 1,2); widget-8 only. */
+  SGIQLispState isp[2];
 
   uint32_t nasid;
   uint32_t widget;

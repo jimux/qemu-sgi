@@ -160,6 +160,7 @@ config SGI_IP27
     depends on MIPS64 && TCG
     select SGI_HUB
     select SGI_BASEIO
+    select SGI_QLISP
     select SERIAL_MM
     select UNIMP
 
