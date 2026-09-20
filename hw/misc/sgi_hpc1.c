@@ -52,19 +52,21 @@
 #define LIO0_DUART     0x20
 
 /*
- * PIT clock.
+ * PIT clocking (matches MAME int2.cpp).
  *
- * [ASSUMPTION] The real HPC1.5 8254 runs at 1 MHz. TCG executes the PROM's
- * 1024-instruction CPU-speed calibration loop far faster than the modeled
- * 50 MHz CPU, so a strict 1 MHz time base measures 0-2 ticks where real
- * hardware measures ~20, and the PROM's delay_calibrate() then divides by a
- * zero constant and self-asserts (this is IP20-only code). Scale the PIT to
- * 10 MHz so the calibration observes the same instruction/tick ratio real
- * hardware would. This is a TCG time-base accommodation in the spirit of the
- * project's clock-decoupling doctrine; the guest's wall clock comes from the
- * DP8572 RTC (host time), NOT this PIT, so IRIX time is unaffected.
+ * The INT2 is clocked at 10 MHz and programs only counter 2 of its 8254 with
+ * clock()/10 = 1 MHz. Counters 0 and 1 are not clocked directly: counter 2's
+ * output is wired to their clock inputs (a cascade). IRIX arms counter 2 as a
+ * 200-count divider (1 MHz / 200 = 5 kHz), then counter 0 with 50 (=> 100 Hz,
+ * the scheduler "clock" on IP4) and counter 1 with 5 (=> 1 kHz, the "kgclock"
+ * on IP5).
+ *
+ * Modelling counters 0/1 directly at the 1 MHz input clock made every tick
+ * 2000x too fast; under -icount that storm overflowed the kernel's semaphore
+ * counts (sema.c assertion) before the mount could run. Counter 2 gets the
+ * 1 MHz base here and counters 0/1 are derived from it.
  */
-#define PIT_CLOCK_HZ   10000000
+#define PIT_BASE_CLK_HZ  1000000
 
 /* ------------------------------------------------------------------ */
 /* Z85C30 DUART                                                        */
@@ -90,6 +92,17 @@ static void scc_tx(SGIHPC1State *s, int d, int c, uint8_t data)
         qemu_chr_fe_write_all(&s->serial, &data, 1);
     }
     (void)scc_console_channel(s, d, c);
+
+    /*
+     * Writing the transmit buffer clears the TX interrupt-pending bit (the
+     * real SCC re-asserts it once the byte shifts out, but our transmit is
+     * instantaneous). Without this an idle console keeps TX IP set forever,
+     * and the kernel's handler has nothing to write, so it storms on an
+     * interrupt it can never clear (observed as a permanent LIO0_DUART /
+     * mask-toggle loop after the SCSI mount phase).
+     */
+    s->uart[d][c].rr3 &= ~(c == 0 ? SCC_TX_IP_A : SCC_TX_IP);
+    scc_update_irq(s);
 }
 
 static void scc_ctrl_write(SGIHPC1State *s, int d, int c, uint8_t val)
@@ -123,9 +136,13 @@ static void scc_ctrl_write(SGIHPC1State *s, int d, int c, uint8_t val)
     case 1: /* WR1: interrupt enables */
         u->wr[1] = val;
         if (val & 0x02) {
+            /* Enabling TX interrupts with an empty buffer raises TX IP. */
             u->rr3 |= (c == 0 ? SCC_TX_IP_A : SCC_TX_IP);
-            scc_update_irq(s);
+        } else {
+            /* Disabling them withdraws it (otherwise it stays pending). */
+            u->rr3 &= ~(c == 0 ? SCC_TX_IP_A : SCC_TX_IP);
         }
+        scc_update_irq(s);
         break;
     case 5: /* WR5: TX parameters */
         u->wr[5] = val;
@@ -167,8 +184,15 @@ static uint8_t scc_ctrl_read(SGIHPC1State *s, int d, int c)
     case 2: /* RR2 interrupt vector */
         val = 0;
         break;
-    case 3: /* RR3 only valid on channel A */
-        val = (c == 0) ? u->rr3 : 0;
+    case 3:
+        /*
+         * RR3 reports interrupt-pending bits, and only channel A's copy is
+         * readable; it carries both channels' IP bits (0x20/0x10 = RX/TX A,
+         * 0x04/0x02 = RX/TX B). Channel B's own RR3 reads as 0. Returning
+         * only channel A's latched bits hid a pending channel-B interrupt
+         * from the guest ISR, which then could never identify or clear it.
+         */
+        val = (c == 0) ? (u->rr3 | s->uart[d][1].rr3) : 0;
         break;
     default: /* RR0 status */
         val = 0x2c; /* TX empty, DCD, CTS */
@@ -210,8 +234,11 @@ static void scc_data_write(SGIHPC1State *s, int d, int c, uint8_t val)
 
 static void int2_update(SGIHPC1State *s)
 {
-    qemu_set_irq(s->cpu_irq[0], (s->lio_status[0] & s->lio_mask[0]) != 0);
-    qemu_set_irq(s->cpu_irq[1], (s->lio_status[1] & s->lio_mask[1]) != 0);
+    bool irq0 = (s->lio_status[0] & s->lio_mask[0]) != 0;
+    bool irq1 = (s->lio_status[1] & s->lio_mask[1]) != 0;
+
+    qemu_set_irq(s->cpu_irq[0], irq0);
+    qemu_set_irq(s->cpu_irq[1], irq1);
 }
 
 static void scc_update_irq(SGIHPC1State *s)
@@ -411,6 +438,24 @@ static uint32_t hpc1_pit_reload(const SGIHPC1State *s, int ch)
 }
 
 /*
+ * Counters 0/1 are clocked by counter 2's output; its rate is the 1 MHz base
+ * divided by counter 2's reload (a cascade). With IRIX's divisor of 200 this
+ * yields 5 kHz, so counter 0 ticks at 100 Hz and counter 1 at 1 kHz.
+ */
+static uint32_t hpc1_pit_ch01_clk_hz(const SGIHPC1State *s)
+{
+    uint32_t hz = PIT_BASE_CLK_HZ / hpc1_pit_reload(s, 2);
+    return hz ? hz : 1;
+}
+
+static int64_t hpc1_pit_period_ns(const SGIHPC1State *s, int ch)
+{
+    uint32_t clk = (ch < 2) ? hpc1_pit_ch01_clk_hz(s) : PIT_BASE_CLK_HZ;
+    int64_t period_ns = (int64_t)hpc1_pit_reload(s, ch) * 1000000000LL / clk;
+    return period_ns < 1000 ? 1000 : period_ns;
+}
+
+/*
  * Fire one PIT channel.  Per-channel callbacks are used because a shared
  * callback cannot tell which channel fired: QEMU clears a timer's pending
  * flag before invoking its callback, so polling timer_pending() inside the
@@ -436,11 +481,7 @@ static void hpc1_pit_fire(SGIHPC1State *s, int ch)
 
     /* Rate generator (mode 2/3) repeats; one-shot modes fire once. */
     if (mode == 2 || mode == 3) {
-        period_ns = (int64_t)hpc1_pit_reload(s, ch) *
-                    (1000000000LL / PIT_CLOCK_HZ);
-        if (period_ns < 1000) {
-            period_ns = 1000;
-        }
+        period_ns = hpc1_pit_period_ns(s, ch);
         timer_mod(s->pit_timer[ch],
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
     }
@@ -459,6 +500,7 @@ static void hpc1_pit_timer1_cb(void *opaque)
 static uint16_t hpc1_pit_remaining(SGIHPC1State *s, int ch)
 {
     uint32_t reload = hpc1_pit_reload(s, ch);
+    uint32_t clk_hz = (ch < 2) ? hpc1_pit_ch01_clk_hz(s) : PIT_BASE_CLK_HZ;
     int64_t elapsed_ns;
     uint64_t ticks;
     unsigned mode = (s->pit_control[ch] >> 1) & 0x7;
@@ -471,14 +513,14 @@ static uint16_t hpc1_pit_remaining(SGIHPC1State *s, int ch)
     if (elapsed_ns < 0) {
         elapsed_ns = 0;
     }
-    ticks = elapsed_ns / (1000000000ULL / PIT_CLOCK_HZ);
+    ticks = elapsed_ns / (1000000000ULL / clk_hz);
 
     /*
-     * TCG executes the PROM's 1024-instruction calibration loop in well
-     * under one 1 MHz PIT tick, so a strict real-time counter can read the
-     * full reload and make the PROM's speed calibration compute "0 ticks".
-     * The real part always sees at least one tick over that loop, so floor
-     * the elapsed time at one tick once the counter has been started.
+     * TCG can execute a short guest loop in well under one PIT tick, so a
+     * strict real-time counter can read the full reload and make the PROM's
+     * speed calibration compute "0 ticks". The real part always sees at
+     * least one tick over such a loop, so floor the elapsed time at one tick
+     * once the counter has been started.
      */
     if (ticks == 0) {
         ticks = 1;
@@ -541,18 +583,23 @@ static void hpc1_pit_write(SGIHPC1State *s, int reg, uint8_t val)
     /*
      * Arm the modelled timer on (re)programming.  The callback re-arms
      * itself, but nothing else starts it, so without this the PIT never
-     * fires.  IRIX 6.2 uses the HPC1 PIT for its kernel clock, so a dead
-     * PIT leaves the system with no tick (permanent idle, no init).
+     * fires.  IRIX uses the HPC1 PIT for its kernel clock, so a dead PIT
+     * leaves the system with no tick (permanent idle, no init).
+     *
+     * Counters 0/1 derive their rate from counter 2's reload (cascade), so
+     * reprogramming counter 2 must re-arm them at the new rate.
      */
-    {
-        int64_t period_ns = (int64_t)hpc1_pit_reload(s, ch) *
-                            (1000000000LL / PIT_CLOCK_HZ);
-        if (period_ns < 1000) {
-            period_ns = 1000;
-        }
-        /* Only channels 0 and 1 have interrupt lines modelled. */
-        if (ch < 2) {
-            timer_mod(s->pit_timer[ch], s->pit_load_ns[ch] + period_ns);
+    if (ch < 2) {
+        timer_mod(s->pit_timer[ch],
+                  s->pit_load_ns[ch] + hpc1_pit_period_ns(s, ch));
+    } else {
+        int c;
+        for (c = 0; c < 2; c++) {
+            if (s->pit_programmed[c]) {
+                timer_mod(s->pit_timer[c],
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          hpc1_pit_period_ns(s, c));
+            }
         }
     }
 }
@@ -1388,11 +1435,106 @@ static const Property sgi_hpc1_properties[] = {
     DEFINE_PROP_STRING("nvram", SGIHPC1State, nvram_filename),
 };
 
+static const VMStateDescription vmstate_sgihpc1_uart = {
+    .name = "sgi-hpc1-uart",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(reg_ptr, SGIHPC1Uart),
+        VMSTATE_UINT8_ARRAY(wr, SGIHPC1Uart, 16),
+        VMSTATE_UINT8(rr3, SGIHPC1Uart),
+        VMSTATE_UINT8_ARRAY(rx_fifo, SGIHPC1Uart, HPC1_RX_FIFO_SIZE),
+        VMSTATE_UINT8(rx_head, SGIHPC1Uart),
+        VMSTATE_UINT8(rx_tail, SGIHPC1Uart),
+        VMSTATE_UINT8(rx_count, SGIHPC1Uart),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/*
+ * The HPC1 was previously not migratable at all, so a qcow2/internal snapshot
+ * or -loadvm silently reset the whole controller (PIT unprogrammed -> kernel
+ * clock dead; SCSI DMA state lost; INT2 masks/status lost).  Restore the
+ * device state and re-arm the PIT timers (QEMUTimer objects cannot migrate).
+ */
+static int sgi_hpc1_post_load(void *opaque, int version_id)
+{
+    SGIHPC1State *s = opaque;
+    int ch;
+
+    for (ch = 0; ch < 2; ch++) {
+        if (s->pit_programmed[ch]) {
+            timer_mod(s->pit_timer[ch],
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      hpc1_pit_period_ns(s, ch));
+        }
+    }
+    int2_update(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_sgi_hpc1 = {
+    .name = "sgi-hpc1",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = sgi_hpc1_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(miscsr, SGIHPC1State),
+        VMSTATE_UINT32(scsi_ctrl, SGIHPC1State),
+        VMSTATE_UINT32(scsi_bc, SGIHPC1State),
+        VMSTATE_UINT32(scsi_cbp, SGIHPC1State),
+        VMSTATE_UINT32(scsi_nbdp, SGIHPC1State),
+        VMSTATE_UINT32(scsi_dma_count, SGIHPC1State),
+        VMSTATE_BOOL(scsi_dma_active, SGIHPC1State),
+        VMSTATE_BOOL(scsi_dma_to_device, SGIHPC1State),
+        VMSTATE_BOOL(scsi_drq, SGIHPC1State),
+        VMSTATE_UINT32(dsp_bc, SGIHPC1State),
+        VMSTATE_BUFFER(core_scratch, SGIHPC1State),
+        VMSTATE_BUFFER(rtc, SGIHPC1State),
+        VMSTATE_INT64(rtc_host_base_ms, SGIHPC1State),
+        VMSTATE_INT64(rtc_guest_base_ms, SGIHPC1State),
+        VMSTATE_UINT8_ARRAY(seeq_station_addr, SGIHPC1State, 6),
+        VMSTATE_UINT8(seeq_rx_cmd, SGIHPC1State),
+        VMSTATE_UINT8(seeq_tx_cmd, SGIHPC1State),
+        VMSTATE_UINT8(seeq_rx_status, SGIHPC1State),
+        VMSTATE_UINT8(seeq_tx_status, SGIHPC1State),
+        VMSTATE_UINT8(aux, SGIHPC1State),
+        VMSTATE_UINT16_ARRAY(nvram, SGIHPC1State, 128),
+        VMSTATE_UINT8(nv_cs, SGIHPC1State),
+        VMSTATE_UINT8(nv_clk, SGIHPC1State),
+        VMSTATE_UINT8(nv_di, SGIHPC1State),
+        VMSTATE_UINT8(nv_do, SGIHPC1State),
+        VMSTATE_UINT8(nv_tick, SGIHPC1State),
+        VMSTATE_UINT8(nv_opcode, SGIHPC1State),
+        VMSTATE_UINT8(nv_addr, SGIHPC1State),
+        VMSTATE_UINT8(nv_writable, SGIHPC1State),
+        VMSTATE_UINT16(nv_data, SGIHPC1State),
+        VMSTATE_UINT8_ARRAY(lio_status, SGIHPC1State, 2),
+        VMSTATE_UINT8_ARRAY(lio_mask, SGIHPC1State, 2),
+        VMSTATE_UINT8(vme_status, SGIHPC1State),
+        VMSTATE_UINT8_ARRAY(vme_mask, SGIHPC1State, 2),
+        VMSTATE_UINT8(int2_config, SGIHPC1State),
+        VMSTATE_UINT8_ARRAY(pit_control, SGIHPC1State, 3),
+        VMSTATE_UINT16_ARRAY(pit_count, SGIHPC1State, 3),
+        VMSTATE_UINT16_ARRAY(pit_low, SGIHPC1State, 3),
+        VMSTATE_UINT8_ARRAY(pit_rw_state, SGIHPC1State, 3),
+        VMSTATE_UINT8_ARRAY(pit_read_state, SGIHPC1State, 3),
+        VMSTATE_INT64_ARRAY(pit_load_ns, SGIHPC1State, 3),
+        VMSTATE_BOOL_ARRAY(pit_programmed, SGIHPC1State, 3),
+        VMSTATE_BOOL_ARRAY(timer_pending, SGIHPC1State, 2),
+        VMSTATE_STRUCT_2DARRAY(uart, SGIHPC1State,
+                               HPC1_NUM_DUARTS, HPC1_DUART_CH, 0,
+                               vmstate_sgihpc1_uart, SGIHPC1Uart),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void sgi_hpc1_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = sgi_hpc1_realize;
+    dc->vmsd = &vmstate_sgi_hpc1;
     device_class_set_props(dc, sgi_hpc1_properties);
     device_class_set_legacy_reset(dc, sgi_hpc1_reset);
 }
