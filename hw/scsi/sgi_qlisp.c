@@ -229,8 +229,20 @@ static void ql_scsi_transfer_data(SCSIRequest *req, uint32_t len)
 {
     SGIQLispState *s = req->hba_private;
     uint8_t *buf = scsi_req_get_buf(req);
+    bool to_host = req->cmd.mode == SCSI_XFER_FROM_DEV;
 
-    ql_sg_move(s, buf, len, req->cmd.mode == SCSI_XFER_FROM_DEV);
+    /*
+     * The data stream is word-reversed by the host driver on machines that do
+     * not define SWAP_DATA_STREAM (i.e. not IP30).  That is the same split as
+     * the control-entry munge: when control_munge is clear (IP27), the driver
+     * munges the data too, so the device must pre-munge what it hands over and
+     * un-munge what it picks up.  ql_munge is its own inverse, so applying it
+     * symmetrically in both directions is correct.
+     */
+    if (!s->control_munge) {
+        ql_munge(buf, len);
+    }
+    ql_sg_move(s, buf, len, to_host);
     scsi_req_continue(req);
 }
 
