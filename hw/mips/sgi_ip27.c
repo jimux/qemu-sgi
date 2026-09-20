@@ -148,14 +148,24 @@ static uint64_t sgi_ip27_mem_config(uint64_t ram_size) {
   int bank = 0;
 
   /*
-   * Use 32 MB banks (MD_SIZE_32MB = code 3): a single >32 MB bank risks the
-   * PROM's 256 MB-dimm path, and 32 MB is the SN0 minimum.  mdir_config()
-   * will overwrite this from the back-door probe anyway.
+   * MD_BANK_SHFT is 29 (512 MB per bank slot), so the node's RAM is packed
+   * into banks 0..7 as descending powers of two.  A 256 MB node is therefore
+   * a single 256 MB bank 0 (MD_SIZE code 6), matching what size_back_door()
+   * derives from the back-door probe.  mdir_config() overwrites this register
+   * from that probe anyway.
    */
-  while (ram_size && bank < 8) {
-    cfg |= (uint64_t)IP27_MD_SIZE_32MB << (bank * 3);
-    ram_size -= (ram_size >= 0x2000000ULL) ? 0x2000000ULL : ram_size;
-    bank++;
+  for (uint64_t sz = 0x20000000ULL; sz >= 0x2000000ULL && bank < 8; sz >>= 1) {
+    if (ram_size >= sz) {
+      int code = 0;
+      uint64_t t = sz >> 22; /* MB / 4: MD_SIZE_MBYTES(code) = 4 << code MB */
+      while (t > 1) {
+        t >>= 1;
+        code++;
+      }
+      cfg |= (uint64_t)code << (bank * 3);
+      ram_size -= sz;
+      bank++;
+    }
   }
   return cfg;
 }
@@ -454,12 +464,14 @@ static bool ip27_bdoor_decode(hwaddr off, uint64_t *store_idx) {
   pa = (idx & IP27_BDDIR_UPPER_MASK) << 2;
   bank = pa >> 29; /* MD_BANK_SHFT: 512 MB per bank slot */
   /*
-   * Model the node as eight 32 MB banks (a 256 MB node).  A single 256 MB
-   * bank is not a valid IP27 configuration: memory_init_all() would take its
-   * 256 MB-dimm "hole" path and disable it.  The probe (size_back_door) then
-   * reports MD_SIZE_32MB for each of banks 0..7 and EMPTY above.
+   * MD_BANK_SHFT is 29, so a bank occupies a 512 MB address slot and a 256 MB
+   * node is entirely bank 0 -- NOT eight 32 MB banks (that aliases every
+   * 32 MB within bank 0's slot, so size_back_door() sizes bank 0 as 32 MB and
+   * the firmware then accounts only 32 MB: the "Mem enabled = 32 MB" summary
+   * and the unbacked-phys TLB refill in the BASEIO monitor).  Report bank 0
+   * as the modelled bank size and banks 1..7 as unpopulated.
    */
-  bank_size = (bank < 8) ? 0x2000000ULL : 0;
+  bank_size = (bank == 0) ? ip27_bdoor_bank0_size : 0;
   if (bank_size == 0) {
     return false;
   }
