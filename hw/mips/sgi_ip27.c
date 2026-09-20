@@ -162,11 +162,36 @@ static uint64_t sgi_ip27_be64(const uint8_t *p) {
 static uint8_t ip27_flash_mem[IP27_FLASH_SIZE];
 static uint64_t ip27_flash_protect;
 
+/* AMD/Fujitsu flash command state (see libkl/ml/fprom.c do_probe/do_write). */
+static int ip27_flash_autoselect;
+static int ip27_flash_unlock;     /* 1 = AA@0x5555 seen, 2 = +55@0x2AAA */
+static int ip27_flash_program;    /* next write stores data */
+static int ip27_flash_erase;      /* 0x80 seen, awaiting 0x10 (chip) / 0x30 (sector) */
+
+static uint8_t ip27_flash_byte(uint64_t off) {
+  if (ip27_flash_autoselect) {
+    /* AMD29F080-style: manufacturer 0x01, device 0xd5 (accepted pair). */
+    switch (off) {
+    case 0:
+      return 0x01;
+    case 1:
+      return 0xd5;
+    case 2:
+      return 0x01;
+    case 3:
+      return 0xd5;
+    default:
+      return 0xff;
+    }
+  }
+  return ip27_flash_mem[off];
+}
+
 static uint64_t ip27_flash_read(void *opaque, hwaddr off, unsigned size) {
   uint64_t v = 0;
   unsigned i;
   for (i = 0; i < size; i++) {
-    v = (v << 8) | ip27_flash_mem[off + i];
+    v = (v << 8) | ip27_flash_byte(off + i);
   }
   return v;
 }
@@ -174,11 +199,63 @@ static uint64_t ip27_flash_read(void *opaque, hwaddr off, unsigned size) {
 static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size) {
   /*
-   * The boot flash is programmed through an AMD/Fujitsu command protocol
-   * (0xAA/0x55 unlock, 0xF0 reset, ...).  Those command words are not array
-   * data: a real flash does not store them, so the PROM code region stays
-   * intact.  Do not commit writes to the array.
+   * AMD/Fujitsu command protocol.  Commands are 64-bit stores at
+   * base + cmd_addr*8, so the flash command address is off/8 and the command
+   * byte is val & 0xff.  Command words are not array data (this is what keeps
+   * the PROM code region intact / the self-checksum valid).
    */
+  uint64_t faddr = off / 8;
+  uint8_t b = val & 0xff;
+  unsigned i;
+
+  if (faddr == 0 && b == 0xf0) {         /* reset to read mode */
+    ip27_flash_autoselect = 0;
+    ip27_flash_unlock = 0;
+    ip27_flash_program = 0;
+    ip27_flash_erase = 0;
+    return;
+  }
+  if (faddr == 0x5555 && b == 0xaa) {
+    ip27_flash_unlock = 1;
+    return;
+  }
+  if (faddr == 0x2aaa && b == 0x55 && ip27_flash_unlock == 1) {
+    ip27_flash_unlock = 2;
+    return;
+  }
+  if (faddr == 0x5555 && ip27_flash_unlock == 2 && b == 0x90) {
+    ip27_flash_autoselect = 1;
+    ip27_flash_unlock = 0;
+    return;
+  }
+  if (faddr == 0x5555 && ip27_flash_unlock == 2 && b == 0xa0) {
+    ip27_flash_program = 1;
+    ip27_flash_unlock = 0;
+    return;
+  }
+  if (faddr == 0x5555 && ip27_flash_unlock == 2 && b == 0x80) {
+    ip27_flash_erase = 1;
+    ip27_flash_unlock = 0;
+    return;
+  }
+  if (ip27_flash_erase) {
+    /* Chip erase (0x10@0x5555) / sector erase (0x30@addr): set to 0xff. */
+    if ((faddr == 0x5555 && b == 0x10) || b == 0x30) {
+      ip27_flash_erase = 0;
+      memset(ip27_flash_mem, 0xff, sizeof(ip27_flash_mem));
+    }
+    return;
+  }
+  if (ip27_flash_program) {
+    /* Program: flash can only clear bits, so AND the data in. */
+    for (i = 0; i < size; i++) {
+      uint8_t nb = (val >> ((size - 1 - i) * 8)) & 0xff;
+      ip27_flash_mem[off + i] &= nb;
+    }
+    ip27_flash_program = 0;
+    return;
+  }
+  ip27_flash_unlock = 0;
 }
 
 static const MemoryRegionOps ip27_flash_ops = {
