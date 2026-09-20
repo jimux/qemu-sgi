@@ -599,7 +599,34 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     /*
-     * BRIDGE local registers: 0x000000-0x00FFFF
+     * BRIDGE widget ID (w_id, XIO config register at +0): part 0xc002 at
+     * [27:12], rev at [31:28]. The PROM's widget discovery (heart_do_port)
+     * and init_bridge read it to identify the Bridge.
+     */
+    case 0x0000 ... 0x0007:
+        {
+            uint64_t wid = 0x1c002000ULL;
+
+            if (size == 8) {
+                val = wid;
+            } else if (size == 4) {
+                /* Big-endian: +0 is the high word, +4 the low (part) word. */
+                val = (offset == 0) ? (uint32_t)(wid >> 32) : (uint32_t)wid;
+            } else {
+                val = 0;
+            }
+        }
+        break;
+    /*
+     * WIDGET_STATUS (0x0c). Bit 5 selects PCI (set) vs GIO mode; the PROM's
+     * real_init_bridge only scans the PCI bus (and so finds the IOC3) when
+     * this bit is set.
+     */
+    case 0x000c:
+        val = s->regs[offset >> 2] | 0x00000020u;
+        break;
+    /*
+     * BRIDGE local registers: 0x000008-0x00FFFF
      *
      * offset 0x000: widget config (w_id etc.)
      * offset 0x104: b_int_status (Interrupt Status register).
@@ -626,12 +653,12 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         val = sgi_bridge_ds_line_read(&s->bridge_ds);
         break;
 
-    case 0x0000 ... 0x00b3:
+    case 0x0008 ... 0x000b:
+    case 0x000d ... 0x00b3:
     case 0x00b5 ... 0x0103:
     case 0x0105 ... 0x2FFF:
         val = s->regs[offset >> 2];
         break;
-
     /*
      * BRIDGE type-0 PCI configuration windows (one 4KB slot per device).
      * The IOC3 is device 2 with vendor 0x10A9 / device 0x0003. Absent devices
@@ -730,11 +757,15 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         /* Interrupt status is read-only. */
         break;
 
+    case 0x0000 ... 0x0007:
+        /* Widget ID is read-only. */
+        break;
+
     case 0x00b4:
         sgi_bridge_ds_line_write(&s->bridge_ds, val);
         break;
 
-    case 0x0000 ... 0x00b3:
+    case 0x0008 ... 0x00b3:
     case 0x00b5 ... 0x0103:
     case 0x0105 ... 0x2FFF:
         /* General register file (POST write/read tests land here). */
@@ -816,6 +847,7 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                       HWADDR_PRIx "\n", offset);
         break;
     }
+
 }
 
 static const MemoryRegionOps sgi_bridge_ops = {

@@ -122,6 +122,82 @@ static void sgi_octane_load_prom(MachineState *machine, MemoryRegion *prom)
 }
 
 /*
+ * Xbow crossbar (widget 0) link/presence model.
+ *
+ * The PROM's widget discovery (heart_install -> heart_do_port ->
+ * xtalk_probe -> xlink_check) only registers a widget as a bus slot if the
+ * xbow reports its link as WIDGET_PRESENT and LINK_ALIVE. Without a real
+ * link model the Bridge (and hence IOC3/tty) is never discovered.
+ *
+ * Register layout from hwreg_xbow.hwreg: link base = 0x100 + 0x40*(port-8);
+ * LINK_STAT +0x14 bit31 LINK_ALIVE, LINK_STAT_CLR +0x2c, LINK_AUX_STAT +0x3c
+ * bit5 WIDGET_PRESENT / bit6 LINK_FAILURE.
+ */
+#define XBOW_REG_WORDS        (0x1000 / 4)
+#define XBOW_LINK_BASE(port)  (0x100 + 0x40 * ((port) - 8))
+#define XBOW_LINK_STAT_OFF    0x14
+#define XBOW_LINK_STAT_CLR_OFF 0x2c
+#define XBOW_LINK_AUX_OFF     0x3c
+#define XB_STAT_LINKALIVE     0x80000000u
+#define XB_AUX_STAT_PRESENT   0x00000020u
+#define XBOW_WIDGET_PART_NUM  0xc111u
+
+typedef struct SGIXbowRegs {
+    uint32_t regs[XBOW_REG_WORDS];
+} SGIXbowRegs;
+
+static bool xbow_link_present(int port)
+{
+    return port == 8 || port == 0xf;
+}
+
+static uint64_t xbow_read(void *opaque, hwaddr off, unsigned size)
+{
+    SGIXbowRegs *s = opaque;
+    uint32_t id = XBOW_WIDGET_PART_NUM << 12; /* part at [27:12] */
+    int p;
+
+    if (off < 8) {
+        return (off >= 4) ? id : 0; /* 64-bit w_id: low word carries the part */
+    }
+    for (p = 8; p <= 0xf; p++) {
+        hwaddr lb = XBOW_LINK_BASE(p);
+
+        if (!xbow_link_present(p)) {
+            continue;
+        }
+        if (off == lb + XBOW_LINK_STAT_OFF ||
+            off == lb + XBOW_LINK_STAT_CLR_OFF) {
+            return XB_STAT_LINKALIVE;
+        }
+        if (off == lb + XBOW_LINK_AUX_OFF) {
+            return XB_AUX_STAT_PRESENT;
+        }
+    }
+    return s->regs[(off >> 2) & (XBOW_REG_WORDS - 1)];
+}
+
+static void xbow_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    SGIXbowRegs *s = opaque;
+
+    if (off < 8) {
+        return; /* widget ID is read-only */
+    }
+    s->regs[(off >> 2) & (XBOW_REG_WORDS - 1)] = val;
+}
+
+static const MemoryRegionOps xbow_ops = {
+    .read = xbow_read,
+    .write = xbow_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+};
+
+/*
  * HEART widget ID word (heart.h HEART_WID_ID): part 0xc001 at [27:12],
  * mfg 0x036 at [10:1], rev A (1) at [31:28].
  */
@@ -254,18 +330,24 @@ static void sgi_octane_init(MachineState *machine)
      */
 
     /*
-     * Xbow crossbar at widget 0 (0x10000000). The PROM's pon_xbow POST runs
-     * register read/write (walking-bit) tests before anything else and halts
-     * into the fault-LED path if a scratch register does not retain its value.
-     * A zero-initialised writable region satisfies those tests for bring-up;
-     * it is a scaffold, not the real Xbow register model (widget IDs and link
-     * status still read 0).
+     * Xbow crossbar at widget 0 (0x10000000). RAM-backed for the register
+     * file, with the widget-ID and link status/presence registers overlaid so
+     * the PROM's widget discovery can find the Bridge on link 0xF.
      */
     {
         MemoryRegion *xbow = g_new(MemoryRegion, 1);
+        SGIXbowRegs *xr = g_new0(SGIXbowRegs, 1);
+
         memory_region_init_ram(xbow, NULL, "sgi.xbow", 16 * MiB,
                                &error_fatal);
         memory_region_add_subregion(system_memory, OCTANE_XBOW_BASE, xbow);
+
+        {
+            MemoryRegion *xbow_regs = g_new(MemoryRegion, 1);
+            memory_region_init_io(xbow_regs, NULL, &xbow_ops, xr,
+                                  "sgi.xbow-regs", 0x1000);
+            memory_region_add_subregion(xbow, 0, xbow_regs);
+        }
     }
 
     /*
