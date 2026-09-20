@@ -2699,6 +2699,17 @@ static void scsi_cd_realize(SCSIDevice *dev, Error **errp)
     }
 
     s->qdev.blocksize = blocksize;
+    /*
+     * Set the medium capacity so reads beyond LBA 0 are accepted even if
+     * the guest does not issue READ CAPACITY first (the SGI PROMs read the
+     * EFS volume header at LBA 0, then the loader at a high LBA).
+     */
+    {
+        uint64_t nb = 0;
+        blk_get_geometry(dev->conf.blk, &nb);
+        nb /= blocksize / BDRV_SECTOR_SIZE;
+        s->qdev.max_lba = nb ? nb - 1 : 0;
+    }
     s->qdev.type = TYPE_ROM;
     s->features |= 1 << SCSI_DISK_F_REMOVABLE;
     if (!s->product) {
