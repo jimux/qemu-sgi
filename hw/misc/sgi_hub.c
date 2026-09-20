@@ -74,6 +74,35 @@
 #define NI_PROTECTION 0x600010
 #define NI_SCRATCH_REG0 0x600100
 #define NI_SCRATCH_REG1 0x600108
+/*
+ * NI vector/PIO engine.  The PROM performs remote ("vector") register reads
+ * (libkl/ml/vector.c) by arming NI_VECTOR/NI_VECTOR_PARMS and polling
+ * NI_VECTOR_STATUS for VALID; a vector path of 0 addresses the local node.
+ */
+#define NI_VECTOR_PARMS 0x600200
+#define NI_VECTOR 0x600208
+#define NI_VECTOR_DATA 0x600210
+#define NI_VECTOR_STATUS 0x600300
+#define NI_RETURN_VECTOR 0x600308
+#define NI_VECTOR_READ_DATA 0x600310
+#define NI_VECTOR_CLEAR 0x600380
+#define NI_AGE_CPU0_MEMORY 0x600500
+#define NI_AGE_CPU0_PIO 0x600508
+#define NI_AGE_CPU1_MEMORY 0x600510
+#define NI_AGE_CPU1_PIO 0x600518
+
+/* NI_VECTOR_PARMS / NI_VECTOR_STATUS fields. */
+#define NVP_PIOID_SHFT 40
+#define NVP_WRITEID_SHFT 32
+#define NVP_ADDRESS_MASK 0x00000000000ffff8ULL /* <19:03> */
+#define NVP_TYPE_MASK 0x3ULL
+#define NVS_VALID (1ULL << 63)
+#define NVS_PIOID_SHFT 40
+#define NVS_PIOID_MASK (0x7ffULL << NVS_PIOID_SHFT)
+#define NVS_WRITEID_SHFT 32
+#define NVS_ADDRESS_MASK 0x00000000fffffff8ULL /* <31:03> */
+#define NVS_TYPE_MASK 0x7ULL
+#define PIOTYPE_READ 0
 
 /* --- Hub II (I/O interface) offsets --- */
 #define IIO_WID 0x400000
@@ -306,6 +335,30 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
                 off, val);
 }
 
+static uint64_t sgi_hub_read_off(SGIHubState *s, hwaddr off);
+
+/*
+ * Execute a NI vector PIO operation (armed via NI_VECTOR/NI_VECTOR_PARMS).
+ * Only the local node (vector path 0) is modelled; a remote vector has no
+ * peer in a single-node system, so VALID is left clear and the caller times
+ * out (the honest "no remote node" result).
+ */
+static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
+  uint64_t pioid = (parms >> NVP_PIOID_SHFT) & 0x7ff;
+  uint64_t wid = (parms >> NVP_WRITEID_SHFT) & 0xff;
+  uint64_t addr = parms & NVP_ADDRESS_MASK;
+  unsigned type = parms & NVP_TYPE_MASK;
+
+  if (s->ni_vector != 0 || type != PIOTYPE_READ) {
+    s->ni_vector_status = 0;
+    return;
+  }
+  s->ni_vector_rd_data = sgi_hub_read_off(s, addr);
+  s->ni_vector_status = NVS_VALID | (pioid << NVS_PIOID_SHFT) |
+                        (wid << NVS_WRITEID_SHFT) |
+                        (addr & NVS_ADDRESS_MASK) | type;
+}
+
 static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
   switch (off) {
   case NI_STATUS_REV_ID:
@@ -318,6 +371,29 @@ static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
     return s->ni_scratch[0];
   case NI_SCRATCH_REG1:
     return s->ni_scratch[1];
+  case NI_VECTOR:
+  case NI_RETURN_VECTOR:
+    return s->ni_vector;
+  case NI_VECTOR_PARMS:
+    return s->ni_vector_parms;
+  case NI_VECTOR_DATA:
+    return s->ni_vector_data;
+  case NI_VECTOR_STATUS:
+    return s->ni_vector_status;
+  case NI_VECTOR_READ_DATA:
+    return s->ni_vector_rd_data;
+  case NI_VECTOR_CLEAR:
+    /* Read-clear: reading it invalidates the previous vector status. */
+    s->ni_vector_status = 0;
+    return 0;
+  case NI_AGE_CPU0_MEMORY:
+    return s->ni_age[0];
+  case NI_AGE_CPU0_PIO:
+    return s->ni_age[1];
+  case NI_AGE_CPU1_MEMORY:
+    return s->ni_age[2];
+  case NI_AGE_CPU1_PIO:
+    return s->ni_age[3];
   default:
     qemu_log_mask(LOG_UNIMP, "sgi-hub: unimplemented NI read @0x%" HWADDR_PRIx
                              "\n",
@@ -337,6 +413,31 @@ static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
     break;
   case NI_SCRATCH_REG1:
     s->ni_scratch[1] = val;
+    break;
+  case NI_VECTOR:
+    s->ni_vector = val;
+    break;
+  case NI_VECTOR_DATA:
+    s->ni_vector_data = val;
+    break;
+  case NI_VECTOR_PARMS:
+    s->ni_vector_parms = val;
+    sgi_hub_ni_vector_go(s, val);
+    break;
+  case NI_VECTOR_CLEAR:
+    s->ni_vector_status = 0;
+    break;
+  case NI_AGE_CPU0_MEMORY:
+    s->ni_age[0] = val;
+    break;
+  case NI_AGE_CPU0_PIO:
+    s->ni_age[1] = val;
+    break;
+  case NI_AGE_CPU1_MEMORY:
+    s->ni_age[2] = val;
+    break;
+  case NI_AGE_CPU1_PIO:
+    s->ni_age[3] = val;
     break;
   default:
     qemu_log_mask(LOG_UNIMP, "sgi-hub: unimplemented NI write @0x%" HWADDR_PRIx

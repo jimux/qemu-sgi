@@ -69,6 +69,15 @@ struct SGIHubState {
   /* NI: identity / scratch. */
   uint64_t ni_scratch[2];
 
+  /* NI: vector/PIO engine (remote register reads/writes). */
+  uint64_t ni_vector;
+  uint64_t ni_vector_parms;
+  uint64_t ni_vector_data;
+  uint64_t ni_vector_status;
+  uint64_t ni_vector_rd_data;
+  /* NI: AGE registers (CPU0/1 memory, CPU0/1 PIO). */
+  uint64_t ni_age[4];
+
   /* II: I/O interface (widget identity/link/access). */
   uint64_t ii_wcr;
   uint64_t ii_iowa;
