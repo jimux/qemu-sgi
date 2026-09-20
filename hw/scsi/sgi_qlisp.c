@@ -80,18 +80,18 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
             uint64_t host = ((uint64_t)ql_mbox_get(s, 2) << 16) |
                             ql_mbox_get(s, 3);
             uint32_t len = ql_mbox_get(s, 4);
-            uint32_t base = addr - QL_RISC_RAMBASE;
+            uint32_t rambase = addr - QL_RISC_RAMBASE;
             uint32_t i;
             uint16_t buf[0x8000];
 
             if (len > ARRAY_SIZE(buf)) {
                 len = ARRAY_SIZE(buf);
             }
-            if (len && base + len <= ARRAY_SIZE(s->risc_ram) &&
+            if (len && rambase + len <= ARRAY_SIZE(s->risc_ram) &&
                 dma_memory_read(&address_space_memory, host, buf,
                                 len * 2, MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
                 for (i = 0; i < len; i++) {
-                    s->risc_ram[base + i] = buf[i ^ 1];
+                    s->risc_ram[rambase + i] = buf[i ^ 1];
                 }
                 s->risc_loaded = len;
             }
