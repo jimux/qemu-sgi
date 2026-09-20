@@ -366,6 +366,22 @@ static void hpc1_scsi_dma_run(SGIHPC1State *s)
         }
     }
 
+    /*
+     * Drain trailing zero-count terminal descriptors (mirrors HPC3). The loop
+     * above exits as soon as async_len reaches 0, but a pending EOX
+     * descriptor with BC=0 still has to be processed to clear dma_active and
+     * the START bit; otherwise the DMA stays "active" and the transfer never
+     * completes (observed as the miniroot mkfs aborting its read-back).
+     */
+    while (s->scsi_dma_active && s->scsi_dma_count == 0) {
+        if (s->scsi_cbp & HPC1_SCSI_EOX) {
+            s->scsi_dma_active = false;
+            s->scsi_ctrl &= ~SCSI_CTRL_START;
+            break;
+        }
+        hpc1_scsi_chain(s);
+    }
+
     if (wdc && wdc->current_req &&
         (wdc->async_len == 0 || wdc->transfer_count == 0)) {
         wd33c93_set_drq(wdc, false);
