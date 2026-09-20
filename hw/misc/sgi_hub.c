@@ -103,6 +103,8 @@
 #define NVS_ADDRESS_MASK 0x00000000fffffff8ULL /* <31:03> */
 #define NVS_TYPE_MASK 0x7ULL
 #define PIOTYPE_READ 0
+#define PIOTYPE_WRITE 1
+#define PIOTYPE_XCHG 3
 
 /* --- Hub II (I/O interface) offsets --- */
 #define IIO_WID 0x400000
@@ -603,6 +605,7 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
 }
 
 static uint64_t sgi_hub_read_off(SGIHubState *s, hwaddr off);
+static void sgi_hub_write_off(SGIHubState *s, hwaddr off, uint64_t val);
 
 /*
  * Execute a NI vector PIO operation (armed via NI_VECTOR/NI_VECTOR_PARMS).
@@ -615,15 +618,44 @@ static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
   uint64_t wid = (parms >> NVP_WRITEID_SHFT) & 0xff;
   uint64_t addr = parms & NVP_ADDRESS_MASK;
   unsigned type = parms & NVP_TYPE_MASK;
+  hwaddr reg;
 
-  if (s->ni_vector != 0 || type != PIOTYPE_READ) {
+  /*
+   * Only the local node (vector path 0) is modelled; a remote vector has no
+   * peer in a single-node system, so VALID is left clear and the caller
+   * times out (the honest "no remote node" result).
+   */
+  if (s->ni_vector != 0) {
     s->ni_vector_status = 0;
     return;
   }
-  s->ni_vector_rd_data = sgi_hub_read_off(s, addr);
+
+  /*
+   * Register addresses in the vector parameter block are NI-block-relative
+   * for the low range (e.g. NI_SCRATCH_REG0 = 0x100); larger values are the
+   * full hub-window offset.
+   */
+  reg = (addr < SGI_HUB_NI_BASE) ? SGI_HUB_NI_BASE + addr : addr;
+
+  switch (type) {
+  case PIOTYPE_READ:
+    s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
+    break;
+  case PIOTYPE_WRITE:
+    sgi_hub_write_off(s, reg, s->ni_vector_data);
+    break;
+  case PIOTYPE_XCHG:
+    s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
+    sgi_hub_write_off(s, reg, s->ni_vector_data);
+    break;
+  default:
+    s->ni_vector_status = 0;
+    return;
+  }
+
   s->ni_vector_status = NVS_VALID | (pioid << NVS_PIOID_SHFT) |
                         (wid << NVS_WRITEID_SHFT) |
-                        (addr & NVS_ADDRESS_MASK) | type;
+                        (addr & NVS_ADDRESS_MASK) | (type & NVS_TYPE_MASK);
 }
 
 static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
