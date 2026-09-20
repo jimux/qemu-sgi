@@ -661,9 +661,10 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         break;
     /*
      * BRIDGE type-0 PCI configuration windows (one 4KB slot per device).
-     * The IOC3 is device 2 with vendor 0x10A9 / device 0x0003. Absent devices
-     * read all-ones. The PROM's device graph / SAIO install needs this to
-     * register the IOC3 serial console.
+     * The IOC3 is device 2 with vendor 0x10A9 / device 0x0003. Absent slots
+     * read 0 so the PROM's PCI scan treats them as empty (non-zero reads are
+     * registered as bogus devices); the PROM's device graph / SAIO install
+     * needs the IOC3 entry to register the serial console.
      */
     case 0x20000 ... 0x2FFFF:
         {
@@ -671,7 +672,7 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
             hwaddr cfg = offset & 0xfff;
 
             if (dev != 2) {
-                val = 0xffffffff;
+                val = 0;
                 break;
             }
             switch (cfg) {
