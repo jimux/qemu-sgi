@@ -121,9 +121,9 @@ static void sgi_sflash_pds_write(void *opaque, hwaddr off, uint64_t value,
     hwaddr o = off & (SGI_SFLASH_SEG_SIZE - 1);
 
     if (s->write_pending) {
-        s->pds[o] = v & 0xff;
+        s->pds[o] = (v >> 8) & 0xff;
         if (o + 1 < SGI_SFLASH_SEG_SIZE) {
-            s->pds[o + 1] = (v >> 8) & 0xff;
+            s->pds[o + 1] = v & 0xff;
         }
         s->write_pending = false;
         return;
@@ -153,9 +153,9 @@ static void sgi_sflash_pds_write(void *opaque, hwaddr off, uint64_t value,
         break;
     default:
         /* Plain data write. */
-        s->pds[o] = v & 0xff;
+        s->pds[o] = (v >> 8) & 0xff;
         if (o + 1 < SGI_SFLASH_SEG_SIZE) {
-            s->pds[o + 1] = (v >> 8) & 0xff;
+            s->pds[o + 1] = v & 0xff;
         }
         break;
     }
