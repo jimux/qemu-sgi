@@ -50,6 +50,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 #define SGI_BASEIO_QLISP0_OFF 0x400000ULL
 #define SGI_BASEIO_QLISP1_OFF 0x600000ULL
 
+/*
+ * IOC3 SSRAM (256 KB address space, may not be fully populated), accessed for
+ * diagnostics at IOC3 offset 0x40000 (IOC3_RAM_OFF).  Words are 16 data bits +
+ * a parity bit (bit 16); a read returns the parity-error bit (bit 17) set when
+ * (parity(data) ^ parity_bit) is odd.  See IRIX sys/PCI/ioc3.h IOC3_SSRAM_DM/PM
+ * and ARCS diag_enet.c enet_ssram.
+ */
+#define SGI_BASEIO_IOC3_SSRAM_OFF (SGI_BASEIO_IOC3_BASE + 0x40000ULL)
+#define SGI_BASEIO_IOC3_SSRAM_LEN 0x40000ULL
+#define SGI_BASEIO_IOC3_SSRAM_WORDS (SGI_BASEIO_IOC3_SSRAM_LEN / 4)
+
 /* DS2502 (family 0x09) example ROM id and 1 Kbit memory. */
 #define SGI_BASEIO_DS_ROM_SIZE 8
 #define SGI_BASEIO_DS_MEM_SIZE 128
@@ -148,6 +159,10 @@ struct SGIBaseIOState {
   uint16_t phy_regs[32];
   uint32_t phy_write_data;
   uint32_t phy_read_data;
+
+  /* IOC3 SSRAM diagnostic region (16-bit data + parity bit). */
+  MemoryRegion ssram_mr;
+  uint32_t ssram[SGI_BASEIO_IOC3_SSRAM_WORDS];
 
   NICConf nic_conf;
   NICState *nic;

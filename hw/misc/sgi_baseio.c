@@ -593,16 +593,48 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
    *             before its NULL check -- the observed POD TLB refill.
    *   other     no device (0xffffffff).
    */
-  if (off >= 0x20000 && off < 0x28000 && (off & 0xfff) == 0) {
+  if (off >= 0x20000 && off < 0x28000) {
     unsigned slot = (off - 0x20000) >> 12;
+    unsigned cfg = off & 0xfff;
+
     if (slot == 0) {
-      return 0x000310a9; /* IOC3 */
+      /* IOC3: vendor 0x10a9 / device 0x0003. */
+      return (cfg == 0x00) ? 0x000310a9 : 0;
     }
     if (slot == 1 || slot == 2) {
-      /* QLogic ISP1020: the SGI_QLISP device on PCI slots 1,2. */
-      return (QLISP_DEVICE << 16) | QLISP_VENDOR;
+      /*
+       * QLogic ISP1020 (SGI_QLISP device) on PCI slots 1,2.  The ISP register
+       * file is 16-bit big-endian with a byte-lane swap, so a config dword
+       * reads back halves swapped: a 16-bit access at cfg 0x00 returns the
+       * device id and one at 0x02 the vendor id.  ql_init_board reads vendor
+       * from struct offset 2 and device from offset 0, so mirror that here
+       * (same convention as the IP30 bridge).
+       */
+      SGIQLispState *isp = &s->isp[slot - 1];
+
+      switch (cfg) {
+      case 0x00:
+        return (size == 2) ? QLISP_DEVICE
+                           : ((QLISP_DEVICE << 16) | QLISP_VENDOR);
+      case 0x02:
+        return QLISP_VENDOR;
+      case 0x04:
+        return isp->pci_cmd;
+      case 0x06:
+        return 0; /* status */
+      case 0x08:
+        return (QLISP_CLASS << 8) | isp->pci_rev;
+      case 0x0c:
+        return 0; /* header type 0, single function */
+      case 0x10:
+        return isp->pci_bar[0];
+      case 0x14:
+        return isp->pci_bar[1];
+      default:
+        return 0;
+      }
     }
-    return 0xffffffff;
+    return (cfg == 0x00) ? 0xffffffff : 0;
   }
   if (off == 0x104 || off == 0x114) {
     return 0;
@@ -647,11 +679,12 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
       s->eth_regs[idx] = val;
     } else if (idx == SGI_IOC3_MICR) {
       unsigned reg = val & 0x1f;
-      unsigned phyaddr = (val & 0x3e0) >> 5;
 
-      if (val & 0x400) { /* READTRIG */
+      if (val & 0x400) { /* READTRIG: latch the addressed PHY register. */
         s->phy_read_data = s->phy_regs[reg];
-      } else if (phyaddr == 0) {
+      } else {
+        /* Write cycle.  The PROM diag and the ef driver address the PHY at
+         * 0x1f (SGI_PHY_ADDR); accept writes at any address. */
         s->phy_regs[reg] = s->phy_write_data;
       }
       s->eth_regs[idx] = val & ~0x800u; /* BUSY stays clear */
@@ -670,6 +703,46 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
                 " = 0x%" PRIx64 " (size %u)\n",
                 off, val, size);
 }
+
+/*
+ * IOC3 SSRAM diagnostic region.  Word = 16 data bits (0..15) + parity bit (16);
+ * a read returns the parity-error bit (17) set when the stored data's parity
+ * disagrees with the stored parity bit.  The in-band write control bit (17) and
+ * the read error bit share bit 17; writers ignore what we return for it (the ef
+ * driver masks reads with IOC3_SSRAM_DM = 0xffff), while the PROM enet_ssram
+ * diagnostic checks it explicitly.
+ */
+static uint64_t sgi_baseio_ssram_read(void *opaque, hwaddr off, unsigned size) {
+  SGIBaseIOState *s = opaque;
+  uint32_t v = s->ssram[(off >> 2) & (SGI_BASEIO_IOC3_SSRAM_WORDS - 1)];
+  uint32_t data = v & 0xffff;
+  uint32_t par = (v >> 16) & 1;
+  uint32_t err = (__builtin_parity(data) ^ par) & 1;
+
+  return data | (par << 16) | (err << 17);
+}
+
+static void sgi_baseio_ssram_write(void *opaque, hwaddr off, uint64_t val,
+                                   unsigned size) {
+  SGIBaseIOState *s = opaque;
+  s->ssram[(off >> 2) & (SGI_BASEIO_IOC3_SSRAM_WORDS - 1)] = val & 0x1ffff;
+}
+
+static const MemoryRegionOps sgi_baseio_ssram_ops = {
+    .read = sgi_baseio_ssram_read,
+    .write = sgi_baseio_ssram_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid =
+        {
+            .min_access_size = 4,
+            .max_access_size = 4,
+        },
+    .impl =
+        {
+            .min_access_size = 4,
+            .max_access_size = 4,
+        },
+};
 
 static const MemoryRegionOps sgi_baseio_ops = {
     .read = sgi_baseio_read,
@@ -750,6 +823,12 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
   memory_region_add_subregion(&s->iomem, SGI_BASEIO_IOC3_UART,
                               &s->ioc3_uart_mr);
 
+  /* IOC3 SSRAM diagnostic region (256 KB). */
+  memory_region_init_io(&s->ssram_mr, OBJECT(s), &sgi_baseio_ssram_ops, s,
+                        "sgi-baseio-ssram", SGI_BASEIO_IOC3_SSRAM_LEN);
+  memory_region_add_subregion(&s->iomem, SGI_BASEIO_IOC3_SSRAM_OFF,
+                              &s->ssram_mr);
+
   /*
    * On-board QLogic ISP1020 SCSI channels.  The children must always be
    * realized (qdev asserts on unrealized children); their register windows are
@@ -759,6 +838,14 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
    * octane).
    */
   for (i = 0; i < 2; i++) {
+    /*
+     * Give the node's IO widget (8) the SCSI bus numbers 0/1 so legacy
+     * -drive if=scsi,bus=N,unit=M drives attach here; the widget-0 alias
+     * claims no bus number so it never steals a drive from the real ones.
+     */
+    object_property_set_uint(OBJECT(&s->isp[i]), "scsi-bus-num",
+                             s->widget == 8 ? (uint32_t)i : 0xffffffffu,
+                             &error_abort);
     if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
       return;
     }

@@ -777,6 +777,7 @@ static void sgi_ip27_class_init(ObjectClass *oc, const void *data) {
   mc->no_floppy = 1;
   mc->no_cdrom = 1;
   mc->no_parallel = 1;
+  mc->block_default_type = IF_SCSI;
 }
 
 static const TypeInfo sgi_ip27_type = {
