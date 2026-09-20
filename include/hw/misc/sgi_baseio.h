@@ -7,9 +7,9 @@
  * register at +0xb4 is the MicroLAN line controller, bit-banged by the PROM's
  * LIBKL NIC driver (nic.c: nic_presence/nic_read/nic_write via access_mcr32).
  *
- * We model the MCR line operations and a DS2502 (family 0x09) whose memory
- * carries the BaseIO manufacturing record (part "030-0734-...", name "BASEIO")
- * that the PROM's board-config parser expects.  Protocol and record layout are
+ * We model the MCR line operations and two DS2502 (family 0x09) devices whose
+ * memories carry the BaseIO manufacturing record (part "030-0734-...", name
+ * "BASEIO") and the IOC3 Ethernet MAC address.  Protocol and record layout are
  * taken from the IRIX 6.5.7m ARCS source (libsk/ml/nic.c, libkl/ml/
  * bridge_nic.c) -- authoritative hardware behaviour.
  *
@@ -21,6 +21,7 @@
 
 #include "hw/char/serial.h"
 #include "hw/core/sysbus.h"
+#include "net/net.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_BASEIO "sgi-baseio"
@@ -43,6 +44,42 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 #define SGI_BASEIO_DS_ROM_SIZE 8
 #define SGI_BASEIO_DS_MEM_SIZE 128
 
+/*
+ * IOC3 Ethernet MAC register block, IOC3 offset 0x0F0 (bridge+0x2000F0).
+ * 25 words: EMCR..MIDR_W. See IRIX sys/PCI/ioc3.h ioc3_eregs_t and the ARCS
+ * standalone ef driver references/stand/arcs/lib/libsk/net/if_ef.c.
+ */
+#define SGI_BASEIO_ETH_OFF 0x2000F0ULL
+#define SGI_BASEIO_ETH_NREGS 25
+#define SGI_BASEIO_ETH_SIZE (SGI_BASEIO_ETH_NREGS * 4)
+
+/* Register word indices (from IOC3 offset 0x0F0). */
+#define SGI_IOC3_EMCR 0
+#define SGI_IOC3_EISR 1
+#define SGI_IOC3_EIER 2
+#define SGI_IOC3_ERCSR 3
+#define SGI_IOC3_ERBR_H 4
+#define SGI_IOC3_ERBR_L 5
+#define SGI_IOC3_ERBAR 6
+#define SGI_IOC3_ERCIR 7
+#define SGI_IOC3_ERPIR 8
+#define SGI_IOC3_ERTR 9
+#define SGI_IOC3_ETCSR 10
+#define SGI_IOC3_ERSR 11
+#define SGI_IOC3_ETCDC 12
+#define SGI_IOC3_EBIR 13
+#define SGI_IOC3_ETBR_H 14
+#define SGI_IOC3_ETBR_L 15
+#define SGI_IOC3_ETCIR 16
+#define SGI_IOC3_ETPIR 17
+#define SGI_IOC3_EMAR_H 18
+#define SGI_IOC3_EMAR_L 19
+#define SGI_IOC3_EHAR_H 20
+#define SGI_IOC3_EHAR_L 21
+#define SGI_IOC3_MICR 22
+#define SGI_IOC3_MIDR_R 23
+#define SGI_IOC3_MIDR_W 24
+
 /* NIC MicroLAN line state machine. */
 typedef enum {
   SGI_DS_IDLE = 0,
@@ -54,6 +91,23 @@ typedef enum {
   SGI_DS_RMEM_ADDR,   /* shifting in the 16-bit memory address */
   SGI_DS_RMEM_DATA,   /* shifting out memory bytes */
 } SGIDSState;
+
+/* One DS2502 1-wire device. */
+typedef struct SGIBaseIODS {
+  uint8_t rom[SGI_BASEIO_DS_ROM_SIZE];
+  uint8_t mem[SGI_BASEIO_DS_MEM_SIZE];
+  SGIDSState state;
+  uint8_t cmd;          /* command shift register */
+  int cmd_bits;
+  uint8_t in;           /* generic bit shift register */
+  int in_bits;
+  int out_index;        /* index for READROM/SEARCH/RMEM_DATA */
+  int search_phase;     /* search: 0=read bit, 1=read complement, 2=choice */
+  int addr;
+  int extra;            /* DS1982 extra status byte pending */
+  int extra_bits;       /* status bits returned before read-memory data */
+  int data_bit;         /* latched line state for the next read */
+} SGIBaseIODS;
 
 struct SGIBaseIOState {
   SysBusDevice parent_obj;
@@ -70,19 +124,20 @@ struct SGIBaseIOState {
   /* Bridge free-running counter/timer (offset 0x100): bit0 = enable. */
   uint32_t timer_en;
 
-  /* DS2502 1-wire device. */
-  uint8_t ds_rom[SGI_BASEIO_DS_ROM_SIZE];
-  uint8_t ds_mem[SGI_BASEIO_DS_MEM_SIZE];
-  SGIDSState ds_state;
-  uint8_t ds_cmd;        /* command shift register */
-  int ds_cmd_bits;
-  uint8_t ds_in;         /* generic bit shift register */
-  int ds_in_bits;
-  int ds_out_index;      /* index for READROM/SEARCH/RMEM_DATA */
-  int ds_search_phase;   /* search: 0=read bit, 1=read complement, 2=choice */
-  int ds_addr;
-  int ds_extra;          /* DS1982 extra status byte pending */
-  int ds_data_bit;       /* latched line state for the next read */
+  /* DS2502 devices: board manufacturing record (0xb4) and MAC (0x200030). */
+  SGIBaseIODS ds_board;
+  SGIBaseIODS ds_mac;
+
+  /* IOC3 Ethernet MAC register file, RX/TX DMA ring cursors. */
+  uint32_t eth_regs[SGI_BASEIO_ETH_NREGS];
+  uint32_t eth_rxprod; /* hardware RX produce, byte offset into the ring */
+  uint32_t eth_txcons; /* hardware TX consume, byte offset into the ring */
+  uint16_t phy_regs[32];
+  uint32_t phy_write_data;
+  uint32_t phy_read_data;
+
+  NICConf nic_conf;
+  NICState *nic;
 };
 
 #endif /* HW_MISC_SGI_BASEIO_H */

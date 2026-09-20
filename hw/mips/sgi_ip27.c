@@ -33,6 +33,7 @@
 #include "hw/misc/sgi_baseio.h"
 #include "hw/misc/sgi_hub.h"
 #include "hw/misc/unimp.h"
+#include "net/net.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
@@ -648,6 +649,8 @@ static void sgi_ip27_init(MachineState *machine) {
     DeviceState *baseio8 = qdev_new(TYPE_SGI_BASEIO);
     qdev_prop_set_uint32(baseio8, "nasid", 0);
     qdev_prop_set_uint32(baseio8, "widget", 8);
+    /* The node's IO board (widget 8) carries the IOC3 Ethernet backend. */
+    qemu_configure_nic_device(baseio8, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(baseio8), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(baseio8), 0, ip27_swin_phys(0, 8));
   }

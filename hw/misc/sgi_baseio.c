@@ -23,6 +23,9 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/bswap.h"
+#include "system/address-spaces.h"
+#include "system/dma.h"
 
 /* --- Dallas/Maxim 1-wire CRC-8 (poly 0x8C, reflected) --- */
 static uint8_t sgi_baseio_crc8(const uint8_t *p, int n) {
@@ -84,29 +87,29 @@ static void sgi_baseio_put(uint8_t *dst, const char *s, int n) {
  * Each 32-byte page carries a trailing 16-bit CRC so that the NIC driver's
  * crc16 over the whole page equals 0xb001.
  */
-static void sgi_baseio_ds_init(SGIBaseIOState *s) {
+static void sgi_baseio_ds_board_init(SGIBaseIODS *ds) {
   static const char part[] = "030-0734-001"; /* IO6 BaseIO */
   static const char name[] = "BASEIO";
   int a, b;
 
-  memset(s->ds_mem, 0xff, sizeof(s->ds_mem));
+  memset(ds->mem, 0xff, sizeof(ds->mem));
 
   /* Page 0. */
-  s->ds_mem[0] = 0x01;
-  sgi_baseio_put(&s->ds_mem[1], "1234567890", 10);
-  sgi_baseio_put(&s->ds_mem[11], part, 19);
+  ds->mem[0] = 0x01;
+  sgi_baseio_put(&ds->mem[1], "1234567890", 10);
+  sgi_baseio_put(&ds->mem[11], part, 19);
 
   /* Page 1. */
-  sgi_baseio_put(&s->ds_mem[32 + 0], "", 6);
-  sgi_baseio_put(&s->ds_mem[32 + 6], "0001", 4);
-  s->ds_mem[32 + 10] = 0x00;
-  memset(&s->ds_mem[32 + 11], 0x00, 4);
-  s->ds_mem[32 + 15] = 0x00;
-  sgi_baseio_put(&s->ds_mem[32 + 16], name, 14);
+  sgi_baseio_put(&ds->mem[32 + 0], "", 6);
+  sgi_baseio_put(&ds->mem[32 + 6], "0001", 4);
+  ds->mem[32 + 10] = 0x00;
+  memset(&ds->mem[32 + 11], 0x00, 4);
+  ds->mem[32 + 15] = 0x00;
+  sgi_baseio_put(&ds->mem[32 + 16], name, 14);
 
   /* Solve each page's trailing 16-bit CRC so crc16(page) == 0xb001. */
   for (int page = 0; page < 2; page++) {
-    uint8_t *pg = &s->ds_mem[page * 32];
+    uint8_t *pg = &ds->mem[page * 32];
     pg[30] = 0;
     pg[31] = 0;
     for (a = 0; a < 256; a++) {
@@ -122,89 +125,134 @@ static void sgi_baseio_ds_init(SGIBaseIOState *s) {
   }
 
   /* ROM id: family 0x09 + 48-bit serial + Dallas CRC-8. */
-  s->ds_rom[0] = 0x09;
-  s->ds_rom[1] = 0x01;
-  s->ds_rom[2] = 0x02;
-  s->ds_rom[3] = 0x03;
-  s->ds_rom[4] = 0x04;
-  s->ds_rom[5] = 0x05;
-  s->ds_rom[6] = 0x06;
-  s->ds_rom[7] = sgi_baseio_crc8(s->ds_rom, 7);
+  ds->rom[0] = 0x09;
+  ds->rom[1] = 0x01;
+  ds->rom[2] = 0x02;
+  ds->rom[3] = 0x03;
+  ds->rom[4] = 0x04;
+  ds->rom[5] = 0x05;
+  ds->rom[6] = 0x06;
+  ds->rom[7] = sgi_baseio_crc8(ds->rom, 7);
+  ds->extra_bits = 8; /* board record page read expects the status byte */
 }
 
-static void sgi_baseio_ds_reset(SGIBaseIOState *s) {
-  s->ds_state = SGI_DS_CMD;
-  s->ds_cmd = 0;
-  s->ds_cmd_bits = 0;
-  s->ds_in = 0;
-  s->ds_in_bits = 0;
-  s->ds_out_index = 0;
-  s->ds_search_phase = 0;
-  s->ds_addr = 0;
-  s->ds_extra = 0;
-  s->ds_data_bit = 0;
+/*
+ * Build the IOC3 MAC-address EEPROM image read by nic_eaddr() (libsk/ml/
+ * nic.c): family 0x09; 14 bytes from address 0:
+ *   [0]=0x8d command CRC, [1]=0x0a length, [6..11]=MAC (MSB..LSB),
+ *   [12..13]=CRC16 solving crc16(bytes[1..13]) == 0xb001.
+ * The MAC matches the octane lane and the netboot responder default
+ * 08:00:69:12:34:56.
+ */
+static void sgi_baseio_ds_mac_init(SGIBaseIODS *ds) {
+  static const uint8_t mac[6] = {0x08, 0x00, 0x69, 0x12, 0x34, 0x56};
+  int i;
+
+  memset(ds->mem, 0xff, sizeof(ds->mem));
+  ds->mem[0] = 0x8d;
+  ds->mem[1] = 0x0a;
+  ds->mem[2] = ds->mem[3] = ds->mem[4] = ds->mem[5] = 0x00;
+  /* eaddr[i] = byte[11-i], so store MSB first at [6]. */
+  for (i = 0; i < 6; i++) {
+    ds->mem[6 + i] = mac[5 - i];
+  }
+  ds->mem[12] = 0;
+  ds->mem[13] = 0;
+  for (int a = 0; a < 256; a++) {
+    for (int b = 0; b < 256; b++) {
+      ds->mem[12] = a;
+      ds->mem[13] = b;
+      if (sgi_baseio_crc16(&ds->mem[1], 13) == 0xb001) {
+        goto done;
+      }
+    }
+  }
+done:;
+
+  ds->rom[0] = 0x09;
+  ds->rom[1] = 0x01;
+  ds->rom[2] = 0x02;
+  ds->rom[3] = 0x03;
+  ds->rom[4] = 0x04;
+  ds->rom[5] = 0x05;
+  ds->rom[6] = 0x06;
+  ds->rom[7] = sgi_baseio_crc8(ds->rom, 7);
+  ds->extra_bits = 0; /* nic_eaddr reads the record from byte 0 */
 }
 
-static void sgi_baseio_ds_decode(SGIBaseIOState *s) {
-  switch (s->ds_cmd) {
+static void sgi_baseio_ds_reset(SGIBaseIODS *ds) {
+  ds->state = SGI_DS_CMD;
+  ds->cmd = 0;
+  ds->cmd_bits = 0;
+  ds->in = 0;
+  ds->in_bits = 0;
+  ds->out_index = 0;
+  ds->search_phase = 0;
+  ds->addr = 0;
+  ds->extra = 0;
+  ds->data_bit = 0;
+}
+
+static void sgi_baseio_ds_decode(SGIBaseIODS *ds) {
+  switch (ds->cmd) {
   case 0x33: /* READ ROM */
-    s->ds_state = SGI_DS_READROM;
-    s->ds_out_index = 0;
+    ds->state = SGI_DS_READROM;
+    ds->out_index = 0;
     break;
   case 0x55: /* MATCH ROM */
-    s->ds_state = SGI_DS_MATCHROM;
-    s->ds_in = 0;
-    s->ds_in_bits = 0;
+    ds->state = SGI_DS_MATCHROM;
+    ds->in = 0;
+    ds->in_bits = 0;
     break;
   case 0xcc: /* SKIP ROM */
-    s->ds_state = SGI_DS_CMD;
+    ds->state = SGI_DS_CMD;
     break;
   case 0xf0: /* read-memory (or search-ROM; decided by next op) */
-    s->ds_state = SGI_DS_F0_PENDING;
+    ds->state = SGI_DS_F0_PENDING;
     break;
   default:
-    s->ds_state = SGI_DS_CMD;
+    ds->state = SGI_DS_CMD;
     break;
   }
-  s->ds_cmd = 0;
-  s->ds_cmd_bits = 0;
+  ds->cmd = 0;
+  ds->cmd_bits = 0;
 }
 
-static void sgi_baseio_ds_write_bit(SGIBaseIOState *s, int bit) {
-  switch (s->ds_state) {
+static void sgi_baseio_ds_write_bit(SGIBaseIODS *ds, int bit) {
+  switch (ds->state) {
   case SGI_DS_CMD:
-    s->ds_cmd |= (bit & 1) << s->ds_cmd_bits;
-    if (++s->ds_cmd_bits == 8) {
-      sgi_baseio_ds_decode(s);
+    ds->cmd |= (bit & 1) << ds->cmd_bits;
+    if (++ds->cmd_bits == 8) {
+      sgi_baseio_ds_decode(ds);
     }
     break;
   case SGI_DS_MATCHROM:
-    s->ds_in |= (bit & 1) << s->ds_in_bits;
-    if (++s->ds_in_bits == 64) {
-      s->ds_state = SGI_DS_CMD;
+    ds->in |= (bit & 1) << ds->in_bits;
+    if (++ds->in_bits == 64) {
+      ds->state = SGI_DS_CMD;
     }
     break;
   case SGI_DS_SEARCH:
     /* Host choice for the current bit; advance to the next ROM bit. */
-    if (s->ds_search_phase == 2) {
-      s->ds_search_phase = 0;
-      if (++s->ds_out_index == 64) {
-        s->ds_state = SGI_DS_CMD;
+    if (ds->search_phase == 2) {
+      ds->search_phase = 0;
+      if (++ds->out_index == 64) {
+        ds->state = SGI_DS_CMD;
       }
     }
     break;
   case SGI_DS_F0_PENDING:
     /* A write after 0xf0 means the 16-bit memory address follows. */
-    s->ds_state = SGI_DS_RMEM_ADDR;
-    s->ds_addr = 0;
-    s->ds_in_bits = 0;
+    ds->state = SGI_DS_RMEM_ADDR;
+    ds->addr = 0;
+    ds->in_bits = 0;
     /* fall through */
   case SGI_DS_RMEM_ADDR:
-    s->ds_addr |= (bit & 1) << s->ds_in_bits;
-    if (++s->ds_in_bits == 16) {
-      s->ds_state = SGI_DS_RMEM_DATA;
-      s->ds_out_index = 0;
-      s->ds_extra = (s->ds_rom[0] == 0x09) ? 8 : 0;
+    ds->addr |= (bit & 1) << ds->in_bits;
+    if (++ds->in_bits == 16) {
+      ds->state = SGI_DS_RMEM_DATA;
+      ds->out_index = 0;
+      ds->extra = ds->extra_bits;
     }
     break;
   default:
@@ -212,40 +260,40 @@ static void sgi_baseio_ds_write_bit(SGIBaseIOState *s, int bit) {
   }
 }
 
-static int sgi_baseio_ds_read_bit(SGIBaseIOState *s) {
+static int sgi_baseio_ds_read_bit(SGIBaseIODS *ds) {
   int bit;
-  switch (s->ds_state) {
+  switch (ds->state) {
   case SGI_DS_READROM:
-    bit = (s->ds_rom[s->ds_out_index / 8] >> (s->ds_out_index % 8)) & 1;
-    if (++s->ds_out_index == 64) {
-      s->ds_state = SGI_DS_CMD;
+    bit = (ds->rom[ds->out_index / 8] >> (ds->out_index % 8)) & 1;
+    if (++ds->out_index == 64) {
+      ds->state = SGI_DS_CMD;
     }
     return bit;
   case SGI_DS_SEARCH:
-    bit = (s->ds_rom[s->ds_out_index / 8] >> (s->ds_out_index % 8)) & 1;
-    if (s->ds_search_phase == 0) {
-      s->ds_search_phase = 1;
+    bit = (ds->rom[ds->out_index / 8] >> (ds->out_index % 8)) & 1;
+    if (ds->search_phase == 0) {
+      ds->search_phase = 1;
       return bit;
     }
-    s->ds_search_phase = 2;
+    ds->search_phase = 2;
     return bit ^ 1;
   case SGI_DS_F0_PENDING:
     /* A read after 0xf0 starts a ROM search. */
-    s->ds_state = SGI_DS_SEARCH;
-    s->ds_out_index = 0;
-    s->ds_search_phase = 0;
-    return sgi_baseio_ds_read_bit(s);
+    ds->state = SGI_DS_SEARCH;
+    ds->out_index = 0;
+    ds->search_phase = 0;
+    return sgi_baseio_ds_read_bit(ds);
   case SGI_DS_RMEM_DATA:
-    if (s->ds_extra > 0) {
-      bit = (0xff >> (8 - s->ds_extra)) & 1;
-      s->ds_extra--;
+    if (ds->extra > 0) {
+      bit = (0xff >> (8 - ds->extra)) & 1;
+      ds->extra--;
       return bit;
     }
-    bit = (s->ds_mem[s->ds_addr + s->ds_out_index / 8] >>
-           (s->ds_out_index % 8)) &
+    bit = (ds->mem[ds->addr + ds->out_index / 8] >>
+           (ds->out_index % 8)) &
           1;
-    if (++s->ds_out_index == 32 * 8) {
-      s->ds_state = SGI_DS_CMD;
+    if (++ds->out_index == 32 * 8) {
+      ds->state = SGI_DS_CMD;
     }
     return bit;
   default:
@@ -254,30 +302,217 @@ static int sgi_baseio_ds_read_bit(SGIBaseIOState *s) {
 }
 
 /* MCR line state: returns DATA bit; DONE is always set for the host poll. */
-static uint64_t sgi_baseio_mcr_read(SGIBaseIOState *s) {
-  return 0x2 | (s->ds_data_bit & 1);
+static uint64_t sgi_baseio_mcr_read(SGIBaseIODS *ds) {
+  return 0x2 | (ds->data_bit & 1);
 }
 
-static void sgi_baseio_mcr_write(SGIBaseIOState *s, uint64_t val) {
+static void sgi_baseio_mcr_write(SGIBaseIODS *ds, uint64_t val) {
   unsigned pulse = (val >> 10) & 0x3ff;
   unsigned sample = (val >> 2) & 0xff;
 
   if (pulse >= 480) {
     /* reset/presence pulse; single device => presence bit 0 */
-    sgi_baseio_ds_reset(s);
-    s->ds_data_bit = 0;
+    sgi_baseio_ds_reset(ds);
+    ds->data_bit = 0;
   } else if (sample == 30) {
-    sgi_baseio_ds_write_bit(s, 0);
-    s->ds_data_bit = 0;
+    sgi_baseio_ds_write_bit(ds, 0);
+    ds->data_bit = 0;
   } else if (sample == 110) {
-    sgi_baseio_ds_write_bit(s, 1);
-    s->ds_data_bit = 0;
+    sgi_baseio_ds_write_bit(ds, 1);
+    ds->data_bit = 0;
   } else if (sample == 13) {
-    s->ds_data_bit = sgi_baseio_ds_read_bit(s);
+    ds->data_bit = sgi_baseio_ds_read_bit(ds);
   } else {
-    s->ds_data_bit = 0;
+    ds->data_bit = 0;
   }
 }
+
+/*
+ * IOC3 Ethernet (10/100 MAC) register and DMA model.  Ported from the octane
+ * lane's hw/misc/sgi_bridge.c; the ring layouts are those of the ARCS
+ * standalone ef driver (references/stand/arcs/lib/libsk/net/if_ef.c):
+ *   - TX ring: 128- or 512-entry descriptors of 128 bytes (cmd, bufcnt, p1,
+ *     p2, then 104 bytes of inline data).  ETPIR/ETCIR are byte offsets.
+ *   - RX ring: 512 entries of 8 bytes, each the IO address of an efrxbuf
+ *     (ioc3_erxbuf { w0, err } followed by the frame at EMCR.RXOFF halfwords).
+ */
+#define IOC3_EMCR_DUPLEX 0x00000001
+#define IOC3_EMCR_RXOFF_MASK 0x000001f8
+#define IOC3_EMCR_RXOFF_SHIFT 3
+#define IOC3_EMCR_LOOPBACK 0x00020000
+#define IOC3_EMCR_RST 0x80000000
+#define IOC3_EISR_RXTHRESHINT 0x00000002
+#define IOC3_EISR_TXEMPTY 0x00010000
+#define IOC3_ETXD_D0V 0x00010000
+#define IOC3_ETXD_B1V 0x00020000
+#define IOC3_ETXD_B2V 0x00040000
+#define IOC3_ETBR_L_RINGSZ_MASK 0x00000001
+#define IOC3_ETBR_L_TXRINGBASE_MASK 0xffffc000
+#define IOC3_ETPIR_TXPRODUCE_MASK 0x0000ffff
+#define IOC3_ERXBUF_V 0x80000000
+#define IOC3_ERXBUF_BYTECNT_SHIFT 16
+#define IOC3_ERXBUF_GOODPKT 0x40000000
+#define IOC3_ERXBUF_LONGEVENT 0x10000000
+#define IOC3_ERXBUF_BROADCAST 0x08000000
+#define IOC3_ERXBUF_MULTICAST 0x04000000
+#define IOC3_RXDSZ 8
+#define IOC3_NRXD 512
+#define IOC3_TXDSZ 128
+#define IOC3_RX_RING_BYTES (IOC3_NRXD * IOC3_RXDSZ)
+
+/*
+ * The ef driver programs the ring base and buffer pointers with
+ * kv_to_bridge32_dirmap() addresses, which on IP27 come out as K1-segment
+ * addresses (0xa0xxxxxx).  Translate those to physical for DMA.
+ */
+static uint64_t sgi_baseio_dma_addr(uint64_t a) {
+  /*
+   * IP27 programs ring bases via kv_to_bridge32_dirmap(), which yields a
+   * 64-bit value whose high word is the bridge dirmap selector and whose low
+   * word is the physical offset (e.g. 0x15000000_01ce0000).  IP30 instead
+   * yields a K1-segment address (0xa0xxxxxx) in a zero-extended 64-bit value.
+   */
+  if ((a >> 32) != 0) {
+    return a & 0xffffffffULL; /* dirmap: low word is the physical address */
+  }
+  if ((a & 0xf0000000ULL) == 0xa0000000ULL) {
+    return a & 0x0fffffffULL; /* K1 segment */
+  }
+  return a & 0x1fffffffULL;
+}
+
+static void sgi_baseio_phy_init(SGIBaseIOState *s) {
+  memset(s->phy_regs, 0, sizeof(s->phy_regs));
+  s->phy_regs[0] = 0x1000; /* BMCR: auto-negotiation enabled */
+  s->phy_regs[1] = 0x7824; /* BMSR: caps + autoneg done + link up */
+  s->phy_regs[2] = 0x0015; /* PHY ID 1: ICS1890 OUI */
+  s->phy_regs[3] = 0xf400; /* PHY ID 2 */
+  s->phy_regs[4] = 0x01e0; /* ANAR: 10/10FD/100/100FD */
+  s->phy_regs[5] = 0x01e0; /* ANLPAR: same */
+  s->phy_regs[6] = 0x0001; /* ANER: link partner auto-neg able */
+  s->phy_write_data = 0;
+  s->phy_read_data = 0;
+}
+
+static void sgi_baseio_eth_deliver(SGIBaseIOState *s, const uint8_t *buf,
+                                   size_t len) {
+  uint32_t emcr = s->eth_regs[SGI_IOC3_EMCR];
+  uint32_t rxoff = ((emcr & IOC3_EMCR_RXOFF_MASK) >> IOC3_EMCR_RXOFF_SHIFT) * 2;
+  uint64_t erbr = sgi_baseio_dma_addr(
+      ((uint64_t)s->eth_regs[SGI_IOC3_ERBR_H] << 32) |
+      s->eth_regs[SGI_IOC3_ERBR_L]);
+  uint64_t slot = 0;
+  uint32_t w0, err;
+  uint8_t frame[2048];
+
+  if (!(emcr & 0x00010000) || erbr == 0 || len > sizeof(frame)) {
+    return; /* RXEN off */
+  }
+  if (dma_memory_read(&address_space_memory, erbr + s->eth_rxprod, &slot,
+                      sizeof(slot), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+      slot == 0) {
+    return;
+  }
+  slot = sgi_baseio_dma_addr(be64_to_cpu(slot));
+
+  w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
+  err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
+  if (len >= 6 && (buf[0] & 1)) {
+    err |= IOC3_ERXBUF_MULTICAST;
+    if (buf[0] == 0xff && buf[1] == 0xff && buf[2] == 0xff && buf[3] == 0xff &&
+        buf[4] == 0xff && buf[5] == 0xff) {
+      err |= IOC3_ERXBUF_BROADCAST;
+    }
+  }
+  memcpy(frame, buf, len);
+  stl_p(&w0, w0);
+  stl_p(&err, err);
+
+  dma_memory_write(&address_space_memory, slot, &w0, 4,
+                   MEMTXATTRS_UNSPECIFIED);
+  dma_memory_write(&address_space_memory, slot + 4, &err, 4,
+                   MEMTXATTRS_UNSPECIFIED);
+  dma_memory_write(&address_space_memory, slot + rxoff, frame, len,
+                   MEMTXATTRS_UNSPECIFIED);
+
+  s->eth_rxprod = (s->eth_rxprod + IOC3_RXDSZ) % IOC3_RX_RING_BYTES;
+  s->eth_regs[SGI_IOC3_ERPIR] = s->eth_rxprod;
+  s->eth_regs[SGI_IOC3_EISR] |= IOC3_EISR_RXTHRESHINT;
+}
+
+static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
+  uint32_t etpir = s->eth_regs[SGI_IOC3_ETPIR] & IOC3_ETPIR_TXPRODUCE_MASK;
+  uint32_t etbr_l = s->eth_regs[SGI_IOC3_ETBR_L];
+  uint64_t base = sgi_baseio_dma_addr(
+      ((uint64_t)s->eth_regs[SGI_IOC3_ETBR_H] << 32) |
+      (etbr_l & IOC3_ETBR_L_TXRINGBASE_MASK));
+  int ntxd = (etbr_l & IOC3_ETBR_L_RINGSZ_MASK) ? 512 : 128;
+  uint32_t ring_bytes = ntxd * IOC3_TXDSZ;
+  uint32_t emcr = s->eth_regs[SGI_IOC3_EMCR];
+
+  while (s->eth_txcons != etpir) {
+    uint8_t desc[IOC3_TXDSZ];
+    uint32_t cmd, bufcnt, d0cnt, b1cnt, b2cnt;
+    uint64_t p1, p2;
+    uint8_t frame[2048];
+    size_t flen = 0;
+
+    if (dma_memory_read(&address_space_memory, base + s->eth_txcons, desc,
+                        sizeof(desc), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+      break;
+    }
+    cmd = ldl_be_p(desc);
+    bufcnt = ldl_be_p(desc + 4);
+    p1 = sgi_baseio_dma_addr(ldq_be_p(desc + 8));
+    p2 = sgi_baseio_dma_addr(ldq_be_p(desc + 16));
+    d0cnt = bufcnt & 0x7f;
+    b1cnt = (bufcnt >> 8) & 0x7ff;
+    b2cnt = (bufcnt >> 20) & 0x7ff;
+
+    if ((cmd & IOC3_ETXD_D0V) && d0cnt <= sizeof(frame)) {
+      memcpy(frame, desc + 24, d0cnt);
+      flen = d0cnt;
+    }
+    if ((cmd & IOC3_ETXD_B1V) && flen + b1cnt <= sizeof(frame)) {
+      dma_memory_read(&address_space_memory, p1, frame + flen, b1cnt,
+                      MEMTXATTRS_UNSPECIFIED);
+      flen += b1cnt;
+    }
+    if ((cmd & IOC3_ETXD_B2V) && flen + b2cnt <= sizeof(frame)) {
+      dma_memory_read(&address_space_memory, p2, frame + flen, b2cnt,
+                      MEMTXATTRS_UNSPECIFIED);
+      flen += b2cnt;
+    }
+
+    if (emcr & IOC3_EMCR_LOOPBACK) {
+      sgi_baseio_eth_deliver(s, frame, flen);
+    } else if (s->nic && flen > 0) {
+      qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
+    }
+    s->eth_txcons = (s->eth_txcons + IOC3_TXDSZ) % ring_bytes;
+  }
+  s->eth_regs[SGI_IOC3_ETCIR] = s->eth_txcons;
+  s->eth_regs[SGI_IOC3_EISR] |= IOC3_EISR_TXEMPTY;
+}
+
+static bool sgi_baseio_eth_can_receive(NetClientState *nc) {
+  SGIBaseIOState *s = qemu_get_nic_opaque(nc);
+  return s->eth_regs[SGI_IOC3_EMCR] & 0x00010000; /* RXEN */
+}
+
+static ssize_t sgi_baseio_eth_receive(NetClientState *nc, const uint8_t *buf,
+                                      size_t size) {
+  SGIBaseIOState *s = qemu_get_nic_opaque(nc);
+  sgi_baseio_eth_deliver(s, buf, size);
+  return size;
+}
+
+static NetClientInfo net_sgi_baseio_eth_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = sgi_baseio_eth_can_receive,
+    .receive = sgi_baseio_eth_receive,
+};
 
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
@@ -312,20 +547,36 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     uint32_t c = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
     return (c << 1) | (s->timer_en & 1);
   }
-  /* Bridge MicroLAN control register (1-wire). */
+  /* Bridge MicroLAN control register (1-wire): board manufacturing record. */
   if (off == 0xb4) {
-    return sgi_baseio_mcr_read(s);
+    return sgi_baseio_mcr_read(&s->ds_board);
   }
   /*
    * IOC3 register block at bridge+0x200000.  Its MCR (0x200030) is a second
-   * 1-wire controller for the IOC3's MAC-address NIC.  Report done for now.
+   * 1-wire controller, for the IOC3's MAC-address EEPROM.
    */
-  if (off == 0x200030) {
-    return 0x2;
+  if (off == SGI_BASEIO_IOC3_MCR) {
+    return sgi_baseio_mcr_read(&s->ds_mac);
   }
   /* IOC3 SuperIO control register: bus arbiter idle. */
   if (off == SGI_BASEIO_IOC3_SIO_CR) {
     return 0x00400000; /* SIO_CR_ARB_DIAG_IDLE */
+  }
+  /* IOC3 Ethernet MAC register file + MII management. */
+  if (off >= SGI_BASEIO_ETH_OFF &&
+      off < SGI_BASEIO_ETH_OFF + SGI_BASEIO_ETH_SIZE) {
+    unsigned idx = (off - SGI_BASEIO_ETH_OFF) >> 2;
+    uint64_t v = s->eth_regs[idx];
+
+    if (idx == SGI_IOC3_EMCR) {
+      /* The ef driver polls ARB_DIAG_IDLE after asserting RST. */
+      v |= 0x00200000; /* IOC3_EMCR_ARB_DIAG_IDLE */
+    } else if (idx == SGI_IOC3_MICR) {
+      v &= ~0x00000800; /* management ops complete instantly (BUSY clear) */
+    } else if (idx == SGI_IOC3_MIDR_R) {
+      v = s->phy_read_data & 0xffff;
+    }
+    return v;
   }
   /*
    * PCI config slots: the Bridge exposes each PCI device's config dword 0 at
@@ -367,7 +618,45 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   SGIBaseIOState *s = opaque;
 
   if (off == 0xb4) {
-    sgi_baseio_mcr_write(s, val);
+    sgi_baseio_mcr_write(&s->ds_board, val);
+    return;
+  }
+  if (off == SGI_BASEIO_IOC3_MCR) {
+    sgi_baseio_mcr_write(&s->ds_mac, val);
+    return;
+  }
+  /* IOC3 Ethernet MAC register file + MII management. */
+  if (off >= SGI_BASEIO_ETH_OFF &&
+      off < SGI_BASEIO_ETH_OFF + SGI_BASEIO_ETH_SIZE) {
+    unsigned idx = (off - SGI_BASEIO_ETH_OFF) >> 2;
+
+    if (idx == SGI_IOC3_EMCR) {
+      /* RST and the idle status bit are handled, not stored. */
+      s->eth_regs[idx] = val & ~(0x80000000u | 0x00200000u);
+      if (val & 0x80000000u) {
+        s->eth_rxprod = 0;
+        s->eth_txcons = 0;
+        memset(s->eth_regs, 0, sizeof(s->eth_regs));
+      }
+    } else if (idx == SGI_IOC3_ETPIR) {
+      s->eth_regs[idx] = val;
+      sgi_baseio_eth_tx_drain(s);
+    } else if (idx == SGI_IOC3_MIDR_W) {
+      s->phy_write_data = val & 0xffff;
+      s->eth_regs[idx] = val;
+    } else if (idx == SGI_IOC3_MICR) {
+      unsigned reg = val & 0x1f;
+      unsigned phyaddr = (val & 0x3e0) >> 5;
+
+      if (val & 0x400) { /* READTRIG */
+        s->phy_read_data = s->phy_regs[reg];
+      } else if (phyaddr == 0) {
+        s->phy_regs[reg] = s->phy_write_data;
+      }
+      s->eth_regs[idx] = val & ~0x800u; /* BUSY stays clear */
+    } else {
+      s->eth_regs[idx] = val;
+    }
     return;
   }
   /* Bridge timer: bit0 = enable (see the read side). */
@@ -421,8 +710,14 @@ static const MemoryRegionOps sgi_baseio_uart_ops = {
 static void sgi_baseio_reset(DeviceState *dev) {
   SGIBaseIOState *s = SGI_BASEIO(dev);
 
-  sgi_baseio_ds_init(s);
-  sgi_baseio_ds_reset(s);
+  sgi_baseio_ds_board_init(&s->ds_board);
+  sgi_baseio_ds_reset(&s->ds_board);
+  sgi_baseio_ds_mac_init(&s->ds_mac);
+  sgi_baseio_ds_reset(&s->ds_mac);
+  memset(s->eth_regs, 0, sizeof(s->eth_regs));
+  s->eth_rxprod = 0;
+  s->eth_txcons = 0;
+  sgi_baseio_phy_init(s);
 }
 
 static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
@@ -452,6 +747,21 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
                         "sgi-baseio-uart", SGI_BASEIO_IOC3_UART_SIZE);
   memory_region_add_subregion(&s->iomem, SGI_BASEIO_IOC3_UART,
                               &s->ioc3_uart_mr);
+
+  /*
+   * IOC3 Ethernet NIC.  The machine claims the default -nic/-netdev backend
+   * before realize; if none was given we still model the register file and DMA
+   * engines, just without a transport.  The MAC the driver programs into EMAR
+   * comes from the DS2502 EEPROM, not the backend, so the two need not agree.
+   */
+  if (s->nic_conf.peers.ncs[0]) {
+    s->nic = qemu_new_nic(&net_sgi_baseio_eth_info, &s->nic_conf,
+                          object_get_typename(OBJECT(s)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->nic_conf.macaddr.a);
+  } else {
+    s->nic = NULL;
+  }
 }
 
 static void sgi_baseio_instance_init(Object *obj) {
@@ -462,6 +772,7 @@ static void sgi_baseio_instance_init(Object *obj) {
 static const Property sgi_baseio_properties[] = {
     DEFINE_PROP_UINT32("nasid", SGIBaseIOState, nasid, 0),
     DEFINE_PROP_UINT32("widget", SGIBaseIOState, widget, 0),
+    DEFINE_NIC_PROPERTIES(SGIBaseIOState, nic_conf),
 };
 
 static void sgi_baseio_class_init(ObjectClass *klass, const void *data) {
