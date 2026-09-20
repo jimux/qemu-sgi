@@ -704,23 +704,13 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
                             b = (ent >> 8) & 0xff;
-                        } else if (typ == 0 || typ == 2) {
+                        } else if (typ == 0) {
                             /*
                              * I8 WID on a 16/32-bit fetch (the 8+8 / 16+16
                              * split): the pixel index is the 8bpp byte in
                              * the WID-selected half of the fetched word.
                              * Lane per buf: 01 = lower half (byte 0 of the
                              * half), 10 = upper half, 11 = both -> byte 0.
-                             *
-                             * typ 2 is documented RG3B2, but the O2 X server
-                             * drives its 8bpp PseudoColor desktop content
-                             * (icons, chrome) through WID 0x0b = typ 2 / cm 0
-                             * with a plain colormap index in the byte lane:
-                             * falling through to the raw 32bpp-RGB default
-                             * read the index byte as the green channel and
-                             * rendered the grey Console icon saturated
-                             * green.  Decode typ 2 as the same 8-bit cmap
-                             * index as I8.
                              */
                             int lane;
                             /*
@@ -743,6 +733,45 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
                             b = (ent >> 8) & 0xff;
+                        } else if (typ == 2) {
+                            /*
+                             * RG3B2 (spec §2.4: typ 2 = RG3B2; §2.7 "RG3B2,
+                             * RGB4, and RGB5 pixels are first expanded to
+                             * RGB8 by bit replication").  Three bits red,
+                             * three green (byte[7:5]/[4:2]) and two blue
+                             * (byte[1:0]) are replicated to 8 bits.
+                             *
+                             * The O2 X server draws the Console icon's
+                             * artwork through DID window did5 -> WID 0x00b
+                             * (typ 2 / cm 0) over x210..294, y16..82: the
+                             * RG3B2 bytes are the icon's own colour.  An
+                             * earlier change decoded typ 2 as an I8 cmap
+                             * index, which sent those bytes through the
+                             * cm0 window of the kernel textport colour map
+                             * (saturated green/blue/cyan/magenta + black
+                             * for unallocated entries) and speckled the
+                             * artwork; RG3B2 reproduces the icon's real
+                             * purple/beige palette.
+                             *
+                             * The 8-bit pixel occupies the same WID-selected
+                             * byte lane as I8 (DDX stores CI in byte1 for
+                             * the lower 16-bit half, byte3 for the upper).
+                             */
+                            int lane;
+                            if (bpp == 2) {
+                                lane = (bufsel == 2) ? 1 : 0;
+                            } else if (bpp == 4) {
+                                lane = (bufsel == 2) ? 3 : 1;
+                            } else {
+                                lane = 0;
+                            }
+                            uint32_t v = buf[bpp * i + lane];
+                            uint32_t r3 = (v >> 5) & 0x7;
+                            uint32_t g3 = (v >> 2) & 0x7;
+                            uint32_t b2 = v & 0x3;
+                            r = (r3 << 5) | (r3 << 2) | (r3 >> 1);
+                            g = (g3 << 5) | (g3 << 2) | (g3 >> 1);
+                            b = (b2 << 6) | (b2 << 4) | (b2 << 2) | b2;
                         } else if (typ == 1) {
                             /*
                              * I12 (WID typ 1): a 12-bit colour index that
