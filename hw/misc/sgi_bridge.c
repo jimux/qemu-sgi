@@ -940,6 +940,7 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                 unsigned idx = (offset - SGI_BRIDGE_ETH_OFF) >> 2;
 
                 if (idx == IOC3_EMCR) {
+                    bool was_rxen = s->eth_regs[idx] & IOC3_EMCR_RXEN;
                     /* RST and the idle status bit are handled, not stored. */
                     s->eth_regs[idx] = val & ~(IOC3_EMCR_RST |
                                                IOC3_EMCR_ARB_DIAG_IDLE);
@@ -947,6 +948,16 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                         s->eth_rxprod = 0;
                         s->eth_txcons = 0;
                         memset(s->eth_regs, 0, sizeof(s->eth_regs));
+                    }
+                    /*
+                     * While RX is disabled, can_receive() makes the net layer
+                     * queue incoming frames.  Deliver them once the guest
+                     * re-enables the receiver, so a frame that raced the
+                     * driver's reset/enable sequence is not lost.
+                     */
+                    if (s->nic && !was_rxen &&
+                        (s->eth_regs[idx] & IOC3_EMCR_RXEN)) {
+                        qemu_flush_queued_packets(qemu_get_queue(s->nic));
                     }
                 } else if (idx == IOC3_ETPIR) {
                     s->eth_regs[idx] = val;
