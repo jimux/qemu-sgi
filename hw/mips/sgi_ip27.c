@@ -140,6 +140,42 @@ static uint64_t sgi_ip27_be64(const uint8_t *p) {
 }
 
 /*
+ * LBOOT flash backing store.  On real hardware the boot flash code region is
+ * read-only and the PROM's log/env/NIC storage lives elsewhere; log writes
+ * that hit the code region so we can catch anything corrupting the PROM
+ * self-checksum.
+ */
+static uint8_t ip27_flash_mem[IP27_FLASH_SIZE];
+static uint64_t ip27_flash_protect;
+
+static uint64_t ip27_flash_read(void *opaque, hwaddr off, unsigned size) {
+  uint64_t v = 0;
+  unsigned i;
+  for (i = 0; i < size; i++) {
+    v = (v << 8) | ip27_flash_mem[off + i];
+  }
+  return v;
+}
+
+static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size) {
+  /*
+   * The boot flash is programmed through an AMD/Fujitsu command protocol
+   * (0xAA/0x55 unlock, 0xF0 reset, ...).  Those command words are not array
+   * data: a real flash does not store them, so the PROM code region stays
+   * intact.  Do not commit writes to the array.
+   */
+}
+
+static const MemoryRegionOps ip27_flash_ops = {
+  .read = ip27_flash_read,
+  .write = ip27_flash_write,
+  .endianness = DEVICE_BIG_ENDIAN,
+  .valid = { .min_access_size = 1, .max_access_size = 8 },
+  .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/*
  * Load an SN0-container PROM (magic "JFKSWCSM" at 0x40).  The header carries
  * the load address (0xA0), code offset (0x98) and code size (0xB0); the code
  * is copied to the IP27 PROM window.  The image is never modified.
@@ -151,7 +187,7 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
   gchar *data = NULL;
   uint64_t load_addr, code_off, code_size, load_phys;
   uint8_t *dst = memory_region_get_ram_ptr(prom);
-  uint8_t *flash_dst = memory_region_get_ram_ptr(flash);
+  uint8_t *flash_dst = ip27_flash_mem;
 
   if (!g_file_get_contents(filename, &data, &len, &err)) {
     error_report("sgi-ip27: could not read PROM '%s': %s", filename,
@@ -189,6 +225,7 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
    * bytes, so the SN0 container header must not be in the window.
    */
   memcpy(flash_dst, data + code_off, MIN((gsize)IP27_FLASH_SIZE, code_size));
+  ip27_flash_protect = MIN((uint64_t)IP27_FLASH_SIZE, code_size);
 
   qemu_log_mask(LOG_GUEST_ERROR,
                 "sgi-ip27: loaded SN0 PROM '%s': load=0x%" PRIx64
@@ -368,8 +405,8 @@ static void sgi_ip27_init(MachineState *machine) {
 
   /* Boot flash in the LBOOT window (identity + the container image). */
   flash = g_new(MemoryRegion, 1);
-  memory_region_init_ram(flash, NULL, "sgi-ip27.flash", IP27_FLASH_SIZE,
-                         &error_fatal);
+  memory_region_init_io(flash, NULL, &ip27_flash_ops, NULL, "sgi-ip27.flash",
+                        IP27_FLASH_SIZE);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_LBOOT_PHYS),
                               flash);
 
