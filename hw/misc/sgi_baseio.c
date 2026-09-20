@@ -328,14 +328,29 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     return 0x00400000; /* SIO_CR_ARB_DIAG_IDLE */
   }
   /*
-   * BaseIO component slots: the Bridge exposes per-slot component IDs at
-   * bride+0x20000 + slot*0x1000; the PROM's BaseIO init scans them and inits
-   * the component whose part is 0x310a9 (the IOC3/SuperIO).  Slot 0 is the
-   * IOC3; the bridge status words read 0 (ok).
+   * PCI config slots: the Bridge exposes each PCI device's config dword 0 at
+   * bridge+0x20000 + slot*0x1000 (BRIDGE_TYPE0_CFG_DEV(slot); see ARCS
+   * include/pci/bridge.h).  ARCS read_pcilink_status/iodiscover.c pci_discover
+   * read the 32-bit pci_id here (device id in [31:16], vendor in [15:0]) and
+   * switch on it to build the KL config components:
+   *   slot 0    IOC3   (device 0x0003, vendor 0x10a9) -> KLSTRUCT_IOC3
+   *   slot 1,2  QLogic ISP1020 (device 0x1020, vendor 0x1077) ->
+   *             KLSTRUCT_SCSI.  ARCS expects at least two QLogic devices on a
+   *             BaseIO (diag_io6config.c: io6confSpace_sanity, "expected 2 or
+   *             more").  With no SCSI component, sn0_dump_diag calls
+   *             dump_scsi_diags(NULL), which reads scsi->scsi_info.diagval
+   *             before its NULL check -- the observed POD TLB refill.
+   *   other     no device (0xffffffff).
    */
   if (off >= 0x20000 && off < 0x28000 && (off & 0xfff) == 0) {
     unsigned slot = (off - 0x20000) >> 12;
-    return (slot == 0) ? 0x310a9 : 0xffffffff;
+    if (slot == 0) {
+      return 0x000310a9; /* IOC3 */
+    }
+    if (slot == 1 || slot == 2) {
+      return 0x10201077; /* QLogic ISP1020 */
+    }
+    return 0xffffffff;
   }
   if (off == 0x104 || off == 0x114) {
     return 0;
