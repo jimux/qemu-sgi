@@ -20,6 +20,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
+#include "system/runstate.h"
 
 static void sgi_hub_reset_bh(void *opaque);
 #include "target/mips/cpu.h"
@@ -695,7 +696,8 @@ static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
 extern void sgi_ip27_local_reset(void);
 
 static void sgi_hub_reset_bh(void *opaque) {
-  sgi_ip27_local_reset();
+  /* Deferred so the reset runs in the main loop with vCPUs stopped. */
+  qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
 static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
