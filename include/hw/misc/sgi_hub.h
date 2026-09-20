@@ -78,6 +78,20 @@ struct SGIHubState {
   /* NI: AGE registers (CPU0/1 memory, CPU0/1 PIO). */
   uint64_t ni_age[4];
 
+  /* NI: hub NIC DS2502 1-wire EEPROM, bit-banged via MD_MLAN_CTL. */
+  uint8_t ds_rom[8];
+  uint8_t ds_mem[64];
+  int ds_state;
+  uint8_t ds_cmd;
+  int ds_cmd_bits;
+  uint8_t ds_in;
+  int ds_in_bits;
+  int ds_out_index;
+  int ds_search_phase;
+  int ds_addr;
+  int ds_extra;
+  int ds_data_bit;
+
   /* II: I/O interface (widget identity/link/access). */
   uint64_t ii_wcr;
   uint64_t ii_iowa;

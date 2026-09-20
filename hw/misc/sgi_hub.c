@@ -287,6 +287,273 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
   }
 }
 
+/*
+ * Hub NIC DS2502 1-wire EEPROM (family 0x09), bit-banged by the PROM through
+ * MD_MLAN_CTL.  get_hub_nic_info() (libsk/ml/nic.c) reads this record and
+ * derives the hub NIC from the DS2502 ROM serial (reported as "Laser:<hex>");
+ * the Name field carries "IP27" so the record is accepted.  The bit protocol
+ * and state machine mirror the ARCS source and the BaseIO model.
+ */
+enum {
+  SGI_HUB_DS_IDLE = 0,
+  SGI_HUB_DS_CMD,        /* shifting in an 8-bit ROM command */
+  SGI_HUB_DS_READROM,    /* shifting out the 64-bit ROM id */
+  SGI_HUB_DS_MATCHROM,   /* shifting in a 64-bit match-ROM sequence */
+  SGI_HUB_DS_SEARCH,     /* ROM search: read bit, complement, write choice */
+  SGI_HUB_DS_F0_PENDING, /* 0xf0 seen: next op decides search vs read-memory */
+  SGI_HUB_DS_RMEM_ADDR,  /* shifting in the 16-bit memory address */
+  SGI_HUB_DS_RMEM_DATA,  /* shifting out memory bytes */
+};
+
+/* --- Dallas/Maxim 1-wire CRC-8 (poly 0x8C, reflected) --- */
+static uint8_t sgi_hub_crc8(const uint8_t *p, int n) {
+  uint8_t crc = 0;
+  int i, j;
+  for (i = 0; i < n; i++) {
+    uint8_t c = p[i];
+    for (j = 0; j < 8; j++) {
+      if ((crc ^ c) & 1) {
+        crc = (crc >> 1) ^ 0x8C;
+      } else {
+        crc >>= 1;
+      }
+      c >>= 1;
+    }
+  }
+  return crc;
+}
+
+/* --- NIC 16-bit CRC (poly 0xC001), from libsk/ml/nic.c --- */
+static const int sgi_hub_oddparity[16] = {0, 1, 1, 0, 1, 0, 0, 1,
+                                          1, 0, 0, 1, 0, 1, 1, 0};
+
+static uint16_t sgi_hub_crc16_step(uint16_t crc, uint8_t in) {
+  uint16_t data = in;
+  data = (data ^ (crc & 0xff)) & 0xff;
+  crc >>= 8;
+  if (sgi_hub_oddparity[data & 0xf] ^ sgi_hub_oddparity[data >> 4]) {
+    crc ^= 0xc001;
+  }
+  data <<= 6;
+  crc ^= data;
+  data <<= 1;
+  crc ^= data;
+  return crc;
+}
+
+static uint16_t sgi_hub_crc16(const uint8_t *p, int n) {
+  uint16_t crc = 0;
+  int i;
+  for (i = 0; i < n; i++) {
+    crc = sgi_hub_crc16_step(crc, p[i]);
+  }
+  return crc;
+}
+
+static void sgi_hub_ds_put(uint8_t *dst, const char *s, int n) {
+  int i;
+  for (i = 0; i < n; i++) {
+    dst[i] = s[i] ? (uint8_t)s[i] : ' ';
+  }
+}
+
+/*
+ * Build the DS2502 image.  page 0: [0]=0x01, [1..10]=serial, [11..29]=part;
+ * page 1: [0..5]=part cont., [6..9]=rev, [16..29]=name ("IP27 ...").
+ * Each 32-byte page carries a trailing 16-bit CRC so the NIC driver's crc16
+ * over the page equals 0xb001.
+ */
+static void sgi_hub_ds_init(SGIHubState *s) {
+  static const char part[] = "030-1055-001";
+  static const char name[] = "IP27 ORIGIN2K";
+  int a, b;
+
+  memset(s->ds_mem, 0xff, sizeof(s->ds_mem));
+
+  s->ds_mem[0] = 0x01;
+  sgi_hub_ds_put(&s->ds_mem[1], "1234567890", 10);
+  sgi_hub_ds_put(&s->ds_mem[11], part, 19);
+
+  sgi_hub_ds_put(&s->ds_mem[32 + 0], "", 6);
+  sgi_hub_ds_put(&s->ds_mem[32 + 6], "0001", 4);
+  s->ds_mem[32 + 10] = 0x00;
+  memset(&s->ds_mem[32 + 11], 0x00, 4);
+  s->ds_mem[32 + 15] = 0x00;
+  sgi_hub_ds_put(&s->ds_mem[32 + 16], name, 14);
+
+  for (int page = 0; page < 2; page++) {
+    uint8_t *pg = &s->ds_mem[page * 32];
+    pg[30] = 0;
+    pg[31] = 0;
+    for (a = 0; a < 256; a++) {
+      for (b = 0; b < 256; b++) {
+        pg[30] = a;
+        pg[31] = b;
+        if (sgi_hub_crc16(pg, 32) == 0xb001) {
+          goto done;
+        }
+      }
+    }
+  done:;
+  }
+
+  /* ROM id: family 0x09 + 48-bit serial + Dallas CRC-8. */
+  s->ds_rom[0] = 0x09;
+  s->ds_rom[1] = 0x01;
+  s->ds_rom[2] = 0x02;
+  s->ds_rom[3] = 0x03;
+  s->ds_rom[4] = 0x04;
+  s->ds_rom[5] = 0x05;
+  s->ds_rom[6] = 0x06;
+  s->ds_rom[7] = sgi_hub_crc8(s->ds_rom, 7);
+}
+
+static void sgi_hub_ds_reset(SGIHubState *s) {
+  s->ds_state = SGI_HUB_DS_CMD;
+  s->ds_cmd = 0;
+  s->ds_cmd_bits = 0;
+  s->ds_in = 0;
+  s->ds_in_bits = 0;
+  s->ds_out_index = 0;
+  s->ds_search_phase = 0;
+  s->ds_addr = 0;
+  s->ds_extra = 0;
+  s->ds_data_bit = 0;
+}
+
+static void sgi_hub_ds_decode(SGIHubState *s) {
+  switch (s->ds_cmd) {
+  case 0x33: /* READ ROM */
+    s->ds_state = SGI_HUB_DS_READROM;
+    s->ds_out_index = 0;
+    break;
+  case 0x55: /* MATCH ROM */
+    s->ds_state = SGI_HUB_DS_MATCHROM;
+    s->ds_in = 0;
+    s->ds_in_bits = 0;
+    break;
+  case 0xcc: /* SKIP ROM */
+    s->ds_state = SGI_HUB_DS_CMD;
+    break;
+  case 0xf0: /* read-memory (or search-ROM; decided by next op) */
+    s->ds_state = SGI_HUB_DS_F0_PENDING;
+    break;
+  default:
+    s->ds_state = SGI_HUB_DS_CMD;
+    break;
+  }
+  s->ds_cmd = 0;
+  s->ds_cmd_bits = 0;
+}
+
+static void sgi_hub_ds_write_bit(SGIHubState *s, int bit) {
+  switch (s->ds_state) {
+  case SGI_HUB_DS_CMD:
+    s->ds_cmd |= (bit & 1) << s->ds_cmd_bits;
+    if (++s->ds_cmd_bits == 8) {
+      sgi_hub_ds_decode(s);
+    }
+    break;
+  case SGI_HUB_DS_MATCHROM:
+    s->ds_in |= (bit & 1) << s->ds_in_bits;
+    if (++s->ds_in_bits == 64) {
+      s->ds_state = SGI_HUB_DS_CMD;
+    }
+    break;
+  case SGI_HUB_DS_SEARCH:
+    if (s->ds_search_phase == 2) {
+      s->ds_search_phase = 0;
+      if (++s->ds_out_index == 64) {
+        s->ds_state = SGI_HUB_DS_CMD;
+      }
+    }
+    break;
+  case SGI_HUB_DS_F0_PENDING:
+    s->ds_state = SGI_HUB_DS_RMEM_ADDR;
+    s->ds_addr = 0;
+    s->ds_in_bits = 0;
+    /* fall through */
+  case SGI_HUB_DS_RMEM_ADDR:
+    s->ds_addr |= (bit & 1) << s->ds_in_bits;
+    if (++s->ds_in_bits == 16) {
+      s->ds_state = SGI_HUB_DS_RMEM_DATA;
+      s->ds_out_index = 0;
+      s->ds_extra = (s->ds_rom[0] == 0x09) ? 8 : 0;
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+static int sgi_hub_ds_read_bit(SGIHubState *s) {
+  int bit;
+  switch (s->ds_state) {
+  case SGI_HUB_DS_READROM:
+    bit = (s->ds_rom[s->ds_out_index / 8] >> (s->ds_out_index % 8)) & 1;
+    if (++s->ds_out_index == 64) {
+      s->ds_state = SGI_HUB_DS_CMD;
+    }
+    return bit;
+  case SGI_HUB_DS_SEARCH:
+    bit = (s->ds_rom[s->ds_out_index / 8] >> (s->ds_out_index % 8)) & 1;
+    if (s->ds_search_phase == 0) {
+      s->ds_search_phase = 1;
+      return bit;
+    }
+    s->ds_search_phase = 2;
+    return bit ^ 1;
+  case SGI_HUB_DS_F0_PENDING:
+    s->ds_state = SGI_HUB_DS_SEARCH;
+    s->ds_out_index = 0;
+    s->ds_search_phase = 0;
+    return sgi_hub_ds_read_bit(s);
+  case SGI_HUB_DS_RMEM_DATA:
+    if (s->ds_extra > 0) {
+      bit = (0xff >> (8 - s->ds_extra)) & 1;
+      s->ds_extra--;
+      return bit;
+    }
+    bit = (s->ds_mem[s->ds_addr + s->ds_out_index / 8] >>
+           (s->ds_out_index % 8)) &
+          1;
+    if (++s->ds_out_index == 32 * 8) {
+      s->ds_state = SGI_HUB_DS_CMD;
+    }
+    return bit;
+  default:
+    return 1;
+  }
+}
+
+/*
+ * MD_MLAN_CTL command: PULSE<19:10>/SAMPLE<9:2>; DONE (bit1) is always set,
+ * RD_DATA (bit0) is the latched 1-wire line state.
+ */
+#define SGI_HUB_MLAN_PULSE(v) (((v) >> 10) & 0x3ff)
+#define SGI_HUB_MLAN_SAMPLE(v) (((v) >> 2) & 0xff)
+
+static void sgi_hub_mlan_write(SGIHubState *s, uint64_t val) {
+  unsigned pulse = SGI_HUB_MLAN_PULSE(val);
+  unsigned sample = SGI_HUB_MLAN_SAMPLE(val);
+
+  if (pulse >= 480) {
+    /* reset/presence pulse; single device => presence bit 0 */
+    sgi_hub_ds_reset(s);
+    s->ds_data_bit = 0;
+  } else if (sample == 30) {
+    sgi_hub_ds_write_bit(s, 0);
+    s->ds_data_bit = 0;
+  } else if (sample == 110) {
+    sgi_hub_ds_write_bit(s, 1);
+    s->ds_data_bit = 0;
+  } else if (sample == 13) {
+    s->ds_data_bit = sgi_hub_ds_read_bit(s);
+  } else {
+    s->ds_data_bit = 0;
+  }
+}
+
 static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
   if (off == MD_MEMORY_CONFIG) {
     return s->mem_config;
@@ -298,8 +565,8 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
     return s->slotid_ustat;
   }
   if (off == MD_MLAN_CTL) {
-    /* DONE (bit1) always set; RD_DATA (bit0) idle high (no EEPROM). */
-    return 0x3;
+    /* DONE (bit1) always set; RD_DATA (bit0) is the latched 1-wire line. */
+    return 0x2 | (s->ds_data_bit & 1);
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
       (off >= MD_UREG1_0 && off <= MD_UREG1_15)) {
@@ -323,7 +590,7 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
     return;
   }
   if (off == MD_MLAN_CTL) {
-    /* PULSE/SAMPLE command; the line model is stateless for now. */
+    sgi_hub_mlan_write(s, val);
     return;
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
@@ -631,6 +898,10 @@ static void sgi_hub_realize(DeviceState *dev, Error **errp) {
   memory_region_init_io(&s->iomem, OBJECT(s), &sgi_hub_ops, s, "sgi-hub",
                         SGI_HUB_WINDOW_SIZE);
   sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+  /* Hub NIC 1-wire EEPROM and its bit-bang state. */
+  sgi_hub_ds_init(s);
+  sgi_hub_ds_reset(s);
 
   for (i = 0; i < SGI_HUB_MAX_CPUS; i++) {
     for (j = 0; j < 5; j++) {
