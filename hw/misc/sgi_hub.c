@@ -75,6 +75,10 @@ static void sgi_hub_reset_bh(void *opaque);
 #define MD_SLOTID_USTAT 0x220048
 /* Front-panel LED (hubmd.h MD_LED0): read/write, low 8 bits. */
 #define MD_LED0 0x220050
+/* Performance monitor: MD_PERF_SEL + 6 free-running counters. */
+#define MD_PERF_SEL 0x210000
+#define MD_PERF_CNT0 0x210010
+#define MD_PERF_CNT5 0x210038
 #define MD_UREG1_0 0x220080
 #define MD_UREG1_15 0x2200f8
 
@@ -591,6 +595,17 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
   if (off == MD_LED0) {
     return s->md_led0 & 0xff;
   }
+  /*
+   * Performance counters (MD_PERF_CNT0..5): the PROM reads them for timing.
+   * Return a value that advances with the virtual clock (they would otherwise
+   * read 0 and any wait/measurement loop on them would never progress).
+   */
+  if (off == MD_PERF_SEL) {
+    return s->md_perf_sel;
+  }
+  if (off >= MD_PERF_CNT0 && off <= MD_PERF_CNT5 && ((off - MD_PERF_CNT0) % 8) == 0) {
+    return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+  }
   if (off == MD_MLAN_CTL) {
     /* DONE (bit1) always set; RD_DATA (bit0) is the latched 1-wire line. */
     return 0x2 | (s->ds_data_bit & 1);
@@ -623,6 +638,13 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
   if (off == MD_LED0) {
     s->md_led0 = val & 0xff;
     return;
+  }
+  if (off == MD_PERF_SEL) {
+    s->md_perf_sel = val;
+    return;
+  }
+  if (off >= MD_PERF_CNT0 && off <= MD_PERF_CNT5) {
+    return; /* counters are read-only free-running */
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
       (off >= MD_UREG1_0 && off <= MD_UREG1_15)) {
