@@ -122,6 +122,35 @@ static void sgi_octane_load_prom(MachineState *machine, MemoryRegion *prom)
 }
 
 /*
+ * HEART widget ID word (heart.h HEART_WID_ID): part 0xc001 at [27:12],
+ * mfg 0x036 at [10:1], rev A (1) at [31:28].
+ */
+#define HEART_WID_ID_VAL 0x000000001c00106cULL
+
+static uint64_t heart_widget_id_read(void *opaque, hwaddr off, unsigned size)
+{
+    if (off >= 8) {
+        return 0;
+    }
+    if (size == 8) {
+        return HEART_WID_ID_VAL;
+    }
+    /* 32-bit access: +0 is the high word, +4 the low word. */
+    return (off == 0) ? (uint32_t)(HEART_WID_ID_VAL >> 32)
+                      : (uint32_t)HEART_WID_ID_VAL;
+}
+
+static const MemoryRegionOps heart_widget_id_ops = {
+    .read = heart_widget_id_read,
+    .write = NULL,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+};
+
+/*
  * Authentic IP30 (Octane) bring-up: HEART + Xbow + BRIDGE, uniprocessor.
  */
 static void sgi_octane_init(MachineState *machine)
@@ -239,8 +268,27 @@ static void sgi_octane_init(MachineState *machine)
         memory_region_add_subregion(system_memory, OCTANE_XBOW_BASE, xbow);
     }
 
-    /* HEART XIO widget-8 window (XIO config side, not the PIU). */
-    create_unimplemented_device("heart-widget", OCTANE_HEART_WIDGET, 16 * MiB);
+    /*
+     * HEART XIO widget-8 window (XIO config side, not the PIU).
+     *
+     * The window's first 8 bytes are the widget ID word HEART_WID_ID
+     * (heart.h): bits [27:12] part 0xc001, [10:1] mfg 0x036, [31:28] rev.
+     * The PROM's widget discovery reads it (64-bit at +0, low word at +4)
+     * and will not identify the node IO widget without it, so the rest of
+     * the 16MB window is RAM-backed and the ID is overlaid at offset 0.
+     */
+    {
+        MemoryRegion *hw = g_new(MemoryRegion, 1);
+        MemoryRegion *hw_id = g_new(MemoryRegion, 1);
+
+        memory_region_init_ram(hw, NULL, "sgi.heart-widget", 16 * MiB,
+                               &error_fatal);
+        memory_region_add_subregion(system_memory, OCTANE_HEART_WIDGET, hw);
+
+        memory_region_init_io(hw_id, NULL, &heart_widget_id_ops, NULL,
+                              "sgi.heart-widget-id", 8);
+        memory_region_add_subregion(hw, 0, hw_id);
+    }
 
     /*
      * Low physical alias of RAM. The PROM copies its resident code/data to the
