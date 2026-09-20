@@ -239,6 +239,85 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
                 filename, load_addr, load_phys, code_off, code_size);
 }
 
+/*
+ * Hub back-door (BDDIR/BDPRT/BDECC) storage.  Real hardware only has
+ * back-door storage where memory is populated, so the PROM's bank-size probe
+ * (size_back_door -> bd_type/bd_alias) sees "unpopulated" beyond a real bank;
+ * that is what makes it size bank 0 as 256 MB and banks 1..7 as EMPTY.
+ *
+ * Per sys/SN/addrs.h (32-bit node): BDPRT/BDDIR live at
+ * HSPEC + NODE_ADDRSPACE_SIZE*3/4 (= HSPEC+0xC0000000), and a physical
+ * address `pa` maps to ((pa>>2) & BDDIR_UPPER_MASK) with
+ * BDDIR_UPPER_MASK = 0xfffff<<10.  So decode the access back to `pa` and only
+ * round-trip where pa is within installed RAM.
+ */
+#define IP27_BDOOR_PHYS 0x80000000ULL      /* HSPEC + 0x80000000 (BDECC) */
+#define IP27_BDDIR_PHYS 0xC0000000ULL      /* BDPRT/BDDIR */
+#define IP27_BDDIR_WINSZ 0x8000000ULL      /* 128 MiB: covers pa < 512 MiB */
+#define IP27_BDDIR_STORE 0x4000000ULL      /* storage (aliased within a bank) */
+#define IP27_BDDIR_UPPER_MASK (0xfffffULL << 10)
+
+static uint8_t *ip27_bdoor_dir;
+static uint64_t ip27_bdoor_bank0_size;
+
+/*
+ * Decode a back-door directory/protection access to a storage index.  Real
+ * hardware aliases the back door within a bank with period = bank size, so
+ * (a) the size probe sees base+size/2 alias base (-> skips too-large sizes)
+ * and (b) accesses past the bank size alias the bank start.  Banks with no
+ * memory are unpopulated (probe sees -1 -> MD_SIZE_EMPTY).
+ */
+static bool ip27_bdoor_decode(hwaddr off, uint64_t *store_idx) {
+  const uint64_t base = IP27_BDDIR_PHYS - IP27_BDOOR_PHYS;
+  uint64_t idx, pa, bank, bank_size;
+
+  if (off < base || off >= base + IP27_BDDIR_WINSZ) {
+    return false; /* BDECC and other: unpopulated for now */
+  }
+  idx = off - base;
+  pa = (idx & IP27_BDDIR_UPPER_MASK) << 2;
+  bank = pa >> 29; /* MD_BANK_SHFT */
+  bank_size = (bank == 0) ? ip27_bdoor_bank0_size : 0;
+  if (bank_size == 0) {
+    return false;
+  }
+  *store_idx = idx & ((bank_size >> 2) - 1);
+  return true;
+}
+
+static uint64_t ip27_bdoor_read(void *opaque, hwaddr off, unsigned size) {
+  uint64_t idx, v = 0;
+  unsigned i;
+
+  if (ip27_bdoor_decode(off, &idx)) {
+    for (i = 0; i < size; i++) {
+      v = (v << 8) | ip27_bdoor_dir[idx + i];
+    }
+  }
+  return v;
+}
+
+static void ip27_bdoor_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size) {
+  uint64_t idx;
+  unsigned i;
+
+  if (ip27_bdoor_decode(off, &idx)) {
+    for (i = 0; i < size; i++) {
+      ip27_bdoor_dir[idx + size - 1 - i] = val & 0xff;
+      val >>= 8;
+    }
+  }
+}
+
+static const MemoryRegionOps ip27_bdoor_ops = {
+  .read = ip27_bdoor_read,
+  .write = ip27_bdoor_write,
+  .endianness = DEVICE_BIG_ENDIAN,
+  .valid = { .min_access_size = 1, .max_access_size = 8 },
+  .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
 static void sgi_ip27_init(MachineState *machine) {
   Clock *cpuclk;
   MemoryRegion *prom;
@@ -378,8 +457,10 @@ static void sgi_ip27_init(MachineState *machine) {
    */
   {
     MemoryRegion *bdoor = g_new(MemoryRegion, 1);
-    memory_region_init_ram(bdoor, NULL, "sgi-ip27.bdoor", 0x80000000ULL,
-                           &error_fatal);
+    ip27_bdoor_dir = g_malloc0(IP27_BDDIR_STORE);
+    ip27_bdoor_bank0_size = MIN(machine->ram_size, (uint64_t)0x20000000);
+    memory_region_init_io(bdoor, NULL, &ip27_bdoor_ops, NULL,
+                          "sgi-ip27.bdoor", 0x80000000ULL);
     memory_region_add_subregion(system_memory,
                                 ip27_phys(IP27_HSPEC_BASE + 0x80000000ULL),
                                 bdoor);
