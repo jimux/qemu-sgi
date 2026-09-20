@@ -79,3 +79,9 @@ config SGI_AIC7880
     # Placeholder AIC-7880 PCI SCSI controller for -M sgi-o2 (IP32);
     # sits on the MACE PCI host bridge (SGI_MACE) with a QEMU SCSI bus.
     select SCSI
+
+config SGI_QLISP
+    bool
+    # QLogic ISP1020/1040 SCSI host adapter for SGI IP30 (Octane BaseIO) and
+    # other machines; register/mailbox/RISC + request/response queues.
+    select SCSI

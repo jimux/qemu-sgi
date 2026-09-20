@@ -21,12 +21,21 @@
 #include "hw/char/serial.h"
 #include "hw/core/sysbus.h"
 #include "net/net.h"
+#include "hw/scsi/sgi_qlisp.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_BRIDGE "sgi-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIBRIDGEState, SGI_BRIDGE)
 
 #define BRIDGE_NUM_REGS 0x1000
+
+/* IP30 BaseIO PCI slot assignments (RACER/IP30.h) */
+#define BRIDGE_SCSI0_ID   0
+#define BRIDGE_SCSI1_ID   1
+#define BRIDGE_IOC3_ID    2
+/* DevIO windows: slots 0/1 at 2MB spacing, slots 2-7 at 1MB after 0x600000 */
+#define BRIDGE_QLISP0_OFF 0x200000
+#define BRIDGE_QLISP1_OFF 0x400000
 
 /*
  * IOC3 Ethernet MAC register block, IOC3 offset 0x0F0 (BRIDGE+0x6000F0).
@@ -161,6 +170,9 @@ struct SGIBRIDGEState {
     uint16_t phy_regs[32];
     uint32_t phy_write_data;
     uint32_t phy_read_data;
+
+    /* IP30 BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 0/1). */
+    SGIQLispState isp[2];
 };
 
 #endif /* HW_MISC_SGI_BRIDGE_H */

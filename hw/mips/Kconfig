@@ -143,6 +143,7 @@ config SGI_OCTANE
     depends on MIPS64 && TCG
     select SGI_HEART
     select SGI_BRIDGE
+    select SGI_QLISP
     select SGI_SFLASH
     select SGI_GBE
     select SGI_BOOTDISK

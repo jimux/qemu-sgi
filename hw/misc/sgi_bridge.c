@@ -714,7 +714,33 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
             unsigned dev = (offset - 0x20000) >> 12;
             hwaddr cfg = offset & 0xfff;
 
-            if (dev != 2) {
+            if (dev == BRIDGE_SCSI0_ID || dev == BRIDGE_SCSI1_ID) {
+                SGIQLispState *isp = &s->isp[dev];
+
+                switch (cfg) {
+                case 0x00:
+                    /* ISP1020 vendor/device (mbus_id_low=0x1077, high=0x1020) */
+                    val = (QLISP_DEVICE << 16) | QLISP_VENDOR;
+                    break;
+                case 0x04:
+                    val = isp->pci_cmd;
+                    break;
+                case 0x08:
+                    val = (QLISP_CLASS << 8) | isp->pci_rev;
+                    break;
+                case 0x10:
+                    val = isp->pci_bar[0];
+                    break;
+                case 0x14:
+                    val = isp->pci_bar[1];
+                    break;
+                default:
+                    val = 0;
+                    break;
+                }
+                break;
+            }
+            if (dev != BRIDGE_IOC3_ID) {
                 val = 0;
                 break;
             }
@@ -825,7 +851,25 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             unsigned dev = (offset - 0x20000) >> 12;
             hwaddr cfg = offset & 0xfff;
 
-            if (dev == 2) {
+            if (dev == BRIDGE_SCSI0_ID || dev == BRIDGE_SCSI1_ID) {
+                SGIQLispState *isp = &s->isp[dev];
+
+                switch (cfg) {
+                case 0x04:
+                    isp->pci_cmd = val;
+                    break;
+                case 0x10:
+                    isp->pci_bar[0] = val;
+                    break;
+                case 0x14:
+                    isp->pci_bar[1] = val;
+                    break;
+                default:
+                    break;
+                }
+                break;
+            }
+            if (dev == BRIDGE_IOC3_ID) {
                 switch (cfg) {
                 case 0x04:
                     s->pci_cmd = val;
@@ -955,6 +999,7 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
 {
     SGIBRIDGEState *s = SGI_BRIDGE(dev);
     Chardev *chr;
+    int i;
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &sgi_bridge_ops, s,
                           "sgi-bridge", BRIDGE_REG_SIZE);
@@ -996,6 +1041,19 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
                                 &s->ioc3_uart_mr2);
 
     /*
+     * IP30 BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 0 and 1),
+     * register (DevIO) windows at 0x200000 and 0x400000.
+     */
+    for (i = 0; i < 2; i++) {
+        if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
+            return;
+        }
+        memory_region_add_subregion(&s->iomem,
+                                    i == 0 ? BRIDGE_QLISP0_OFF : BRIDGE_QLISP1_OFF,
+                                    &s->isp[i].regs);
+    }
+
+    /*
      * IOC3 Ethernet NIC. The machine claims the default -nic/-netdev backend
      * (qemu_configure_nic_device) before realize; if none was given we still
      * model the register file and DMA engines, just without a transport. The
@@ -1016,6 +1074,8 @@ static void sgi_bridge_instance_init(Object *obj)
 {
     SGIBRIDGEState *s = SGI_BRIDGE(obj);
     object_initialize_child(obj, "ioc3-uart", &s->ioc3_uart, TYPE_SERIAL);
+    object_initialize_child(obj, "qlisp0", &s->isp[0], TYPE_SGI_QLISP);
+    object_initialize_child(obj, "qlisp1", &s->isp[1], TYPE_SGI_QLISP);
 }
 
 static const Property sgi_bridge_properties[] = {
