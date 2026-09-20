@@ -315,8 +315,27 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
    * at offset 0: the PROM reads its checksum source at LBOOT+0 for code_size
    * bytes, so the SN0 container header must not be in the window.
    */
+  /* Blank NOR flash reads 0xff, not zero. */
+  memset(flash_dst, 0xff, IP27_FLASH_SIZE);
   memcpy(flash_dst, data + code_off, MIN((gsize)IP27_FLASH_SIZE, code_size));
   ip27_flash_protect = MIN((uint64_t)IP27_FLASH_SIZE, code_size);
+
+  /*
+   * Pre-initialise the PROM log (factory state) in the top two 64 KiB
+   * sectors.  The PROM/BASEIO monitor refuses to assign a module id until a
+   * valid log exists, and its own initlog path is not run automatically.
+   * Format (sys/SN/promlog.h, IP27prom/Promlog/promlog.txt): header at
+   * offset 0 of the active sector 14 -- magic 0x504c4f47 ("PLOG") at 0x10,
+   * version at 0x14, sequence at 0x18; entries from 0x100, the first being
+   * the end-of-log marker (status=valid, type=END=3 => 0xe0).
+   */
+  {
+    uint8_t *lg = flash_dst + 14 * 0x10000;
+    lg[0x10] = 0x50; lg[0x11] = 0x4c; lg[0x12] = 0x4f; lg[0x13] = 0x47;
+    lg[0x14] = 0; lg[0x15] = 0; lg[0x16] = 0; lg[0x17] = 1;
+    lg[0x18] = 0; lg[0x19] = 0; lg[0x1a] = 0; lg[0x1b] = 1;
+    lg[0x100] = 0xe0; lg[0x101] = 0; lg[0x102] = 0; lg[0x103] = 0;
+  }
 
   qemu_log_mask(LOG_GUEST_ERROR,
                 "sgi-ip27: loaded SN0 PROM '%s': load=0x%" PRIx64
