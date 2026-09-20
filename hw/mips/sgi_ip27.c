@@ -103,8 +103,13 @@ static void main_cpu_reset(void *opaque) {
   cpu->env.active_tc.gpr[29] = 0xa800000000100000ULL; /* PROMDATA stack */
   /* Default console-device descriptor ($f3), as left by the sloader. */
   cpu->env.active_fpu.fpr[3].d = 0xc00000001fc74ce0ULL;
+  /*
+   * The PROM runs in XKSEG (KSEG3), which is TLB-mapped, and changes ASID as
+   * it initialises; the bootstrap mapping must be global (EntryLo G bit 0)
+   * so it survives those ASID changes.  flags: V(0x2) | G(0x1) | C=2(0x10).
+   */
   mips_cpu_install_mapping(cpu, 0xc00000001fc00000ULL, 0x1fc00000ULL,
-                           0x001fe000, 1, 0x12);
+                           0x001fe000, 1, 0x13);
 }
 
 /*
