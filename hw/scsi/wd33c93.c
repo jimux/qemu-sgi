@@ -746,22 +746,61 @@ static void wd33c93_transfer_data(SCSIRequest *req, uint32_t len)
     s->async_buf = scsi_req_get_buf(req);
 
     /*
-     * A real WD33C93 has only a small FIFO; it does not accept more data
-     * than the programmed transfer count. The IP20 PROM (and sash) drive a
-     * fresh TC-sized pass per DMA descriptor and do NOT implement the
-     * unexpected-phase reprogram path, so never enter it here: deliver at
-     * most transfer_count bytes and let the phase complete normally. The
-     * initiator's next TC/descriptor pass is a new request.
+     * If TC has already reached zero but the SCSI device still has data,
+     * raise an "unexpected phase" interrupt so the driver can reprogram
+     * TC and DMA descriptors for the next chunk.  This is the normal
+     * multi-pass DMA flow on real WD33C93B hardware, used by IRIX for
+     * transfers >256KB (64 DMA descriptors × 4KB pages).
+     *
+     * Reference: IRIX wd93.c:2936 — ST_UNEX_SDATA/RDATA handler
      */
     if (s->transfer_count == 0) {
+        if (s->no_unex) {
+            /*
+             * HPC1 / IP20: the driver drives a fresh TC-sized pass per DMA
+             * descriptor and does not implement the unexpected-phase reprogram
+             * path, so never enter it: complete this pass and let the initiator
+             * start the next one. (See multipass_dma_fix.md; the IP20 driver
+             * responds to UNEX with "Too much data sent ... Resetting SCSI
+             * bus".)
+             */
+            s->async_len = 0;
+            s->async_buf = NULL;
+            wd33c93_set_drq(s, false);
+            return;
+        }
+        s->pending_len = len;
+        s->pending_buf = scsi_req_get_buf(req);
         s->async_len = 0;
         s->async_buf = NULL;
         wd33c93_set_drq(s, false);
+        s->aux_status &= ~(ASR_DBR | ASR_CIP | ASR_BSY);
+
+        /* MAME: COMMAND_PHASE_TRANSFER_COUNT = 0x46 (IRIX: PH_DATA) */
+        s->regs[WD_COMMAND_PHASE] = 0x46;
+
+        /*
+         * Status codes are named from the WD33C93 chip's perspective:
+         *   UNEX_RDATA (0x48) = chip receiving data = DATA OUT (write)
+         *   UNEX_SDATA (0x49) = chip sending data   = DATA IN (read)
+         * IRIX wd93.c:2930: ST_UNEX_RDATA with !SCDMA_IN (write),
+         *                   ST_UNEX_SDATA with SCDMA_IN (read).
+         */
+        uint8_t status = (req->cmd.mode == SCSI_XFER_TO_DEV)
+                       ? SCSI_STATUS_UNEX_RDATA    /* DATA OUT: chip receives */
+                       : SCSI_STATUS_UNEX_SDATA;   /* DATA IN: chip sends  */
+        s->scsi_status = status;
+        wd33c93_raise_irq(s);
         return;
     }
 
-    /* Cap the transfer to the remaining TC (discard any excess). */
+    /* Cap the transfer to the remaining TC */
     if (len > s->transfer_count) {
+        if (!s->no_unex) {
+            /* Save remainder for multi-pass DMA resume after TC reaches 0 */
+            s->pending_len = len - s->transfer_count;
+            s->pending_buf = s->async_buf + s->transfer_count;
+        }
         len = s->transfer_count;
     }
     s->async_len = len;
@@ -995,12 +1034,22 @@ static const VMStateDescription vmstate_wd33c93 = {
 /*
  * Device class init
  */
+static const Property wd33c93_properties[] = {
+    /*
+     * Set by controllers whose initiator driver does not implement the
+     * unexpected-phase multi-pass reprogram path (e.g. HPC1 / IP20); the
+     * default keeps the WD33C93B multi-pass behaviour used by IRIX on HPC3.
+     */
+    DEFINE_PROP_BOOL("no-unex", WD33C93State, no_unex, false),
+};
+
 static void wd33c93_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = wd33c93_realize;
     device_class_set_legacy_reset(dc, wd33c93_reset);
+    device_class_set_props(dc, wd33c93_properties);
     dc->vmsd = &vmstate_wd33c93;
 }
 

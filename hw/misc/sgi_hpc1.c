@@ -1424,6 +1424,12 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
 
     /* WD33C93 SCSI controller */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
+    /*
+     * The IP20 driver drives a fresh TC-sized pass per DMA descriptor and has
+     * no unexpected-phase reprogram path, so disable the UNEX multi-pass used
+     * by the HPC3/Indy path (see progress_notes/indy/multipass_dma_fix.md).
+     */
+    object_property_set_bool(OBJECT(s->scsi), "no-unex", true, &error_fatal);
     qdev_realize(DEVICE(s->scsi), NULL, &error_fatal);
     qdev_connect_gpio_out_named(DEVICE(s->scsi), "irq", 0,
                                 qdev_get_gpio_in_named(dev, "scsi-irq", 0));

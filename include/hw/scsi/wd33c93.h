@@ -170,6 +170,7 @@ struct WD33C93State {
      * TRANSFER_INFO to resume. See IRIX wd93.c ST_UNEX_SDATA/RDATA. */
     uint32_t pending_len;               /* Bytes awaiting next TC */
     uint8_t *pending_buf;               /* Buffer pointer (into SCSI buf) */
+    bool no_unex;                       /* Initiator has no UNEX reprogram path */
 
     /* Output signals */
     qemu_irq irq;                       /* Interrupt output */
