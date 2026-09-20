@@ -128,6 +128,24 @@ static const MemoryRegionOps sgi_ip20_board_rev_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The IP20's R4000 has a 1MB unified secondary cache, so CP0 Config0's
+ * CONFIG_SC bit (0x00020000, "0 == secondary cache present") must read 0.
+ * QEMU's generic R4000 model leaves it set, which makes SGI IRIX's
+ * size_2nd_cache() return 0 and hence a zero-length cache flush.  IRIX 6.2's
+ * rmi_cacheflush() (unlike 6.5's) asserts on a zero-length flush, so without
+ * this the 6.2 kernel panics in mlsetup().  Re-applied on reset, after the
+ * CPU's own Config0 reset.
+ */
+#define IP20_CONFIG0_CONF_SC    0x00020000
+
+static void sgi_indigo_cpu_config_reset(void *opaque)
+{
+    MIPSCPU *cpu = opaque;
+
+    cpu->env.CP0_Config0 &= ~IP20_CONFIG0_CONF_SC;
+}
+
 static void sgi_indigo_init(MachineState *machine)
 {
     MemoryRegion *system_memory = get_system_memory();
@@ -153,6 +171,10 @@ static void sgi_indigo_init(MachineState *machine)
     cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk, true);
     cpu_mips_irq_init_cpu(cpu);
     cpu_mips_clock_init(cpu);
+
+    /* IP20 R4000 reports a secondary cache present (see above). */
+    sgi_indigo_cpu_config_reset(cpu);
+    qemu_register_reset(sgi_indigo_cpu_config_reset, cpu);
 
     /* PROM at 0x1fc00000 */
     prom = g_new(MemoryRegion, 1);
