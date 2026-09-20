@@ -288,6 +288,16 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off == 4) {
     return (uint64_t)(SGI_BASEIO_WIDGET_PART << 12);
   }
+  /*
+   * Widget status (WIDGET_STATUS = 0x0c): bit 5 is the PCI/GIO mode select
+   * (BRIDGE_STAT_PCI_GIO_N).  bridge_discover (libkl/ml/iodiscover.c:410)
+   * only proceeds to PCI discovery -- and thus to init_klcfg_ioc3, creating
+   * the BaseIO lboard + KLSTRUCT_IOC3 component -- when this bit says the
+   * bridge has a PCI interface.
+   */
+  if (off == 0x0c) {
+    return 0x20;
+  }
   /* Bridge MicroLAN control register (1-wire). */
   if (off == 0xb4) {
     return sgi_baseio_mcr_read(s);
