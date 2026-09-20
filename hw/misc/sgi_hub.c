@@ -639,6 +639,21 @@ static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
 
   switch (type) {
   case PIOTYPE_READ:
+    if (reg == NI_STATUS_REV_ID) {
+      /*
+       * A vector/path-0 NSRI read is the PROM's discovery of the local
+       * node's "port 0": on a single node no peer answers there.  Report an
+       * unknown chip id (not HUB/ROUTER) so discover_object() takes its
+       * default branch and leaves the hub's port.index invalid; that makes
+       * nasid_assign() keep this sole node at NASID 0 (otherwise it treats
+       * the node as back-to-back with itself and assigns NASID 1, which the
+       * later config walk dereferences via NODE_RBOOT_BASE(1)).
+       */
+      s->ni_vector_rd_data =
+          ((uint64_t)(s->nasid & 0x1ff) << NSRI_NODEID_SHFT) |
+          ((uint64_t)SGI_HUB_REV << NSRI_REV_SHFT) | 0x5;
+      break;
+    }
     s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
     break;
   case PIOTYPE_WRITE:
