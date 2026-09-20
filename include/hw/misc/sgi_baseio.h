@@ -67,6 +67,9 @@ struct SGIBaseIOState {
   uint32_t nasid;
   uint32_t widget;
 
+  /* Bridge free-running counter/timer (offset 0x100): bit0 = enable. */
+  uint32_t timer_en;
+
   /* DS2502 1-wire device. */
   uint8_t ds_rom[SGI_BASEIO_DS_ROM_SIZE];
   uint8_t ds_mem[SGI_BASEIO_DS_MEM_SIZE];

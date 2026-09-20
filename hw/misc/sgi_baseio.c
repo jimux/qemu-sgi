@@ -22,6 +22,7 @@
 #include "chardev/char.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 
 /* --- Dallas/Maxim 1-wire CRC-8 (poly 0x8C, reflected) --- */
 static uint8_t sgi_baseio_crc8(const uint8_t *p, int n) {
@@ -298,6 +299,19 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off == 0x0c) {
     return 0x20;
   }
+  /*
+   * Bridge free-running counter/timer at +0x100.  The PROM reads it as the
+   * timeout source for its wait-for-value loops (e.g. the poll in the IP27
+   * PROM at VA 0x...1fc58490: it reads this, computes count/10*8, and spins
+   * until the value changes).  Returning 0 makes every timeout instantly
+   * expire-or-never-expire and spins forever, so return a value that advances
+   * with the virtual clock.  Bit 0 is the enable (set by the PROM via
+   * `ld; ori 1; sd`).
+   */
+  if (off == 0x100) {
+    uint32_t c = (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    return (c << 1) | (s->timer_en & 1);
+  }
   /* Bridge MicroLAN control register (1-wire). */
   if (off == 0xb4) {
     return sgi_baseio_mcr_read(s);
@@ -339,6 +353,11 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
 
   if (off == 0xb4) {
     sgi_baseio_mcr_write(s, val);
+    return;
+  }
+  /* Bridge timer: bit0 = enable (see the read side). */
+  if (off == 0x100) {
+    s->timer_en = val & 1;
     return;
   }
   qemu_log_mask(LOG_UNIMP,
