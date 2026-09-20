@@ -1297,30 +1297,24 @@ static int sgi_hpc1_serial_can_receive(void *opaque)
 static void sgi_hpc1_serial_receive(void *opaque, const uint8_t *buf, int size)
 {
     SGIHPC1State *s = opaque;
-    int i, d, c;
+    int i;
     /*
-     * The IP20 PROM's console input is DUART1 channel B (it polls that
-     * channel's RR0); DUART0A/2A also carry early output. Feed them all so
-     * the console works regardless of which the PROM reads.
+     * The IP20 console input is DUART1 channel B, and the PROM/kernel drains
+     * that channel. Feed ONLY it: feeding the other channels left undrained
+     * bytes in their RX FIFOs, so their RR0 "RX available" bit stayed set and
+     * the PROM's input-drain loop (poll RR0 bit0, never read the data port)
+     * spun forever after `fx` exited.
      */
-    const int targets[][2] = { { 1, 1 }, { 2, 0 }, { 0, 0 } };
-
     for (i = 0; i < size; i++) {
-        int t;
-        for (t = 0; t < 3; t++) {
-            SGIHPC1Uart *u;
-            d = targets[t][0];
-            c = targets[t][1];
-            u = &s->uart[d][c];
-            if (u->rx_count >= HPC1_RX_FIFO_SIZE) {
-                continue;
-            }
-            u->rx_fifo[u->rx_head] = buf[i];
-            u->rx_head = (u->rx_head + 1) % HPC1_RX_FIFO_SIZE;
-            u->rx_count++;
-            if (u->wr[1] & 0x18) {
-                u->rr3 |= (c == 0 ? SCC_RX_IP_A : SCC_RX_IP);
-            }
+        SGIHPC1Uart *u = &s->uart[1][1];
+        if (u->rx_count >= HPC1_RX_FIFO_SIZE) {
+            continue;
+        }
+        u->rx_fifo[u->rx_head] = buf[i];
+        u->rx_head = (u->rx_head + 1) % HPC1_RX_FIFO_SIZE;
+        u->rx_count++;
+        if (u->wr[1] & 0x18) {
+            u->rr3 |= SCC_RX_IP;
         }
     }
     scc_update_irq(s);
