@@ -447,35 +447,30 @@ static uint8_t *ip27_bdoor_dir;
 static uint64_t ip27_bdoor_bank0_size;
 
 /*
- * Decode a back-door directory/protection access to a storage index.  Real
- * hardware aliases the back door within a bank with period = bank size, so
- * (a) the size probe sees base+size/2 alias base (-> skips too-large sizes)
- * and (b) accesses past the bank size alias the bank start.  Banks with no
- * memory are unpopulated (probe sees -1 -> MD_SIZE_EMPTY).
+ * Decode a back-door directory/protection access to a storage index.
+ *
+ * The BDPRT/BDDIR address encodes the physical address as pa>>2 in
+ * BDDIR_UPPER_MASK (addrs.h BDPRT_ENTRY / BDPRT_TO_MEM), so idx == pa>>2.
+ * Back ONLY bank 0's real RAM extent: above it the directory entry is
+ * unpopulated, so bd_type() reads its test pattern back unstable (-1) and
+ * size_back_door() stops at the true size.  If instead the whole 512 MB bank
+ * slot aliased (MD_BANK_SHFT=29), the probe would size bank 0 as 512 MB and
+ * memory_init_all() would test unbacked space past 256 MB -> Data Bus Err ->
+ * "No useable RAM installed".  Banks 1..7 (pa >= 512 MB) lie outside the
+ * window and are likewise unpopulated.
  */
 static bool ip27_bdoor_decode(hwaddr off, uint64_t *store_idx) {
   const uint64_t base = IP27_BDDIR_PHYS - IP27_BDOOR_PHYS;
-  uint64_t idx, pa, bank, bank_size;
+  uint64_t idx;
 
   if (off < base || off >= base + IP27_BDDIR_WINSZ) {
     return false; /* BDECC and other: unpopulated for now */
   }
-  idx = off - base;
-  pa = (idx & IP27_BDDIR_UPPER_MASK) << 2;
-  bank = pa >> 29; /* MD_BANK_SHFT: 512 MB per bank slot */
-  /*
-   * MD_BANK_SHFT is 29, so a bank occupies a 512 MB address slot and a 256 MB
-   * node is entirely bank 0 -- NOT eight 32 MB banks (that aliases every
-   * 32 MB within bank 0's slot, so size_back_door() sizes bank 0 as 32 MB and
-   * the firmware then accounts only 32 MB: the "Mem enabled = 32 MB" summary
-   * and the unbacked-phys TLB refill in the BASEIO monitor).  Report bank 0
-   * as the modelled bank size and banks 1..7 as unpopulated.
-   */
-  bank_size = (bank == 0) ? ip27_bdoor_bank0_size : 0;
-  if (bank_size == 0) {
-    return false;
+  idx = off - base; /* == pa>>2 (BDDIR_UPPER_MASK encodes pa>>2) */
+  if (idx >= (ip27_bdoor_bank0_size >> 2)) {
+    return false; /* above bank 0's real extent: unpopulated */
   }
-  *store_idx = idx & ((bank_size >> 2) - 1);
+  *store_idx = idx;
   return true;
 }
 
