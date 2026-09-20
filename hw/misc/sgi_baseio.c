@@ -636,7 +636,20 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     }
     return (cfg == 0x00) ? 0xffffffff : 0;
   }
-  if (off == 0x104 || off == 0x114) {
+  /*
+   * BRIDGE_INT_STATUS (0x104): one bit per PCI device (bit N = device N).
+   * The IOC3 is device 0; it asserts its interrupt line while any enabled
+   * Ethernet interrupt condition is pending (EISR & EIER).  The PROM
+   * enet_ioc3_loop diagnostic reads this after TX_EMPTY.
+   */
+  if (off == 0x104) {
+    uint32_t st = 0;
+    if (s->eth_regs[SGI_IOC3_EISR] & s->eth_regs[SGI_IOC3_EIER]) {
+      st |= 1u << 0;
+    }
+    return st;
+  }
+  if (off == 0x114) {
     return 0;
   }
   qemu_log_mask(LOG_UNIMP,
