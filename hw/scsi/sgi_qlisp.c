@@ -14,6 +14,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+#include "system/address-spaces.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -67,24 +68,73 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
         break;
 
     case MBOX_CMD_LOAD_RAM:
-        /* firmware image is DMA'd by the RISC; we don't run it word-wise.
-         * mbox1=A, mbox2/3=host ptr hi/lo, mbox4=length. Accept. */
+        /*
+         * DMA the firmware image from host physical memory into the RISC's
+         * instruction RAM. mbox1 = RISC start, mbox2/3 = host ptr hi/lo,
+         * mbox4 = length in words. The driver's DMA copy is pairwise swapped
+         * (SWAP_DATA_STREAM), so swap adjacent 16-bit words back to recover
+         * the logical firmware image.
+         */
+        {
+            uint32_t addr = ql_mbox_get(s, 1);
+            uint64_t host = ((uint64_t)ql_mbox_get(s, 2) << 16) |
+                            ql_mbox_get(s, 3);
+            uint32_t len = ql_mbox_get(s, 4);
+            uint32_t base = addr - QL_RISC_RAMBASE;
+            uint32_t i;
+            uint16_t buf[0x8000];
+
+            if (len > ARRAY_SIZE(buf)) {
+                len = ARRAY_SIZE(buf);
+            }
+            if (len && base + len <= ARRAY_SIZE(s->risc_ram) &&
+                dma_memory_read(&address_space_memory, host, buf,
+                                len * 2, MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
+                for (i = 0; i < len; i++) {
+                    s->risc_ram[base + i] = buf[i ^ 1];
+                }
+                s->risc_loaded = len;
+            }
+        }
         sts = MBOX_STS_COMMAND_COMPLETE;
         break;
 
     case MBOX_CMD_WRITE_RAM_WORD:
-        ql_reg_put(s, 0x80, 0); /* touch accumulator: keep model simple */
+        /* mbox1 = RISC addr, mbox2 = data */
+        {
+            uint32_t a = ql_mbox_get(s, 1) - QL_RISC_RAMBASE;
+            if (a < ARRAY_SIZE(s->risc_ram)) {
+                s->risc_ram[a] = ql_mbox_get(s, 2);
+                if (a + 1 > s->risc_loaded) {
+                    s->risc_loaded = a + 1;
+                }
+            }
+        }
         sts = MBOX_STS_COMMAND_COMPLETE;
         break;
 
     case MBOX_CMD_READ_RAM_WORD:
-        ql_mbox_put(s, 2, 0);
+        /* mbox1 = RISC addr; result returned in mbox2 */
+        {
+            uint32_t a = ql_mbox_get(s, 1) - QL_RISC_RAMBASE;
+            ql_mbox_put(s, 2, (a < ARRAY_SIZE(s->risc_ram)) ?
+                               s->risc_ram[a] : 0);
+        }
         sts = MBOX_STS_COMMAND_COMPLETE;
         break;
 
     case MBOX_CMD_VERIFY_CHECKSUM:
-        /* mbox6 = checksum (host compares when VERIFY_TEST) */
-        ql_mbox_put(s, 6, 0);
+        /* mbox1 = RISC addr; the ISP's 16-bit sum is returned in mbox2,
+         * matching the driver's simple sum over the loaded firmware. */
+        {
+            uint32_t n = s->risc_loaded ? s->risc_loaded : 0;
+            uint32_t i;
+            uint16_t sum = 0;
+            for (i = 0; i < n && i < ARRAY_SIZE(s->risc_ram); i++) {
+                sum += s->risc_ram[i];
+            }
+            ql_mbox_put(s, 2, sum);
+        }
         sts = MBOX_STS_COMMAND_COMPLETE;
         break;
 
@@ -183,9 +233,12 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
     }
 
     ql_mbox_put(s, 0, sts);
-    qemu_log_mask(LOG_UNIMP,
-                  "sgi-qlisp: mbox cmd=0x%x in=%d sts=0x%x\n", cmd,
-                  ql_mbox_get(s, 1), sts);
+    {
+        static unsigned long dbg_cnt;
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-qlisp: #%lu mbox cmd=0x%x in=%d sts=0x%x\n",
+                      dbg_cnt++, cmd, ql_mbox_get(s, 1), sts);
+    }
 }
 
 static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
@@ -197,9 +250,10 @@ static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
     if (size == 2) {
         switch (off & ~1) {
         case QL_BUS_ID_LOW:
-            return QLISP_VENDOR;
-        case QL_BUS_ID_HIGH:
+            /* byte-lane swapped: mem 0x00 is the device id, 0x02 the vendor */
             return QLISP_DEVICE;
+        case QL_BUS_ID_HIGH:
+            return QLISP_VENDOR;
         case QL_BUS_SEMA:
             /* RISC owns the semaphore while a mailbox reply is unacked. */
             return s->cmd_pending ? BUS_SEMA_LOCK : ql_reg_get(s, off);

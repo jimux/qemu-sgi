@@ -717,16 +717,32 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
             if (dev == BRIDGE_SCSI0_ID || dev == BRIDGE_SCSI1_ID) {
                 SGIQLispState *isp = &s->isp[dev];
 
+                /*
+                 * The ISP register file is 16-bit big-endian with a byte-lane
+                 * swap, so a config dword reads back halves swapped: a 16-bit
+                 * access at cfg 0x00 returns the *device* id and one at 0x02
+                 * the *vendor* id. ql_init_board reads vendor from struct
+                 * offset 2 and device from offset 0, so mirror that here.
+                 */
                 switch (cfg) {
                 case 0x00:
-                    /* ISP1020 vendor/device (mbus_id_low=0x1077, high=0x1020) */
-                    val = (QLISP_DEVICE << 16) | QLISP_VENDOR;
+                    val = (size == 2) ? QLISP_DEVICE
+                                      : ((QLISP_DEVICE << 16) | QLISP_VENDOR);
+                    break;
+                case 0x02:
+                    val = QLISP_VENDOR;
                     break;
                 case 0x04:
                     val = isp->pci_cmd;
                     break;
+                case 0x06:
+                    val = 0; /* status */
+                    break;
                 case 0x08:
                     val = (QLISP_CLASS << 8) | isp->pci_rev;
+                    break;
+                case 0x0c:
+                    val = 0; /* header type 0, single function */
                     break;
                 case 0x10:
                     val = isp->pci_bar[0];
