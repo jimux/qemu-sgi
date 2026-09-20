@@ -3289,7 +3289,7 @@ static const Property scsi_hd_properties[] = {
 
 static const VMStateDescription vmstate_scsi_disk_state = {
     .name = "scsi-disk",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_SCSI_DEVICE(qdev, SCSIDiskState),
@@ -3298,6 +3298,14 @@ static const VMStateDescription vmstate_scsi_disk_state = {
         VMSTATE_BOOL(eject_request, SCSIDiskState),
         VMSTATE_BOOL(tray_open, SCSIDiskState),
         VMSTATE_BOOL(tray_locked, SCSIDiskState),
+        /*
+         * Derived geometry cache.  Without these a qcow2/internal snapshot
+         * restores max_lba=0 and the guest's first post-mount READ (LBA>0)
+         * is rejected as LBA-out-of-range.  Migrate them so snapshots and
+         * live migration keep the device usable.
+         */
+        VMSTATE_INT32_V(qdev.blocksize, SCSIDiskState, 2),
+        VMSTATE_UINT64_V(qdev.max_lba, SCSIDiskState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
