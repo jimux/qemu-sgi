@@ -773,9 +773,6 @@ static void hpc1_nvram_init_defaults(SGIHPC1State *s)
     memset(t, 0, sizeof(t));
     t[1] = 6;                    /* NV_CURRENT_REV */
     t[2] = 'd';                  /* console = serial */
-    memcpy(&t[4], "scsi(0)disk(4)rdisk(0)partition(8)", 32);  /* SystemPartition: CD */
-    memcpy(&t[52], "sashARCS", 8);   /* OSLoader */
-    memcpy(&t[130], "scsi(0)disk(4)rdisk(0)partition(8)", 32); /* OSLoadPartition */
     memcpy(&t[116], "9600", 4);  /* dbaud */
     memcpy(&t[128], "PST8PDT", 7); /* timezone */
     t[121] = '0';                /* diskless */
