@@ -345,6 +345,53 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
   ip27_flash_protect = MIN((uint64_t)IP27_FLASH_SIZE, code_size);
 
   /*
+   * Synthesize the flash-resident IP27CONFIG record.  It is embedded in the
+   * running image (start.s XLEAF(ip27config)) at offset 0x60 and is zero in
+   * the built image; the firmware reads it (magic + freq_cpu/freq_hub/
+   * freq_rtc) and uses check_sum_adj to keep the image checksum 0 after the
+   * overlay.  ip27config_t offsets: time_const@0, r10k_mode@4, magic@8,
+   * freq_cpu@16, freq_hub@24, freq_rtc@32, ecc_enable@40, fprom_cyc@44,
+   * mach_type@48, check_sum_adj@52 (all from base 0x60).
+   */
+#define IP27_CONFIG_MAGIC    0x69703237636f6e66ULL /* CONFIG_MAGIC */
+#define IP27_CONFIG_FREQ_CPU 200000000ULL
+#define IP27_CONFIG_FREQ_HUB 100000000ULL
+#define IP27_CONFIG_FREQ_RTC 1250ULL
+  {
+    uint8_t *c = flash_dst + 0x60;
+    uint8_t *adj = flash_dst + 0x60 + 0x34; /* check_sum_adj */
+    uint8_t old_adj = *adj;
+    uint8_t old_sum = 0, new_sum = 0;
+    uint64_t d;
+    int i;
+
+    for (i = 0; i < 0x34; i++) {
+      old_sum += c[i];
+    }
+    d = IP27_CONFIG_MAGIC;
+    for (i = 0; i < 8; i++) {
+      c[0x08 + i] = (d >> ((7 - i) * 8)) & 0xff;
+    }
+    d = IP27_CONFIG_FREQ_CPU;
+    for (i = 0; i < 8; i++) {
+      c[0x10 + i] = (d >> ((7 - i) * 8)) & 0xff;
+    }
+    d = IP27_CONFIG_FREQ_HUB;
+    for (i = 0; i < 8; i++) {
+      c[0x18 + i] = (d >> ((7 - i) * 8)) & 0xff;
+    }
+    d = IP27_CONFIG_FREQ_RTC;
+    for (i = 0; i < 8; i++) {
+      c[0x20 + i] = (d >> ((7 - i) * 8)) & 0xff;
+    }
+    for (i = 0; i < 0x34; i++) {
+      new_sum += c[i];
+    }
+    /* Keep the image's byte sum unchanged: adj += old_sum - new_sum. */
+    *adj = (uint8_t)(old_adj + old_sum - new_sum);
+  }
+
+  /*
    * Pre-initialise the PROM log (factory state) in the top two 64 KiB
    * sectors.  The PROM/BASEIO monitor refuses to assign a module id until a
    * valid log exists, and its own initlog path is not run automatically.
@@ -582,13 +629,7 @@ static void sgi_ip27_init(MachineState *machine) {
   create_unimplemented_device("ip27-xio-high", ip27_phys(IP27_IO_BASE) + 0x9000000ULL,
                               0x100000000ULL - 0x9000000ULL);
 
-  /*
-   * Hub RBOOT window (HSPEC + 0x30000000): the PROM reads its reboot/status
-   * word there.  Model as zero-returning until a hub detail is needed.
-   */
-  create_unimplemented_device("ip27-rboot",
-                              ip27_phys(IP27_HSPEC_BASE + 0x30000000ULL),
-                              0x10000000ULL);
+  /* Hub RBOOT window is aliased onto the boot flash after it is created. */
 
   /*
    * Hub back-door space (HSPEC + 0x80000000: BDDIR/BDPRT/BDECC directory,
@@ -650,6 +691,20 @@ static void sgi_ip27_init(MachineState *machine) {
                         8 * IP27_FLASH_SIZE);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_LBOOT_PHYS),
                               flash);
+
+  /*
+   * RBOOT is a per-node HSPEC alias of the same boot flash; the firmware
+   * reads IP27CONFIG via IP27CONFIG_ADDR_NODE = RBOOT+0x60.  Alias the flash
+   * into the RBOOT window so the synthesized config is visible there too.
+   */
+  {
+    MemoryRegion *rboot = g_new(MemoryRegion, 1);
+    memory_region_init_alias(rboot, NULL, "sgi-ip27.rboot", flash, 0,
+                             8 * IP27_FLASH_SIZE);
+    memory_region_add_subregion(system_memory,
+                                ip27_phys(IP27_HSPEC_BASE + 0x30000000ULL),
+                                rboot);
+  }
 
   if (machine->firmware) {
     g_autofree char *filename =
