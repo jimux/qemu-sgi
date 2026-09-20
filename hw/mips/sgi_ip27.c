@@ -184,7 +184,10 @@ static uint8_t ip27_flash_byte(uint64_t off) {
       return 0xff;
     }
   }
-  return ip27_flash_mem[off];
+  if (off < IP27_FLASH_SIZE) {
+    return ip27_flash_mem[off];
+  }
+  return 0xff;
 }
 
 static uint64_t ip27_flash_read(void *opaque, hwaddr off, unsigned size) {
@@ -206,7 +209,6 @@ static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
    */
   uint64_t faddr = off / 8;
   uint8_t b = val & 0xff;
-  unsigned i;
 
   if (faddr == 0 && b == 0xf0) {         /* reset to read mode */
     ip27_flash_autoselect = 0;
@@ -244,7 +246,7 @@ static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
       ip27_flash_erase = 0;
       memset(ip27_flash_mem, 0xff, sizeof(ip27_flash_mem));
     } else if (b == 0x30) {
-      uint64_t sec = off & ~(uint64_t)0xffff; /* 64 KiB sector */
+      uint64_t sec = (off / 8) & ~(uint64_t)0xffff; /* 64 KiB sector */
       ip27_flash_erase = 0;
       if (sec + 0x10000 <= sizeof(ip27_flash_mem)) {
         memset(ip27_flash_mem + sec, 0xff, 0x10000);
@@ -253,10 +255,11 @@ static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
     return;
   }
   if (ip27_flash_program) {
-    /* Program: flash can only clear bits, so AND the data in. */
-    for (i = 0; i < size; i++) {
-      uint8_t nb = (val >> ((size - 1 - i) * 8)) & 0xff;
-      ip27_flash_mem[off + i] &= nb;
+    /* Program: the hub flash write address is the offset * 8, and only the
+     * LSByte is used.  Flash can only clear bits, so AND the data in. */
+    uint64_t fidx = off / 8;
+    if (fidx < IP27_FLASH_SIZE) {
+      ip27_flash_mem[fidx] &= (val & 0xff);
     }
     ip27_flash_program = 0;
     return;
@@ -340,7 +343,7 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
     lg[0x10] = 0x50; lg[0x11] = 0x4c; lg[0x12] = 0x4f; lg[0x13] = 0x47;
     lg[0x14] = 0; lg[0x15] = 0; lg[0x16] = 0; lg[0x17] = 1;
     lg[0x18] = 0; lg[0x19] = 0; lg[0x1a] = 0; lg[0x1b] = 1;
-    lg[0x100] = 0xe0; lg[0x101] = 0; lg[0x102] = 0; lg[0x103] = 0;
+    /* Entry area left 0xff (erased); promlog appends into erased space. */
   }
 
   qemu_log_mask(LOG_GUEST_ERROR,
@@ -629,7 +632,7 @@ static void sgi_ip27_init(MachineState *machine) {
   /* Boot flash in the LBOOT window (identity + the container image). */
   flash = g_new(MemoryRegion, 1);
   memory_region_init_io(flash, NULL, &ip27_flash_ops, NULL, "sgi-ip27.flash",
-                        IP27_FLASH_SIZE);
+                        8 * IP27_FLASH_SIZE);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_LBOOT_PHYS),
                               flash);
 
