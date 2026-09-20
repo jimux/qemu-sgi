@@ -444,43 +444,59 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
 #define IP27_BDDIR_UPPER_MASK (0xfffffULL << 10)
 
 static uint8_t *ip27_bdoor_dir;
+static uint8_t *ip27_bdecc_dir;
 static uint64_t ip27_bdoor_bank0_size;
 
 /*
- * Decode a back-door directory/protection access to a storage index.
+ * Select the back-door storage for an access and its byte index, or NULL if
+ * the location is unpopulated.
  *
- * The BDPRT/BDDIR address encodes the physical address as pa>>2 in
- * BDDIR_UPPER_MASK (addrs.h BDPRT_ENTRY / BDPRT_TO_MEM), so idx == pa>>2.
- * Back ONLY bank 0's real RAM extent: above it the directory entry is
- * unpopulated, so bd_type() reads its test pattern back unstable (-1) and
- * size_back_door() stops at the true size.  If instead the whole 512 MB bank
- * slot aliased (MD_BANK_SHFT=29), the probe would size bank 0 as 512 MB and
- * memory_init_all() would test unbacked space past 256 MB -> Data Bus Err ->
- * "No useable RAM installed".  Banks 1..7 (pa >= 512 MB) lie outside the
- * window and are likewise unpopulated.
+ * The back door is three distinct address spaces (sys/SN/addrs.h):
+ *   - BDECC  at HSPEC + NODE_ADDRSPACE_SIZE/2 (our BDOOR base, offset 0);
+ *            BDECC_ENTRY = pa>>2 & BDECC_UPPER_MASK | pa>>3 & 3
+ *   - BDDIR  at HSPEC + NODE_ADDRSPACE_SIZE*3/4, is-dir bit 0x200 set,
+ *            LO/HI entries 8 bytes apart
+ *   - BDPRT  same base, is-dir bit clear, region in bits [4:3]
+ * They must not share storage: the memory test's ECC/enable state lives in
+ * BDECC, and folding it into the directory array makes the test miscompare.
+ *
+ * Within each space the entry index is a function of pa with pa>>2 in
+ * BDDIR_UPPER_MASK, i.e. idx == pa>>2 (addrs.h BDPRT_ENTRY/BDPRT_TO_MEM).
+ * Only bank 0's real RAM extent is populated, so size_back_door() stops at the
+ * true size instead of sizing bank 0 to the whole 512 MB slot.
  */
-static bool ip27_bdoor_decode(hwaddr off, uint64_t *store_idx) {
-  const uint64_t base = IP27_BDDIR_PHYS - IP27_BDOOR_PHYS;
-  uint64_t idx;
+static uint8_t *ip27_bdoor_sel(hwaddr off, uint64_t *idx) {
+  const uint64_t dirbase = IP27_BDDIR_PHYS - IP27_BDOOR_PHYS; /* BDDIR/BDPRT */
+  uint64_t mask = (ip27_bdoor_bank0_size >> 2) - 1;
 
-  if (off < base || off >= base + IP27_BDDIR_WINSZ) {
-    return false; /* BDECC and other: unpopulated for now */
+  if (off >= dirbase && off < dirbase + IP27_BDDIR_WINSZ) {
+    /*
+     * The array aliases within bank 0 with period = bank size, so the entry
+     * for pa == bank0_size maps onto the entry for pa == 0.  That is what
+     * size_back_door's bd_alias() needs to settle on the true size (rather
+     * than the whole 512 MB slot), and it also lets the memory test write and
+     * read back a pattern at the bank boundary (pa = 256 MB).
+     */
+    *idx = (off - dirbase) & mask;
+    return ip27_bdoor_dir;
   }
-  idx = off - base; /* == pa>>2 (BDDIR_UPPER_MASK encodes pa>>2) */
-  if (idx >= (ip27_bdoor_bank0_size >> 2)) {
-    return false; /* above bank 0's real extent: unpopulated */
+  /* BDECC (ECC byte array), likewise aliased within bank 0. */
+  if (off < IP27_BDDIR_STORE) {
+    *idx = off & mask;
+    return ip27_bdecc_dir;
   }
-  *store_idx = idx;
-  return true;
+  return NULL;
 }
 
 static uint64_t ip27_bdoor_read(void *opaque, hwaddr off, unsigned size) {
+  uint8_t *arr;
   uint64_t idx, v = 0;
   unsigned i;
 
-  if (ip27_bdoor_decode(off, &idx)) {
+  arr = ip27_bdoor_sel(off, &idx);
+  if (arr) {
     for (i = 0; i < size; i++) {
-      v = (v << 8) | ip27_bdoor_dir[idx + i];
+      v = (v << 8) | arr[idx + i];
     }
   }
   return v;
@@ -488,12 +504,14 @@ static uint64_t ip27_bdoor_read(void *opaque, hwaddr off, unsigned size) {
 
 static void ip27_bdoor_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size) {
+  uint8_t *arr;
   uint64_t idx;
   unsigned i;
 
-  if (ip27_bdoor_decode(off, &idx)) {
+  arr = ip27_bdoor_sel(off, &idx);
+  if (arr) {
     for (i = 0; i < size; i++) {
-      ip27_bdoor_dir[idx + size - 1 - i] = val & 0xff;
+      arr[idx + size - 1 - i] = val & 0xff;
       val >>= 8;
     }
   }
@@ -506,6 +524,8 @@ static const MemoryRegionOps ip27_bdoor_ops = {
   .valid = { .min_access_size = 1, .max_access_size = 8 },
   .impl = { .min_access_size = 1, .max_access_size = 8 },
 };
+
+#define IP27_BANK_SIZE 0x20000000ULL /* MD_BANK_SHFT=29: 512 MB per bank slot */
 
 static void sgi_ip27_init(MachineState *machine) {
   Clock *cpuclk;
@@ -561,9 +581,15 @@ static void sgi_ip27_init(MachineState *machine) {
   /* Node-local memory at physical 0, aliased uncached (UNCAC/MSPEC spaces). */
   memory_region_add_subregion(system_memory, 0, ram);
 
+  /*
+   * Node-local memory aliases.  The PROM's memory_init_all() tests configured
+   * banks at these addresses, so they must be backed up to the installed size.
+   * The back-door arrays (BDDIR/BDPRT/BDECC) carry the aliasing that makes the
+   * size probe settle on the bank size; the RAM windows themselves are linear.
+   */
   ram_uncac = g_new(MemoryRegion, 1);
-  memory_region_init_alias(ram_uncac, NULL, "sgi-ip27.ram.uncac", ram,
-                           0, machine->ram_size);
+  memory_region_init_alias(ram_uncac, NULL, "sgi-ip27.ram.uncac", ram, 0,
+                           machine->ram_size);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_UNCAC_BASE),
                               ram_uncac);
   create_unimplemented_device("ip27-uncac-high",
@@ -589,14 +615,6 @@ static void sgi_ip27_init(MachineState *machine) {
                            machine->ram_size);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_CAC_BASE),
                               ram_cac);
-  /*
-   * Do NOT back the CAC space above the installed size: the PROM's 256 MB
-   * bank "hole" probe (memory_init_all, memory.c:468+) deliberately touches
-   * [bank_end, bank_end+64MB] and [bank_end+128MB, +64MB] and expects those
-   * accesses to FAULT (it installs a fault handler).  Leaving the range
-   * unassigned makes QEMU raise the bus error the probe relies on; a
-   * zero-returning region would instead be read back as a miscompare.
-   */
 
 
   /* Hub ASIC in the node's widget-1 small window. */
@@ -647,6 +665,7 @@ static void sgi_ip27_init(MachineState *machine) {
   {
     MemoryRegion *bdoor = g_new(MemoryRegion, 1);
     ip27_bdoor_dir = g_malloc0(IP27_BDDIR_STORE);
+    ip27_bdecc_dir = g_malloc0(IP27_BDDIR_STORE);
     ip27_bdoor_bank0_size = MIN(machine->ram_size, (uint64_t)0x20000000);
     memory_region_init_io(bdoor, NULL, &ip27_bdoor_ops, NULL,
                           "sgi-ip27.bdoor", 0x80000000ULL);
