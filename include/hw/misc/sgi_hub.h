@@ -74,6 +74,15 @@ struct SGIHubState {
   uint64_t md_led0;
   /* MD performance-monitor event selector (0x210000). */
   uint64_t md_perf_sel;
+  /*
+   * MD_PERF_CNT0..5 (0x210010..0x210038).  With MD_PERF_SEL=0 these are not
+   * counting, and the PROM deliberately clears them at startup "so they can
+   * be used as scratch registers that are initialized to 0" (main.c).  It
+   * uses CNT0 as HUB_LOCK_REG, CNT1 as the memory-test disable mask, and
+   * CNT2..5 as a pass counter -- all read-modify-write, so they must read
+   * back what was written.
+   */
+  uint64_t md_perf_cnt[6];
 
   /* NI: identity / scratch. */
   uint64_t ni_scratch[2];

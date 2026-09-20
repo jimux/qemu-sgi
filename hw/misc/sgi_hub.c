@@ -596,15 +596,17 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
     return s->md_led0 & 0xff;
   }
   /*
-   * Performance counters (MD_PERF_CNT0..5): the PROM reads them for timing.
-   * Return a value that advances with the virtual clock (they would otherwise
-   * read 0 and any wait/measurement loop on them would never progress).
+   * Performance counters (MD_PERF_CNT0..5): with MD_PERF_SEL=0 they are not
+   * counting, and the PROM uses them as read-modify-write scratch (hub lock
+   * register, memory-test disable mask, pass counter).  Hold the last value
+   * written; do not free-run, or the lock/disable bits it stores change under
+   * it.
    */
   if (off == MD_PERF_SEL) {
     return s->md_perf_sel;
   }
   if (off >= MD_PERF_CNT0 && off <= MD_PERF_CNT5 && ((off - MD_PERF_CNT0) % 8) == 0) {
-    return (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+    return s->md_perf_cnt[(off - MD_PERF_CNT0) / 8];
   }
   if (off == MD_MLAN_CTL) {
     /* DONE (bit1) always set; RD_DATA (bit0) is the latched 1-wire line. */
@@ -643,8 +645,9 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
     s->md_perf_sel = val;
     return;
   }
-  if (off >= MD_PERF_CNT0 && off <= MD_PERF_CNT5) {
-    return; /* counters are read-only free-running */
+  if (off >= MD_PERF_CNT0 && off <= MD_PERF_CNT5 && ((off - MD_PERF_CNT0) % 8) == 0) {
+    s->md_perf_cnt[(off - MD_PERF_CNT0) / 8] = val;
+    return;
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
       (off >= MD_UREG1_0 && off <= MD_UREG1_15)) {
@@ -989,6 +992,11 @@ static void sgi_hub_reset(DeviceState *dev) {
   s->cc_mask = 0;
   s->region_present = 1;
   s->calias_size = 0;
+
+  s->md_perf_sel = 0;
+  for (i = 0; i < 6; i++) {
+    s->md_perf_cnt[i] = 0;
+  }
 
   s->cpu_present[0] = 1;
   s->cpu_enable[0] = 1;
