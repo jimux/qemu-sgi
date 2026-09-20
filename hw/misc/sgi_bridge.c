@@ -1114,6 +1114,9 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
     for (i = 0; i < 2; i++) {
         object_property_set_uint(OBJECT(&s->isp[i]), "scsi-bus-num", i,
                                  &error_abort);
+        /* IP30's ARCS ql.c munges control entries; IP27's does not. */
+        object_property_set_bool(OBJECT(&s->isp[i]), "control-munge", true,
+                                 &error_abort);
         if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
             return;
         }
