@@ -86,6 +86,7 @@
 
 /* MD_MEMORY_CONFIG bank size codes (hubmd.h MD_SIZE_*). */
 #define IP27_MD_SIZE_8MB 1
+#define IP27_MD_SIZE_32MB 3
 #define IP27_MD_SIZE_1GB 8
 
 static uint64_t ip27_phys(uint64_t va) { return va & IP27_PAMASK; }
@@ -131,14 +132,14 @@ static uint64_t sgi_ip27_mem_config(uint64_t ram_size) {
   uint64_t cfg = 0;
   int bank = 0;
 
+  /*
+   * Use 32 MB banks (MD_SIZE_32MB = code 3): a single >32 MB bank risks the
+   * PROM's 256 MB-dimm path, and 32 MB is the SN0 minimum.  mdir_config()
+   * will overwrite this from the back-door probe anyway.
+   */
   while (ram_size && bank < 8) {
-    int code = IP27_MD_SIZE_8MB; /* 8 MB */
-    while (code < IP27_MD_SIZE_1GB &&
-           (0x800000ULL << (code - IP27_MD_SIZE_8MB)) * 2 <= ram_size) {
-      code++;
-    }
-    cfg |= (uint64_t)code << (bank * 3);
-    ram_size -= 0x800000ULL << (code - IP27_MD_SIZE_8MB);
+    cfg |= (uint64_t)IP27_MD_SIZE_32MB << (bank * 3);
+    ram_size -= (ram_size >= 0x2000000ULL) ? 0x2000000ULL : ram_size;
     bank++;
   }
   return cfg;
@@ -284,8 +285,14 @@ static bool ip27_bdoor_decode(hwaddr off, uint64_t *store_idx) {
   }
   idx = off - base;
   pa = (idx & IP27_BDDIR_UPPER_MASK) << 2;
-  bank = pa >> 29; /* MD_BANK_SHFT */
-  bank_size = (bank == 0) ? ip27_bdoor_bank0_size : 0;
+  bank = pa >> 29; /* MD_BANK_SHFT: 512 MB per bank slot */
+  /*
+   * Model the node as eight 32 MB banks (a 256 MB node).  A single 256 MB
+   * bank is not a valid IP27 configuration: memory_init_all() would take its
+   * 256 MB-dimm "hole" path and disable it.  The probe (size_back_door) then
+   * reports MD_SIZE_32MB for each of banks 0..7 and EMPTY above.
+   */
+  bank_size = (bank < 8) ? 0x2000000ULL : 0;
   if (bank_size == 0) {
     return false;
   }
@@ -408,9 +415,14 @@ static void sgi_ip27_init(MachineState *machine) {
                            machine->ram_size);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_CAC_BASE),
                               ram_cac);
-  create_unimplemented_device("ip27-cac-high",
-                              ip27_phys(IP27_CAC_BASE) + machine->ram_size,
-                              IP27_NODE_SIZE - machine->ram_size);
+  /*
+   * Do NOT back the CAC space above the installed size: the PROM's 256 MB
+   * bank "hole" probe (memory_init_all, memory.c:468+) deliberately touches
+   * [bank_end, bank_end+64MB] and [bank_end+128MB, +64MB] and expects those
+   * accesses to FAULT (it installs a fault handler).  Leaving the range
+   * unassigned makes QEMU raise the bus error the probe relies on; a
+   * zero-returning region would instead be read back as a miscompare.
+   */
 
 
   /* Hub ASIC in the node's widget-1 small window. */
