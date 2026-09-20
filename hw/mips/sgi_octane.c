@@ -171,6 +171,7 @@ static void sgi_octane_init(MachineState *machine)
 
     /* BRIDGE (widget 0xF) at 0x1F000000, 12MB covering PCI/IOC3/devio. */
     bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
+    qemu_configure_nic_device(bridge_dev, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bridge_dev), 0, OCTANE_BRIDGE_BASE);
 

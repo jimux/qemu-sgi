@@ -20,12 +20,48 @@
 
 #include "hw/char/serial.h"
 #include "hw/core/sysbus.h"
+#include "net/net.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_BRIDGE "sgi-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIBRIDGEState, SGI_BRIDGE)
 
 #define BRIDGE_NUM_REGS 0x1000
+
+/*
+ * IOC3 Ethernet MAC register block, IOC3 offset 0x0F0 (BRIDGE+0x6000F0).
+ * 25 words: EMCR..MIDR_W. See IRIX sys/PCI/ioc3.h ioc3_eregs_t.
+ */
+#define SGI_BRIDGE_ETH_OFF    0x6000F0
+#define SGI_BRIDGE_ETH_NREGS  25
+#define SGI_BRIDGE_ETH_SIZE   (SGI_BRIDGE_ETH_NREGS * 4)
+
+/* Register word indices (from IOC3 offset 0x0F0). */
+#define IOC3_EMCR   0
+#define IOC3_EISR   1
+#define IOC3_EIER   2
+#define IOC3_ERCSR  3
+#define IOC3_ERBR_H 4
+#define IOC3_ERBR_L 5
+#define IOC3_ERBAR  6
+#define IOC3_ERCIR  7
+#define IOC3_ERPIR  8
+#define IOC3_ERTR   9
+#define IOC3_ETCSR  10
+#define IOC3_ERSR   11
+#define IOC3_ETCDC  12
+#define IOC3_EBIR   13
+#define IOC3_ETBR_H 14
+#define IOC3_ETBR_L 15
+#define IOC3_ETCIR  16
+#define IOC3_ETPIR  17
+#define IOC3_EMAR_H 18
+#define IOC3_EMAR_L 19
+#define IOC3_EHAR_H 20
+#define IOC3_EHAR_L 21
+#define IOC3_MICR   22
+#define IOC3_MIDR_R 23
+#define IOC3_MIDR_W 24
 
 /* DS2502-family 1-wire device state (bridge board EEPROM, IOC3 MAC EEPROM). */
 typedef struct SGIDS {
@@ -105,6 +141,17 @@ struct SGIBRIDGEState {
     SerialState ioc3_uart;
     MemoryRegion ioc3_uart_mr;
     MemoryRegion ioc3_uart_mr2;
+
+    /*
+     * IOC3 Ethernet MAC (10/100 Fast Ethernet) register file plus the
+     * RX/TX DMA engines. The ring base addresses live in ERBR/ETBR and
+     * the descriptor rings themselves are in guest RAM, reached with DMA.
+     */
+    NICConf nic_conf;
+    NICState *nic;
+    uint32_t eth_regs[SGI_BRIDGE_ETH_NREGS];
+    uint32_t eth_rxprod;  /* hardware RX produce, byte offset into the ring */
+    uint32_t eth_txcons;  /* hardware TX consume, byte offset into the ring */
 };
 
 #endif /* HW_MISC_SGI_BRIDGE_H */

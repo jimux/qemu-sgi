@@ -42,6 +42,9 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "chardev/char.h"
+#include "net/net.h"
+#include "system/address-spaces.h"
+#include "system/dma.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 
@@ -411,6 +414,184 @@ static void sgi_bridge_ds_line_write(SGIDS *ds, uint64_t val)
     }
 }
 
+/*
+ * IOC3 Ethernet (10/100 MAC) register and DMA model.
+ *
+ * The ring layouts are those of the ARCS standalone `ef` driver
+ * (references/stand/arcs/lib/libsk/net/if_ef.c):
+ *   - TX ring: NTXD 128- or 512-byte-offset descriptors of 128 bytes
+ *     (cmd, bufcnt, p1, p2, then 104 bytes of inline data). ETPIR/ETCIR
+ *     are byte offsets into the ring (index * TXDSZ).
+ *   - RX ring: 512 entries of 8 bytes, each the IO address of an
+ *     `efrxbuf` (ioc3_erxbuf { w0, err } followed by the frame at
+ *     EMCR.RXOFF halfwords). ERPIR is a byte offset (index * 8).
+ */
+#define IOC3_EMCR_DUPLEX    0x00000001
+#define IOC3_EMCR_PROMISC   0x00000002
+#define IOC3_EMCR_PADEN     0x00000004
+#define IOC3_EMCR_RXOFF_MASK 0x000001f8
+#define IOC3_EMCR_RXOFF_SHIFT 3
+#define IOC3_EMCR_TXDMAEN   0x00002000
+#define IOC3_EMCR_TXEN      0x00004000
+#define IOC3_EMCR_RXDMAEN   0x00008000
+#define IOC3_EMCR_RXEN      0x00010000
+#define IOC3_EMCR_LOOPBACK  0x00020000
+#define IOC3_EMCR_ARB_DIAG_IDLE 0x00200000
+#define IOC3_EMCR_RST       0x80000000
+
+#define IOC3_EISR_RXTIMERINT 0x00000001
+#define IOC3_EISR_RXTHRESHINT 0x00000002
+#define IOC3_EISR_TXEMPTY    0x00010000
+
+#define IOC3_ETXD_D0V       0x00010000
+#define IOC3_ETXD_B1V       0x00020000
+#define IOC3_ETXD_B2V       0x00040000
+
+#define IOC3_ETBR_L_RINGSZ_MASK 0x00000001
+#define IOC3_ETBR_L_TXRINGBASE_MASK 0xffffc000
+#define IOC3_ETPIR_TXPRODUCE_MASK 0x0000ffff
+
+#define IOC3_ERXBUF_V           0x80000000
+#define IOC3_ERXBUF_BYTECNT_SHIFT 16
+#define IOC3_ERXBUF_GOODPKT     0x40000000
+#define IOC3_ERXBUF_LONGEVENT   0x10000000
+#define IOC3_ERXBUF_BROADCAST   0x08000000
+#define IOC3_ERXBUF_MULTICAST   0x04000000
+
+#define IOC3_RXDSZ 8
+#define IOC3_NRXD  512
+#define IOC3_TXDSZ 128
+#define IOC3_RX_RING_BYTES (IOC3_NRXD * IOC3_RXDSZ)
+
+static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
+                                   size_t len)
+{
+    uint32_t emcr = s->eth_regs[IOC3_EMCR];
+    uint32_t rxoff = ((emcr & IOC3_EMCR_RXOFF_MASK) >> IOC3_EMCR_RXOFF_SHIFT) * 2;
+    uint64_t erbr = ((uint64_t)s->eth_regs[IOC3_ERBR_H] << 32) |
+                    s->eth_regs[IOC3_ERBR_L];
+    uint64_t slot;
+    uint32_t w0, err;
+    uint8_t frame[2048];
+
+    if (!(emcr & IOC3_EMCR_RXEN) || len > sizeof(frame)) {
+        return;
+    }
+
+    if (dma_memory_read(&address_space_memory,
+                        erbr + s->eth_rxprod, &slot, sizeof(slot),
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+        slot == 0) {
+        return;
+    }
+
+    w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
+    err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
+    if (len >= 6 && (buf[0] & 1)) {
+        err |= IOC3_ERXBUF_MULTICAST;
+        if (buf[0] == 0xff && buf[1] == 0xff && buf[2] == 0xff &&
+            buf[3] == 0xff && buf[4] == 0xff && buf[5] == 0xff) {
+            err |= IOC3_ERXBUF_BROADCAST;
+        }
+    }
+
+    memcpy(frame, buf, len);
+    stl_p(&w0, cpu_to_be32(w0));
+    stl_p(&err, cpu_to_be32(err));
+
+    dma_memory_write(&address_space_memory, slot, &w0, 4,
+                     MEMTXATTRS_UNSPECIFIED);
+    dma_memory_write(&address_space_memory, slot + 4, &err, 4,
+                     MEMTXATTRS_UNSPECIFIED);
+    dma_memory_write(&address_space_memory, slot + rxoff, frame, len,
+                     MEMTXATTRS_UNSPECIFIED);
+
+    s->eth_rxprod = (s->eth_rxprod + IOC3_RXDSZ) % IOC3_RX_RING_BYTES;
+    s->eth_regs[IOC3_ERPIR] = s->eth_rxprod;
+    s->eth_regs[IOC3_EISR] |= IOC3_EISR_RXTHRESHINT;
+}
+
+static void sgi_bridge_eth_tx_drain(SGIBRIDGEState *s)
+{
+    uint32_t etpir = s->eth_regs[IOC3_ETPIR] & IOC3_ETPIR_TXPRODUCE_MASK;
+    uint32_t etbr_l = s->eth_regs[IOC3_ETBR_L];
+    uint64_t base = ((uint64_t)s->eth_regs[IOC3_ETBR_H] << 32) |
+                    (etbr_l & IOC3_ETBR_L_TXRINGBASE_MASK);
+    int ntxd = (etbr_l & IOC3_ETBR_L_RINGSZ_MASK) ? 512 : 128;
+    uint32_t ring_bytes = ntxd * IOC3_TXDSZ;
+    uint32_t emcr = s->eth_regs[IOC3_EMCR];
+
+    while (s->eth_txcons != etpir) {
+        uint8_t desc[IOC3_TXDSZ];
+        uint32_t cmd, bufcnt, d0cnt, b1cnt, b2cnt;
+        uint64_t p1, p2;
+        uint8_t frame[2048];
+        size_t flen = 0;
+
+        if (dma_memory_read(&address_space_memory, base + s->eth_txcons,
+                            desc, sizeof(desc),
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            break;
+        }
+        cmd = ldl_be_p(desc);
+        bufcnt = ldl_be_p(desc + 4);
+        p1 = ldq_be_p(desc + 8);
+        p2 = ldq_be_p(desc + 16);
+        d0cnt = bufcnt & 0x7f;
+        b1cnt = (bufcnt >> 8) & 0x7ff;
+        b2cnt = (bufcnt >> 20) & 0x7ff;
+
+        if ((cmd & IOC3_ETXD_D0V) && d0cnt <= sizeof(frame)) {
+            memcpy(frame, desc + 24, d0cnt);
+            flen = d0cnt;
+        }
+        if ((cmd & IOC3_ETXD_B1V) && flen + b1cnt <= sizeof(frame)) {
+            dma_memory_read(&address_space_memory, p1, frame + flen, b1cnt,
+                            MEMTXATTRS_UNSPECIFIED);
+            flen += b1cnt;
+        }
+        if ((cmd & IOC3_ETXD_B2V) && flen + b2cnt <= sizeof(frame)) {
+            dma_memory_read(&address_space_memory, p2, frame + flen, b2cnt,
+                            MEMTXATTRS_UNSPECIFIED);
+            flen += b2cnt;
+        }
+
+        if (emcr & IOC3_EMCR_LOOPBACK) {
+            sgi_bridge_eth_deliver(s, frame, flen);
+        } else if (s->nic && flen > 0) {
+            qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
+        }
+
+        s->eth_txcons = (s->eth_txcons + IOC3_TXDSZ) % ring_bytes;
+    }
+
+    s->eth_regs[IOC3_ETCIR] = s->eth_txcons;
+    s->eth_regs[IOC3_EISR] |= IOC3_EISR_TXEMPTY;
+}
+
+static bool sgi_bridge_eth_can_receive(NetClientState *nc)
+{
+    SGIBRIDGEState *s = qemu_get_nic_opaque(nc);
+
+    return s->eth_regs[IOC3_EMCR] & IOC3_EMCR_RXEN;
+}
+
+static ssize_t sgi_bridge_eth_receive(NetClientState *nc, const uint8_t *buf,
+                                      size_t size)
+{
+    SGIBRIDGEState *s = qemu_get_nic_opaque(nc);
+
+    sgi_bridge_eth_deliver(s, buf, size);
+    return size;
+}
+
+static NetClientInfo net_sgi_bridge_eth_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = sgi_bridge_eth_can_receive,
+    .receive = sgi_bridge_eth_receive,
+};
+
 static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIBRIDGEState *s = opaque;
@@ -502,6 +683,15 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         } else if (offset == 0x600030) {
             /* IOC3 MCR: 1-wire line to the MAC-address EEPROM. */
             val = sgi_bridge_ds_line_read(&s->ioc3_ds);
+        } else if (offset >= SGI_BRIDGE_ETH_OFF &&
+                   offset < SGI_BRIDGE_ETH_OFF + SGI_BRIDGE_ETH_SIZE) {
+            unsigned idx = (offset - SGI_BRIDGE_ETH_OFF) >> 2;
+
+            val = s->eth_regs[idx];
+            if (idx == IOC3_EMCR) {
+                /* The driver spins on ARB_DIAG_IDLE after asserting RST. */
+                val |= IOC3_EMCR_ARB_DIAG_IDLE;
+            }
         } else {
             val = s->ioc3_regs[(offset - 0x600000) >> 2];
         }
@@ -579,8 +769,29 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             /* IOC3 MCR: 1-wire line to the MAC-address EEPROM. */
             sgi_bridge_ds_line_write(&s->ioc3_ds, val);
         } else if (offset != 0x600028) {
-            /* SIO_CR bit 22 is a live status bit; store everything else. */
-            s->ioc3_regs[(offset - 0x600000) >> 2] = val;
+            if (offset >= SGI_BRIDGE_ETH_OFF &&
+                offset < SGI_BRIDGE_ETH_OFF + SGI_BRIDGE_ETH_SIZE) {
+                unsigned idx = (offset - SGI_BRIDGE_ETH_OFF) >> 2;
+
+                if (idx == IOC3_EMCR) {
+                    /* RST and the idle status bit are handled, not stored. */
+                    s->eth_regs[idx] = val & ~(IOC3_EMCR_RST |
+                                               IOC3_EMCR_ARB_DIAG_IDLE);
+                    if (val & IOC3_EMCR_RST) {
+                        s->eth_rxprod = 0;
+                        s->eth_txcons = 0;
+                        memset(s->eth_regs, 0, sizeof(s->eth_regs));
+                    }
+                } else if (idx == IOC3_ETPIR) {
+                    s->eth_regs[idx] = val;
+                    sgi_bridge_eth_tx_drain(s);
+                } else {
+                    s->eth_regs[idx] = val;
+                }
+            } else {
+                /* SIO_CR bit 22 is a live status bit; store everything else. */
+                s->ioc3_regs[(offset - 0x600000) >> 2] = val;
+            }
         }
         break;
 
@@ -639,6 +850,9 @@ static void sgi_bridge_reset(DeviceState *dev)
     sgi_bridge_ds_mac_init(&s->ioc3_ds);
     sgi_bridge_ds_reset(&s->bridge_ds);
     sgi_bridge_ds_reset(&s->ioc3_ds);
+    memset(s->eth_regs, 0, sizeof(s->eth_regs));
+    s->eth_rxprod = 0;
+    s->eth_txcons = 0;
 }
 
 static void sgi_bridge_realize(DeviceState *dev, Error **errp)
@@ -684,6 +898,22 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
                           "ioc3-uart-a", 8);
     memory_region_add_subregion(&s->iomem, IOC3_UART_B_OFFSET,
                                 &s->ioc3_uart_mr2);
+
+    /*
+     * IOC3 Ethernet NIC. The machine claims the default -nic/-netdev backend
+     * (qemu_configure_nic_device) before realize; if none was given we still
+     * model the register file and DMA engines, just without a transport. The
+     * MAC address the driver programs into EMAR comes from the DS2502 EEPROM,
+     * not from the backend, so the two need not agree.
+     */
+    if (s->nic_conf.peers.ncs[0]) {
+        s->nic = qemu_new_nic(&net_sgi_bridge_eth_info, &s->nic_conf,
+                              object_get_typename(OBJECT(dev)), dev->id,
+                              &dev->mem_reentrancy_guard, s);
+        qemu_format_nic_info_str(qemu_get_queue(s->nic), s->nic_conf.macaddr.a);
+    } else {
+        s->nic = NULL;
+    }
 }
 
 static void sgi_bridge_instance_init(Object *obj)
@@ -692,11 +922,16 @@ static void sgi_bridge_instance_init(Object *obj)
     object_initialize_child(obj, "ioc3-uart", &s->ioc3_uart, TYPE_SERIAL);
 }
 
+static const Property sgi_bridge_properties[] = {
+    DEFINE_NIC_PROPERTIES(SGIBRIDGEState, nic_conf),
+};
+
 static void sgi_bridge_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = sgi_bridge_realize;
+    device_class_set_props(dc, sgi_bridge_properties);
     device_class_set_legacy_reset(dc, sgi_bridge_reset);
 }
 
