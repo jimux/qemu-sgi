@@ -232,6 +232,18 @@ static const SCSIBusInfo qlisp_scsi_info = {
 static void ql_process_requests(SGIQLispState *s)
 {
     uint32_t in;
+    static unsigned dbg;
+
+    if (dbg < 16) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-qlisp: process fw=%d cnt=%u base=0x%llx out=%u "
+                      "in=%u cur=%p\n",
+                      s->firmware_running, s->req.count,
+                      (unsigned long long)s->req.base, s->req.out,
+                      s->req.count ? ql_mbox_get(s, 4) % s->req.count : 0,
+                      (void *)s->cur_req);
+        dbg++;
+    }
 
     if (!s->firmware_running || s->cur_req || !s->req.count) {
         return;
@@ -561,6 +573,18 @@ static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
              * requests here (unless a mailbox command is in flight, whose
              * own poll also reads this register).
              */
+            {
+                static unsigned dbg_isr;
+                if (s->firmware_running && dbg_isr < 16) {
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-qlisp: rd bus_isr pending=%d fw=%d "
+                                  "cnt=%u out=%u mbox4=%u\n",
+                                  s->cmd_pending, s->firmware_running,
+                                  s->req.count, s->req.out,
+                                  ql_mbox_get(s, 4));
+                    dbg_isr++;
+                }
+            }
             if (!s->cmd_pending) {
                 ql_process_requests(s);
             }
