@@ -669,7 +669,14 @@ static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
   case NI_SCRATCH_REG0:
     return s->ni_scratch[0];
   case NI_SCRATCH_REG1:
-    return s->ni_scratch[1];
+    /*
+     * A single node is always NASID 0.  The PROM's discovery can leave the
+     * ADVERT_NASID field [15:0] as 1 (its port-0 self-probe makes
+     * nasid_assign() treat the node as back-to-back with itself), which then
+     * makes the PROM remap its window to a node-1 address.  Report the field
+     * as 0 so the node stays at NASID 0 (its true identity).
+     */
+    return s->ni_scratch[1] & ~0xffffULL;
   case NI_VECTOR:
   case NI_RETURN_VECTOR:
     return s->ni_vector;
