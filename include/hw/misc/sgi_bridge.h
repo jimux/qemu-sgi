@@ -40,6 +40,7 @@ typedef struct SGIDS {
     int search_phase;
     int addr;
     int extra;
+    int extra_bits; /* status/extra bits before read-memory data */
     uint8_t data_bit;
 } SGIDS;
 

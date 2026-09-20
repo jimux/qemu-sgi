@@ -215,6 +215,7 @@ static void sgi_bridge_ds_board_init(SGIDS *ds)
     ds->rom[5] = 0x05;
     ds->rom[6] = 0x06;
     ds->rom[7] = sgi_bridge_crc8(ds->rom, 7);
+    ds->extra_bits = 8; /* DS1982 returns a status byte before the data */
 }
 
 /*
@@ -257,6 +258,7 @@ done:;
     ds->rom[5] = 0x05;
     ds->rom[6] = 0x06;
     ds->rom[7] = sgi_bridge_crc8(ds->rom, 7);
+    ds->extra_bits = 0; /* nic_eaddr reads the record from byte 0 */
 }
 
 static void sgi_bridge_ds_reset(SGIDS *ds)
@@ -332,7 +334,7 @@ static void sgi_bridge_ds_write_bit(SGIDS *ds, int bit)
         if (++ds->in_bits == 16) {
             ds->state = 7;
             ds->out_index = 0;
-            ds->extra = (ds->rom[0] == 0x09) ? 8 : 0;
+            ds->extra = ds->extra_bits;
         }
         break;
     default:
