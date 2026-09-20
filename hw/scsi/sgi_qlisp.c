@@ -304,8 +304,19 @@ static void ql_process_requests(SGIQLispState *s)
         if (cdb_len == 0 || cdb_len > sizeof(cdb)) {
             cdb_len = sizeof(cdb);
         }
-        for (i = 0; i < cdb_len; i++) {
-            cdb[i] = raw[0x14 + i];   /* CDB is contiguous in the raw image */
+        /*
+         * The CDB is stored per-32-bit-word reversed in the entry (its words
+         * are byte-swapped independently of the control munge). Reading from
+         * the already-un-munged copy `e` and reversing each word recovers the
+         * natural CDB: for IP30 `e` is un-munged so this reproduces the raw
+         * bytes; for IP27 `e` is raw so this undoes the CDB's word reversal.
+         * The CDB field is 4-byte aligned, so reverse the whole 16-byte field
+         * and then take cdb_len (which may not be a multiple of 4).
+         */
+        memcpy(cdb, e + 0x14, sizeof(cdb));
+        ql_munge(cdb, sizeof(cdb));
+        if (cdb_len < sizeof(cdb)) {
+            memset(cdb + cdb_len, 0, sizeof(cdb) - cdb_len);
         }
         seg_cnt = ql_ld16(e + 0x10);
 
