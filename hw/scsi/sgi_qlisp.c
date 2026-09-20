@@ -12,10 +12,10 @@
 #include "hw/scsi/sgi_qlisp.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
-#include "system/address-spaces.h"
 #include "system/dma.h"
 #include "system/address-spaces.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
@@ -43,6 +43,266 @@ static uint16_t ql_mbox_get(SGIQLispState *s, int n)
 static void ql_mbox_put(SGIQLispState *s, int n, uint16_t v)
 {
     ql_reg_put(s, ql_mbox_off[n], v);
+}
+
+/*
+ * Command/status entries are byte-reversed per 32-bit word by the driver
+ * (munge(), ql.c) so the little-endian RISC reads them correctly.  Un-munge
+ * a copy to recover the host (big-endian) struct bytes; the CDB is byte-wise
+ * correct in the raw image.
+ */
+static void ql_munge(uint8_t *p, int n)
+{
+    int i;
+
+    for (i = 0; i + 4 <= n; i += 4) {
+        uint8_t t0 = p[i], t1 = p[i + 1];
+        p[i] = p[i + 3];
+        p[i + 1] = p[i + 2];
+        p[i + 2] = t1;
+        p[i + 3] = t0;
+    }
+}
+
+static uint32_t ql_ld32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+static uint16_t ql_ld16(const uint8_t *p)
+{
+    return (p[0] << 8) | p[1];
+}
+
+/* Bridge 32-bit direct-mapped DMA address -> host physical address. */
+static uint64_t ql_dma_to_phys(uint64_t a)
+{
+    return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
+}
+
+/* Read a 64-byte queue entry, returning the un-munged copy in `e`. */
+static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
+                         uint8_t *e)
+{
+    if (dma_memory_read(&address_space_memory, ql_dma_to_phys(addr), raw,
+                        QL_ENTRY_SIZE,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        return false;
+    }
+    memcpy(e, raw, QL_ENTRY_SIZE);
+    ql_munge(e, QL_ENTRY_SIZE);
+    return true;
+}
+
+/* base/count of dseg[i] from an un-munged command entry (A64 layout). */
+static void ql_get_dseg(const uint8_t *e, unsigned i, QLSG *sg)
+{
+    uint32_t lo = ql_ld32(e + 0x28 + i * 12);
+    uint32_t hi = ql_ld32(e + 0x2c + i * 12);
+
+    sg->addr = ((uint64_t)hi << 32) | lo;
+    sg->len = ql_ld32(e + 0x30 + i * 12);
+}
+
+static bool ql_sg_move(SGIQLispState *s, uint8_t *buf, uint32_t len,
+                       bool to_host)
+{
+    while (len) {
+        QLSG *g;
+        uint32_t n;
+
+        if (s->sg_idx >= s->nsg) {
+            return false;   /* guest SG exhausted */
+        }
+        g = &s->sg[s->sg_idx];
+        if (s->sg_off >= g->len) {
+            s->sg_idx++;
+            s->sg_off = 0;
+            continue;
+        }
+        n = MIN(len, g->len - s->sg_off);
+        if (to_host) {
+            address_space_write(&address_space_memory,
+                                ql_dma_to_phys(g->addr) + s->sg_off,
+                                MEMTXATTRS_UNSPECIFIED, buf, n);
+        } else {
+            address_space_read(&address_space_memory,
+                               ql_dma_to_phys(g->addr) + s->sg_off,
+                               MEMTXATTRS_UNSPECIFIED, buf, n);
+        }
+        s->sg_off += n;
+        buf += n;
+        len -= n;
+    }
+    return true;
+}
+
+/* Post a status entry to the response ring; raise the RISC interrupt. */
+static void ql_write_status(SGIQLispState *s, uint16_t completion,
+                            uint16_t scsi_status, uint32_t residual,
+                            const uint8_t *sense, uint32_t sense_len)
+{
+    uint8_t st[QL_ENTRY_SIZE];
+
+    if (!s->rsp.count) {
+        return;
+    }
+    memset(st, 0, sizeof(st));
+    st[2] = 1;                       /* entry_cnt */
+    st[3] = QL_ET_STATUS;
+    stl_be_p(st + 0x04, s->cur_handle);
+    stw_be_p(st + 0x08, completion);
+    stw_be_p(st + 0x0a, scsi_status);
+    stw_be_p(st + 0x0c, 0);          /* status_flags */
+    stw_be_p(st + 0x0e, QL_SS_GOT_STATUS | QL_SS_TRANSFER_COMPLETE);
+    stw_be_p(st + 0x10, sense_len);
+    stw_be_p(st + 0x12, 0);          /* time */
+    stl_be_p(st + 0x14, residual);
+    if (sense && sense_len) {
+        memcpy(st + 0x20, sense, MIN(sense_len, 32));
+    }
+
+    ql_munge(st, sizeof(st));
+    dma_memory_write(&address_space_memory,
+                     ql_dma_to_phys(s->rsp.base) +
+                         (uint64_t)s->rsp.in * QL_ENTRY_SIZE,
+                     st, QL_ENTRY_SIZE, MEMTXATTRS_UNSPECIFIED);
+
+    s->rsp.in = (s->rsp.in + 1) % s->rsp.count;
+    ql_mbox_put(s, 5, s->rsp.in);
+    ql_reg_put(s, QL_BUS_ISR,
+               ql_reg_get(s, QL_BUS_ISR) | BUS_ISR_RISC_INT);
+}
+
+static void ql_process_requests(SGIQLispState *s);
+
+static void ql_scsi_transfer_data(SCSIRequest *req, uint32_t len)
+{
+    SGIQLispState *s = req->hba_private;
+    uint8_t *buf = scsi_req_get_buf(req);
+
+    ql_sg_move(s, buf, len, req->cmd.mode == SCSI_XFER_FROM_DEV);
+    scsi_req_continue(req);
+}
+
+static void ql_scsi_command_complete(SCSIRequest *req, size_t residual)
+{
+    SGIQLispState *s = req->hba_private;
+
+    s->cur_req = NULL;
+    ql_write_status(s, QL_SCS_COMPLETE, req->status, residual,
+                    req->sense, req->sense_len);
+    scsi_req_unref(req);
+    ql_process_requests(s);
+}
+
+static void ql_scsi_request_cancelled(SCSIRequest *req)
+{
+    SGIQLispState *s = req->hba_private;
+
+    if (s->cur_req == req) {
+        s->cur_req = NULL;
+        scsi_req_unref(req);
+    }
+}
+
+static const SCSIBusInfo qlisp_scsi_info = {
+    .tcq = false,
+    .max_target = 16,
+    .max_lun = 8,
+    .transfer_data = ql_scsi_transfer_data,
+    .complete = ql_scsi_command_complete,
+    .cancel = ql_scsi_request_cancelled,
+};
+
+/*
+ * Fetch and execute request-queue entries from the RISC's out-pointer up to
+ * the host's in-pointer (mailbox4).  Commands run one at a time: a command
+ * that reaches the SCSI layer stops the scan and is resumed from its
+ * completion callback; absent targets complete inline with a transport error.
+ */
+static void ql_process_requests(SGIQLispState *s)
+{
+    uint32_t in;
+
+    if (!s->firmware_running || s->cur_req || !s->req.count) {
+        return;
+    }
+    in = ql_mbox_get(s, 4) % s->req.count;
+
+    while (s->req.out != in) {
+        uint8_t raw[QL_ENTRY_SIZE], e[QL_ENTRY_SIZE];
+        uint64_t eaddr = s->req.base +
+                         (uint64_t)s->req.out * QL_ENTRY_SIZE;
+        uint8_t cdb[16];
+        uint32_t i, cdb_len, seg_cnt, ncont;
+        uint8_t etype;
+        SCSIDevice *sdev;
+        int datalen;
+
+        if (!ql_get_entry(s, eaddr, raw, e)) {
+            return;
+        }
+        etype = e[3];
+        if (etype == QL_ET_MARKER) {
+            s->req.out = (s->req.out + 1) % s->req.count;
+            continue;
+        }
+        if (etype != QL_ET_COMMAND && etype != QL_ET_COMMAND_LEGACY) {
+            /* Not a command at the head: stop rather than walk garbage. */
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: ring head entry_type=0x%x (out=%u in=%u)\n",
+                          etype, s->req.out, in);
+            return;
+        }
+
+        cdb_len = ql_ld16(e + 0x08);
+        if (cdb_len == 0 || cdb_len > sizeof(cdb)) {
+            cdb_len = sizeof(cdb);
+        }
+        for (i = 0; i < cdb_len; i++) {
+            cdb[i] = raw[0x14 + i];   /* CDB is contiguous in the raw image */
+        }
+        seg_cnt = ql_ld16(e + 0x10);
+
+        s->cur_handle = ql_ld32(e + 0x04);
+        s->nsg = 0;
+        s->sg_idx = 0;
+        s->sg_off = 0;
+        for (i = 0; i < seg_cnt && s->nsg < QL_MAX_SG; i++) {
+            if (i < QL_IOCB_SEGS) {
+                ql_get_dseg(e, i, &s->sg[s->nsg++]);
+            } else {
+                uint32_t ci = (i - QL_IOCB_SEGS) / QL_CONT_SEGS;
+                uint32_t cj = (i - QL_IOCB_SEGS) % QL_CONT_SEGS;
+                uint32_t slot = (s->req.out + 1 + ci) % s->req.count;
+                uint8_t craw[QL_ENTRY_SIZE], ce[QL_ENTRY_SIZE];
+                if (!ql_get_entry(s, s->req.base +
+                                     (uint64_t)slot * QL_ENTRY_SIZE,
+                                  craw, ce)) {
+                    break;
+                }
+                ql_get_dseg(ce, QL_IOCB_SEGS + cj, &s->sg[s->nsg++]);
+            }
+        }
+        /* A64: continuation entries hold QL_CONT_SEGS dsegs each. */
+        ncont = seg_cnt > QL_IOCB_SEGS ?
+                (seg_cnt - QL_IOCB_SEGS + QL_CONT_SEGS - 1) / QL_CONT_SEGS : 0;
+        s->req.out = (s->req.out + 1 + ncont) % s->req.count;
+
+        sdev = scsi_device_find(&s->bus, 0, e[0x0a], e[0x0b]);
+        if (!sdev) {
+            ql_write_status(s, QL_SCS_TRANSPORT_ERROR, 0, 0, NULL, 0);
+            continue;
+        }
+        s->cur_req = scsi_req_new(sdev, 0, e[0x0b], cdb, cdb_len, s);
+        datalen = scsi_req_enqueue(s->cur_req);
+        if (datalen != 0) {
+            scsi_req_continue(s->cur_req);
+        }
+        return;   /* resume from ql_scsi_command_complete() */
+    }
 }
 
 /*
@@ -88,7 +348,8 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
                 len = ARRAY_SIZE(buf);
             }
             if (len && rambase + len <= ARRAY_SIZE(s->risc_ram) &&
-                dma_memory_read(&address_space_memory, host, buf,
+                dma_memory_read(&address_space_memory,
+                                ql_dma_to_phys(host), buf,
                                 len * 2, MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
                 for (i = 0; i < len; i++) {
                     s->risc_ram[rambase + i] = buf[i ^ 1];
@@ -258,6 +519,15 @@ static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
             /* RISC owns the semaphore while a mailbox reply is unacked. */
             return s->cmd_pending ? BUS_SEMA_LOCK : ql_reg_get(s, off);
         case QL_BUS_ISR:
+            /*
+             * The RISC services the request ring continuously; the host's
+             * ql_poll() reads this register in its wait loop.  Run queued
+             * requests here (unless a mailbox command is in flight, whose
+             * own poll also reads this register).
+             */
+            if (!s->cmd_pending) {
+                ql_process_requests(s);
+            }
             return ql_reg_get(s, off) |
                    (s->cmd_pending ? BUS_ISR_RISC_INT : 0);
         default:
@@ -298,6 +568,13 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case QL_BUS_ICR:
         ql_reg_put(s, QL_BUS_ICR, val & 0xffff);
+        break;
+    case QL_MBOX5:
+        /* host acks consumed responses by writing response_out */
+        ql_reg_put(s, off, val & 0xffff);
+        if (s->rsp.count) {
+            s->rsp.out = val % s->rsp.count;
+        }
         break;
     case QL_HCCR:
     case 0xc0:
@@ -350,6 +627,10 @@ static void qlisp_reset(DeviceState *dev)
     memset(s->risc_ram, 0, sizeof(s->risc_ram));
     s->firmware_running = false;
     s->pci_cmd = 0;
+    s->cur_req = NULL;
+    s->nsg = 0;
+    s->sg_idx = 0;
+    s->sg_off = 0;
     memset(&s->req, 0, sizeof(s->req));
     memset(&s->rsp, 0, sizeof(s->rsp));
 }
@@ -360,11 +641,15 @@ static void qlisp_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->regs, OBJECT(dev), &qlisp_ops, s,
                           "sgi-qlisp-regs", QLISP_REGS_SIZE);
+    scsi_bus_init(&s->bus, sizeof(s->bus), dev, &qlisp_scsi_info);
+    s->bus.busnr = s->busnr;
+    scsi_bus_legacy_handle_cmdline(&s->bus);
 }
 
 static const Property qlisp_props[] = {
     DEFINE_PROP_DRIVE("drive", SGIQLispState, blk),
     DEFINE_PROP_UINT8("revision", SGIQLispState, pci_rev, QLISP_REV),
+    DEFINE_PROP_UINT32("scsi-bus-num", SGIQLispState, busnr, 0),
 };
 
 static void qlisp_class_init(ObjectClass *klass, const void *data)

@@ -1061,6 +1061,8 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
      * register (DevIO) windows at 0x200000 and 0x400000.
      */
     for (i = 0; i < 2; i++) {
+        object_property_set_uint(OBJECT(&s->isp[i]), "scsi-bus-num", i,
+                                 &error_abort);
         if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
             return;
         }

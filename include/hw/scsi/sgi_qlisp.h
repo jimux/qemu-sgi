@@ -19,6 +19,7 @@
 
 #include "hw/core/registerfields.h"
 #include "hw/core/sysbus.h"
+#include "hw/scsi/scsi.h"
 #include "qom/object.h"
 #include "block/block.h"
 #include "system/dma.h"
@@ -126,12 +127,41 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 /* RISC instruction RAM base (firmware load/verify addresses are based here) */
 #define QL_RISC_RAMBASE   0x1000
 
+/* A64 command/continuation entry geometry (ql_standalone.h) */
+#define QL_ENTRY_SIZE        64
+#define QL_IOCB_SEGS         2
+#define QL_CONT_SEGS         5
+#define QL_MAX_SG            64
+#define QL_ET_COMMAND        0x9
+#define QL_ET_COMMAND_LEGACY 0x1
+#define QL_ET_CONTINUATION   0xa
+#define QL_ET_STATUS         0x3
+#define QL_ET_MARKER         0x4
+
+/*
+ * IP30 bridge 32-bit direct-mapped DMA window: the driver's ql.c does
+ * MAKE_DIRECT_MAPPED_2GIG() = kv_to_bridge32_dirmap(), and the PROM programs
+ * the bridge so that DMA address = host physical + 0x80000000.
+ */
+#define QL_DMA_DIRECT_BASE   0x80000000ULL
+
+/* status entry completion status (ql_standalone.h) */
+#define QL_SCS_COMPLETE          0x0000
+#define QL_SCS_TRANSPORT_ERROR   0x0003
+#define QL_SS_GOT_STATUS         0x1000
+#define QL_SS_TRANSFER_COMPLETE  0x4000
+
 typedef struct QLQueue {
     uint64_t base;      /* host physical base address */
     uint32_t count;     /* entries */
     uint32_t in;        /* host in-pointer (RISC fetch) */
     uint32_t out;       /* host out-pointer (RISC post) */
 } QLQueue;
+
+typedef struct QLSG {
+    uint64_t addr;
+    uint32_t len;
+} QLSG;
 
 struct SGIQLispState {
     DeviceState parent_obj;
@@ -156,7 +186,22 @@ struct SGIQLispState {
     QLQueue req;
     QLQueue rsp;
 
-    /* SCSI backend */
+    /* internal SCSI bus (scsi-hd/scsi-cd children) */
+    SCSIBus bus;
+    uint32_t busnr;
+
+    /* in-flight request (synchronous RISC model) */
+    SCSIRequest *cur_req;
+    uint32_t cur_handle;
+    uint32_t cur_tag;
+    bool cur_tgt_present;
+    uint32_t nsg;
+    QLSG sg[QL_MAX_SG];
+    uint32_t sg_idx;
+    uint32_t sg_off;
+    uint32_t xfer_total;
+
+    /* SCSI backend (legacy -drive property) */
     BlockBackend *blk;
 };
 
