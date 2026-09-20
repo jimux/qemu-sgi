@@ -148,14 +148,14 @@ static uint64_t sgi_ip27_mem_config(uint64_t ram_size) {
   int bank = 0;
 
   /*
-   * MD_BANK_SHFT is 29 (512 MB per bank slot), so the node's RAM is packed
-   * into banks 0..7 as descending powers of two.  A 256 MB node is therefore
-   * a single 256 MB bank 0 (MD_SIZE code 6), matching what size_back_door()
-   * derives from the back-door probe.  mdir_config() overwrites this register
-   * from that probe anyway.
+   * MD_BANK_SHFT is 29 (512 MB per bank slot).  Pack the node as 128 MB DIMMs
+   * into successive bank slots (a 256 MB node is bank0+bank1, code 5 each):
+   * each bank's size_back_door() then settles at 128 MB, so memory_init_all()
+   * never takes its 256 MB-DIMM "hole" path.  mdir_config() overwrites this
+   * register from that probe anyway.
    */
-  for (uint64_t sz = 0x20000000ULL; sz >= 0x2000000ULL && bank < 8; sz >>= 1) {
-    if (ram_size >= sz) {
+  for (uint64_t sz = 0x8000000ULL; sz >= 0x2000000ULL && bank < 8; sz >>= 1) {
+    while (ram_size >= sz && bank < 8) {
       int code = 0;
       uint64_t t = sz >> 22; /* MB / 4: MD_SIZE_MBYTES(code) = 4 << code MB */
       while (t > 1) {
@@ -439,13 +439,19 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
  */
 #define IP27_BDOOR_PHYS 0x80000000ULL      /* HSPEC + 0x80000000 (BDECC) */
 #define IP27_BDDIR_PHYS 0xC0000000ULL      /* BDPRT/BDDIR */
-#define IP27_BDDIR_WINSZ 0x8000000ULL      /* 128 MiB: covers pa < 512 MiB */
+#define IP27_BDDIR_WINSZ 0x40000000ULL     /* 1 GiB: full per-node BDDIR address
+                                              range.  BDDIR_UPPER_MASK =
+                                              0xfffff<<10 over pa>>2 spans all
+                                              4 GiB of pa, so bank1 (pa=512 MiB)
+                                              encodes dirraw=0x8000000 which the
+                                              old 128 MiB window excluded. */
 #define IP27_BDDIR_STORE 0x4000000ULL      /* storage (aliased within a bank) */
 #define IP27_BDDIR_UPPER_MASK (0xfffffULL << 10)
 
 static uint8_t *ip27_bdoor_dir;
 static uint8_t *ip27_bdecc_dir;
 static uint64_t ip27_bdoor_bank0_size;
+static uint64_t ip27_bdoor_num_banks;
 
 /*
  * Select the back-door storage for an access and its byte index, or NULL if
@@ -470,10 +476,22 @@ static uint8_t *ip27_bdoor_sel(hwaddr off, uint64_t *idx) {
   uint64_t mask = (ip27_bdoor_bank0_size >> 2) - 1;
 
   if (off >= dirbase && off < dirbase + IP27_BDDIR_WINSZ) {
-    /* Alias within bank0 (period = bank size): the hole dir/PRT entries map
-     * onto the bank start, so mtest_dir passes there and size_back_door's
-     * bd_alias() settles on the true bank size. */
-    *idx = (off - dirbase) & mask;
+    /*
+     * The directory is per-DIMM (per bank slot), so storage is keyed by the
+     * bank (pa bits [31:29], i.e. 512 MB slots) and the address within the
+     * bank folds with period = the DIMM's directory capacity.  Unpopulated
+     * bank slots have no directory and read back as absent, so
+     * size_back_door() reports them EMPTY rather than aliasing bank0.
+     */
+    uint64_t dirraw = off - dirbase;
+    uint64_t bank = dirraw / 0x8000000ULL;      /* 512 MB slot >> 2 */
+    uint64_t within = dirraw % 0x8000000ULL;
+    uint64_t period = ip27_bdoor_bank0_size >> 2;
+
+    if (bank >= ip27_bdoor_num_banks || period == 0) {
+      return NULL;
+    }
+    *idx = bank * period + (within % period);
     return ip27_bdoor_dir;
   }
   if (off < IP27_BDDIR_STORE) {
@@ -522,19 +540,25 @@ static const MemoryRegionOps ip27_bdoor_ops = {
 
 #define IP27_BANK_SIZE 0x20000000ULL /* MD_BANK_SHFT=29: 512 MB per bank slot */
 
-static void ip27_add_ram_mirror(MemoryRegion *sysmem, uint64_t base,
-                                MemoryRegion *ram, uint64_t ram_size,
-                                const char *name) {
+/*
+ * Map node RAM into an XKPHYS space as one DIMM per 512 MB bank slot.  Unlike
+ * a flat alias, bank b's DIMM lives at slot b (b << 29) so the PROM's memory
+ * test reaches bank1 at (space + 512 MB) rather than folding it into bank0.
+ */
+static void ip27_add_ram_banks(MemoryRegion *sysmem, uint64_t space_base,
+                               MemoryRegion *ram, uint64_t ram_size,
+                               uint64_t banksz, const char *name) {
   MemoryRegion *c = g_new(MemoryRegion, 1);
-  uint64_t off;
-  memory_region_init(c, NULL, name, IP27_BANK_SIZE);
-  for (off = 0; off < IP27_BANK_SIZE; off += ram_size) {
+  uint64_t nbank = ram_size / banksz;
+  uint64_t b;
+
+  memory_region_init(c, NULL, name, nbank * IP27_BANK_SIZE);
+  for (b = 0; b < nbank; b++) {
     MemoryRegion *a = g_new(MemoryRegion, 1);
-    uint64_t sz = MIN(ram_size, IP27_BANK_SIZE - off);
-    memory_region_init_alias(a, NULL, name, ram, 0, sz);
-    memory_region_add_subregion(c, off, a);
+    memory_region_init_alias(a, NULL, name, ram, b * banksz, banksz);
+    memory_region_add_subregion(c, b << 29, a);
   }
-  memory_region_add_subregion(sysmem, ip27_phys(base), c);
+  memory_region_add_subregion(sysmem, ip27_phys(space_base), c);
 }
 
 static void sgi_ip27_init(MachineState *machine) {
@@ -588,20 +612,16 @@ static void sgi_ip27_init(MachineState *machine) {
   }
 
   /* Node-local memory at physical 0, aliased uncached (UNCAC/MSPEC spaces). */
-  memory_region_add_subregion(system_memory, 0, ram);
-
-  ip27_add_ram_mirror(system_memory, IP27_UNCAC_BASE, ram, machine->ram_size,
-                      "sgi-ip27.ram.uncac");
-  create_unimplemented_device("ip27-uncac-high",
-                              ip27_phys(IP27_UNCAC_BASE) + IP27_BANK_SIZE,
-                              IP27_NODE_SIZE - IP27_BANK_SIZE);
-  ip27_add_ram_mirror(system_memory, IP27_MSPEC_BASE, ram, machine->ram_size,
-                      "sgi-ip27.ram.mspec");
-  create_unimplemented_device("ip27-mspec-high",
-                              ip27_phys(IP27_MSPEC_BASE) + IP27_BANK_SIZE,
-                              IP27_NODE_SIZE - IP27_BANK_SIZE);
-  ip27_add_ram_mirror(system_memory, IP27_CAC_BASE, ram, machine->ram_size,
-                      "sgi-ip27.ram.cac");
+  {
+    uint64_t banksz = MIN(machine->ram_size, (uint64_t)0x8000000);
+    memory_region_add_subregion(system_memory, 0, ram);
+    ip27_add_ram_banks(system_memory, IP27_UNCAC_BASE, ram,
+                       machine->ram_size, banksz, "sgi-ip27.ram.uncac");
+    ip27_add_ram_banks(system_memory, IP27_MSPEC_BASE, ram,
+                       machine->ram_size, banksz, "sgi-ip27.ram.mspec");
+    ip27_add_ram_banks(system_memory, IP27_CAC_BASE, ram,
+                       machine->ram_size, banksz, "sgi-ip27.ram.cac");
+  }
 
 
   /* Hub ASIC in the node's widget-1 small window. */
@@ -651,9 +671,17 @@ static void sgi_ip27_init(MachineState *machine) {
    */
   {
     MemoryRegion *bdoor = g_new(MemoryRegion, 1);
-    ip27_bdoor_dir = g_malloc0(IP27_BDDIR_STORE);
-    ip27_bdecc_dir = g_malloc0(IP27_BDDIR_STORE);
-    ip27_bdoor_bank0_size = MIN(machine->ram_size, (uint64_t)0x20000000);
+    {
+      uint64_t period;
+      uint64_t store;
+      ip27_bdoor_bank0_size = MIN(machine->ram_size, (uint64_t)0x8000000);
+      period = ip27_bdoor_bank0_size >> 2;
+      ip27_bdoor_num_banks =
+          (machine->ram_size + ip27_bdoor_bank0_size - 1) / ip27_bdoor_bank0_size;
+      store = MAX(IP27_BDDIR_STORE, ip27_bdoor_num_banks * period);
+      ip27_bdoor_dir = g_malloc0(store);
+      ip27_bdecc_dir = g_malloc0(store);
+    }
     memory_region_init_io(bdoor, NULL, &ip27_bdoor_ops, NULL,
                           "sgi-ip27.bdoor", 0x80000000ULL);
     memory_region_add_subregion(system_memory,
