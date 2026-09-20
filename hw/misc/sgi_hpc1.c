@@ -92,14 +92,21 @@ static void scc_tx(SGIHPC1State *s, int d, int c, uint8_t data)
     (void)scc_console_channel(s, d, c);
 
     /*
-     * Writing the transmit buffer clears the TX interrupt-pending bit (the
-     * real SCC re-asserts it once the byte shifts out, but our transmit is
-     * instantaneous). Without this an idle console keeps TX IP set forever,
-     * and the kernel's handler has nothing to write, so it storms on an
-     * interrupt it can never clear (observed as a permanent LIO0_DUART /
-     * mask-toggle loop after the SCSI mount phase).
+     * Writing the transmit buffer clears TX IP; once the byte has shifted out
+     * the buffer is empty again and the real SCC re-asserts TX IP (if TX
+     * interrupts are enabled). Our transmit is instantaneous, so re-assert
+     * here — otherwise a console driver that relies on the TX interrupt only
+     * ever gets the first one and stalls waiting for the next (observed as the
+     * miniroot printing "C\rM" and then going silent).
      */
-    s->uart[d][c].rr3 &= ~(c == 0 ? SCC_TX_IP_A : SCC_TX_IP);
+    {
+        SGIHPC1Uart *u = &s->uart[d][c];
+        uint8_t bit = (c == 0 ? SCC_TX_IP_A : SCC_TX_IP);
+        u->rr3 &= ~bit;
+        if (u->wr[1] & 0x02) {   /* WR1 bit 1: TX interrupt enable */
+            u->rr3 |= bit;
+        }
+    }
     scc_update_irq(s);
 }
 
