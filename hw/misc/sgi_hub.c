@@ -19,6 +19,9 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
+
+static void sgi_hub_reset_bh(void *opaque);
 #include "target/mips/cpu.h"
 
 /* --- Hub PI (processor interface) offsets, from Linux sn0/hubpi.h --- */
@@ -50,6 +53,10 @@
 #define PI_RT_EN_B 0x000148
 #define PI_RT_LOCAL_CTRL 0x000160
 #define PI_RT_COUNT 0x030100
+/* PI error-stack addresses; entry.s resets once unless _B holds "Rst0". */
+#define PI_ERR_STACK_ADDR_A 0x000418
+#define PI_ERR_STACK_ADDR_B 0x000420
+#define PI_ERR_STACK_RST0 0x52737430ULL
 
 /* --- Hub MD (memory/directory) offsets --- */
 #define MD_MEMORY_CONFIG 0x200018
@@ -207,6 +214,10 @@ static uint64_t sgi_hub_pi_read(SGIHubState *s, hwaddr off) {
     return s->rt_enable[1];
   case PI_RT_COUNT:
     return sgi_hub_rtc_count();
+  case PI_ERR_STACK_ADDR_A:
+    return s->pi_err_stack[0];
+  case PI_ERR_STACK_ADDR_B:
+    return s->pi_err_stack[1];
   case PI_RT_LOCAL_CTRL:
     return 0;
   default:
@@ -231,6 +242,12 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
     break;
   case PI_CALIAS_SIZE:
     s->calias_size = val;
+    break;
+  case PI_ERR_STACK_ADDR_A:
+    s->pi_err_stack[0] = val;
+    break;
+  case PI_ERR_STACK_ADDR_B:
+    s->pi_err_stack[1] = val;
     break;
   case PI_INT_PEND_MOD: {
     /* Set/clear a pending interrupt level. */
@@ -541,7 +558,8 @@ static void sgi_hub_mlan_write(SGIHubState *s, uint64_t val) {
 
   if (pulse >= 480) {
     /* reset/presence pulse; single device => presence bit 0 */
-    sgi_hub_ds_reset(s);
+  sgi_hub_ds_reset(s);
+  s->reset_bh = qemu_bh_new(sgi_hub_reset_bh, s);
     s->ds_data_bit = 0;
   } else if (sample == 30) {
     sgi_hub_ds_write_bit(s, 0);
@@ -673,6 +691,13 @@ static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
                         (addr & NVS_ADDRESS_MASK) | (type & NVS_TYPE_MASK);
 }
 
+/* Implemented by the IP27 machine: CPU-local reset re-running the PROM. */
+extern void sgi_ip27_local_reset(void);
+
+static void sgi_hub_reset_bh(void *opaque) {
+  sgi_ip27_local_reset();
+}
+
 static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
   switch (off) {
   case NI_STATUS_REV_ID:
@@ -727,6 +752,16 @@ static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
                              unsigned size) {
   switch (off) {
   case NI_PORT_RESET:
+    /*
+     * reset_system() writes NPR_PORTRESET|NPR_LOCALRESET; NPR_LOCALRESET
+     * (bit 0) resets the hub/system.  Defer a CPU-local reset (re-run the
+     * PROM from the reset vector); no full machine/device reset, so the
+     * serial chardev and the flash (ip27log) survive.
+     */
+    if (val & 0x1) {
+      qemu_bh_schedule(s->reset_bh);
+    }
+    break;
   case NI_PROTECTION:
     break;
   case NI_SCRATCH_REG0:
@@ -930,6 +965,14 @@ static void sgi_hub_reset(DeviceState *dev) {
     s->rt_compare[i] = 0;
     s->rt_enable[i] = 0;
   }
+
+  /*
+   * The PROM's entry (entry.s) performs a one-time reset unless
+   * PI_ERR_STACK_ADDR_B already reads "Rst0"; model the post-first-reset
+   * state so it goes straight to normal init.
+   */
+  s->pi_err_stack[0] = 0;
+  s->pi_err_stack[1] = PI_ERR_STACK_RST0;
 
   /* MD_SLOTID_USTAT: FPGA/flash ready, slot id 0. */
   s->slotid_ustat = 0x10;

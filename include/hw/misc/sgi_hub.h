@@ -41,6 +41,7 @@ struct SGIHubState {
   SysBusDevice parent_obj;
 
   MemoryRegion iomem;
+  QEMUBH *reset_bh;
 
   uint32_t nasid;
   uint32_t num_cpus;
@@ -60,6 +61,10 @@ struct SGIHubState {
   /* PI: real-time counter compare/enable, per slice. */
   uint64_t rt_compare[SGI_HUB_MAX_CPUS];
   uint64_t rt_enable[SGI_HUB_MAX_CPUS];
+
+  /* PI: error-stack addresses (A=CPU0, B=CPU1).  The PROM's entry does a
+   * deliberate one-time reset unless PI_ERR_STACK_ADDR_B holds "Rst0". */
+  uint64_t pi_err_stack[2];
 
   /* MD: memory configuration (bank sizes) and refresh. */
   uint64_t mem_config;

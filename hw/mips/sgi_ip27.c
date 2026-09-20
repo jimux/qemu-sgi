@@ -97,6 +97,8 @@ static uint64_t ip27_swin_phys(uint32_t nasid, uint32_t wid) {
                    ((uint64_t)wid << 24));
 }
 
+void sgi_ip27_local_reset(void);
+
 static void main_cpu_reset(void *opaque) {
   MIPSCPU *cpu = opaque;
   cpu_reset(CPU(cpu));
@@ -119,6 +121,19 @@ static void main_cpu_reset(void *opaque) {
    */
   mips_cpu_install_mapping(cpu, 0xc00000001fc00000ULL, 0x1fc00000ULL,
                            0x001fe000, 1, 0x13);
+}
+
+/*
+ * CPU-local reset requested via the hub's NI_PORT_RESET (NPR_LOCALRESET):
+ * re-run each CPU from the PROM reset vector with the sloader boot state,
+ * leaving the flash/IP27log and the console chardev intact.
+ */
+void sgi_ip27_local_reset(void) {
+  CPUState *c;
+
+  CPU_FOREACH(c) {
+    main_cpu_reset(MIPS_CPU(c));
+  }
 }
 
 /*
