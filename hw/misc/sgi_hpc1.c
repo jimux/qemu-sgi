@@ -305,13 +305,15 @@ static void hpc1_scsi_dma_run(SGIHPC1State *s)
         }
 
         if (s->scsi_dma_to_device) {
-            address_space_read(&address_space_memory,
-                               s->scsi_cbp & HPC1_SCSI_BUFADDR,
-                               MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
-        } else {
+            /* SCSI_CTRL bit 0x10 = "to memory": device -> memory (READ) */
             address_space_write(&address_space_memory,
                                 s->scsi_cbp & HPC1_SCSI_BUFADDR,
                                 MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
+        } else {
+            /* memory -> device (WRITE) */
+            address_space_read(&address_space_memory,
+                               s->scsi_cbp & HPC1_SCSI_BUFADDR,
+                               MEMTXATTRS_UNSPECIFIED, wdc->async_buf, chunk);
         }
         s->scsi_cbp += chunk;
         wdc->async_buf += chunk;

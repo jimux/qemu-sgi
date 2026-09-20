@@ -746,45 +746,22 @@ static void wd33c93_transfer_data(SCSIRequest *req, uint32_t len)
     s->async_buf = scsi_req_get_buf(req);
 
     /*
-     * If TC has already reached zero but the SCSI device still has data,
-     * raise an "unexpected phase" interrupt so the driver can reprogram
-     * TC and DMA descriptors for the next chunk.  This is the normal
-     * multi-pass DMA flow on real WD33C93B hardware, used by IRIX for
-     * transfers >256KB (64 DMA descriptors × 4KB pages).
-     *
-     * Reference: IRIX wd93.c:2936 — ST_UNEX_SDATA/RDATA handler
+     * A real WD33C93 has only a small FIFO; it does not accept more data
+     * than the programmed transfer count. The IP20 PROM (and sash) drive a
+     * fresh TC-sized pass per DMA descriptor and do NOT implement the
+     * unexpected-phase reprogram path, so never enter it here: deliver at
+     * most transfer_count bytes and let the phase complete normally. The
+     * initiator's next TC/descriptor pass is a new request.
      */
     if (s->transfer_count == 0) {
-        s->pending_len = len;
-        s->pending_buf = scsi_req_get_buf(req);
         s->async_len = 0;
         s->async_buf = NULL;
         wd33c93_set_drq(s, false);
-        s->aux_status &= ~(ASR_DBR | ASR_CIP | ASR_BSY);
-
-        /* MAME: COMMAND_PHASE_TRANSFER_COUNT = 0x46 (IRIX: PH_DATA) */
-        s->regs[WD_COMMAND_PHASE] = 0x46;
-
-        /*
-         * Status codes are named from the WD33C93 chip's perspective:
-         *   UNEX_RDATA (0x48) = chip receiving data = DATA OUT (write)
-         *   UNEX_SDATA (0x49) = chip sending data   = DATA IN (read)
-         * IRIX wd93.c:2930: ST_UNEX_RDATA with !SCDMA_IN (write),
-         *                   ST_UNEX_SDATA with SCDMA_IN (read).
-         */
-        uint8_t status = (req->cmd.mode == SCSI_XFER_TO_DEV)
-                       ? SCSI_STATUS_UNEX_RDATA    /* DATA OUT: chip receives */
-                       : SCSI_STATUS_UNEX_SDATA;   /* DATA IN: chip sends  */
-        s->scsi_status = status;
-        wd33c93_raise_irq(s);
         return;
     }
 
-    /* Cap the transfer to the remaining TC */
+    /* Cap the transfer to the remaining TC (discard any excess). */
     if (len > s->transfer_count) {
-        /* Save remainder for multi-pass DMA resume after TC reaches 0 */
-        s->pending_len = len - s->transfer_count;
-        s->pending_buf = s->async_buf + s->transfer_count;
         len = s->transfer_count;
     }
     s->async_len = len;
