@@ -495,6 +495,7 @@ sgi_mace_audio_mscust(uint64_t addr, uint64_t val) "MSC/UST 0x%02"PRIx64" = 0x%0
 sgi_mace_isa_reg(int rw, uint64_t addr, uint64_t val) "ISA rw=%d 0x%03"PRIx64" = 0x%016"PRIx64
 sgi_mace_ds_slot(int phase, int64_t width_ns) "DS slot phase=%d width=%"PRId64"ns"
 sgi_mace_ds_state(int phase, int data, int idx) "DS state phase=%d data=%d idx=%d"
+sgi_mace_rtc_read(int reg, int value) "RTC calendar reg=%d = 0x%02x (host clock)"
 
 # sgi_crime.c (O2 CRIME interrupt controller)
 sgi_crime_irq(int irq, int level, uint64_t intstat, uint64_t intmask) "crime irq %d level=%d intstat=0x%08"PRIx64" intmask=0x%08"PRIx64

@@ -10,7 +10,8 @@
  *   CRIME INTSTAT bit 4 (MACE_PERIPH_SERIAL) -> CPU IP2
  * - ISA interface (interrupt status/mask, flash/NIC/LED, ring base)
  * - UST/MSC timer (free-running counter)
- * - DS17287 RTC stub
+ * - DS17287 RTC: calendar registers are synthesised from the host clock
+ *   (honouring -rtc base=), status/NVRAM are backed by the register file
  * - All other sub-blocks accept writes and return 0 on reads
  *
  * Physical base: 0x1F000000 (kseg1: 0xBF000000)
@@ -49,6 +50,7 @@
 #include "hw/pci/pci_host.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "system/rtc.h"
 #include "trace.h"
 
 /* Verbose debug logging - set to 1 to enable */
@@ -2975,6 +2977,74 @@ static void sgi_mace_isa_write(SGIMACEState *s, hwaddr isa_off,
     }
 }
 /*
+ * @@SEMANTICS@@ DS17287 calendar registers are read-only and carry the
+ * host's wall-clock time rather than a frozen reset value.  The IRIX IP32
+ * kernel clock driver (kern/ml/MOOSEHEAD/IP32clock.c, rtodc()/_clock_func())
+ * forces the part into BCD, 24-hour mode and decodes every calendar field
+ * as BCD, so the model synthesises BCD from the host clock on each read.
+ * QEMU's standard -rtc base=utc|localtime|<datetime> is honoured through
+ * qemu_get_timedate(); its default is the host's current UTC time, so a
+ * plain boot comes up on the real date instead of the reset epoch -- which,
+ * with the century byte unset, the kernel folded all the way down to 1970.
+ * Calendar registers stay read-only to the guest: a guest settime() is
+ * carried by the kernel and must not drag the host-authoritative RTC back.
+ */
+static uint8_t sgi_mace_rtc_bcd(int v)
+{
+    return ((v / 10) << 4) | (v % 10);
+}
+
+/*
+ * DS17287 bank-1 century byte.  sys/ds17287.h defines it as
+ * DS_OFFSET(DS_BANK1_BASE, 8) and the kernel indexes it as
+ * clock->ram[DS_BANK1_CENTURY]; the fixed 256-byte struct means
+ * ram[] starts at register 0x0E, so (0x40-0x0E)+8 = 0x48 is the flat
+ * register the driver actually reads at the IP32 256-byte stride.
+ * The kernel folds it into the year (year = 2-digit-BCD + century*100);
+ * if it reads 0 the year drops below YRREF and the date collapses to 1970.
+ */
+#define SGI_MACE_RTC_CENTURY_REG 0x48
+
+/*
+ * If @rtc_reg is a calendar register the DS17287 answers from the host
+ * clock; fill *out and return true.  Status registers (A-D) and NVRAM are
+ * not time and fall through to the register file.
+ */
+static bool sgi_mace_rtc_live_reg(int rtc_reg, uint8_t *out)
+{
+    struct tm tm;
+
+    switch (rtc_reg) {
+    case 0:  /* seconds       */
+    case 2:  /* minutes       */
+    case 4:  /* hours         */
+    case 6:  /* day of week   */
+    case 7:  /* date          */
+    case 8:  /* month         */
+    case 9:  /* year (2-digit)*/
+    case SGI_MACE_RTC_CENTURY_REG:
+        break;
+    default:
+        return false;
+    }
+
+    qemu_get_timedate(&tm, 0);
+    switch (rtc_reg) {
+    case 0:  *out = sgi_mace_rtc_bcd(tm.tm_sec); break;
+    case 2:  *out = sgi_mace_rtc_bcd(tm.tm_min); break;
+    case 4:  *out = sgi_mace_rtc_bcd(tm.tm_hour); break;
+    /* IRIX get_dayof_week() numbers Sunday=1 .. Saturday=7. */
+    case 6:  *out = tm.tm_wday + 1; break;
+    case 7:  *out = sgi_mace_rtc_bcd(tm.tm_mday); break;
+    case 8:  *out = sgi_mace_rtc_bcd(tm.tm_mon + 1); break;
+    case 9:  *out = sgi_mace_rtc_bcd((tm.tm_year + 1900) % 100); break;
+    case SGI_MACE_RTC_CENTURY_REG:
+        *out = sgi_mace_rtc_bcd((tm.tm_year + 1900) / 100); break;
+    }
+    return true;
+}
+
+/*
  * Main MACE read handler.
  * Dispatches to sub-blocks based on offset from MACE_BASE.
  */
@@ -3104,13 +3174,20 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
         int rtc_reg = rtc_off / 256;
         if (rtc_reg < 128) {
             uint8_t val = s->rtc_regs[rtc_reg];
-            /* Register D bit 7 = VRT (Valid RAM and Time) = battery OK */
-            if (rtc_reg == 13) {
-                val |= 0x80;
-            }
-            /* Register C: reading clears interrupt flags */
-            if (rtc_reg == 12) {
-                s->rtc_regs[12] = 0;
+            uint8_t live = 0;
+
+            if (sgi_mace_rtc_live_reg(rtc_reg, &live)) {
+                val = live;
+                trace_sgi_mace_rtc_read(rtc_reg, val);
+            } else {
+                /* Register D bit 7 = VRT (Valid RAM and Time) = battery OK */
+                if (rtc_reg == 13) {
+                    val |= 0x80;
+                }
+                /* Register C: reading clears interrupt flags */
+                if (rtc_reg == 12) {
+                    s->rtc_regs[12] = 0;
+                }
             }
             MACE_DPRINTF("RTC read reg %d = 0x%02x\n", rtc_reg, val);
             return val;
@@ -3389,19 +3466,17 @@ static void sgi_mace_reset(DeviceState *dev)
     sgi_mace_ds_reset(s);
 
     /*
-     * DS17287 RTC reset values:
+     * DS17287 RTC status defaults:
      *   Reg A (10): 0x20 = oscillator running, divider chain on
      *   Reg B (11): 0x06 = binary mode (bit 2), 24-hour (bit 1)
      *   Reg D (13): 0x80 = VRT (Valid RAM and Time, battery OK)
-     * Set a sensible time: 2026-02-14 12:00:00 Saturday (day=7)
+     * The calendar registers (0-9) and the bank-1 century byte are NOT
+     * seeded here: sgi_mace_rtc_live_reg() answers them from the host
+     * clock (qemu_get_timedate(), i.e. -rtc base=) on every read, so the
+     * guest boots on the real date instead of a fixed reset epoch.  (A
+     * reset-time seed would also be wrong: qemu_get_timedate() is not
+     * usable until configure_rtc() has run, which is after device realize.)
      */
-    s->rtc_regs[0]  = 0x00;    /* seconds */
-    s->rtc_regs[2]  = 0x00;    /* minutes */
-    s->rtc_regs[4]  = 0x12;    /* hours (12, binary mode) */
-    s->rtc_regs[6]  = 0x07;    /* day of week (Saturday=7) */
-    s->rtc_regs[7]  = 0x14;    /* date (14) */
-    s->rtc_regs[8]  = 0x02;    /* month (February) */
-    s->rtc_regs[9]  = 0x26;    /* year (26 = 2026 with century byte) */
     s->rtc_regs[10] = 0x20;    /* Register A: oscillator on */
     s->rtc_regs[11] = 0x06;    /* Register B: binary, 24h */
     s->rtc_regs[13] = 0x80;    /* Register D: VRT */
