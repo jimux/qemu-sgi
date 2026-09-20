@@ -27,6 +27,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBRIDGEState, SGI_BRIDGE)
 
 #define BRIDGE_NUM_REGS 0x1000
 
+/* DS2502-family 1-wire device state (bridge board EEPROM, IOC3 MAC EEPROM). */
+typedef struct SGIDS {
+    uint8_t rom[8];
+    uint8_t mem[128];
+    uint8_t state;
+    uint8_t cmd;
+    int cmd_bits;
+    uint8_t in;
+    int in_bits;
+    int out_index;
+    int search_phase;
+    int addr;
+    int extra;
+    uint8_t data_bit;
+} SGIDS;
+
 /*
  * BRIDGE register offsets (from 0x1F400000)
  *
@@ -46,25 +62,10 @@ struct SGIBRIDGEState {
     /* CPU interrupt output (BRIDGE -> CPU IP3) */
     qemu_irq cpu_irq;
 
-    /*
-     * BRIDGE MicroLAN/1-wire line state (BRIDGE_NIC at +0xb4). The PROM reads
-     * the board-config EEPROM through this; bit 0 is the data line and the
-     * transaction-done bit is reported as set.
-     */
-    uint8_t nic_data_bit;
-
-    /* DS2502 1-wire board-config EEPROM on the bridge NIC line. */
-    uint8_t ds_rom[8];
-    uint8_t ds_mem[128];
-    uint8_t ds_state;
-    uint8_t ds_cmd;
-    int ds_cmd_bits;
-    uint8_t ds_in;
-    int ds_in_bits;
-    int ds_out_index;
-    int ds_search_phase;
-    int ds_addr;
-    int ds_extra;
+    /* DS2502 board-config EEPROM on the bridge MicroLAN line (+0xb4). */
+    SGIDS bridge_ds;
+    /* DS2502 MAC-address EEPROM on the IOC3 MicroLAN line (+0x600030). */
+    SGIDS ioc3_ds;
 
     /*
      * IOC3 PCI configuration (BRIDGE type-0 config, device 2 at +0x22000):
