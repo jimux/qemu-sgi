@@ -280,6 +280,9 @@ static void sgi_octane_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bridge_dev), 0, OCTANE_BRIDGE_BASE);
 
+    /* Device-line interrupts are sent to HEART as their b_int_addr[] vector. */
+    SGI_BRIDGE(bridge_dev)->heart = SGI_HEART(heart_dev);
+
     /*
      * BRIDGE PCI interrupt aggregation -> HEART widget-error BASEIO vector
      * (IP30_HVEC_WIDERR_BASEIO = 57).  The two QLogic ISP channels are BaseIO
@@ -458,6 +461,9 @@ static void sgi_ip54pv_init(MachineState *machine)
     bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bridge_dev), 0, OCTANE_BRIDGE_BASE);
+
+    /* Device-line interrupts are sent to HEART as their b_int_addr[] vector. */
+    SGI_BRIDGE(bridge_dev)->heart = SGI_HEART(heart_dev);
 
     /* Paravirtual device bank (0x1f480000-0x1f4807ff). */
     smp_dev = qdev_new(TYPE_SGI_SMP);

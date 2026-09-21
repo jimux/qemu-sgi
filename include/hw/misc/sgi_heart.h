@@ -241,4 +241,10 @@ struct SGIHEARTState {
     int64_t time_offset;
 };
 
+/*
+ * Raise/lower a HEART interrupt vector directly (a device asserting its
+ * xtalk interrupt sends the vector programmed in the bridge's b_int_addr[]).
+ */
+void sgi_heart_raise_vector(SGIHEARTState *s, int vec, int level);
+
 #endif /* HW_MISC_SGI_HEART_H */

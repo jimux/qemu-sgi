@@ -38,6 +38,7 @@
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
 #include "hw/misc/sgi_bridge.h"
+#include "hw/misc/sgi_heart.h"
 #include "hw/char/serial.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -1102,7 +1103,12 @@ static void sgi_bridge_update_irq(SGIBRIDGEState *s)
 {
     uint32_t status = s->regs[BRIDGE_INT_STATUS_OFF >> 2];
     uint32_t enable = s->regs[BRIDGE_INT_ENABLE_OFF >> 2];
-    int level = (status & (enable | BRIDGE_ISR_INT_MSK)) != 0;
+    /*
+     * Only the bridge ERROR bits (high) go to the HEART widget-error vector
+     * (57) via this single output.  Device-line interrupts (low 8) are sent
+     * per-line as their own HEART vector in sgi_bridge_dev_irq().
+     */
+    int level = (status & enable & ~BRIDGE_ISR_INT_MSK) != 0;
 
     qemu_set_irq(s->cpu_irq, level);
 }
@@ -1111,11 +1117,22 @@ static void sgi_bridge_dev_irq(void *opaque, int n, int level)
 {
     SGIBRIDGEState *s = opaque;
     uint32_t *status = &s->regs[BRIDGE_INT_STATUS_OFF >> 2];
+    /* HEART vector the kernel programmed for this device line. */
+    unsigned vec = s->regs[(0x134 + n * 8) >> 2] & 0xff;
 
     if (level) {
         *status |= (1u << n);
     } else {
         *status &= ~(1u << n);
+    }
+    /*
+     * A device asserting its PCI interrupt sends the xtalk vector in
+     * b_int_addr[line] (pcibr_xintr_preset / pcibr_intr_connect).  The kernel
+     * dispatches that HEART vector to pcibr_intr_list_func -> the driver's
+     * handler (e.g. qlintr).  Drive the HEART directly.
+     */
+    if (vec) {
+        sgi_heart_raise_vector(s->heart, vec, level);
     }
     sgi_bridge_update_irq(s);
 }

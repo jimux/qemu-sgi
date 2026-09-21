@@ -131,40 +131,43 @@ static void sgi_heart_update_irq(SGIHEARTState *s)
     /*
      * HEART aggregate interrupt -> IP6 (env.irq[6]).
      *
-     * The kernel's ffintrctbl maps Cause bit14 (IP6) -> pri 10 = heart_intr_err,
-     * which reads h_imsr and dispatches heart_ivec[] (vector 50 = heartclock,
-     * 51-63 = widget/bridge errors incl. 57).  Cause bit15 (IP7) maps to
-     * pri 9 = counter_intr, the CPU count/compare timer, so the HEART must NOT
-     * drive IP7.  Widget errors (level 4) belong on IP6 with the HEART timer
-     * (level 3); both are dispatched via h_imsr.
+     * IRIX's ffintrctbl maps Cause bit14 (IP6) -> pri 10 = heart_intr_err,
+     * which reads h_imsr and dispatches heart_ivec[vec] for EVERY HEART vector
+     * (50 = heartclock, 51-63 = widget/bridge errors, and the device-line
+     * vectors like 18).  So all HEART vectors share this one output.  IP7 is
+     * the CPU count/compare timer and must not be driven by the HEART.
      */
-    if (masked & (HEART_INT_LEVEL3 | HEART_INT_LEVEL4)) {
+    if (masked) {
         qemu_irq_raise(s->cpu_irq[1]);  /* IP6 -> heart_intr_err */
     } else {
         qemu_irq_lower(s->cpu_irq[1]);
     }
-    /* IP7 (cpu_irq[0]) is the CPU timer; the HEART does not drive it. */
-    qemu_irq_lower(s->cpu_irq[0]);
+    qemu_irq_lower(s->cpu_irq[0]);      /* IP7: CPU timer only */
+    qemu_irq_lower(s->cpu_irq[2]);
+    qemu_irq_lower(s->cpu_irq[3]);
+    qemu_irq_lower(s->cpu_irq[4]);
+}
 
-    /* Level 2 (IP5) - vectors 49-32 */
-    if (masked & HEART_INT_LEVEL2) {
-        qemu_irq_raise(s->cpu_irq[2]);  /* IP5 */
-    } else {
-        qemu_irq_lower(s->cpu_irq[2]);
+/*
+ * Raise/lower a HEART interrupt vector directly.  A device asserting its
+ * xtalk interrupt sends the vector the bridge programmed in b_int_addr[]
+ * (BRIDGE_INT_ADDR_FLD & vect); model that as setting the HEART ISR bit.
+ */
+void sgi_heart_raise_vector(SGIHEARTState *s, int vec, int level)
+{
+    if (!s || vec < 0 || vec >= HEART_NUM_IRQS) {
+        return;
     }
 
-    /* Level 1 (IP4) - vectors 31-16 */
-    if (masked & HEART_INT_LEVEL1) {
-        qemu_irq_raise(s->cpu_irq[3]);  /* IP4 */
-    } else {
-        qemu_irq_lower(s->cpu_irq[3]);
-    }
-
-    /* Level 0 (IP3) - vectors 15-0 */
-    if (masked & HEART_INT_LEVEL0) {
-        qemu_irq_raise(s->cpu_irq[4]);  /* IP3 */
-    } else {
-        qemu_irq_lower(s->cpu_irq[4]);
+    /*
+     * The HEART ISR is a LATCH: a device pulse sets the bit and it stays set
+     * until software clears it (write ISR/CLR_ISR).  If we followed the input
+     * level a short device pulse (assert-then-deassert before the CPU services
+     * the IP) would be lost and the vector handler never dispatched.
+     */
+    if (level) {
+        s->isr |= (1ULL << vec);
+        sgi_heart_update_irq(s);
     }
 }
 

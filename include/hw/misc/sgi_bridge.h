@@ -183,6 +183,14 @@ struct SGIBRIDGEState {
 
     /* IP30 BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 0/1). */
     SGIQLispState isp[2];
+
+    /*
+     * HEART link (set by the machine).  On a device-line assert the bridge
+     * sends the HEART vector programmed in b_int_addr[line] (a real xtalk
+     * interrupt send); modelled as a direct HEART ISR set, since the HEART's
+     * vector inputs are not individually wired to the bridge as QEMU gpios.
+     */
+    void *heart;
 };
 
 #endif /* HW_MISC_SGI_BRIDGE_H */
