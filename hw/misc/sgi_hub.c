@@ -50,6 +50,8 @@ static void sgi_hub_reset_bh(void *opaque);
 #define PI_CC_MASK 0x0000e8
 #define PI_RT_COMPARE_A 0x000108
 #define PI_RT_COMPARE_B 0x000110
+#define PI_RT_PEND_A 0x000120
+#define PI_RT_PEND_B 0x000128
 #define PI_RT_EN_A 0x000140
 #define PI_RT_EN_B 0x000148
 #define PI_RT_LOCAL_CTRL 0x000160
@@ -163,17 +165,38 @@ static uint64_t sgi_hub_rtc_count(void) {
   return (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
 }
 
-static void sgi_hub_update_irqs(SGIHubState *s) {
+/* Latch PI_RT_PEND_x once a freshly armed, enabled COMPARE_x is reached. */
+static void sgi_hub_rtc_poll(SGIHubState *s) {
+  uint64_t now = sgi_hub_rtc_count();
   int i;
 
   for (i = 0; i < SGI_HUB_MAX_CPUS; i++) {
-    qemu_set_irq(s->irq[i][0], (s->int_pend0 != 0));
-    qemu_set_irq(s->irq[i][1], (s->int_pend1 != 0));
-    if (s->rt_enable[i] && s->rt_compare[i] &&
-        sgi_hub_rtc_count() >= s->rt_compare[i]) {
-      qemu_set_irq(s->irq[i][2], 1);
+    if (s->rt_armed[i] && s->rt_enable[i] && now >= s->rt_compare[i]) {
+      s->rt_pend[i] = 1;
+      s->rt_armed[i] = 0;
     }
   }
+}
+
+static void sgi_hub_update_irqs(SGIHubState *s) {
+  int i;
+
+  sgi_hub_rtc_poll(s);
+  for (i = 0; i < SGI_HUB_MAX_CPUS; i++) {
+    qemu_set_irq(s->irq[i][0], (s->int_pend0 != 0));
+    qemu_set_irq(s->irq[i][1], (s->int_pend1 != 0));
+    /* L4 (RTC): asserted while a pend bit is latched and the slice is
+     * enabled.  The OS reads PI_RT_PEND_x and acks by writing it 0. */
+    qemu_set_irq(s->irq[i][2], s->rt_pend[i] && s->rt_enable[i]);
+  }
+}
+
+/* The RTC interrupt can fire while the CPU is idle, so poll it on a timer. */
+static void sgi_hub_rtc_timer(void *opaque) {
+  SGIHubState *s = opaque;
+
+  sgi_hub_update_irqs(s);
+  timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
 static uint64_t sgi_hub_pi_read(SGIHubState *s, hwaddr off) {
@@ -215,6 +238,10 @@ static uint64_t sgi_hub_pi_read(SGIHubState *s, hwaddr off) {
     return s->rt_compare[0];
   case PI_RT_COMPARE_B:
     return s->rt_compare[1];
+  case PI_RT_PEND_A:
+    return s->rt_pend[0];
+  case PI_RT_PEND_B:
+    return s->rt_pend[1];
   case PI_RT_EN_A:
     return s->rt_enable[0];
   case PI_RT_EN_B:
@@ -293,15 +320,33 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
     break;
   case PI_RT_COMPARE_A:
     s->rt_compare[0] = val;
+    s->rt_pend[0] = 0;
+    s->rt_armed[0] = (val != 0);
+    sgi_hub_update_irqs(s);
     break;
   case PI_RT_COMPARE_B:
     s->rt_compare[1] = val;
+    s->rt_pend[1] = 0;
+    s->rt_armed[1] = (val != 0);
+    sgi_hub_update_irqs(s);
+    break;
+  case PI_RT_PEND_A:
+    /* The OS acks the RTC interrupt by writing the pend bit 0; it must not
+     * re-assert until COMPARE_A is armed again. */
+    s->rt_pend[0] = 0;
+    sgi_hub_update_irqs(s);
+    break;
+  case PI_RT_PEND_B:
+    s->rt_pend[1] = 0;
+    sgi_hub_update_irqs(s);
     break;
   case PI_RT_EN_A:
     s->rt_enable[0] = val;
+    sgi_hub_update_irqs(s);
     break;
   case PI_RT_EN_B:
     s->rt_enable[1] = val;
+    sgi_hub_update_irqs(s);
     break;
   case PI_RT_LOCAL_CTRL:
     break;
@@ -1006,6 +1051,8 @@ static void sgi_hub_reset(DeviceState *dev) {
   for (i = 0; i < SGI_HUB_MAX_CPUS; i++) {
     s->rt_compare[i] = 0;
     s->rt_enable[i] = 0;
+    s->rt_pend[i] = 0;
+    s->rt_armed[i] = 0;
   }
 
   /*
@@ -1047,6 +1094,9 @@ static void sgi_hub_realize(DeviceState *dev, Error **errp) {
       sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i][j]);
     }
   }
+
+  s->rt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_hub_rtc_timer, s);
+  timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
 }
 
 static const Property sgi_hub_properties[] = {

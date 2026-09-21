@@ -58,9 +58,16 @@ struct SGIHubState {
   uint64_t int_mask[4];
   uint64_t cc_mask;
 
-  /* PI: real-time counter compare/enable, per slice. */
+  /* PI: real-time counter compare/enable/pending, per slice.
+   * PI_RT_PEND_x latches when the free-running PI_RT_COUNT reaches a freshly
+   * armed PI_RT_COMPARE_x; the OS raises its L4 (RTC) interrupt while the
+   * pend bit is set and acks by writing PI_RT_PEND_x=0.  Once acked the pend
+   * must NOT re-assert until PI_RT_COMPARE_x is written again -- rt_armed
+   * tracks that one-shot latch (klclock.c hub_rtc_init/acktmoclock/COMPARE). */
   uint64_t rt_compare[SGI_HUB_MAX_CPUS];
   uint64_t rt_enable[SGI_HUB_MAX_CPUS];
+  uint64_t rt_pend[SGI_HUB_MAX_CPUS];
+  uint64_t rt_armed[SGI_HUB_MAX_CPUS];
 
   /* PI: error-stack addresses (A=CPU0, B=CPU1).  The PROM's entry does a
    * deliberate one-time reset unless PI_ERR_STACK_ADDR_B holds "Rst0". */
@@ -127,6 +134,9 @@ struct SGIHubState {
 
   /* CPUs, for reset / timer handling. */
   CPUState *cpus[SGI_HUB_MAX_CPUS];
+
+  /* Polls the free-running RTC against each slice's armed COMPARE. */
+  QEMUTimer *rt_timer;
 };
 
 #endif /* HW_MISC_SGI_HUB_H */
