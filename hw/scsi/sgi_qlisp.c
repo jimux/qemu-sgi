@@ -725,6 +725,9 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     switch (off & ~1) {
     case QL_BUS_SEMA:
     case QL_NVRAM:
+        if (getenv("QLISP_DEBUG") && off == QL_BUS_SEMA) {
+            fprintf(stderr, "sgi-qlisp: SEMA wr %04x\n", val & 0xffff);
+        }
         ql_reg_put(s, off, val & 0xffff);
         if (val == 0) {
             s->cmd_pending = false;      /* host releases the semaphore */
@@ -760,6 +763,9 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          * process eagerly here so an interrupt-driven driver (the IRIX kernel
          * ql module) completes without polling bus_isr first.
          */
+        if (getenv("QLISP_DEBUG")) {
+            fprintf(stderr, "sgi-qlisp: MBOX4 wr in=%u (req ring)\n", val & 0xffff);
+        }
         ql_reg_put(s, off, val & 0xffff);
         ql_process_requests(s);
         break;
