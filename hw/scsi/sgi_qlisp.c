@@ -732,6 +732,18 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         }
         break;
     case QL_BUS_ICR:
+        if (getenv("QLISP_DEBUG")) {
+            fprintf(stderr, "sgi-qlisp: ICR wr %04x\n", val & 0xffff);
+        }
+        /* Soft reset asserts HCCR_RESET; our RISC resets instantly so clear it
+         * (a poll waiting for the reset to finish then exits). */
+        if (val & 0x0080) {
+            s->firmware_running = false;
+            s->cmd_pending = false;
+            ql_reg_put(s, QL_HCCR, HCCR_RESET);
+            ql_reg_put(s, QL_HCCR, 0);
+            ql_reg_put(s, QL_MBOX0, MBOX_STS_COMMAND_COMPLETE);
+        }
         ql_reg_put(s, QL_BUS_ICR, val & 0xffff);
         break;
     case QL_MBOX5:
@@ -753,6 +765,9 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case QL_HCCR:
     case 0xc0:
+        if (getenv("QLISP_DEBUG")) {
+            fprintf(stderr, "sgi-qlisp: HCCR wr %04x\n", val & 0xffff);
+        }
         switch (val & 0xf000) {
         case HCCR_CMD_SET_HOST_INT:
             ql_do_mbox_cmd(s);
