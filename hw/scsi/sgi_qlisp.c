@@ -125,6 +125,15 @@ static uint64_t ql_dma_to_phys(uint64_t a)
     if (a >> 32) {
         return a & 0xffffffffULL;
     }
+    /*
+     * K1 (0xa0000000-0xbfffffff) and K0SEG (0x80000000-0x9fffffff) are
+     * direct-mapped: strip the segment base.  The request/response queue bases
+     * the driver publishes are K1 kernel virtuals, while data DMA addresses come
+     * through the Bridge direct map (QL_DMA_DIRECT_BASE = 0x80000000).
+     */
+    if (a >= 0xa0000000ULL && a < 0xc0000000ULL) {
+        return a - 0xa0000000ULL;
+    }
     return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
 }
 
