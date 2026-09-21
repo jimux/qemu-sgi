@@ -191,6 +191,15 @@ struct SGIQLispState {
 
     MemoryRegion regs;
 
+    /*
+     * Interrupt output: asserted while the RISC-interrupt condition is active
+     * (BUS_ISR_RISC_INT pending or a mailbox command awaiting the host ack).
+     * On IP30 this line is routed through the BRIDGE PCI interrupt to HEART;
+     * the ARCS driver polls bus_isr and does not need it, but the IRIX kernel
+     * ql driver is interrupt-driven.
+     */
+    qemu_irq irq;
+
     /* register file: [0x00..0xff] as 16-bit words */
     uint16_t reg[QLISP_REGS_SIZE / 2];
 

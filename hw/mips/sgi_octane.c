@@ -280,6 +280,16 @@ static void sgi_octane_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(bridge_dev), 0, OCTANE_BRIDGE_BASE);
 
+    /*
+     * BRIDGE PCI interrupt aggregation -> HEART widget-error BASEIO vector
+     * (IP30_HVEC_WIDERR_BASEIO = 57).  The two QLogic ISP channels are BaseIO
+     * devices 0/1; the IRIX kernel ql driver is interrupt-driven (the ARCS
+     * driver polls), so without this its INQUIRY never completes and no
+     * target/lun/disk vertices appear under /hw/ql/0.
+     */
+    qdev_connect_gpio_out(DEVICE(bridge_dev), 0,
+                          qdev_get_gpio_in(DEVICE(heart_dev), 57));
+
     /* PROM at 0x1FC00000 (1MB). */
     prom = g_new(MemoryRegion, 1);
     memory_region_init_rom(prom, NULL, "sgi.prom", OCTANE_PROM_SIZE,

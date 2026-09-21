@@ -36,6 +36,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/irq.h"
 #include "hw/misc/sgi_bridge.h"
 #include "hw/char/serial.h"
 #include "hw/core/qdev-properties.h"
@@ -864,6 +865,8 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
     return val;
 }
 
+static void sgi_bridge_update_irq(SGIBRIDGEState *s);
+
 static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                              unsigned size)
 {
@@ -1033,6 +1036,8 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     }
 
+    /* b_int_enable (or any write) can change whether an IRQ is asserted. */
+    sgi_bridge_update_irq(s);
 }
 
 static const MemoryRegionOps sgi_bridge_ops = {
@@ -1073,11 +1078,54 @@ static void sgi_bridge_reset(DeviceState *dev)
     sgi_bridge_phy_init(s);
 }
 
+/*
+ * BRIDGE PCI interrupt aggregation.
+ *
+ * On IP30 the BRIDGE collects the PCI device interrupt requests (the two
+ * QLogic ISP channels are BaseIO devices 0 and 1) into b_int_status and, when
+ * one is pending, raises a single line that the machine routes to HEART's
+ * IP30_HVEC_WIDERR_BASEIO (57).  The IRIX kernel's pcibr handler then reads
+ * b_int_status and dispatches to the device's registered handler (qlintr).
+ *
+ * b_int_status is the low 8 bits (bvec: SCSI0=0, SCSI1=1, IOC3 eth=2, ...);
+ * the high bits are bridge error conditions gated by b_int_enable.  Device
+ * requests are level driven: the device line drops when the driver acks it.
+ */
+#define BRIDGE_INT_STATUS_OFF 0x104
+#define BRIDGE_INT_ENABLE_OFF 0x10c
+#define BRIDGE_ISR_INT_MSK    0x000000ffu
+
+static void sgi_bridge_update_irq(SGIBRIDGEState *s)
+{
+    uint32_t status = s->regs[BRIDGE_INT_STATUS_OFF >> 2];
+    uint32_t enable = s->regs[BRIDGE_INT_ENABLE_OFF >> 2];
+    int level = (status & (enable | BRIDGE_ISR_INT_MSK)) != 0;
+
+    qemu_set_irq(s->cpu_irq, level);
+}
+
+static void sgi_bridge_dev_irq(void *opaque, int n, int level)
+{
+    SGIBRIDGEState *s = opaque;
+    uint32_t *status = &s->regs[BRIDGE_INT_STATUS_OFF >> 2];
+
+    if (level) {
+        *status |= (1u << n);
+    } else {
+        *status &= ~(1u << n);
+    }
+    sgi_bridge_update_irq(s);
+}
+
 static void sgi_bridge_realize(DeviceState *dev, Error **errp)
 {
     SGIBRIDGEState *s = SGI_BRIDGE(dev);
     Chardev *chr;
     int i;
+
+    /* Output line to HEART IP30_HVEC_WIDERR_BASEIO; inputs are PCI devices. */
+    qdev_init_gpio_out(dev, &s->cpu_irq, 1);
+    qdev_init_gpio_in(dev, sgi_bridge_dev_irq, 8);
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &sgi_bridge_ops, s,
                           "sgi-bridge", BRIDGE_REG_SIZE);
@@ -1134,6 +1182,10 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
         memory_region_add_subregion(&s->iomem,
                                     i == 0 ? BRIDGE_QLISP0_OFF : BRIDGE_QLISP1_OFF,
                                     &s->isp[i].regs);
+    }
+    /* Route the two ISP interrupt lines into b_int_status bits 0/1. */
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out(DEVICE(&s->isp[i]), 0, qdev_get_gpio_in(dev, i));
     }
 
     /*

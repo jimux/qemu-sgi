@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/irq.h"
 #include "hw/scsi/sgi_qlisp.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -58,6 +59,24 @@ static uint16_t ql_mbox_get(SGIQLispState *s, int n)
 static void ql_mbox_put(SGIQLispState *s, int n, uint16_t v)
 {
     ql_reg_put(s, ql_mbox_off[n], v);
+}
+
+/*
+ * Drive the interrupt output line: asserted while the RISC-interrupt
+ * condition is live (bus_isr RISC_INT set, or a mailbox command finished and
+ * is awaiting the host ack).  The ARCS driver polls bus_isr and ignores this,
+ * but the IRIX kernel ql driver is interrupt-driven on IP30.
+ */
+static void ql_update_irq(SGIQLispState *s)
+{
+    uint16_t isr = ql_reg_get(s, QL_BUS_ISR);
+    int level;
+
+    if (s->cmd_pending) {
+        isr |= BUS_ISR_RISC_INT;
+    }
+    level = (isr & BUS_ISR_RISC_INT) ? 1 : 0;
+    qemu_set_irq(s->irq, level);
 }
 
 /*
@@ -212,6 +231,7 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
     ql_mbox_put(s, 5, s->rsp.in);
     ql_reg_put(s, QL_BUS_ISR,
                ql_reg_get(s, QL_BUS_ISR) | BUS_ISR_RISC_INT);
+    ql_update_irq(s);
 
     if (qlisp_dbg()) {
         qemu_log_mask(LOG_UNIMP,
@@ -710,6 +730,16 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             s->rsp.out = val % s->rsp.count;
         }
         break;
+    case QL_MBOX4:
+        /*
+         * Host publishes the request-queue in-pointer; the real RISC fetches
+         * the new entries and posts responses (raising the interrupt).  We
+         * process eagerly here so an interrupt-driven driver (the IRIX kernel
+         * ql module) completes without polling bus_isr first.
+         */
+        ql_reg_put(s, off, val & 0xffff);
+        ql_process_requests(s);
+        break;
     case QL_HCCR:
     case 0xc0:
         switch (val & 0xf000) {
@@ -741,6 +771,7 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         ql_reg_put(s, off, val & 0xffff);
         break;
     }
+    ql_update_irq(s);
 }
 
 static const MemoryRegionOps qlisp_ops = {
@@ -767,6 +798,7 @@ static void qlisp_reset(DeviceState *dev)
     s->sg_off = 0;
     memset(&s->req, 0, sizeof(s->req));
     memset(&s->rsp, 0, sizeof(s->rsp));
+    ql_update_irq(s);
 }
 
 static void qlisp_realize(DeviceState *dev, Error **errp)
@@ -775,6 +807,7 @@ static void qlisp_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->regs, OBJECT(dev), &qlisp_ops, s,
                           "sgi-qlisp-regs", QLISP_REGS_SIZE);
+    qdev_init_gpio_out(dev, &s->irq, 1);
     scsi_bus_init(&s->bus, sizeof(s->bus), dev, &qlisp_scsi_info);
     s->bus.busnr = s->busnr;
     scsi_bus_legacy_handle_cmdline(&s->bus);
