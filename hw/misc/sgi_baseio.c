@@ -677,12 +677,22 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
     unsigned idx = (off - SGI_BASEIO_ETH_OFF) >> 2;
 
     if (idx == SGI_IOC3_EMCR) {
+      uint32_t old = s->eth_regs[idx];
+
       /* RST and the idle status bit are handled, not stored. */
       s->eth_regs[idx] = val & ~(0x80000000u | 0x00200000u);
       if (val & 0x80000000u) {
         s->eth_rxprod = 0;
         s->eth_txcons = 0;
         memset(s->eth_regs, 0, sizeof(s->eth_regs));
+      } else if (!(old & 0x00010000u) && (val & 0x00010000u) && s->nic) {
+        /*
+         * RXEN 0->1: the ef driver clears RXEN in ef_close and re-enables it
+         * on the next open; while it was clear can_receive() was false so QEMU
+         * queued (rather than dropped) incoming frames.  Flush them now or the
+         * frame that arrived during the close is never delivered.
+         */
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
       }
     } else if (idx == SGI_IOC3_ETPIR) {
       s->eth_regs[idx] = val;
