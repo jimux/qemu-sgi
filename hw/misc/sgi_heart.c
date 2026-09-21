@@ -128,19 +128,23 @@ static void sgi_heart_update_irq(SGIHEARTState *s)
     uint64_t imr = s->imr[0];  /* CPU 0 mask for now */
     uint64_t masked = isr & imr;
 
-    /* Level 4 (IP7) - vectors 63-51 */
-    if (masked & HEART_INT_LEVEL4) {
-        qemu_irq_raise(s->cpu_irq[0]);  /* IP7 */
-    } else {
-        qemu_irq_lower(s->cpu_irq[0]);
-    }
-
-    /* Level 3 (IP6) - vector 50 */
-    if (masked & HEART_INT_LEVEL3) {
-        qemu_irq_raise(s->cpu_irq[1]);  /* IP6 */
+    /*
+     * HEART aggregate interrupt -> IP6 (env.irq[6]).
+     *
+     * The kernel's ffintrctbl maps Cause bit14 (IP6) -> pri 10 = heart_intr_err,
+     * which reads h_imsr and dispatches heart_ivec[] (vector 50 = heartclock,
+     * 51-63 = widget/bridge errors incl. 57).  Cause bit15 (IP7) maps to
+     * pri 9 = counter_intr, the CPU count/compare timer, so the HEART must NOT
+     * drive IP7.  Widget errors (level 4) belong on IP6 with the HEART timer
+     * (level 3); both are dispatched via h_imsr.
+     */
+    if (masked & (HEART_INT_LEVEL3 | HEART_INT_LEVEL4)) {
+        qemu_irq_raise(s->cpu_irq[1]);  /* IP6 -> heart_intr_err */
     } else {
         qemu_irq_lower(s->cpu_irq[1]);
     }
+    /* IP7 (cpu_irq[0]) is the CPU timer; the HEART does not drive it. */
+    qemu_irq_lower(s->cpu_irq[0]);
 
     /* Level 2 (IP5) - vectors 49-32 */
     if (masked & HEART_INT_LEVEL2) {
