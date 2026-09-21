@@ -391,9 +391,19 @@ static void hpc1_scsi_dma_run(SGIHPC1State *s)
             wdc->async_buf = NULL;
             wdc->aux_status &= ~(ASR_DBR | ASR_CIP | ASR_BSY);
             wdc->regs[WD_COMMAND_PHASE] = 0x46;
+            /*
+             * scsi_dma_to_device is the CTRL "to memory" bit, i.e. a READ
+             * (device -> memory): the chip is the sender, so the correct
+             * unexpected-phase status is UNEX_SDATA. UNEX_RDATA (chip
+             * receiving) is for writes. Reporting these backwards makes the
+             * IRIX driver print "Too much data sent (probable SCSI bus cabling
+             * problem). Resetting SCSI bus".
+             * Reference: wd33c93_transfer_data()'s TC==0 branch (read ->
+             * UNEX_SDATA, write -> UNEX_RDATA).
+             */
             wdc->scsi_status = s->scsi_dma_to_device
-                               ? SCSI_STATUS_UNEX_RDATA
-                               : SCSI_STATUS_UNEX_SDATA;
+                               ? SCSI_STATUS_UNEX_SDATA
+                               : SCSI_STATUS_UNEX_RDATA;
             wdc->aux_status |= ASR_INT;
             qemu_irq_raise(wdc->irq);
         } else {
@@ -1425,11 +1435,17 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     /* WD33C93 SCSI controller */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
     /*
-     * The IP20 driver drives a fresh TC-sized pass per DMA descriptor and has
-     * no unexpected-phase reprogram path, so disable the UNEX multi-pass used
-     * by the HPC3/Indy path (see progress_notes/indy/multipass_dma_fix.md).
+     * Enable the WD33C93 unexpected-phase (UNEX) multi-pass resume, matching
+     * the HPC3/Indy path. The IP20 driver caps a DMA chain at 64 descriptors
+     * and programs TC to the chain total, which is short of the CDB length by
+     * the tail: e.g. a 262144-byte READ whose buffer starts 1504 bytes into a
+     * page yields [bc=2592] + 63*[bc=4096] = 260640, leaving 1504 bytes. The
+     * driver relies on the UNEX interrupt to transfer that tail in a second
+     * pass. The earlier "no-unex" conclusion rested on a stale run that
+     * predated the HPC1 DMA drain/SCC/DUART fixes.
+     * (See progress_notes/ip20/LEG22-mkfs-finalization-blocker.md.)
      */
-    object_property_set_bool(OBJECT(s->scsi), "no-unex", true, &error_fatal);
+    object_property_set_bool(OBJECT(s->scsi), "no-unex", false, &error_fatal);
     qdev_realize(DEVICE(s->scsi), NULL, &error_fatal);
     qdev_connect_gpio_out_named(DEVICE(s->scsi), "irq", 0,
                                 qdev_get_gpio_in_named(dev, "scsi-irq", 0));
