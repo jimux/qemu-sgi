@@ -136,8 +136,12 @@ void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
 {
     if (timer_dbg()) {
         uint32_t c = cpu_mips_get_count_val(env);
-        fprintf(stderr, "cp0timer: store_compare=0x%08x count=0x%08x delta=%d\n",
-                value, c, (int32_t)(value - c));
+        static int64_t c0, last; static long n; int64_t now = qemu_clock_get_ns(mips_count_clock_type());
+        if (!n) c0 = now;
+        if (n % 500 == 0)
+            fprintf(stderr, "cp0timer: store_compare=0x%08x count=0x%08x delta=%d t=%.3fs n=%ld\n",
+                    value, c, (int32_t)(value - c), (now - c0)/1e9, n);
+        last = now; n++;
     }
     env->CP0_Compare = value;
     if (!(env->CP0_Cause & (1 << CP0Ca_DC))) {
