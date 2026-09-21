@@ -268,11 +268,11 @@ static void sgi_octane_init(MachineState *machine)
      * HEART interrupt outputs -> CPU IP3-IP7. Level 4 (errors/widget) -> IP7,
      * level 3 (timer) -> IP6, level 2 -> IP5, level 1 -> IP4, level 0 -> IP3.
      */
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpu->env.irq[7]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpu->env.irq[6]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpu->env.irq[5]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpu->env.irq[4]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpu->env.irq[3]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpu->env.irq[6]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpu->env.irq[5]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpu->env.irq[4]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpu->env.irq[3]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpu->env.irq[2]);
 
     /* BRIDGE (widget 0xF) at 0x1F000000, 12MB covering PCI/IOC3/devio. */
     bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
@@ -452,11 +452,11 @@ static void sgi_ip54pv_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(heart_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(heart_dev), 0, OCTANE_HEART_BASE);
 
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpus[0]->env.irq[7]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpus[0]->env.irq[6]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpus[0]->env.irq[5]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpus[0]->env.irq[4]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpus[0]->env.irq[3]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpus[0]->env.irq[6]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpus[0]->env.irq[5]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpus[0]->env.irq[4]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpus[0]->env.irq[3]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpus[0]->env.irq[2]);
 
     bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(bridge_dev), &error_fatal);

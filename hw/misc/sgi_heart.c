@@ -129,23 +129,39 @@ static void sgi_heart_update_irq(SGIHEARTState *s)
     uint64_t masked = isr & imr;
 
     /*
-     * HEART aggregate interrupt -> IP6 (env.irq[6]).
-     *
-     * IRIX's ffintrctbl maps Cause bit14 (IP6) -> pri 10 = heart_intr_err,
-     * which reads h_imsr and dispatches heart_ivec[vec] for EVERY HEART vector
-     * (50 = heartclock, 51-63 = widget/bridge errors, and the device-line
-     * vectors like 18).  So all HEART vectors share this one output.  IP7 is
-     * the CPU count/compare timer and must not be driven by the HEART.
+     * HEART level -> CPU IP map (from IRIX ffintrctbl/c0vec_tbl):
+     *   level0 (vec 3-15)  -> IP2  (heart_intr_low)
+     *   level1 (vec 16-31) -> IP3  (heart_intr_med)
+     *   level2 (vec 32-49) -> IP4  (heart_intr_hi)
+     *   level3 (vec 50)    -> IP5  (heartclock_intr)
+     *   level4 (vec 51-63) -> IP6  (heart_intr_err)
+     * The machine wires cpu_irq[i] -> the matching env.irq (see sgi_octane.c).
      */
-    if (masked) {
-        qemu_irq_raise(s->cpu_irq[1]);  /* IP6 -> heart_intr_err */
+    if (masked & HEART_INT_LEVEL4) {
+        qemu_irq_raise(s->cpu_irq[0]);
+    } else {
+        qemu_irq_lower(s->cpu_irq[0]);
+    }
+    if (masked & HEART_INT_LEVEL3) {
+        qemu_irq_raise(s->cpu_irq[1]);
     } else {
         qemu_irq_lower(s->cpu_irq[1]);
     }
-    qemu_irq_lower(s->cpu_irq[0]);      /* IP7: CPU timer only */
-    qemu_irq_lower(s->cpu_irq[2]);
-    qemu_irq_lower(s->cpu_irq[3]);
-    qemu_irq_lower(s->cpu_irq[4]);
+    if (masked & HEART_INT_LEVEL2) {
+        qemu_irq_raise(s->cpu_irq[2]);
+    } else {
+        qemu_irq_lower(s->cpu_irq[2]);
+    }
+    if (masked & HEART_INT_LEVEL1) {
+        qemu_irq_raise(s->cpu_irq[3]);
+    } else {
+        qemu_irq_lower(s->cpu_irq[3]);
+    }
+    if (masked & HEART_INT_LEVEL0) {
+        qemu_irq_raise(s->cpu_irq[4]);
+    } else {
+        qemu_irq_lower(s->cpu_irq[4]);
+    }
 }
 
 /*
