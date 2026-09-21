@@ -622,6 +622,15 @@ static void sgi_ip27_init(MachineState *machine) {
                        machine->ram_size, banksz, "sgi-ip27.ram.mspec");
     ip27_add_ram_banks(system_memory, IP27_CAC_BASE, ram,
                        machine->ram_size, banksz, "sgi-ip27.ram.cac");
+    /*
+     * HSPEC is another access-mode alias of node memory: TO_HSPEC(x) =
+     * HSPEC_BASE | (x & TO_PHYS_MASK), so HSPEC+off reads/writes local RAM at
+     * off (addrs.h).  The LBOOT flash and the bdoor directory are added later,
+     * so they overlay this alias.  Without it the kernel's fill of its BSS/
+     * heap via HSPEC (e.g. 0x9000000001bdf818) hits unmapped space -> DBE.
+     */
+    ip27_add_ram_banks(system_memory, IP27_HSPEC_BASE, ram,
+                       machine->ram_size, banksz, "sgi-ip27.ram.hspec");
   }
 
 
