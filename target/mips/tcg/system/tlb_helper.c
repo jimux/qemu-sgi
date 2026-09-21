@@ -113,6 +113,51 @@ static void r4k_helper_tlbinvf(CPUMIPSState *env)
     cpu_mips_tlb_flush(env);
 }
 
+/*
+ * Machine-scoped pinned translation.  On SGI IP27 the loader is supposed to
+ * leave a valid TLB entry mapping the kernel's K2 entry (0xc000000000000000)
+ * to its load physical address before jumping in; our executed path never
+ * installs it (no tlbwr anywhere in the PROM), so the kernel-entry code faults
+ * (TLBL) before it can map itself.  A machine calls
+ * mips_cpu_pin_kernel_mapping() to name that region; when the guest then
+ * writes an *invalidating* entry for that VPN we re-assert the pinned mapping.
+ * Latent unless a machine opts in: vpn stays 0 for indy/o2/virtuix.
+ */
+static uint64_t pinned_vpn;
+static uint64_t pinned_paddr;
+static uint32_t pinned_pagemask;
+static uint32_t pinned_flags;
+
+void mips_cpu_pin_kernel_mapping(uint64_t vpn, uint64_t paddr,
+                                 uint32_t pagemask, uint32_t flags)
+{
+    pinned_vpn = vpn;
+    pinned_paddr = paddr;
+    pinned_pagemask = pagemask;
+    pinned_flags = flags;
+}
+
+static void r4k_repin_if_kernel_entry(CPUMIPSState *env, int idx,
+                                      target_ulong VPN)
+{
+    uint64_t page;
+
+    if (!pinned_vpn || VPN != pinned_vpn) {
+        return;
+    }
+    /* Only step in when the guest is invalidating the entry (V=0 in both
+     * halves) -- a valid write (the kernel's own mapped_kernel_setup_tlb)
+     * wins and this stays out of the way. */
+    if ((env->CP0_EntryLo0 & 2) || (env->CP0_EntryLo1 & 2)) {
+        return;
+    }
+    page = pinned_pagemask ? ((uint64_t)pinned_pagemask + 0x2000) / 2 : 0x1000;
+    env->CP0_PageMask = pinned_pagemask;
+    env->CP0_EntryLo0 = ((pinned_paddr >> 12) << 6) | pinned_flags;
+    env->CP0_EntryLo1 = (((pinned_paddr + page) >> 12) << 6) | pinned_flags;
+    r4k_fill_tlb(env, idx);
+}
+
 static void r4k_helper_tlbwi(CPUMIPSState *env)
 {
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
@@ -159,6 +204,7 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
 
     r4k_invalidate_tlb(env, idx, 0);
     r4k_fill_tlb(env, idx);
+    r4k_repin_if_kernel_entry(env, idx, VPN);
 }
 
 static void r4k_helper_tlbwr(CPUMIPSState *env)

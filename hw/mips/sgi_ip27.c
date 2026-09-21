@@ -54,6 +54,19 @@
 #define IP27_UNCAC_BASE 0x9600000000000000ULL
 #define IP27_CAC_BASE 0xa800000000000000ULL
 
+/*
+ * Kernel K2 (XKSEG) entry base.  The kernel links at 0xc000000000000000+ and
+ * its entry runs there, so this VPN must be TLB-mapped before the jump.
+ */
+#define IP27_K2_BASE 0xc000000000000000ULL
+/*
+ * PageMask for a 16 MB page, and EntryLo flags V|D|G|C=5 -- enough to cover
+ * the kernel's load at the start of node RAM.  (Encoding mirrors the PROM
+ * mapping flags above.)
+ */
+#define IP27_K2_PAGEMASK 0x01ffe000ULL
+#define IP27_K2_FLAGS 0x2fULL
+
 /* Preserve bits [58:0]; bits [58:56] carry the address-space selector. */
 /*
  * Physical-address mask for XKPHYS.  Must retain the XKPHYS region
@@ -611,6 +624,20 @@ static void sgi_ip27_init(MachineState *machine) {
       CPU(c)->start_powered_off = true;
     }
   }
+
+  /*
+   * Emulation accommodation: on real IP27 the loader leaves the kernel's K2
+   * entry (0xc000000000000000) mapped to its load physical address before
+   * jumping in.  Our executed ARCS/ELF path never installs it (the PROM
+   * contains no tlbwr, and the ELF loader's kdmtolocal() is the identity), so
+   * the kernel-entry code takes TLBL before it can map itself.  Pin the region
+   * to the start of node RAM -- a 16 MB page covers the kernel's load at
+   * ~0x19000 -- re-asserted whenever the guest invalidates that VPN.  A valid
+   * write by the kernel's own mapped_kernel_setup_tlb then supersedes it.
+   * Latent on every other machine (pinned_vpn stays 0).
+   */
+  mips_cpu_pin_kernel_mapping(IP27_K2_BASE, 0, IP27_K2_PAGEMASK,
+                              IP27_K2_FLAGS);
 
   /* Node-local memory at physical 0, aliased uncached (UNCAC/MSPEC spaces). */
   {

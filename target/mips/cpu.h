@@ -1418,4 +1418,13 @@ MIPSCPU *mips_cpu_create_with_clock(const char *cpu_type, Clock *cpu_refclk,
 void mips_cpu_install_mapping(MIPSCPU *cpu, uint64_t vaddr, uint64_t paddr,
                               uint32_t pagemask, uint32_t asid, uint32_t flags);
 
+/*
+ * Machine-scoped emulation accommodation: name a translation the loader is
+ * supposed to leave pinned (SGI IP27's kernel K2 entry).  When the guest
+ * invalidates that VPN, the machine's pinned mapping is re-asserted.  Latent
+ * unless a machine calls it, so other machines are unaffected.
+ */
+void mips_cpu_pin_kernel_mapping(uint64_t vpn, uint64_t paddr,
+                                 uint32_t pagemask, uint32_t flags);
+
 #endif /* MIPS_CPU_H */
