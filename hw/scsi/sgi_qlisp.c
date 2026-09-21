@@ -259,6 +259,12 @@ static void ql_scsi_transfer_data(SCSIRequest *req, uint32_t len)
      * un-munge what it picks up.  ql_munge is its own inverse, so applying it
      * symmetrically in both directions is correct.
      */
+    if (getenv("QLISP_DEBUG") && req->cmd.buf[0] == 0x12) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-qlisp: INQ len=%u buf=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                      len, buf[0], buf[1], buf[2], buf[3],
+                      buf[4], buf[5], buf[6], buf[7]);
+    }
     if (!s->control_munge) {
         ql_munge(buf, len);
     }
