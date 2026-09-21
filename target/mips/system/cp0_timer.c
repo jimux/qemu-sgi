@@ -59,13 +59,25 @@ static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
             (uint32_t)clock_ns_to_ticks(env->count_clock, now_ns);
 }
 
+static int timer_dbg(void)
+{
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("TIMER_DEBUG"); c = (e && *e && *e != '0'); }
+    return c;
+}
+
 static void cpu_mips_timer_update(CPUMIPSState *env)
 {
     uint64_t now_ns, next_ns;
-    uint32_t wait;
+    uint32_t wait, cnt;
 
     now_ns = qemu_clock_get_ns(mips_count_clock_type());
-    wait = env->CP0_Compare - cpu_mips_get_count_val(env);
+    cnt = cpu_mips_get_count_val(env);
+    wait = env->CP0_Compare - cnt;
+    if (timer_dbg() && wait > 2000000u) {
+        fprintf(stderr, "cp0timer: BIG wait=%u compare=0x%08x count=0x%08x delta=%d\n",
+                wait, env->CP0_Compare, cnt, (int32_t)(env->CP0_Compare - cnt));
+    }
     /* Clamp interval to overflow if virtual time had not progressed */
     if (!wait) {
         wait = UINT32_MAX;
@@ -122,6 +134,11 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
 
 void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
 {
+    if (timer_dbg()) {
+        uint32_t c = cpu_mips_get_count_val(env);
+        fprintf(stderr, "cp0timer: store_compare=0x%08x count=0x%08x delta=%d\n",
+                value, c, (int32_t)(value - c));
+    }
     env->CP0_Compare = value;
     if (!(env->CP0_Cause & (1 << CP0Ca_DC))) {
         cpu_mips_timer_update(env);
