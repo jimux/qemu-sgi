@@ -93,8 +93,8 @@ static void sgi_heart_compare_cb(void *opaque)
 }
 
 /*
- * GPIO input handler: device IRQ lines → HEART ISR bits.
- * Each line N maps to ISR bit N. Level=1 sets the bit, level=0 clears it.
+ * GPIO input handler: device IRQ lines -> HEART ISR bits.
+ * Each line N maps to ISR bit N.
  */
 static void sgi_heart_set_irq(void *opaque, int n, int level)
 {
@@ -106,10 +106,8 @@ static void sgi_heart_set_irq(void *opaque, int n, int level)
 
     if (level) {
         s->isr |= (1ULL << n);
-    } else {
-        s->isr &= ~(1ULL << n);
+        sgi_heart_update_irq(s);
     }
-    sgi_heart_update_irq(s);
 }
 
 /*
@@ -404,16 +402,24 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
         val = s->isr;
         break;
     case HEART_ISR:
-        val = s->isr;
+        /* Big-endian 64-bit register: high word at +0, low word at +4. */
+        val = (size == 4) ? (s->isr >> 32) : s->isr;
+        break;
+    case HEART_ISR + 4:
+        val = s->isr & 0xffffffffu;
         break;
     case HEART_IMSR:
         /*
          * Interrupt masked status (read-only): the pending vectors after the
-         * per-CPU mask.  The kernel's vector dispatcher reads IMSR to find
+         * per-CPU mask.  The kernel's vector dispatcher reads IMSR/ISR to find
          * which vector fired; returning a stale/zero field makes it see no
          * vector even though IP7 is asserted.
          */
-        val = s->isr & s->imr[0];
+        val = (size == 4) ? ((s->isr & s->imr[0]) >> 32)
+                          : (s->isr & s->imr[0]);
+        break;
+    case HEART_IMSR + 4:
+        val = (s->isr & s->imr[0]) & 0xffffffffu;
         break;
     case HEART_CAUSE:
         val = s->cause;
