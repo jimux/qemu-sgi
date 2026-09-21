@@ -154,7 +154,7 @@ static bool xbow_link_present(int port)
 static uint64_t xbow_read(void *opaque, hwaddr off, unsigned size)
 {
     SGIXbowRegs *s = opaque;
-    uint32_t id = XBOW_WIDGET_PART_NUM << 12; /* part at [27:12] */
+    uint32_t id = (1u << 28) | (XBOW_WIDGET_PART_NUM << 12); /* rev 1, part [27:12] */
     int p;
 
     if (off < 8) {
