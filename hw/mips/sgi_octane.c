@@ -140,7 +140,7 @@ static void sgi_octane_load_prom(MachineState *machine, MemoryRegion *prom)
 #define XBOW_LINK_AUX_OFF     0x3c
 #define XB_STAT_LINKALIVE     0x80000000u
 #define XB_AUX_STAT_PRESENT   0x00000020u
-#define XBOW_WIDGET_PART_NUM  0xc111u
+#define XBOW_WIDGET_PART_NUM  0x0000u
 
 typedef struct SGIXbowRegs {
     uint32_t regs[XBOW_REG_WORDS];

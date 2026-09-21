@@ -643,13 +643,16 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     /*
-     * BRIDGE widget ID (w_id, XIO config register at +0): part 0xc002 at
-     * [27:12], rev at [31:28]. The PROM's widget discovery (heart_do_port)
-     * and init_bridge read it to identify the Bridge.
+     * BRIDGE widget ID (w_id, XIO config register at +4): part 0xc002 at
+     * [27:12], mfg 0x036 (=54, SGI) at [10:1], rev 1 at [31:28]. The PROM's
+     * widget discovery (heart_do_port) and init_bridge read it to identify
+     * the Bridge, and the kernel's xwidget/cdl match requires BOTH the part
+     * (BRIDGE_WIDGET_PART_NUM) and the mfg (SGI 0x036) to match pcibr_init's
+     * xwidget_driver_register(0xc002, 54, "pcibr", ...).
      */
     case 0x0000 ... 0x0007:
         {
-            uint64_t wid = 0x1c002000ULL;
+            uint64_t wid = 0x1c00206cULL;
 
             if (size == 8) {
                 val = wid;
