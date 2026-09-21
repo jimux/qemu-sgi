@@ -407,7 +407,13 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
         val = s->isr;
         break;
     case HEART_IMSR:
-        val = s->imsr;
+        /*
+         * Interrupt masked status (read-only): the pending vectors after the
+         * per-CPU mask.  The kernel's vector dispatcher reads IMSR to find
+         * which vector fired; returning a stale/zero field makes it see no
+         * vector even though IP7 is asserted.
+         */
+        val = s->isr & s->imr[0];
         break;
     case HEART_CAUSE:
         val = s->cause;
