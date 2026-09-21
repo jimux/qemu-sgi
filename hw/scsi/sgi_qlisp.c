@@ -388,10 +388,15 @@ static void ql_process_requests(SGIQLispState *s)
             qemu_log_mask(LOG_UNIMP,
                           "sgi-qlisp: CMD bus=%d out=%u in=%u etype=0x%x "
                           "handle=%u tgt=%u lun=%u cdb_len=%u seg=%u "
-                          "cdb=%02x%02x%02x%02x%02x%02x\n",
+                          "cdb="
+                          "%02x%02x%02x%02x%02x%02x%02x%02x"
+                          "%02x%02x%02x%02x%02x%02x%02x%02x\n",
                           s->busnr, s->req.out, in, etype, s->cur_handle,
-                          e[0x0a], e[0x0b], cdb_len, seg_cnt, cdb[0], cdb[1],
-                          cdb[2], cdb[3], cdb[4], cdb[5]);
+                          e[0x0a], e[0x0b], cdb_len, seg_cnt,
+                          cdb[0], cdb[1], cdb[2], cdb[3],
+                          cdb[4], cdb[5], cdb[6], cdb[7],
+                          cdb[8], cdb[9], cdb[10], cdb[11],
+                          cdb[12], cdb[13], cdb[14], cdb[15]);
         }
         s->nsg = 0;
         s->sg_idx = 0;
