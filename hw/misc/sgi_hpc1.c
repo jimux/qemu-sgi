@@ -1160,13 +1160,16 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
                 case 0x20:
                     return s->seeq_mcast_lsb[reg];
                 default:                    /* 0x40: bank 2 */
-                    switch (reg) {
-                    case 0:  return s->seeq_mcast_msb[0];
-                    case 1:  return s->seeq_mcast_msb[1];
-                    case 2:  return s->seeq_pktgap;
-                    case 3:  return s->seeq_seeqctl;
-                    default: return 0;
-                    }
+                    /*
+                     * On READS bank 2 exposes a DIFFERENT view from the
+                     * write one (seeq.h union): seq_read = coll_xmit[2],
+                     * coll_total[2], fill6, flags -- the transmit collision
+                     * counters.  Returning the write-side view (mcast_msb /
+                     * pktgap / ctl) here fed the driver junk collision
+                     * counts, which showed up as netstat -i "Coll" in the
+                     * hundreds on a link with no real collisions.
+                     */
+                    return 0;               /* no collisions, no flags */
                 }
             }
             return 0;
