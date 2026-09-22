@@ -116,6 +116,14 @@ static void iris3130_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68020");
     mc->valid_cpu_types = valid_cpu_types;
     mc->max_cpus = 1;
+    /*
+     * This default RAM is declared for the machine core but is intentionally
+     * NOT mapped by iris3130_init(): the IP2 board owns the guest RAM as its
+     * own MemoryRegion ("ip2.ram", backed by SGIIP2State::ram, size
+     * IP2_RAM_SIZE) at physical 0. Consequently -m sizes only this unmapped
+     * region and is a no-op for the RAM the guest actually sees; the machine
+     * RAM size is the board's fixed 4 MiB.
+     */
     mc->default_ram_size = 4 * MiB;
     mc->default_ram_id = "iris3130.ram";
 }
