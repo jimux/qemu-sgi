@@ -273,3 +273,13 @@ saa7111_write(unsigned reg, unsigned val, int ro) "SAA7111 write reg[0x%02x] = 0
 saa7111_read(unsigned reg, unsigned val) "SAA7111 read reg[0x%02x] = 0x%02x"
 saa7185_write(unsigned reg, unsigned val, int ro) "SAA7185 write reg[0x%02x] = 0x%02x ro=%d"
 saa7185_read(unsigned reg, unsigned val) "SAA7185 read reg[0x%02x] = 0x%02x"
+
+# sgi_gr1.c
+sgi_gr1_read(uint32_t eff, unsigned size, uint32_t val) "gr1 read  eff=0x%04x size=%u -> 0x%x"
+sgi_gr1_write(uint32_t eff, unsigned size, uint32_t val) "gr1 write eff=0x%04x size=%u <- 0x%x"
+sgi_gr1_fifo_w(unsigned offset, uint32_t data, unsigned depth) "fifo_w reg=0x%02x data=0x%08x depth=%u"
+sgi_gr1_ge_fetch(uint32_t token, uint32_t data) "ge5 fetch token=0x%02x data=0x%08x"
+sgi_gr1_ge_int(int state, uint32_t pc) "ge5 interrupt %d pc=0x%04x"
+sgi_gr1_re_ir(unsigned ir, uint32_t x, uint32_t y, unsigned n, uint32_t rwmode, uint32_t r, uint32_t g, uint32_t b) "re2 ir=%u x=0x%x y=%u numpix=%u rwmode=%u r=0x%x g=0x%x b=0x%x"
+sgi_gr1_re_read(uint32_t x, uint32_t y, uint32_t rwmode, uint32_t val) "re2 readbuf x=%u y=%u rwmode=%u -> 0x%08x"
+sgi_gr1_board_reset(void) "gr1 board reset (cpuauxctl bit 7 falling)"

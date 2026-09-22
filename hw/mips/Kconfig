@@ -111,6 +111,7 @@ config SGI_IP6
     select WD33C93
     select SGI_SCN2681
     select SGI_IP6_INPUT
+    select SGI_GR1
     select UNIMP
 
 # IP6 serial keyboard/mouse HLE: the mouse is a Mouse Systems peer on

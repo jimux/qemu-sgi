@@ -145,6 +145,7 @@ endif
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
 system_ss.add(when: 'CONFIG_SGI_NEWPORT', if_true: files('sgi_newport.c'))
+system_ss.add(when: 'CONFIG_SGI_GR1', if_true: files('sgi_gr1.c'))
 system_ss.add(when: 'CONFIG_SGI_NEWPORT_VIRTUIX', if_true: files('sgi_newport_virtuix.c'))
 system_ss.add(when: 'CONFIG_SGI_GBE', if_true: files('sgi_gbe.c'))
 system_ss.add(when: 'CONFIG_SGI_MACE_VIDEO', if_true: files('saa7111.c', 'saa7185.c'))

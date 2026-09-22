@@ -9,8 +9,9 @@
  * This machine currently implements the 4D/25 configuration: the CTL1
  * register shell (memcfg/sysid/cpucfg/cpuauxctl + DMA map), the serial
  * EEPROM the PROM uses for board/memory detection, flat RAM, the boot
- * PROM and the LIO interrupt block.  The remaining devices (SCSI, LANCE,
- * graphics, audio, DUART, PIT) are reachable but unimplemented.
+ * PROM and the LIO interrupt block, plus the devices listed below.  The
+ * GR1 graphics board is hw/display/sgi_gr1.c (a port of MAME's GR1/GE5/RE2
+ * that executes the host-downloaded GE5 microcode).
  *
  * References:
  *   - MAME src/mame/sgi/ip6.cpp and ctl1.cpp (hardware reference)
@@ -28,6 +29,8 @@
 #include "hw/core/qdev.h"
 #include "hw/core/loader.h"
 #include "hw/char/sgi_scn2681.h"
+#include "hw/core/sysbus.h"
+#include "hw/display/sgi_gr1.h"
 #include "hw/misc/sgi_ip6_input.h"
 #include "trace.h"
 #include "hw/isa/isa.h"
@@ -108,10 +111,12 @@
 #define SGI_IP6_SCSIRST_SIZE 0x10
 
 /* LIO interrupt bits (MAME ip6.cpp lio_int_number) */
+#define LIO_VR              2   /* vertical retrace interrupt */
 #define LIO_GE              6   /* ge interrupt: asserted by the GE5 */
 #define LIO_FIFO            7
 #define LIO_SCSI            4
 #define LIO_ENET            5
+#define LIO_VRSTAT          9   /* vertical retrace status (no interrupt) */
 
 /* SCN2681 DUARTs */
 #define SGI_IP6_DUART_BASE  0x1fb80000ULL
@@ -127,6 +132,7 @@
 /* cpuauxctl bits */
 #define CPUAUX_EEPROM_CS    0x20
 #define CPUAUX_EEPROM_CLK   0x40
+#define CPUAUX_GR1_RESET    0x80   /* graphics board reset (MAME reset_w) */
 
 /* cpucfg bits */
 #define CPUCFG_SERDATA      0x0100
@@ -171,82 +177,11 @@ typedef struct SGIip6State {
     WD33C93State *scsi;
     SCN2681State *duart[2];
     SgiIp6InputState *mouse;
-    MemoryRegion gr1_regs;
-    uint32_t gr1_win[0x800];  /* upper bank 0x8000..0x9fff (2048 words) */
-    uint8_t gr1_bank;         /* mar_msb: bank selected at 0x0e00..0x0e07 */
-    uint32_t *gr1_code;       /* GE5 microcode store (2 words per uword) */
-    uint32_t *gr1_data_store; /* GE5 data store (space(1), 8 KB byte space) */
-    uint8_t gr1_mar;          /* microcode address register (page) */
-    uint16_t gr1_pc;          /* microcode PC, read back by the firmware */
-    uint32_t gr1_finish[2];
-    uint32_t gr1_code_data;   /* data/buffer FIFO (simplified) */
-    /*
-     * The GE5 command aperture at 0x800-0xbff is a FIFO OF INDEXED REGISTER
-     * WRITES, not a linear queue and not a plain register file.  Reference:
-     * MAME sgi_gr1.cpp sgi_gr1_device::fifo_w() -
-     *     m_fifo.enqueue((u64(offset) << 32) | data);
-     * i.e. BOTH the aperture offset (register selector) and the data are
-     * carried, and the GE5 microcode consumes the stream and dispatches on
-     * the offset.  fifo_w also drives DR3_FIFOEMPTY / DR3_FIFOFULL (the
-     * queue length > 256) and raises the FIFO interrupt through
-     * m_int_fifo_cb; buffer_r() returns m_bus (it does NOT pop).
-     * Stated wrongly twice before this: first as a plain linear FIFO
-     * (ignored the selectors), then as a plain register aperture (ignored
-     * the queue).  Both wrong framings would likely have passed the
-     * firmware's RE-pattern check, which is why the reference source, not
-     * the test, settled it.
-     */
-    uint64_t gr1_fifo[256];   /* (offset << 32) | data, per fifo_w */
-    /*
-     * Partial GE5 command consumer, for the draw/sample operation class the
-     * firmware's RE-pattern test uses.  Command stream shape per MAME
-     * sgi_gr1.cpp fifo_w() (a queue of indexed register writes) and the
-     * PROM's own writers:
-     *   0xbfc047d4 : selector 0x818 then 0x800<-{0, 0, a0, a1, 1279}  (position)
-     *   0xbfc04c9c : selector 0x81c then 0x800<-{0x2a8, colour, 0,0,0,0,0}
-     *   0xbfc0485c : selector 0x83c then 0x800<-{a0, a1}             (sample)
-     * The engine consumes the stream and writes its RESULT into space(1);
-     * this models that output for this operation class only.
-     *
-     * MEASURED (this model does NOT yet pass the RE-pattern test):
-     *  - the consumer runs - the selectors arrive (0x818 x480768,
-     *    0x81c x45568, 0x83c x468144 over a boot) and are recognised;
-     *  - but param[1] of the 0x81c command reads 0 via this indexing,
-     *    whereas the trace shows the draw writing 0x2a8 then 0x7800, so the
-     *    PARAM INDEXING IS WRONG (0x7800 lands on a different index);
-     *  - and the output FORMAT is unmodelled: 0x7800 is 15 << 11 (the
-     *    (c&0xff)<<11 field of the firmware's 24->16-bit conversion) while
-     *    the suite's oracle expects 15, so the engine's colour->pixel
-     *    pipeline is not a plain framebuffer.
-     * MEASURED FURTHER (param-indexing probe, then stopped): the same
-     * selector carries DIFFERENT operand meanings on different occasions,
-     * so the parameters are microcode OPERANDS, not fixed fields:
-     *   0x81c (cmd 7): idx0 = 0x500 (1280 = display width), idx1..7 = 0
-     *                  -> a geometry command, NOT the colour;
-     *   0x818 (cmd 6): idx2 varies 0/1/2, idx3 = 0x4ff (1279)
-     *                  -> a per-line command;
-     *   0x83c (cmd f): idx0 varies 0x32/0x27/0x36/0x25, idx1 varies 1/0/6
-     *                  across otherwise-identical uses.
-     * Not statically decodable, so this is where the route stops: the
-     * remaining step is the microcode interpreter, by name or otherwise.
-     *
-     * Both are MICROCODE SEMANTICS, not inference: which parameter means
-     * what, and how a colour becomes a pixel word, are not derivable from
-     * the call sites.  This is the interpreter boundary the doctrine
-     * reserves for a visible-accuracy gap.  The FIFO-of-indexed-register-
-     * writes structure above is reference-backed (MAME sgi_gr1.cpp fifo_w)
-     * and is kept; the command SEMANTICS are what remain.
-     */
-    uint8_t gr1_ge_cmd;          /* active selector, 0 = none */
-    uint32_t gr1_ge_params[8];
-    unsigned gr1_ge_nparam;
-    uint32_t gr1_ge_colour;      /* last colour command's colour */
-    bool gr1_ge_sample_pending;  /* a sample command awaits its read */
-    unsigned gr1_fifo_len;
-    uint32_t gr1_fifo_bus;    /* buffer_r() read-back (MAME: m_bus) */
-    bool gr1_kicked;
-    QEMUTimer *gr1_ge_timer;   /* releases the GE LIO bit when it completes */
-    uint8_t gr1_dr[5];        /* dr0..dr4 display registers */
+    /* GR1 "Eclipse" graphics board (hw/display/sgi_gr1.c) */
+    DeviceState *gr1;
+    MemoryRegion gr1_mirror;
+    MemoryRegion vrrst;
+    int lio_fifo;             /* FIFO line state (MAME m_lio_fifo) */
 
     PCNetState *lance;
     DeviceState *lance_dev;
@@ -438,6 +373,10 @@ static void sgi_ip6_ctl1_write(void *opaque, hwaddr addr, uint64_t data,
     }
     case SGI_IP6_CTL1_CPUAUX:
         s->cpuauxctl = (val >> 24) & 0xff;
+        if (s->gr1) {
+            qemu_set_irq(qdev_get_gpio_in(s->gr1, 0),
+                         !!(s->cpuauxctl & CPUAUX_GR1_RESET));
+        }
         if (s->eeprom) {
             eeprom93xx_write(s->eeprom,
                              !!(s->cpuauxctl & CPUAUX_EEPROM_CS),
@@ -596,6 +535,14 @@ static void sgi_ip6_lio_write(void *opaque, hwaddr addr, uint64_t data,
 
     if (off >= 8 && off < 0xc) {
         s->lio_imr = data & 0xff;
+        /* fifo interrupt status follows line state if not enabled */
+        if (!(s->lio_imr & (1u << LIO_FIFO))) {
+            if (s->lio_fifo) {
+                s->lio_isr |= 1u << LIO_FIFO;
+            } else {
+                s->lio_isr &= ~(1u << LIO_FIFO);
+            }
+        }
         sgi_ip6_lio_update(s);
     }
 }
@@ -996,275 +943,70 @@ static const MemoryRegionOps sgi_ip6_duart_ops = {
 };
 
 /*
- * ---- GR1 ("Eclipse") graphics: probe instrument ----------------------
+ * ---- LIO interrupt sources --------------------------------------------
  *
- * No registers are modelled yet.  Every access is traced with the guest PC
- * and the value returned, on the read path as well as the write path, so a
- * probe that still sees zero says so in the trace rather than leaving the
- * subsequent fault as the only evidence.  The response the firmware expects
- * is to be determined from its own use of the value, not invented here.
+ * MAME ip6.cpp lio_interrupt(): status bits are active low (set = idle).
+ * The FIFO bit has special handling: while its interrupt is enabled and
+ * pending, a line change is not reflected until the mask is rewritten.
  */
-/*
- * The upper bank (selected by mar_msb, which the firmware writes at 0x0e04)
- * holds the display registers.  MAME's map is authoritative:
- *   dr1 0x84c0  dr0 0x84e0  dr4 0x85a0  dr3 0x85c0  dr2 0x85e0
- * each a byte in lane 3 (umask32(0xff000000)), with the reset values below.
- * The RAMDAC at 0x8500..0x850f is what the firmware's presence probe actually
- * pokes (walking value in at 0x8500/0x8508 under bank 4), which is why the
- * probe window still has to return what was written.
- */
-static const struct {
-    uint16_t off;             /* bank-relative, lane 3 */
-    uint8_t reset;
-    uint8_t wmask, rmask;
-} gr1_drs[5] = {
-    { 0x84e0, 0x09, 0xf7, 0xff },   /* dr0: GRF1EN | SMALLMON0 */
-    { 0x84c0, 0x08, 0xe7, 0xff },   /* dr1: TURBO */
-    { 0x85e0, 0x00, 0xe7, 0xff },   /* dr2 */
-    { 0x85c0, 0x00, 0xe7, 0xff },   /* dr3 */
-    { 0x85a0, 0x08, 0xe7, 0x9f },   /* dr4: MEGOPT */
-};
-
-/*
- * Return the display-register index whose lane-3 byte this access touches,
- * given the effective (bank-relative) offset.  The DR offsets in gr1_drs are
- * already effective offsets, so they must not be re-based.
- */
-static int gr1_dr_hit(uint32_t eff, unsigned size)
+static void sgi_ip6_lio_interrupt(SGIip6State *s, unsigned number, int state)
 {
-    int i;
+    uint16_t mask = 1u << number;
 
-    for (i = 0; i < 5; i++) {
-        uint32_t b = gr1_drs[i].off + 3;
-
-        if (b >= eff && b < eff + size) {
-            return i;
+    if (number == LIO_FIFO) {
+        s->lio_fifo = state;
+        if ((s->lio_imr & mask) && !(s->lio_isr & mask)) {
+            return;
         }
     }
-    return -1;
+    if (state) {
+        s->lio_isr |= mask;
+    } else {
+        s->lio_isr &= ~mask;
+    }
+    sgi_ip6_lio_update(s);
 }
 
-/*
- * ---- GE5 microcode download path (stage 2, bounded experiment) ----------
- *
- * Only the download is modelled: the microcode store, the address register
- * "mar" (a page: m_pc = offset | (mar & 0x7f) << 8), the PC the firmware
- * reads back, and the command write that kicks the engine.  There is no
- * instruction interpreter yet - the experiment is whether the firmware's
- * test only needs the download to land and the read-back to move, or
- * whether it executes microcode and needs the real engine.
- *
- * code_w has High/Low halves carrying a second instruction word; MAME
- * forces the secondary-instruction bit on the High write (its FIXME, kept
- * verbatim because it is documented behaviour rather than a bug).
- */
-#define GR1_CODE_LO   0x0000u   /* bank-relative */
-#define GR1_BUF       0x0800u
-#define GR1_MAR       0x0c00u
-#define GR1_MAR_MSB   0x0e00u
-#define GR1_DATA      0x1400u
-/* GE command selectors, aperture-relative word indices ((off-0x800)>>2).
- * bfc047d4 -> 0x818, bfc04c9c -> 0x81c, bfc0485c -> 0x83c. */
-#define GR1_GE_SEL_POS    ((0x818u - GR1_BUF) >> 2)   /* 6  */
-#define GR1_GE_SEL_COLOUR ((0x81cu - GR1_BUF) >> 2)   /* 7  */
-#define GR1_GE_SEL_SAMPLE ((0x83cu - GR1_BUF) >> 2)   /* 15 */
-#define GR1_GE_SEL_PARAM  ((0x800u - GR1_BUF) >> 2)   /* 0  */
-#define GR1_FINISH    0x2000u
-#define GR1_CODE_HI   0x8000u
-#define GR1_COMMAND   0x8640u
-#define GR1_PC_REG    0x8740u
-
-/*
- * The engine "completes": release the LIO ge bit so the status returns to
- * idle.  We do not execute microcode, but a completion edge is the visible
- * contract the firmware expects.
- */
-/*
- * A command asserts (clears) the LIO ge bit and it LATCHES: both the
- * download check (0xbfc1d0cc) and the graphics verdict's first check
- * (0xbfc04958) read this bit as completion, and an earlier model that
- * released it after 2 ms left any later check seeing it idle and timing
- * out.  Clearing on command, never releasing.
- */
-static void sgi_ip6_gr1_ge_done(void *opaque)
-{
-    (void)opaque;
-}
-
-static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
+/* GR1 outputs are active high; the LIO status bits are active low. */
+static void sgi_ip6_gr1_irq(void *opaque, int n, int level)
 {
     SGIip6State *s = opaque;
-    uint32_t base = (uint32_t)s->gr1_bank * 0x2000;
-    uint32_t eff = base + (uint32_t)addr;
-    uint64_t val = 0;
-    int i;
 
-    i = gr1_dr_hit(eff, size);
-    if (i >= 0) {
-        val = (uint32_t)s->gr1_dr[i] & gr1_drs[i].rmask;
-    } else if (eff < GR1_CODE_LO + 0x400) {
-        uint16_t pc = eff | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
-
-        val = s->gr1_code[pc * 2];
-    } else if (eff >= GR1_CODE_HI && eff < GR1_CODE_HI + 0x400) {
-        uint16_t pc = (eff - GR1_CODE_HI) | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
-
-        val = s->gr1_code[pc * 2 + 1];
-    } else if (eff >= GR1_PC_REG && eff < GR1_PC_REG + 4) {
-        val = s->gr1_pc;
-    } else if (eff >= GR1_FINISH && eff < GR1_FINISH + 8) {
-        val = s->gr1_finish[(eff - GR1_FINISH) >> 2];
-    } else if (eff >= GR1_BUF && eff < GR1_BUF + 0x400) {
-        /* MAME sgi_ge5.cpp: u32 buffer_r(offs_t) { return m_bus; } */
-        val = s->gr1_fifo_bus;
-    } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
-        /*
-         * The GE data window (MAME: space(1), map(0x1400,0x17ff), 8 KB RAM).
-         * The address is map-relative and page-selected by mar:
-         *   m_memptr = offset | (mar & 0x3f) << 8
-         * This is a read-back, not an identity word: the guest writes a
-         * data port and reads it back, so the store contents are the
-         * contract.  (Earlier we had no data branch at all, so 0x1560 read
-         * 0 - the graphics suite's poll at 0xbfc089a0.)
-         */
-        uint32_t mp = (eff - GR1_DATA) |
-                      ((uint32_t)(s->gr1_mar & 0x3f) << 8);
-
-        if (s->gr1_ge_sample_pending) {
-            /*
-             * The engine's OUTPUT for the sample operation class: the pixel
-             * reads back as the colour drawn there.  (Cell mapping not
-             * modelled - see the state comment.)
-             */
-            val = s->gr1_ge_colour;
-            s->gr1_ge_sample_pending = false;
+    switch (n) {
+    case SGI_GR1_IRQ_GE:
+        sgi_ip6_lio_interrupt(s, LIO_GE, !level);
+        break;
+    case SGI_GR1_IRQ_FIFO:
+        sgi_ip6_lio_interrupt(s, LIO_FIFO, !level);
+        break;
+    case SGI_GR1_IRQ_VBLANK:
+        /* MAME: vblank start clears VRSTAT and asserts VR; vrrst releases */
+        if (level) {
+            s->lio_isr &= ~(1u << LIO_VRSTAT);
+            sgi_ip6_lio_interrupt(s, LIO_VR, 0);
         } else {
-            val = s->gr1_data_store[(mp >> 2) & 0x7ff];
+            s->lio_isr |= 1u << LIO_VRSTAT;
         }
-    } else if (eff >= 0x8000 && eff < 0xa000) {
-        val = s->gr1_win[(eff - 0x8000) >> 2];
+        break;
     }
-    trace_sgi_ip6_gr1_read((uint32_t)s->cpu->env.active_tc.PC,
-                           (uint32_t)addr, s->gr1_mar, s->gr1_bank,
-                           (uint32_t)val);
-    return val;
 }
 
-static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
-                              unsigned size)
+/* vrrst (0x1fac0000): any access releases the vertical retrace interrupt */
+static uint64_t sgi_ip6_vrrst_read(void *opaque, hwaddr addr, unsigned size)
 {
-    SGIip6State *s = opaque;
-    uint32_t base = (uint32_t)s->gr1_bank * 0x2000;
-    uint32_t eff = base + (uint32_t)addr;
-    int i;
-
-    if (addr >= GR1_MAR_MSB && addr <= GR1_MAR_MSB + 7) {
-        s->gr1_bank = (uint8_t)addr & 7;
-    }
-
-    i = gr1_dr_hit(eff, size);
-    if (i >= 0) {
-        s->gr1_dr[i] = (s->gr1_dr[i] & ~gr1_drs[i].wmask)
-                     | ((uint8_t)val & gr1_drs[i].wmask);
-    } else if (eff < GR1_CODE_LO + 0x400) {
-        uint16_t pc = eff | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
-
-        s->gr1_code[pc * 2] = val;
-    } else if (eff >= GR1_CODE_HI && eff < GR1_CODE_HI + 0x400) {
-        uint16_t pc = (eff - GR1_CODE_HI) | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
-        uint32_t data = val;
-
-        /* MAME's FIXME, verbatim: force the secondary instruction bit. */
-        if ((data & 0x100) && !(data & 0x10)) {
-            data |= 0x10;
-        }
-        s->gr1_code[pc * 2 + 1] = data;
-    } else if (eff >= GR1_MAR && eff < GR1_MAR + 0x200) {
-        s->gr1_mar = eff & 0x7f;
-    } else if (eff >= GR1_BUF && eff < GR1_BUF + 0x400) {
-        /*
-         * MAME sgi_gr1.cpp fifo_w(): enqueue BOTH the aperture offset (the
-         * register selector the microcode dispatches on) and the data.
-         */
-        if (s->gr1_fifo_len < ARRAY_SIZE(s->gr1_fifo)) {
-            s->gr1_fifo[s->gr1_fifo_len++] =
-                ((uint64_t)(eff - GR1_BUF) << 32) | (uint32_t)val;
-        }
-        s->gr1_fifo_bus = val;
-
-        /*
-         * Consume the stream (partial): a selector word begins a command,
-         * following 0x800 words are its parameters.  See the state comment
-         * for the three commands and their provenance.
-         */
-        {
-            unsigned reg = (eff - GR1_BUF) >> 2;
-
-            if (reg == GR1_GE_SEL_POS || reg == GR1_GE_SEL_COLOUR ||
-                reg == GR1_GE_SEL_SAMPLE) {
-                s->gr1_ge_cmd = (uint8_t)reg;
-                s->gr1_ge_nparam = 0;
-                if (reg == GR1_GE_SEL_SAMPLE) {
-                    /* sample command: the engine will produce a result */
-                    s->gr1_ge_sample_pending = true;
-                }
-            } else if (reg == GR1_GE_SEL_PARAM && s->gr1_ge_cmd) {
-                if (s->gr1_ge_nparam < ARRAY_SIZE(s->gr1_ge_params)) {
-                    s->gr1_ge_params[s->gr1_ge_nparam++] = (uint32_t)val;
-                }
-                if (s->gr1_ge_cmd == GR1_GE_SEL_COLOUR && s->gr1_ge_nparam == 2) {
-                    /* param[1] is the colour (param[0] observed as 0x2a8) */
-                    s->gr1_ge_colour = (uint32_t)val;
-                }
-            }
-        }
-    } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
-        uint32_t mp = (eff - GR1_DATA) |
-                      ((uint32_t)(s->gr1_mar & 0x3f) << 8);
-
-        s->gr1_data_store[(mp >> 2) & 0x7ff] = val;
-    } else if (eff >= GR1_FINISH && eff < GR1_FINISH + 8) {
-        s->gr1_finish[(eff - GR1_FINISH) >> 2] = val;
-    } else if (eff >= GR1_COMMAND && eff < GR1_COMMAND + 0x144) {
-        /*
-         * Command write kicks the engine.  With no interpreter the only
-         * honest statement is that the command was accepted; completion is
-         * observable through pc/finish, and the trace shows what the
-         * firmware reads afterwards.  Traced on both paths per the
-         * instrument rule.
-         */
-        s->gr1_kicked = true;
-        /*
-         * TODO(ge5): this assert is WRONG IN PRINCIPLE and only harmless
-         * because the latch below holds the bit clear (the value both
-         * firmware checks want, and a clear-interrupt on an already-clear
-         * bit is a no-op).  Reference: MAME sgi_ge5.cpp command_w()  -
-         * 0x8640 is the microcode's CONTROL register, not a kick:
-         *     offset 0x00 clear stall (m_state = DECODE)
-         *     offset 0x10/0x20/0x30 set/clear/exec single step
-         *     offset 0x50 clear interrupt (set_int(false))
-         * The real lifecycle is: the ENGINE asserts its interrupt on
-         * completion (set_int(true)) and command_w 0x50 clears it, while
-         * the FIFO interrupt is a SEPARATE line (m_int_fifo_cb, driven by
-         * DR3_FIFOEMPTY/DR3_FIFOFULL).  Fix when the register-file model
-         * is built, not as a standalone patch: this is a wrong-but-passing
-         * mechanism, which is exactly what misleads the next reader.
-         */
-        s->lio_isr &= ~(1u << LIO_GE);
-        sgi_ip6_lio_update(s);
-        qemu_log_mask(LOG_UNIMP, "sgi-ip6-gr1: GE5 command 0x%" PRIx64
-                      " accepted; no microcode interpreter modelled\n", val);
-    } else if (eff >= 0x8000 && eff < 0xa000) {
-        s->gr1_win[(eff - 0x8000) >> 2] = val;
-    }
-    trace_sgi_ip6_gr1_write((uint32_t)s->cpu->env.active_tc.PC,
-                            (uint32_t)addr, s->gr1_mar, s->gr1_bank,
-                            (uint32_t)val);
+    sgi_ip6_lio_interrupt(opaque, LIO_VR, 1);
+    return 0;
 }
 
-static const MemoryRegionOps sgi_ip6_gr1_ops = {
-    .read = sgi_ip6_gr1_read,
-    .write = sgi_ip6_gr1_write,
+static void sgi_ip6_vrrst_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    sgi_ip6_lio_interrupt(opaque, LIO_VR, 1);
+}
+
+static const MemoryRegionOps sgi_ip6_vrrst_ops = {
+    .read = sgi_ip6_vrrst_read,
+    .write = sgi_ip6_vrrst_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -1866,24 +1608,22 @@ static void sgi_ip6_init(MachineState *machine)
     /* Devices not yet implemented: LANCE and GR1 graphics.  Map them
      * as unimplemented so accesses are logged rather than aborting. */
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
-    create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
-    memory_region_init_io(&s->gr1_regs, OBJECT(machine), &sgi_ip6_gr1_ops, s,
-                          "sgi-ip6-gr1", 0x8000);
-    memory_region_add_subregion(system_memory, 0x1f000000, &s->gr1_regs);
+    memory_region_init_io(&s->vrrst, OBJECT(machine), &sgi_ip6_vrrst_ops, s,
+                          "sgi-ip6-vrrst", 4);
+    memory_region_add_subregion(system_memory, 0x1fac0000, &s->vrrst);
 
-    /* GR1 display-register reset values (MAME sgi_gr1_device::device_reset). */
-    s->gr1_code = g_new0(uint32_t, 0x8000 * 2);
-    s->gr1_data_store = g_new0(uint32_t, 0x800);
-    s->gr1_bank = 0;
-    s->gr1_dr[0] = 0x09;
-    s->gr1_dr[1] = 0x08;
-    s->gr1_dr[2] = 0x00;
-    s->gr1_dr[3] = 0x00;
-    s->gr1_dr[4] = 0x08;
-    s->gr1_mar = 0;
-    s->gr1_pc = 0;
-    s->gr1_kicked = false;
-    s->gr1_ge_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_ip6_gr1_ge_done, s);
+    /* GR1: map(0x1f000000, 0x1f007fff).m(gfx).mirror(0x8000) */
+    s->gr1 = qdev_new(TYPE_SGI_GR1);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gr1), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->gr1), 0, 0x1f000000);
+    memory_region_init_alias(&s->gr1_mirror, OBJECT(machine), "sgi-gr1-mirror",
+                             sysbus_mmio_get_region(SYS_BUS_DEVICE(s->gr1), 0),
+                             0, 0x8000);
+    memory_region_add_subregion(system_memory, 0x1f008000, &s->gr1_mirror);
+    for (int i = 0; i < 3; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->gr1), i,
+                           qemu_allocate_irq(sgi_ip6_gr1_irq, s, i));
+    }
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
     create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
     create_unimplemented_device("sgi-ip6-gio", 0x1f400000, 0x400000);
@@ -1917,12 +1657,11 @@ static void sgi_ip6_init(MachineState *machine)
     s->pit0_programmed = false;
     /*
      * LIO status bits are active low: set = idle, clear = asserted.  The GE
-     * bit is asserted only while the graphics engine is working: the
-     * firmware's download routine kicks the engine and reads the bit to
-     * decide whether it responded, then the engine releases it again, so it
-     * must be transient rather than held.
+     * bit follows the GE5's own interrupt (the microcode's SET INT, cleared
+     * by the host through command offset 0x50), as in MAME.
      */
     s->lio_isr = 0x3ff;
+    s->lio_fifo = 1;
     s->lio_imr = 0;
 }
 

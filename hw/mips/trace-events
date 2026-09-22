@@ -6,6 +6,3 @@ malta_fpga_display(const char *text) "ASCII '%s'"
 sgi_ip6_input_report(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4) "mouse report %02x %02x %02x %02x %02x"
 sgi_ip6_input_drain(int n) "mouse peer drained %d byte(s) to the DUART"
 
-# sgi_ip6.c (GR1 probe instrument)
-sgi_ip6_gr1_read(uint32_t pc, uint32_t off, uint32_t mar, uint32_t bank, uint32_t val) "gr1 read  pc=0x%08x off=0x%x mar=0x%x bank=%u -> 0x%x"
-sgi_ip6_gr1_write(uint32_t pc, uint32_t off, uint32_t mar, uint32_t bank, uint32_t val) "gr1 write pc=0x%08x off=0x%x mar=0x%x bank=%u <- 0x%x"
