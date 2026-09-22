@@ -218,6 +218,18 @@ typedef struct SGIip6State {
      *    (c&0xff)<<11 field of the firmware's 24->16-bit conversion) while
      *    the suite's oracle expects 15, so the engine's colour->pixel
      *    pipeline is not a plain framebuffer.
+     * MEASURED FURTHER (param-indexing probe, then stopped): the same
+     * selector carries DIFFERENT operand meanings on different occasions,
+     * so the parameters are microcode OPERANDS, not fixed fields:
+     *   0x81c (cmd 7): idx0 = 0x500 (1280 = display width), idx1..7 = 0
+     *                  -> a geometry command, NOT the colour;
+     *   0x818 (cmd 6): idx2 varies 0/1/2, idx3 = 0x4ff (1279)
+     *                  -> a per-line command;
+     *   0x83c (cmd f): idx0 varies 0x32/0x27/0x36/0x25, idx1 varies 1/0/6
+     *                  across otherwise-identical uses.
+     * Not statically decodable, so this is where the route stops: the
+     * remaining step is the microcode interpreter, by name or otherwise.
+     *
      * Both are MICROCODE SEMANTICS, not inference: which parameter means
      * what, and how a colour becomes a pixel word, are not derivable from
      * the call sites.  This is the interpreter boundary the doctrine
