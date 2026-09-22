@@ -109,6 +109,7 @@ config SGI_IP6
     depends on MIPS64 && TCG
     select NMC93XX_EEPROM
     select WD33C93
+    select SGI_SCN2681
     select UNIMP
 
 # Virtuix (IP55) -- SGI-Indy-derived virtualization-native SMP machine. Built

@@ -26,6 +26,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev.h"
 #include "hw/core/loader.h"
+#include "hw/char/sgi_scn2681.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/unimp.h"
 #include "hw/nvram/eeprom93xx.h"
@@ -39,6 +40,7 @@
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/runstate.h"
+#include "system/system.h"
 
 #define SGI_IP6_PROM_BASE   0x1fc00000ULL
 #define SGI_IP6_PROM_SIZE   (256 * KiB)
@@ -78,6 +80,10 @@
 /* LIO interrupt bits */
 #define LIO_SCSI            4
 
+/* SCN2681 DUARTs */
+#define SGI_IP6_DUART_BASE  0x1fb80000ULL
+#define SGI_IP6_DUART_SIZE  0x100
+
 /* cpuauxctl bits */
 #define CPUAUX_EEPROM_CS    0x20
 #define CPUAUX_EEPROM_CLK   0x40
@@ -103,9 +109,11 @@ typedef struct SGIip6State {
     MemoryRegion rtc;
     MemoryRegion scsi_regs;
     MemoryRegion scsi_reset;
+    MemoryRegion duart_regs;
 
     MIPSCPU *cpu;
     WD33C93State *scsi;
+    SCN2681State *duart[2];
 
     eeprom_t *eeprom;
 
@@ -123,6 +131,9 @@ typedef struct SGIip6State {
 
     uint32_t erradr;
     uint32_t refadr;
+
+    uint8_t vme_isr;
+    uint8_t vme_imr;
 
     uint16_t lio_isr;
     uint8_t lio_imr;
@@ -153,6 +164,12 @@ static uint64_t sgi_ip6_ctl1_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case SGI_IP6_CTL1_CPUAUX:
         val = (uint32_t)s->cpuauxctl << 24;
+        break;
+    case 0x40000: /* VME interrupt status register */
+        val = s->vme_isr;
+        break;
+    case 0x40008: /* VME interrupt mask register */
+        val = s->vme_imr;
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -212,6 +229,12 @@ static void sgi_ip6_ctl1_write(void *opaque, hwaddr addr, uint64_t data,
                              !!(s->cpuauxctl & CPUAUX_EEPROM_CLK),
                              !!(s->cpucfg & CPUCFG_SERDATA));
         }
+        break;
+    case 0x40000: /* VME interrupt status register */
+        s->vme_isr = val & 0xff;
+        break;
+    case 0x40008: /* VME interrupt mask register */
+        s->vme_imr = val & 0xff;
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -283,10 +306,19 @@ static const MemoryRegionOps sgi_ip6_dma_ops = {
 static uint64_t sgi_ip6_lio_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
+    uint32_t off = addr & 0xf;
 
-    if ((addr & 0xf) == 0) {
-        return s->lio_isr;
-    } else if ((addr & 0xf) == 8) {
+    if (off < 4) {
+        /* 16-bit interrupt status register */
+        uint32_t v = s->lio_isr;
+
+        if (size == 1) {
+            v >>= 8 * (3 - (addr & 3));
+        }
+        return v;
+    }
+    if (off >= 8 && off < 0xc) {
+        /* 8-bit interrupt mask register */
         return s->lio_imr;
     }
     return 0;
@@ -296,8 +328,9 @@ static void sgi_ip6_lio_write(void *opaque, hwaddr addr, uint64_t data,
                               unsigned size)
 {
     SGIip6State *s = opaque;
+    uint32_t off = addr & 0xf;
 
-    if ((addr & 0xf) == 8) {
+    if (off >= 8 && off < 0xc) {
         s->lio_imr = data & 0xff;
         sgi_ip6_lio_update(s);
     }
@@ -491,10 +524,11 @@ static void sgi_ip6_scsi_irq(void *opaque, int n, int level)
 {
     SGIip6State *s = opaque;
 
+    /* LIO status bits are active low: set = idle, clear = pending. */
     if (level) {
-        s->lio_isr |= (1u << LIO_SCSI);
-    } else {
         s->lio_isr &= ~(1u << LIO_SCSI);
+    } else {
+        s->lio_isr |= (1u << LIO_SCSI);
     }
     sgi_ip6_lio_update(s);
 }
@@ -502,6 +536,51 @@ static void sgi_ip6_scsi_irq(void *opaque, int n, int level)
 static void sgi_ip6_scsi_drq(void *opaque, int n, int level)
 {
     /* SCSI DMA is not wired yet; the PROM's early init does not use it. */
+}
+
+/* ---- SCN2681 DUARTs --------------------------------------------------- */
+
+static uint64_t sgi_ip6_duart_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    int chip = addr & 1;
+    int reg = (addr >> 4) & 0xf;
+
+    return scn2681_read(s->duart[chip], reg);
+}
+
+static void sgi_ip6_duart_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    SGIip6State *s = opaque;
+    int chip = addr & 1;
+    int reg = (addr >> 4) & 0xf;
+
+    scn2681_write(s->duart[chip], reg, data & 0xff);
+}
+
+static const MemoryRegionOps sgi_ip6_duart_ops = {
+    .read = sgi_ip6_duart_read,
+    .write = sgi_ip6_duart_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void sgi_ip6_duart_irq(void *opaque, int n, int level)
+{
+    SGIip6State *s = opaque;
+    int bit = n & 1;   /* LIO_D0 = bit 0, LIO_D1 = bit 1 */
+
+    /* LIO status bits are active low: set = idle, clear = pending. */
+    if (level) {
+        s->lio_isr &= ~(1u << bit);
+    } else {
+        s->lio_isr |= (1u << bit);
+    }
+    sgi_ip6_lio_update(s);
 }
 
 /* ---- machine ---------------------------------------------------------- */
@@ -630,13 +709,35 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_add_subregion(system_memory, SGI_IP6_SCSIRST_BASE,
                                 &s->scsi_reset);
 
-    /* Devices not yet implemented: PIT, SCN2681 DUARTs, LANCE and GR1
-     * graphics.  Map them as unimplemented so accesses are logged rather
-     * than aborting. */
+    /* Two SCN2681 DUARTs: 0 = keyboard/mouse, 1 = serial ports. */
+    for (int i = 0; i < 2; i++) {
+        int ch;
+
+        s->duart[i] = SGI_SCN2681(qdev_new(TYPE_SGI_SCN2681));
+        for (ch = 0; ch < 2; ch++) {
+            if (serial_hd(i * 2 + ch)) {
+                qdev_prop_set_chr(DEVICE(s->duart[i]),
+                                  ch ? "chardev-b" : "chardev-a",
+                                  serial_hd(i * 2 + ch));
+            }
+        }
+        qdev_realize(DEVICE(s->duart[i]), NULL, &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(s->duart[i]), "irq", 0,
+                                    qemu_allocate_irq(sgi_ip6_duart_irq, s,
+                                                      i));
+    }
+
+    memory_region_init_io(&s->duart_regs, OBJECT(machine),
+                          &sgi_ip6_duart_ops, s, "sgi-ip6-duart",
+                          SGI_IP6_DUART_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_DUART_BASE,
+                                &s->duart_regs);
+
+    /* Devices not yet implemented: PIT, LANCE and GR1 graphics.  Map them
+     * as unimplemented so accesses are logged rather than aborting. */
     create_unimplemented_device("sgi-ip6-pit", 0x1fb40000, 0x10);
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
     create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
-    create_unimplemented_device("sgi-ip6-duart", 0x1fb80000, 0x100);
     create_unimplemented_device("sgi-ip6-lance", 0x1f950000, 0x20000);
     create_unimplemented_device("sgi-ip6-gr1", 0x1f000000, 0x8000);
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
@@ -659,6 +760,8 @@ static void sgi_ip6_init(MachineState *machine)
     memset(s->dmahi, 0, sizeof(s->dmahi));
     s->erradr = 0;
     s->refadr = 0;
+    s->vme_isr = 0;
+    s->vme_imr = 0;
     memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
     s->lio_int = false;
     s->lio_isr = 0x3ff;
