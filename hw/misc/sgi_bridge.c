@@ -572,6 +572,27 @@ static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
     uint32_t pending = s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] & s->ioc3_sio_ienb;
     int level = pending != 0;
 
+    /*
+     * The TX-completion interrupt is NOT raised by default.
+     *
+     * This model drains the TX ring synchronously, so the transmitter is
+     * instantly "empty" after every write and SIO_IR_SA_TX_MT / _TX_EXPLICIT
+     * are set on every console write.  The guest polls that bit (ioc3_wrflush
+     * SPINs on SA_TX_MT) and, because the ring never fills, its output queue
+     * never blocks -- so the status bits alone are sufficient.  Delivering a
+     * CPU interrupt per write instead drives the console tty's output
+     * notification (csio_output_lowat -> sv_broadcast) far faster than the
+     * upper layer re-arms it, overflowing its sv semaphore (kernel assertion
+     * sema.c "s_st.count < SHRT_MAX") right after root/swap mount.  Measured:
+     * without the interrupt the miniroot boots to the installer prompt;
+     * with it, the guest panics.  A faithful interrupt needs an asynchronous
+     * (baud-rate) TX drain so TX-empty tracks a real idle transition; until
+     * then the guest's polled path is what it actually uses.  Set
+     * SGIBRIDGE_SIO_IRQ=1 to deliver it anyway (investigation only).
+     */
+    if (!getenv("SGIBRIDGE_SIO_IRQ")) {
+        return;
+    }
     if (level != s->ioc3_sio_irq_level) {
         s->ioc3_sio_irq_level = level;
         sgi_bridge_dev_irq(s, BRIDGE_BVEC_IOC3_SERIAL, level);
