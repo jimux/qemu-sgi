@@ -673,6 +673,14 @@ struct SGIMACEState {
     /* MACE interrupt output to CRIME */
     qemu_irq crime_irq[16];
 
+    /*
+     * The CRIME this MACE is attached to (QOM link).  The DS2502 1-wire
+     * bit-bang uses CRIME's CRM_TIME as its pulse stopwatch, so the MACE
+     * tells CRIME while the DQ line is held low.  May be NULL in unit
+     * tests that build a MACE without a CRIME.
+     */
+    struct SGICRIMEState *crime;
+
     /* ISA registers */
     uint64_t isa_ringbase;
     uint64_t isa_flash_nic;

@@ -193,6 +193,13 @@ struct SGICRIMEState {
     int64_t time_offset;    /* Guest-written offset for CRM_TIME */
     uint64_t last_time_read; /* Last value returned from CRM_TIME */
     uint64_t last_raw_time; /* Raw CRM_TIME at the previous read (unclamped) */
+    /*
+     * Set by the MACE while the DS2502 1-wire bit-bang holds the DQ line
+     * low.  CRM_TIME is then the guest's pulse stopwatch (the PROM zeroes
+     * it and polls to the target), so the calibration floor must not be
+     * applied -- see sgi_crime_get_time().
+     */
+    bool onewire_hold;
     uint64_t cpu_error_addr;
     uint64_t cpu_error_stat;
     uint64_t cpu_error_ena;
@@ -206,5 +213,13 @@ struct SGICRIMEState {
     uint64_t mem_error_ecc_chk;
     uint64_t mem_error_ecc_repl;
 };
+
+/*
+ * Tell CRIME that the MACE DS2502 bit-bang is (or is no longer) holding
+ * the 1-wire DQ line low.  While held, CRM_TIME is being polled as a
+ * pulse stopwatch and must advance per poll iteration, not per host wall
+ * time; the calibration floor is suppressed for the duration.
+ */
+void sgi_crime_set_onewire_hold(SGICRIMEState *s, bool hold);
 
 #endif /* HW_MISC_SGI_CRIME_H */

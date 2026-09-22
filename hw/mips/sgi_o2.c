@@ -1041,6 +1041,9 @@ static void sgi_o2_init(MachineState *machine) {
 
   /* MACE at 0x1F000000 */
   mace_dev = qdev_new(TYPE_SGI_MACE);
+  /* The DS2502 1-wire bit-bang times its pulses on CRIME CRM_TIME. */
+  object_property_set_link(OBJECT(mace_dev), "crime", OBJECT(crime_dev),
+                           &error_fatal);
   /* Don't pass chardev to MACE — serial port 0 is handled by serial_mm below */
   /*
    * The MACE's MAC110 ethernet is always physically present on the

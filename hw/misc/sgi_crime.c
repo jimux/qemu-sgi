@@ -148,6 +148,24 @@ static uint64_t sgi_crime_get_time(SGICRIMEState *s)
     uint64_t raw = (sgi_crime_raw_time() + s->time_offset) & 0xffffffffffffULL;
     uint64_t val;
 
+    /*
+     * The MACE DS2502 bit-bang holds the 1-wire DQ line low while the PROM
+     * times each pulse: it zeroes CRM_TIME and polls it until the target,
+     * then releases.  In that window CRM_TIME is a per-iteration stopwatch,
+     * not a measure of host wall time, so a host scheduling stall between
+     * two poll reads must not advance it.  Advancing by exactly
+     * MIN_TIME_ADVANCE per read makes usecwait(8) take two reads (~9us) and
+     * usecwait(90) twenty (~90us) regardless of host load.  Applying the
+     * calibration floor here instead would inflate a short 8us write-1 pulse
+     * past the DS2502 zero threshold, decode the commanded 1 as a 0, and
+     * corrupt the eaddr read (transient dead-ec0 boot).
+     */
+    if (s->onewire_hold) {
+        s->last_time_read += MIN_TIME_ADVANCE;
+        s->last_raw_time = raw;
+        return s->last_time_read;
+    }
+
     /* Ensure monotonic advancement by at least MIN_TIME_ADVANCE per read */
     val = raw;
     if (val < s->last_time_read + MIN_TIME_ADVANCE) {
@@ -170,6 +188,13 @@ static uint64_t sgi_crime_get_time(SGICRIMEState *s)
     s->last_time_read = val;
 
     return val;
+}
+
+void sgi_crime_set_onewire_hold(SGICRIMEState *s, bool hold)
+{
+    if (s != NULL) {
+        s->onewire_hold = hold;
+    }
 }
 
 /*
@@ -651,6 +676,7 @@ static void sgi_crime_reset(DeviceState *dev)
     s->time_offset = 0;
     s->last_time_read = 0;
     s->last_raw_time = 0;
+    s->onewire_hold = false;
     s->cpu_error_addr = 0;
     s->cpu_error_stat = 0;
     s->cpu_error_ena = 0;
@@ -795,6 +821,7 @@ static const VMStateDescription vmstate_sgi_crime = {
         VMSTATE_INT64(time_offset, SGICRIMEState),
         VMSTATE_UINT64(last_time_read, SGICRIMEState),
         VMSTATE_UINT64(last_raw_time, SGICRIMEState),
+        VMSTATE_BOOL(onewire_hold, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_addr, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_stat, SGICRIMEState),
         VMSTATE_UINT64(cpu_error_ena, SGICRIMEState),

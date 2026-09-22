@@ -43,6 +43,7 @@
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "hw/misc/sgi_mace.h"
+#include "hw/misc/sgi_crime.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/irq.h"
@@ -2942,14 +2943,24 @@ static void sgi_mace_isa_write(SGIMACEState *s, hwaddr isa_off,
          * The 0->1 edge that ends a low pulse presents one slot to
          * the DS2502; the pulse width is read from CRM_TIME, which
          * the PROM's delay routine just counted up to that width.
+         *
+         * While the line is held low the PROM's usecwait zeroes and
+         * polls CRM_TIME as a pulse stopwatch, so tell CRIME to serve
+         * a per-poll counter for the duration (see
+         * sgi_crime_get_time): otherwise a host scheduling stall is
+         * mistaken for a longer pulse and corrupts the eaddr read.
          */
         uint64_t old = s->isa_flash_nic;
         bool old_de = (old & ISA_NIC_DEASSERT) != 0;
         bool new_de = (value & ISA_NIC_DEASSERT) != 0;
 
         s->isa_flash_nic = value;
+        if (old_de && !new_de) {
+            sgi_crime_set_onewire_hold(s->crime, true);
+        }
         if (!old_de && new_de) {
             sgi_mace_ds_slot(s, sgi_mace_ds_pulse_ns());
+            sgi_crime_set_onewire_hold(s->crime, false);
         }
         break;
     }
@@ -3627,6 +3638,8 @@ static const Property sgi_mace_properties[] = {
     DEFINE_PROP_CHR("chardev", SGIMACEState, serial),
     DEFINE_NIC_PROPERTIES(SGIMACEState, nic_conf),
     DEFINE_AUDIO_PROPERTIES(SGIMACEState, audio_be),
+    DEFINE_PROP_LINK("crime", SGIMACEState, crime, TYPE_SGI_CRIME,
+                     SGICRIMEState *),
 };
 
 static bool sgi_mace_ps2_needed(void *opaque)
