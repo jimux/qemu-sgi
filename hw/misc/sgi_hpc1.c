@@ -1463,11 +1463,15 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
  *     #define MAX_RPKT   (MAX_TPKT + HPC_RSPACE + 64)   == 1586
  * The driver arms r_rbcnt = MAX_RPKT (1586) and derives
  *     rlen = MAX_RPKT - r_rbcnt - HPC_RSPACE
- * then reads the Seeq status byte from MEMORY at eh + rlen.  With RSPACE = 3
+ * then reads the Seeq status byte from MEMORY at eh + rlen.  The BUILT IP20
+ * kernel uses HPC_RSPACE = 3 (verified: with 8 the driver read a non-GOOD byte,
+ * took the SN_ERROR path in if_ecintr, ether_input++'d again and dropped every
+ * frame -> Ierrs = 2*Ipkts and arp stayed incomplete; with 3, Ierrs = 0 and ARP
+ * resolves).  With RSPACE = 3
  * the model under-decremented by 5, so the driver read the status 5 bytes
  * early (frame data instead of SEQ_RS_GOOD) and dropped every frame.
  */
-#define HPC1_ENET_RSPACE        8u
+#define HPC1_ENET_RSPACE        3u
 #define HPC1_ENET_SEQ_RXS_GOOD  0x20  /* SEQ_RS_GOOD */
 #define HPC1_ENET_SEQ_RXS_END   0x10  /* SEQ_RS_END */
 
