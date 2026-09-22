@@ -515,19 +515,46 @@ static const MemoryRegionOps sgi_ip6_clrerr_ops = {
  * sequencing, so the registers must persist writes even before the calendar
  * is modelled.
  */
+/*
+ * DP8572A register file.  The PROM maps the chip as 32 registers at 4-byte
+ * stride with the register byte in the top bus lane (bits 31:24): it writes
+ * `sw value<<24` and reads back `srl ...,0x18`.  Indexing by byte offset and
+ * masking `data & 0xff` therefore stored zeros, so the PROM's set-then-verify
+ * never matched and it looped on "can't set tod clock".  Decode the lane.
+ */
 static uint64_t sgi_ip6_rtc_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
+    uint8_t v = s->rtc_regs[(addr & 0x7f) >> 2];
 
-    return s->rtc_regs[addr & (SGI_IP6_RTC_SIZE - 1)];
+    switch (size) {
+    case 4:
+        return (uint32_t)v << 24;
+    case 2:
+        return (uint32_t)v << 8;
+    default:
+        return v;
+    }
 }
 
 static void sgi_ip6_rtc_write(void *opaque, hwaddr addr, uint64_t data,
                               unsigned size)
 {
     SGIip6State *s = opaque;
+    uint8_t v;
 
-    s->rtc_regs[addr & (SGI_IP6_RTC_SIZE - 1)] = data & 0xff;
+    switch (size) {
+    case 4:
+        v = (data >> 24) & 0xff;
+        break;
+    case 2:
+        v = (data >> 8) & 0xff;
+        break;
+    default:
+        v = data & 0xff;
+        break;
+    }
+    s->rtc_regs[(addr & 0x7f) >> 2] = v;
 }
 
 static const MemoryRegionOps sgi_ip6_rtc_ops = {
