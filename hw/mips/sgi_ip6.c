@@ -368,7 +368,7 @@ static const MemoryRegionOps sgi_ip6_mapindex_ops = {
 static uint64_t sgi_ip6_dmahi_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
-    uint32_t idx = ((addr & (SGI_IP6_DMAHI_SIZE - 1)) >> 1) & 0x7ff;
+    uint32_t idx = ((addr & (SGI_IP6_DMAHI_SIZE - 1)) >> 2) & 0x3ff;
 
     return s->dmahi[idx];
 }
@@ -377,7 +377,7 @@ static void sgi_ip6_dmahi_write(void *opaque, hwaddr addr, uint64_t data,
                                 unsigned size)
 {
     SGIip6State *s = opaque;
-    uint32_t idx = ((addr & (SGI_IP6_DMAHI_SIZE - 1)) >> 1) & 0x7ff;
+    uint32_t idx = ((addr & (SGI_IP6_DMAHI_SIZE - 1)) >> 2) & 0x3ff;
 
     s->dmahi[idx] = data & 0xffff;
 }
@@ -750,7 +750,7 @@ static void sgi_ip6_scsi_drq(void *opaque, int n, int level)
     }
 
     while (wdc->async_len > 0) {
-        uint32_t addr = ((uint32_t)s->dmahi[s->mapindex & 0x7ff] << 12) |
+        uint32_t addr = ((uint32_t)s->dmahi[s->mapindex & 0x3ff] << 12) |
                         (s->dmalo & 0x0fff);
 
         if (s->dmalo & 0x8000) {
@@ -951,11 +951,16 @@ struct SGIip6LanceState {
 };
 
 /*
- * The LANCE DMAs through the CTL1 address-mapping table: its top 256 entries
- * (dmahi[0x200..0x2ff]) map the LANCE's 4 KB pages, so the physical address is
+ * The LANCE DMAs through the CTL1 address-mapping table: entries 0x200..0x2ff
+ * map the LANCE's 4 KB pages, so the physical address is
  * (dmahi[0x200 + ((addr >> 12) & 0xff)] << 12) | (addr & 0xfff).  Each 16-bit
  * word is translated separately, as MAME does.  When the driver leaves BSWP
  * clear the LANCE's byte order differs from the host's, so swap in that case.
+ *
+ * The map is a 32-bit-spaced array of 16-bit entries (the PROM stores each
+ * entry in the low half of a 32-bit slot, so a 16-bit-half index would land on
+ * every other entry); sgi_ip6_dmahi_read/write index by the 32-bit word, which
+ * is why the LANCE base is word 0x200 and the SCSI base is word 0.
  */
 static void sgi_ip6_lance_dma_read(void *opaque, hwaddr addr, uint8_t *buf,
                                    int len, int do_bswap)
@@ -966,7 +971,7 @@ static void sgi_ip6_lance_dma_read(void *opaque, hwaddr addr, uint8_t *buf,
     for (i = 0; i + 1 < len; i += 2) {
         hwaddr a = addr + i;
         unsigned page = 0x200 + ((a >> 12) & 0xff);
-        hwaddr pa = ((hwaddr)s->dmahi[page & 0x7ff] << 12) | (a & 0xfff);
+        hwaddr pa = ((hwaddr)s->dmahi[page & 0x3ff] << 12) | (a & 0xfff);
 
         address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
                            buf + i, 2);
@@ -992,7 +997,7 @@ static void sgi_ip6_lance_dma_write(void *opaque, hwaddr addr, uint8_t *buf,
     for (i = 0; i + 1 < len; i += 2) {
         hwaddr a = addr + i;
         unsigned page = 0x200 + ((a >> 12) & 0xff);
-        hwaddr pa = ((hwaddr)s->dmahi[page & 0x7ff] << 12) | (a & 0xfff);
+        hwaddr pa = ((hwaddr)s->dmahi[page & 0x3ff] << 12) | (a & 0xfff);
 
         address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
                             buf + i, 2);
@@ -1012,10 +1017,31 @@ static void sgi_ip6_lance_irq(void *opaque, int n, int level)
     sgi_ip6_lio_update(s);
 }
 
+static ssize_t sgi_ip6_lance_receive(NetClientState *nc, const uint8_t *buf,
+                                     size_t size)
+{
+    /*
+     * Real Ethernet pads frames shorter than the 60-byte minimum at the PHY,
+     * not in the LANCE, and the PROM's driver rejects short frames
+     * ("receive packet too small").  Pad here as the wire would, so senders
+     * that emit raw short frames (e.g. a hand-written ARP reply) still look
+     * like a real link to the guest.
+     */
+    uint8_t pad[60] = { 0 };
+
+    if (size < sizeof(pad)) {
+        memcpy(pad, buf, size);
+        buf = pad;
+        size = sizeof(pad);
+    }
+
+    return pcnet_receive(nc, buf, size);
+}
+
 static NetClientInfo net_sgi_ip6_lance_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
-    .receive = pcnet_receive,
+    .receive = sgi_ip6_lance_receive,
     .link_status_changed = pcnet_set_link_status,
 };
 
