@@ -156,6 +156,7 @@ typedef struct SGIip6State {
     eeprom_t *eeprom;
 
     uint8_t rtc_regs[SGI_IP6_RTC_SIZE];
+    QEMUTimer *rtc_timer;
 
     bool lio_int;
     bool pit0_level;
@@ -555,6 +556,53 @@ static void sgi_ip6_rtc_write(void *opaque, hwaddr addr, uint64_t data,
         break;
     }
     s->rtc_regs[(addr & 0x7f) >> 2] = v;
+}
+
+/* BCD increment with roll-over at @max. */
+static uint8_t sgi_ip6_rtc_bcd_inc(uint8_t v, uint8_t max)
+{
+    v++;
+    if ((v & 0x0f) > 9) {
+        v += 6;
+    }
+    if (v > max) {
+        v = 0;
+    }
+    return v;
+}
+
+/*
+ * The DP8572A counts hundredths of a second, and the PROM polls that register
+ * (reg 5) waiting for the clock to run, so a seconds-granular tick would leave
+ * it frozen.  Advance at 100 Hz and roll the writable BCD set up.
+ */
+static void sgi_ip6_rtc_tick(void *opaque)
+{
+    SGIip6State *s = opaque;
+    uint8_t *r = s->rtc_regs;
+
+    r[5] = sgi_ip6_rtc_bcd_inc(r[5], 0x99);             /* hundredths */
+    if (r[5] == 0) {
+        r[6] = sgi_ip6_rtc_bcd_inc(r[6], 0x59);         /* seconds */
+        if (r[6] == 0) {
+            r[7] = sgi_ip6_rtc_bcd_inc(r[7], 0x59);     /* minutes */
+            if (r[7] == 0) {
+                r[8] = sgi_ip6_rtc_bcd_inc(r[8], 0x23); /* hours */
+                if (r[8] == 0) {
+                    r[9] = sgi_ip6_rtc_bcd_inc(r[9], 0x31);  /* day */
+                    if (r[9] == 0) {
+                        r[10] = sgi_ip6_rtc_bcd_inc(r[10], 0x12); /* month */
+                        if (r[10] == 0) {
+                            r[11] = sgi_ip6_rtc_bcd_inc(r[11], 0x99);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    timer_mod(s->rtc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / 100);
 }
 
 static const MemoryRegionOps sgi_ip6_rtc_ops = {
@@ -1314,6 +1362,10 @@ static void sgi_ip6_init(MachineState *machine)
     s->vme_isr = 0;
     s->vme_imr = 0;
     memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
+    s->rtc_regs[1] = 0x18;   /* status: clock running + RAM/time valid */
+    s->rtc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_ip6_rtc_tick, s);
+    timer_mod(s->rtc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / 100);
     s->lio_int = false;
     s->pit0_level = true;   /* PIT output is high out of reset; see out0 */
     s->pit0_programmed = false;
