@@ -133,6 +133,14 @@ struct SGIGr2State {
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */
     uint8_t bitplanes; /* 8 or 24 */
     bool zbuffer;
+    /* Board-version/config bytes, one per 32-bit slot at 0x6c000/4/8/c.  These
+     * are per-instance so a variant can report its own identity: XZ defaults
+     * to 0x06/0x30/0x00/0x00 (24-bit + Z); XS-24 is 0x06/0x10/0x00/0x00
+     * (24-bit, no Z).  See the BDVERS defaults below. */
+    uint8_t bdvers0;
+    uint8_t bdvers1;
+    uint8_t bdvers2;
+    uint8_t bdvers3;
 };
 
 #endif /* HW_MISC_SGI_GR2_H */

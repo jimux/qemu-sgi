@@ -270,11 +270,12 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->regs[SGI_GR2_HQ_MYSTERY + 3] = SGI_GR2_HQ_MAGIC & 0xff;
 
     /* Board version / config bytes decoded by Gr2Probe: one byte per 32-bit
-     * slot at 0x6c000/4/8/c. */
-    s->regs[SGI_GR2_BDVERS_OFF + 0] = SGI_GR2_BDVERS0;
-    s->regs[SGI_GR2_BDVERS_OFF + 4] = SGI_GR2_BDVERS1;
-    s->regs[SGI_GR2_BDVERS_OFF + 8] = SGI_GR2_BDVERS2;
-    s->regs[SGI_GR2_BDVERS_OFF + 12] = SGI_GR2_BDVERS3;
+     * slot at 0x6c000/4/8/c.  Per-instance so a variant (e.g. XS-24) can
+     * report its own identity. */
+    s->regs[SGI_GR2_BDVERS_OFF + 0] = s->bdvers0;
+    s->regs[SGI_GR2_BDVERS_OFF + 4] = s->bdvers1;
+    s->regs[SGI_GR2_BDVERS_OFF + 8] = s->bdvers2;
+    s->regs[SGI_GR2_BDVERS_OFF + 12] = s->bdvers3;
 
     /* HQ2 revision register (read >> 16 into gr2_info.HQ2Rev). */
     s->regs[SGI_GR2_HQ_OFF + 0x6c + 0] = 0x00;
@@ -311,6 +312,12 @@ static const Property sgi_gr2_properties[] = {
     DEFINE_PROP_UINT8("ges", SGIGr2State, ges, 2),
     DEFINE_PROP_UINT8("bitplanes", SGIGr2State, bitplanes, 24),
     DEFINE_PROP_BOOL("zbuffer", SGIGr2State, zbuffer, true),
+    /* Per-variant board identity.  Defaults = XZ (2 GE, 24-bit + Z).  XS-24
+     * sets bdvers1=0x10 (24-bit, no Z); XS sets bdvers1=0x00 (8-bit). */
+    DEFINE_PROP_UINT8("bdvers0", SGIGr2State, bdvers0, SGI_GR2_BDVERS0),
+    DEFINE_PROP_UINT8("bdvers1", SGIGr2State, bdvers1, SGI_GR2_BDVERS1),
+    DEFINE_PROP_UINT8("bdvers2", SGIGr2State, bdvers2, SGI_GR2_BDVERS2),
+    DEFINE_PROP_UINT8("bdvers3", SGIGr2State, bdvers3, SGI_GR2_BDVERS3),
 };
 
 static void sgi_gr2_class_init(ObjectClass *klass, const void *data)
