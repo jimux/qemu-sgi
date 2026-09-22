@@ -111,6 +111,26 @@ static int sgi_ip6_peer_write(Chardev *chr, const uint8_t *buf, int len)
             qemu_log_mask(LOG_UNIMP,
                           "sgi-ip6-kbd: guest->kbd byte %02x (#%u)\n",
                           buf[i], s->kb_cmds);
+
+            /*
+             * MEASURED: the PROM's driver (0xbfc148b4) writes 0x10 and expects
+             * ONE reply byte -- the layout id, which it requires to be < 16
+             * (stored at 0xa03ce960).  When nothing answers it retries 0x10 up
+             * to three times and then reports "Error-- keyboard not
+             * responding".  The rest of the handshake (0x09/0x11/0x21/0x41,
+             * 0x01, 0x82) is only sent AFTER a valid layout reply, which is
+             * why none of it appears in a capture with no keyboard.
+             */
+            if (buf[i] == 0x10) {
+                uint8_t reply = 1;      /* US layout id (measured next) */
+                qemu_log_mask(LOG_UNIMP,
+                              "sgi-ip6-kbd: queueing layout reply %02x "
+                              "(can_write=%d)\n", reply,
+                              (int)qemu_chr_be_can_write(s->chr));
+                sgi_ip6_input_queue(s, &reply, 1);
+                qemu_log_mask(LOG_UNIMP,
+                              "sgi-ip6-kbd: after queue rx_len=%d\n", s->rx_len);
+            }
         }
         return len;
     }
