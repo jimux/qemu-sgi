@@ -541,3 +541,4 @@ sgi_vino_field_src(int ch, uint32_t row_bytes, size_t frame_len, int use_frame) 
 # sgi_gr2.c (Indy XZ GR2 / "Express" register shell)
 sgi_gr2_read(uint64_t off, unsigned size, uint64_t val) "GR2 read  off=0x%05"PRIx64" size=%u -> 0x%"PRIx64
 sgi_gr2_write(uint64_t off, uint64_t val, unsigned size) "GR2 write off=0x%05"PRIx64" val=0x%"PRIx64" size=%u"
+sgi_gr2_fifo(uint64_t off, uint64_t val, unsigned size) "GR2 fifo  off=0x%05"PRIx64" val=0x%"PRIx64" size=%u"

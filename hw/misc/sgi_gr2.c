@@ -126,6 +126,12 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset < 0x40 || offset >= SGI_GR2_HQUCODE_OFF) {
         trace_sgi_gr2_write(offset, value, size);
     }
+    /* Token-FIFO traffic (fifo[token] = data) is the producer/consumer channel;
+     * trace it separately and cheaply so a draw window does not require tracing
+     * the whole register block. */
+    if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
+        trace_sgi_gr2_fifo(offset, value, size);
+    }
     /* GE7 instruction load/verify: store the window and load-register words
      * verbatim into the per-PC slot selected by the last gepc write.  No
      * masking or tidying — the driver compares against what it wrote. */
