@@ -616,6 +616,20 @@ static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
     }
     level = pending != 0;
     if (level != s->ioc3_sio_irq_level) {
+        if (level) {
+            s->dbg_irq_raises++;
+            if (getenv("SGIBRIDGE_RXDBG") &&
+                (s->dbg_irq_raises <= 30 ||
+                 (s->dbg_irq_raises & 0x3ff) == 0)) {
+                fprintf(stderr, "RXIRQ#%llu pending=%08x raises=%llu bytes=%llu "
+                        "sir_reads=%llu rx_timer_acks=%llu\n",
+                        (unsigned long long)s->dbg_irq_raises, pending,
+                        (unsigned long long)s->dbg_irq_raises,
+                        (unsigned long long)s->dbg_rx_bytes,
+                        (unsigned long long)s->dbg_sir_reads,
+                        (unsigned long long)s->dbg_rx_timer_acks);
+            }
+        }
         s->ioc3_sio_irq_level = level;
         sgi_bridge_dev_irq(s, BRIDGE_BVEC_IOC3_SERIAL, level);
     }
@@ -743,12 +757,20 @@ static void sgi_bridge_ioc3_sio_rx(SGIBRIDGEState *s, const uint8_t *buf,
         }
         prod = (prod + sizeof(entry)) & IOC3_SIO_RING_MASK;
         s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRPIR_OFF)] = prod;
+        s->dbg_rx_bytes++;
         irq |= IOC3_SIO_IR_SA_RX_TIMER;
     }
 
     if (irq) {
         s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] |= irq;
-        sgi_bridge_ioc3_sio_irq_update(s);
+        if (getenv("SGIBRIDGE_RXDBG")) {
+            fprintf(stderr, "SIRSET rx idx=%d -> %08x\n",
+                    (int)IOC3_IDX(IOC3_SIO_IR_OFF),
+                    s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)]);
+        }
+        if (!getenv("SGIBRIDGE_RX_NOIRQ")) {
+            sgi_bridge_ioc3_sio_irq_update(s);
+        }
     }
 }
 
@@ -1183,6 +1205,15 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
             }
         } else {
             val = s->ioc3_regs[(offset - 0x600000) >> 2];
+            if (offset == IOC3_SIO_IR_OFF) {
+                /* Instrumentation: each ISR PENDING() poll reads this. */
+                s->dbg_sir_reads++;
+                if (getenv("SGIBRIDGE_RXDBG") && s->dbg_rx_bytes > 0 &&
+                    s->dbg_sir_reads <= 200) {
+                    fprintf(stderr, "SIRRD#%llu val=%08x\n",
+                            (unsigned long long)s->dbg_sir_reads, val);
+                }
+            }
         }
         break;
 
@@ -1248,6 +1279,10 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         offset += 0x100000;
     }
 
+    if (getenv("SGIBRIDGE_RXDBG") && offset >= 0x130 && offset < 0x170) {
+        fprintf(stderr, "BINTADDR W [%06llx] = %08llx\n",
+                (unsigned long long)offset, (unsigned long long)val);
+    }
     if (getenv("IOC3_SIO_DEBUG") && offset >= 0x600000 && offset < 0x600100) {
         fprintf(stderr, "IOC3SIO W [%06llx] = %08llx size=%u\n",
                 (unsigned long long)offset, (unsigned long long)val, size);
@@ -1341,6 +1376,25 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         } else if (offset == IOC3_SIO_IR_OFF) {
             /* SIO_IR is 1-to-clear: the ISR acks its source bits by writing. */
             s->ioc3_regs[IOC3_IDX(offset)] &= ~val;
+            if (getenv("SGIBRIDGE_RXDBG") && s->dbg_sir_writes <= 60) {
+                s->dbg_sir_writes++;
+                fprintf(stderr, "SIRWR#%llu val=%08x -> sir=%08x\n",
+                        (unsigned long long)s->dbg_sir_writes, val,
+                        s->ioc3_regs[IOC3_IDX(offset)]);
+            }
+            if (val & IOC3_SIO_IR_SA_RX_TIMER) {
+                s->dbg_rx_timer_acks++;
+                if (getenv("SGIBRIDGE_RXDBG") &&
+                    (s->dbg_rx_timer_acks <= 10 ||
+                     (s->dbg_rx_timer_acks & 0x3ff) == 0)) {
+                    fprintf(stderr, "RXACK#%llu rx_timer val=%08x raises=%llu "
+                            "bytes=%llu sir_reads=%llu\n",
+                            (unsigned long long)s->dbg_rx_timer_acks, val,
+                            (unsigned long long)s->dbg_irq_raises,
+                            (unsigned long long)s->dbg_rx_bytes,
+                            (unsigned long long)s->dbg_sir_reads);
+                }
+            }
             sgi_bridge_ioc3_sio_irq_update(s);
         } else if (offset == IOC3_SIO_IES_OFF) {
             s->ioc3_sio_ienb |= val;    /* SuperIO interrupt enable set   */
@@ -1555,6 +1609,18 @@ static void sgi_bridge_dev_irq(void *opaque, int n, int level)
      * dispatches that HEART vector to pcibr_intr_list_func -> the driver's
      * handler (e.g. qlintr).  Drive the HEART directly.
      */
+    if (getenv("SGIBRIDGE_RXDBG") && n == 4) {
+        fprintf(stderr, "DEVIRQ n=%d level=%d vec=%02x b_int_addr=%08x "
+                "b_int_enable=%08x bytes=%llu raises=%llu sir_reads=%llu "
+                "sir_writes=%llu rxacks=%llu\n", n, level, vec,
+                s->regs[(0x134 + n * 8) >> 2],
+                s->regs[BRIDGE_INT_ENABLE_OFF >> 2],
+                (unsigned long long)s->dbg_rx_bytes,
+                (unsigned long long)s->dbg_irq_raises,
+                (unsigned long long)s->dbg_sir_reads,
+                (unsigned long long)s->dbg_sir_writes,
+                (unsigned long long)s->dbg_rx_timer_acks);
+    }
     if (vec) {
         sgi_heart_raise_vector(s->heart, vec, level);
     }

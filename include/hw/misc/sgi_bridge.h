@@ -152,6 +152,19 @@ struct SGIBRIDGEState {
     int ioc3_sio_irq_level;
 
     /*
+     * RX-path instrumentation (SGIBRIDGE_RXDBG).  dbg_rx_bytes counts bytes
+     * pushed into the ring, dbg_irq_raises counts bvec 4 level 0->1 edges (one
+     * guest ISR entry each), dbg_sir_reads counts guest reads of sio_ir (each
+     * PENDING() poll inside the ISR do/while loop), dbg_rx_timer_acks counts
+     * guest acks of RX_TIMER (one per loop pass that saw it set).
+     */
+    uint64_t dbg_rx_bytes;
+    uint64_t dbg_irq_raises;
+    uint64_t dbg_sir_reads;
+    uint64_t dbg_sir_writes;
+    uint64_t dbg_rx_timer_acks;
+
+    /*
      * IOC3 serial RX path (port A console input).  The kernel's console input
      * does NOT read the 16550 RBR: after boot it reads the SIO RX DMA ring
      * (io/sio_ioc3.c ioc3_read(), producer srpir, consumer srcir).  The chardev
