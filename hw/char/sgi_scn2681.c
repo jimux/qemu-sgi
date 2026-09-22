@@ -114,6 +114,12 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
         s->ch[0].sr &= ~SCN2681_SR_RXRDY;
         s->isr &= ~SCN2681_ISR_RXRDYA;
         scn2681_update_irq(s);
+        /*
+         * The RX holding register is free again; let the backend (a serial
+         * peer that queues bytes) know it may send the next one.  Inert for
+         * backends that do not implement chr_accept_input.
+         */
+        qemu_chr_fe_accept_input(&s->chr_a);
         break;
     case SCN2681_REG_IPCR:
         ret = 0x0f; /* no input port change pending */
@@ -143,6 +149,8 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
         s->ch[1].sr &= ~SCN2681_SR_RXRDY;
         s->isr &= ~SCN2681_ISR_RXRDYB;
         scn2681_update_irq(s);
+        /* See THRA: let a queuing backend resume (inert otherwise). */
+        qemu_chr_fe_accept_input(&s->chr_b);
         break;
     case SCN2681_REG_IVR:
         ret = s->ivr;
