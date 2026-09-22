@@ -130,16 +130,30 @@ static int sgi_ip6_peer_write(Chardev *chr, const uint8_t *buf, int len)
                  * so it expects 0xAA (ACK).  A layout id (e.g. 0x01) is read
                  * and REJECTED, which is exactly what we observed.
                  */
-                uint8_t reply = 0xaa;
+                /*
+                 * MEASURED reply SEQUENCE (not a single byte).  The 0x6e
+                 * branch is the SUCCESS path:
+                 *   bfc14918: jal 0xbfc144c0     ; read reply #2
+                 *   bfc14928: slti <16            ; LAYOUT must be < 16
+                 *   bfc14938: sb v1,0xa03ce960    ; store LAYOUT
+                 *   bfc14940: li s1,1             ; success
+                 *   ... writes 0x11,0x21,0x41,0x01, then 0x82
+                 * The 0xaa branch is the DEGRADED path: it stores layout
+                 * 0xcc ("unknown") and keeps retrying -- which is what we
+                 * were doing.  So: reply 0x6e, then the layout id.
+                 */
+                uint8_t reply[2] = { 0x6e, 1 };   /* 0x6e, then US layout 1 */
                 qemu_log_mask(LOG_UNIMP,
-                              "sgi-ip6-kbd: queueing ACK %02x\n", reply);
-                sgi_ip6_input_queue(s, &reply, 1);
-                if (!s->kb_handshaked) {
-                    s->kb_handshaked = true;
-                    qemu_log_mask(LOG_UNIMP,
-                                  "sgi-ip6-kbd: handshake accepted -> "
-                                  "switching to KEY EVENT input\n");
-                }
+                              "sgi-ip6-kbd: queueing 6e + layout %02x\n",
+                              reply[1]);
+                sgi_ip6_input_queue(s, reply, sizeof(reply));
+            }
+            if (buf[i] == 0x82 && !s->kb_handshaked) {
+                /* 0x82 is the last byte of the driver's success handshake. */
+                s->kb_handshaked = true;
+                qemu_log_mask(LOG_UNIMP,
+                              "sgi-ip6-kbd: handshake complete -> "
+                              "KEY EVENT input\n");
             }
         }
         return len;
