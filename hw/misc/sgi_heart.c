@@ -686,8 +686,14 @@ static void sgi_heart_reset(DeviceState *dev)
     memset(s->fc_addr, 0, sizeof(s->fc_addr));
     memset(s->fc_cr_cnt, 0, sizeof(s->fc_cr_cnt));
     memset(s->fc_timer, 0, sizeof(s->fc_timer));
-    /* Widget ID 8 in bits [3:0] — HEART is hardwired to XIO port 8 */
-    s->status = 8;
+    /*
+     * Widget ID 8 in bits [3:0] -- HEART is hardwired to XIO port 8.
+     * Also report PROC_ACTIVE (h_status[4+i]) for each present CPU: the IP30
+     * kernel's cpu_exists()/maxcpus probe reads these bits, and with none set
+     * it leaves maxcpus at its MAXCPU initialiser (2) even on a 1-CPU machine,
+     * which then schedules work onto a CPU that does not exist.
+     */
+    s->status = 8 | (((1ULL << s->num_cpus) - 1) << 4);
     s->berr_addr = 0;
     s->berr_misc = 0;
     s->memerr_addr = 0;
