@@ -526,7 +526,24 @@ static const MemoryRegionOps sgi_ip6_clrerr_ops = {
 static uint64_t sgi_ip6_rtc_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
-    uint8_t v = s->rtc_regs[(addr & 0x7f) >> 2];
+    unsigned reg = (addr & 0x7f) >> 2;
+    uint8_t v;
+
+    /*
+     * The reader (PROM 0xbfc13138) zero-writes regs 0x19..0x1d and then reads
+     * those same offsets as the calendar - a write-then-read at one offset can
+     * only be the chip's latched time window, not the register just written.
+     * Present the live calendar there (setter wrote regs 6..11).
+     */
+    switch (reg) {
+    case 0x19: v = s->rtc_regs[6]; break;   /* seconds */
+    case 0x1a: v = s->rtc_regs[7]; break;   /* minutes */
+    case 0x1b: v = s->rtc_regs[8]; break;   /* hours */
+    case 0x1c: v = s->rtc_regs[10]; break;  /* month */
+    case 0x1d: v = s->rtc_regs[9]; break;   /* day */
+    case 0x0b: v = s->rtc_regs[11]; break;  /* year */
+    default: v = s->rtc_regs[reg]; break;
+    }
 
     switch (size) {
     case 4:
@@ -542,7 +559,13 @@ static void sgi_ip6_rtc_write(void *opaque, hwaddr addr, uint64_t data,
                               unsigned size)
 {
     SGIip6State *s = opaque;
+    unsigned reg = (addr & 0x7f) >> 2;
     uint8_t v;
+
+    /* The reader's zero-writes in this window are a latch strobe, not data. */
+    if (reg >= 0x19 && reg <= 0x1d) {
+        return;
+    }
 
     switch (size) {
     case 4:
@@ -555,7 +578,7 @@ static void sgi_ip6_rtc_write(void *opaque, hwaddr addr, uint64_t data,
         v = data & 0xff;
         break;
     }
-    s->rtc_regs[(addr & 0x7f) >> 2] = v;
+    s->rtc_regs[reg] = v;
 }
 
 /* BCD increment with roll-over at @max. */
