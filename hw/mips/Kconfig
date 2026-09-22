@@ -96,6 +96,7 @@ config SGI_INDY
     select SGI_HPC3
     select SGI_ARCS
     select SGI_NEWPORT
+    select SGI_GR2
     select WD33C93
     select SERIAL_MM
     select UNIMP

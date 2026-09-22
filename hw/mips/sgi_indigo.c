@@ -42,9 +42,11 @@
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
+#include "monitor/qdev.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/sgi_hpc1.h"
 #include "hw/misc/sgi_mc.h"
+#include "hw/misc/sgi_gr2.h"
 #include "hw/misc/unimp.h"
 #include "hw/scsi/scsi.h"
 #include "qapi/error.h"
@@ -154,8 +156,10 @@ static void sgi_indigo_init(MachineState *machine)
     MemoryRegion *dsp_ram;
     DeviceState *mc_dev;
     DeviceState *hpc1_dev;
+    DeviceState *gr2_dev;
     MIPSCPU *cpu;
     Clock *cpuclk;
+    bool gr2_present;
     char *filename;
     int bios_size;
 
@@ -253,6 +257,36 @@ static void sgi_indigo_init(MachineState *machine)
     create_gio_empty_slot(system_memory, "gio-gfx", SGI_GIO_GFX_BASE, 4 * MiB);
     create_gio_empty_slot(system_memory, "gio-exp0", SGI_GIO_EXP0_BASE, 2 * MiB);
     create_gio_empty_slot(system_memory, "gio-exp1", SGI_GIO_EXP1_BASE, 4 * MiB);
+
+    /*
+     * GR2 / "Express" graphics (Indigo XS/XS24/XZ), opt-in.  present=off
+     * (default) leaves the empty GIO graphics slot stub above untouched, so a
+     * plain `-M indigo` boot is unchanged.  present=on overlays the slot with
+     * the GR2 register window so the PROM/kernel probe finds the HQ2 presence
+     * magic at 0x6a07c.
+     *
+     * Slot exclusivity: the IP20 has NO Newport, so GR2 is structurally the
+     * only device that can occupy 0x1f000000 (there is no competing graphics
+     * device to enable alongside it).  Were a Newport added to this machine,
+     * enabling both here would be undefined and must be rejected.
+     *
+     * Variant: XS-24 = 1 GE, 24-bit, no Z (vs the core's XZ default).  This
+     * is selectable from the command line via -global, e.g.
+     *   -global sgi-gr2.present=on -global sgi-gr2.ges=1
+     *   -global sgi-gr2.bitplanes=24 -global sgi-gr2.zbuffer=off
+     * (the board-version register is still hardwired in the core, so the
+     * decoded identifier stays XZ until that core patch lands).
+     */
+    gr2_dev = qdev_new(TYPE_SGI_GR2);
+    qdev_set_id(gr2_dev, g_strdup("sgi-gr2"), &error_fatal);
+    gr2_present = object_property_get_bool(OBJECT(gr2_dev), "present",
+                                           &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(gr2_dev), &error_fatal);
+    if (gr2_present) {
+        memory_region_add_subregion_overlap(
+            system_memory, SGI_GIO_GFX_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(gr2_dev), 0), 1);
+    }
 
     /*
      * Memory probe areas: the MC dynamically maps RAM aliases over these.
