@@ -794,6 +794,33 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             r = (ent >> 24) & 0xff;
                             g = (ent >> 16) & 0xff;
                             b = (ent >> 8) & 0xff;
+                        } else if (typ == 5) {
+                            /*
+                             * RGB8 (spec §2.4 typ 5).  @@SEMANTICS@@ — the
+                             * O2 normal-plane 32bpp pixel is stored ABGR:
+                             * memory bytes [A][B][G][R], R in the LAST byte.
+                             * The GBE spec's RGB8 diagram puts R at bits
+                             * [31:24]; on the little-endian GBE fetch that is
+                             * exactly the last byte.  The canonical CRIME-RE
+                             * fragment is RGBA (R=31:24..A=7:0), so the RE
+                             * converts on write and GBE must convert back on
+                             * scan: read the three colour bytes from the low
+                             * end (R=byte3, G=byte2, B=byte1) and ignore the
+                             * alpha byte0.
+                             *
+                             * The old raw-RGB default read byte0, which for
+                             * the clogin greeter panel is the alpha lane
+                             * (always 0x00), so the panel's neutral grey
+                             * (memory 0x00C0C0C0) scanned out as saturated
+                             * cyan (0,192,192) — every panel row.  This is
+                             * the same ABGR order commit 79ecd6a182 fixed for
+                             * the VICE tiles; the normal-plane scanout needed
+                             * it too.
+                             */
+                            int lane = (bpp == 4) ? 4 * i : 2 * i;
+                            r = buf[lane + 3];
+                            g = buf[lane + 2];
+                            b = buf[lane + 1];
                         } else if (bpp == 2) {
                             uint16_t p = (buf[2 * i] << 8) | buf[2 * i + 1];
                             r = ((p >> 10) & 0x1f) << 3;

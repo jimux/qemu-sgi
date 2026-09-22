@@ -221,12 +221,12 @@ static uint32_t sgi_crime_re_get_pixel(SGICRIMEREState *s, uint32_t bufmode,
             return ((uint32_t)b[0] << 8) | b[1];
         }
         return b[crim_ci_lane(bufmode)];
-    case 1:                             /* RGB (alpha reads 0) */
-        return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-               ((uint32_t)b[2] << 8);
-    default:                            /* RGBA / ABGR pack same bytes */
-        return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-               ((uint32_t)b[2] << 8) | b[3];
+    case 1:                             /* RGB: ABGR in memory, alpha=0 */
+        return ((uint32_t)b[3] << 24) | ((uint32_t)b[2] << 16) |
+               ((uint32_t)b[1] << 8);
+    default:                            /* ABGR in memory -> canonical RGBA */
+        return ((uint32_t)b[3] << 24) | ((uint32_t)b[2] << 16) |
+               ((uint32_t)b[1] << 8) | b[0];
     }
 }
 
@@ -333,7 +333,14 @@ static inline int crim_bufmode_rgb_bits(uint32_t bufmode)
 
 /*
  * Write one pixel through the dst BufMode with ROP/masking applied.
- * Color packing per gxemul getputpixel semantics (CI8/RGB/RGBA).
+ *
+ * @@SEMANTICS@@ — the canonical fragment colour is RGBA (R=31:24..A=7:0;
+ * see crim_dither_rgb).  The O2 normal-plane 32bpp surface is ABGR in
+ * memory (bytes A,B,G,R), matching commit 79ecd6a182's tile order and
+ * the GBE RGB8 scanout (r=buf[3], g=buf[2], b=buf[1]).  put_pixel packs
+ * RGBA->ABGR here; get_pixel and xfer_fetch reverse it.  RGB surfaces
+ * (pixType 1) carry no alpha, so their byte0 is written 0 and reads are
+ * alpha-less.  8/16-bit CI (pixType 0) is unaffected.
  */
 static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
                                    int x, int y, uint32_t color)
@@ -387,14 +394,14 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
         }
         break;
     }
-    case 1:                             /* RGB */
+    case 1:                             /* RGB canonical -> ABGR memory */
         bpp = 4;
-        b[0] = color >> 24; b[1] = color >> 16; b[2] = color >> 8; b[3] = 0;
+        b[0] = 0; b[1] = color >> 8; b[2] = color >> 16; b[3] = color >> 24;
         break;
-    case 2:                             /* RGBA */
+    case 2:                             /* RGBA canonical -> ABGR memory */
     default:
         bpp = 4;
-        b[0] = color >> 24; b[1] = color >> 16; b[2] = color >> 8; b[3] = color;
+        b[0] = color; b[1] = color >> 8; b[2] = color >> 16; b[3] = color >> 24;
         break;
     }
 
@@ -416,8 +423,9 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
                 b[0] = color & 0xff;
             }
         } else {
-            b[0] = color >> 24; b[1] = color >> 16;
-            b[2] = color >> 8;  b[3] = color;
+            b[0] = (pix_type == 1) ? 0 : color;
+            b[1] = color >> 8;
+            b[2] = color >> 16; b[3] = color >> 24;
         }
     }
     if (dm & DM_ENCOLORMASK) {
@@ -439,8 +447,43 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
             if (!(m & 0x000000ffu)) { b[3] = ob[3]; }
         }
     }
+
+    /*
+     * @@SEMANTICS@@ — DrawMode.enColorByteMask (crimedef.h
+     * DM_ENCOLORBYTEMASK = bits [6:3]): one write-enable bit per
+     * destination byte lane, bit 3 -> the first byte b[0], bit 6 -> the
+     * last b[3] (the same low-bit-first lane order the MTE.byteMask uses,
+     * where a clear bit leaves the destination byte untouched).  A clear
+     * bit preserves the destination byte.
+     *
+     * The O2 X DDX builds the clogin greeter panel's 1x1 dither by
+     * pixel-transferring a small pattern pixmap with fg 0xC0C0C000 /
+     * 0xC1C1C100 and byte mask 0xe: the three colour lanes are written
+     * and the alpha lane is preserved, so the RE composes the grey over
+     * whatever alpha the surface already holds.  With the canonical RGBA
+     * fragment packed ABGR into memory (R in the last byte), mask 0xe
+     * enables bytes 1..3 = B,G,R and leaves byte0 = alpha.
+     *
+     * The previous code ignored the field entirely and wrote all four
+     * bytes of every fill.  That is only benign once the pixel lane order
+     * is right (which it now is); before the ABGR pack it clobbered the
+     * lanes the guest was preserving.
+     */
+    {
+        uint32_t bmask = (dm >> 3) & 0xf;
+        if (bmask != 0xf) {
+            uint8_t ob[4];
+            address_space_rw(&address_space_memory, phys,
+                             MEMTXATTRS_UNSPECIFIED, ob, bpp, false);
+            for (int k = 0; k < bpp; k++) {
+                if (!((bmask >> k) & 1)) {
+                    b[k] = ob[k];
+                }
+            }
+        }
+    }
     address_space_rw(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
-                     b, bpp, true);
+                      b, bpp, true);
 }
 
 /* ------------------------------------------------------------------ */
@@ -770,18 +813,22 @@ static uint32_t sgi_crime_re_xfer_fetch(SGICRIMEREState *s,
     if (pix_type == 0) {
         return b[crim_ci_lane(s->bufmode_src)];
     }
-    if (pix_type == 3) {
+    if (pix_type == 1) {
+        /* RGB src is ABGR in memory (unused byte0); return canonical RGBA. */
+        return ((uint32_t)b[3] << 24) | ((uint32_t)b[2] << 16)
+             | ((uint32_t)b[1] << 8);
+    }
+    if (pix_type == 2 || pix_type == 3) {
         /*
-         * @@SEMANTICS@@ — BufMode.src pixType 3 is ABGR (spec §7.3.1.4
-         * Table 7-4): the big-endian word is A(31:24) B(23:16) G(15:8)
-         * R(7:0), i.e. memory bytes A,B,G,R.  This is exactly the MACE
-         * capture packing the OpenGL video path feeds in, and the
-         * destination here is pixType 2 (RGBA: memory R,G,B,A) whose
-         * GBE RGB8 scanout reads byte0 as R.  Return the canonical
-         * internal RGBA (the same convention get_pixel/put_pixel and
-         * the shade/dither arithmetic use: R=31:24..A=7:0) so the
-         * engine performs the ABGR->RGBA component reorder; without it
-         * the window showed the alpha byte (0xff) as red.
+         * @@SEMANTICS@@ — the O2 normal-plane 32bpp surfaces are ABGR in
+         * memory: bytes A,B,G,R.  This holds for pixType 2 (RGBA) and 3
+         * (ABGR) alike — the earlier note that pixType 2 was "memory
+         * R,G,B,A" was wrong and is the defect this fixes: the clogin
+         * pattern pixmap was read back un-reordered, so the canonical R
+         * came from the alpha byte (always 0) and the panel scanned out
+         * cyan.  Return the canonical internal RGBA (the convention
+         * get_pixel/put_pixel and the shade/dither arithmetic use:
+         * R=31:24..A=7:0); put_pixel performs the reverse.
          */
         return ((uint32_t)b[3] << 24) | ((uint32_t)b[2] << 16)
              | ((uint32_t)b[1] << 8) | b[0];
