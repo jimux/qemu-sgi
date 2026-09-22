@@ -145,6 +145,16 @@ struct SGIGL2State {
     bool ge_pending;              /* a passthru header awaiting its opcode */
     unsigned ge_pending_need;
 
+    /* Raw GE polygon commands (rectfi/rectfs clear and paint backgrounds). */
+    int ge_poly_op;               /* 0 none, 0x30 movepoly, 0x31 drawpoly */
+    int ge_poly_isd;              /* coords are shorts (else longs) */
+    int ge_poly_ncoord;           /* coords per vertex */
+    int ge_poly_need;             /* words still expected for a vertex */
+    int ge_poly_got;              /* words collected so far */
+    uint16_t ge_poly_w[8];
+    int16_t poly_x[32], poly_y[32];
+    int poly_n;
+
     /* Kernel textport state (FBCcharposnabs / FBCdrawchars). */
     int16_t char_x, char_y;
 
@@ -689,6 +699,96 @@ static bool gl2_fbc_known(uint16_t c)
     }
 }
 
+/* Fill the polygon accumulated from raw GE movepoly/drawpoly vertices. */
+static void gl2_fill_poly(SGIGL2State *s)
+{
+    int i, y, n = s->poly_n;
+    int ymin, ymax;
+    uint16_t we_ab = s->we_ab ? s->we_ab : 0xf;
+    uint16_t we_cd = s->we_cd ? s->we_cd : 0xf;
+
+    if (n < 3) {
+        return;
+    }
+    ymin = ymax = s->poly_y[0];
+    for (i = 1; i < n; i++) {
+        ymin = MIN(ymin, s->poly_y[i]);
+        ymax = MAX(ymax, s->poly_y[i]);
+    }
+    if (s->trace) {
+        fprintf(stderr, "gl2: fillpoly n=%d y=%d..%d color=%#x we=%#x\n",
+                n, ymin, ymax, s->color_ab, s->we_ab);
+    }
+    ymin = MAX(ymin, 0);
+    ymax = MIN(ymax, GL2_YDIM - 1);
+
+    for (y = ymin; y <= ymax; y++) {
+        int xs[32], nx = 0, k;
+
+        for (i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            int yi = s->poly_y[i], yj = s->poly_y[j];
+            int xi = s->poly_x[i], xj = s->poly_x[j];
+
+            if ((yi <= y && yj > y) || (yj <= y && yi > y)) {
+                int x = xi + (int)(((long)(y - yi) * (xj - xi)) / (yj - yi));
+                if (nx < 32) {
+                    xs[nx++] = x;
+                }
+            }
+        }
+        for (k = 0; k < nx; k++) {
+            int l;
+            for (l = k + 1; l < nx; l++) {
+                if (xs[l] < xs[k]) {
+                    int t = xs[k]; xs[k] = xs[l]; xs[l] = t;
+                }
+            }
+        }
+        for (k = 0; k + 1 < nx; k += 2) {
+            int x;
+            for (x = MAX(xs[k], 0); x <= MIN(xs[k + 1], GL2_XDIM - 1); x++) {
+                uint8_t *p = &s->fb[y * GL2_XDIM + x];
+                *p = gl2_blend(*p, s->color_ab, we_ab, 0);
+                *p = gl2_blend(*p, s->color_cd, we_cd, 2);
+            }
+        }
+    }
+    s->dirty = true;
+}
+
+/* Recognise a raw GE command word and set up its coordinate operands.
+ * Returns true if w was consumed as a GE command. */
+static bool gl2_ge_raw(SGIGL2State *s, uint16_t w)
+{
+    unsigned op = w & 0x3f;
+    unsigned flags = (w >> 8) & 0xf;
+    int isd = (flags & 0x8) ? 1 : 0;        /* GEPA_S: short coords */
+    int ncoord = (flags & 0x2) ? 3 : 2;     /* GEPA_3D: 3 coords */
+    int cw = isd ? 1 : 2;                   /* words per coordinate */
+
+    switch (op) {
+    case 0x10: case 0x11: case 0x12:
+    case 0x13: case 0x14: case 0x15: case 0x16:
+    case 0x30: case 0x31: case 0x37: case 0x38:
+        s->ge_poly_op = op;
+        s->ge_poly_isd = isd;
+        s->ge_poly_ncoord = ncoord;
+        s->ge_poly_need = ncoord * cw;
+        s->ge_poly_got = 0;
+        if (op == 0x30) {
+            s->poly_n = 0;
+        }
+        return true;
+    case 0x33:                              /* closepoly */
+        gl2_fill_poly(s);
+        s->poly_n = 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void gl2_ge_word(SGIGL2State *s, uint16_t w)
 {
     if (s->ge_in_cmd) {
@@ -699,6 +799,36 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
         if (--s->ge_need == 0) {
             gl2_ge_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
             s->ge_in_cmd = false;
+        }
+        return;
+    }
+
+    if (s->ge_poly_need > 0) {
+        s->ge_poly_w[s->ge_poly_got++] = w;
+        if (--s->ge_poly_need == 0) {
+            int x, y;
+
+            if (s->ge_poly_isd) {
+                x = (int16_t)s->ge_poly_w[0];
+                y = (int16_t)s->ge_poly_w[1];
+            } else {
+                x = (int16_t)((s->ge_poly_w[0] << 16) | s->ge_poly_w[1]);
+                y = (int16_t)((s->ge_poly_w[2] << 16) | s->ge_poly_w[3]);
+            }
+            if (s->ge_poly_op == 0x30 || s->ge_poly_op == 0x31) {
+                if (s->poly_n < (int)ARRAY_SIZE(s->poly_x)) {
+                    s->poly_x[s->poly_n] = x;
+                    s->poly_y[s->poly_n] = y;
+                    s->poly_n++;
+                }
+            } else if (s->ge_poly_op == 0x12) {
+                /* GEpoint sets the current point; the following
+                 * FBCcharposnabs (no operands) latches it as the character
+                 * position -- this is how im_cmov2i positions text. */
+                s->char_x = x;
+                s->char_y = y;
+            }
+            s->ge_poly_got = 0;
         }
         return;
     }
@@ -717,13 +847,16 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
             return;
         }
         /* Bogus header: it was GE operand data; fall through and let w
-         * itself be considered as a header. */
+         * itself be considered as a header or raw GE command. */
     }
 
     if ((w & 0xff) == 0x08 && !(w & 0x8000)) {
         s->ge_pending = true;
         s->ge_pending_need = ((w >> 8) & 0x7f) + 1;
+        return;
     }
+
+    gl2_ge_raw(s, w);
 }
 
 static uint64_t gl2_ge_read(void *opaque, hwaddr addr, unsigned size)
@@ -823,6 +956,10 @@ static void gl2_reset(DeviceState *dev)
     s->ge_in_cmd = false;
     s->ge_pending = false;
     s->ge_pending_need = 0;
+    s->ge_poly_op = 0;
+    s->ge_poly_need = 0;
+    s->ge_poly_got = 0;
+    s->poly_n = 0;
     s->ge_need = s->ge_nargs = 0;
     s->ge_cmd = 0;
     memset(s->ge_args, 0, sizeof(s->ge_args));
