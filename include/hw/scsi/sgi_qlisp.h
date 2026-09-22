@@ -236,4 +236,23 @@ struct SGIQLispState {
     BlockBackend *blk;
 };
 
+/*
+ * ISP1020 PCI configuration BARs.  The bridge exposes the ISP config space, and
+ * the OS sizes each BAR with the standard all-ones probe: it writes 0xffffffff
+ * and reads back the size mask (a 0 answer means "BAR not implemented", so a
+ * careful probe then rejects the device).  BAR0 is an I/O BAR (bit 0 reads 1)
+ * and BAR1 a memory BAR (type bits [3:1] read 0); the sizes fit the BaseIO
+ * windows and match the Linux qla1280 driver's expectations (types confirmed
+ * from qla1280, sizes not datasheet-confirmed).
+ */
+#define QLISP_PCI_BAR0_OFF 0x10 /* I/O BAR: probe reads 0xffffff01 */
+#define QLISP_PCI_BAR1_OFF 0x14 /* memory BAR: probe reads 0xfffff000 */
+#define QLISP_BAR0_SIZE 256
+#define QLISP_BAR1_SIZE 4096
+
+/* Config-space BAR read/write: applies the sizing mask + type on read, and
+ * latches only the base bits on write.  See the ISP1020 contract above. */
+uint32_t sgi_qlisp_pci_config_read(SGIQLispState *s, unsigned cfg);
+void sgi_qlisp_pci_config_write(SGIQLispState *s, unsigned cfg, uint32_t val);
+
 #endif /* HW_SCSI_SGI_QLISP_H */

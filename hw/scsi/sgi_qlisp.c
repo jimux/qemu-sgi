@@ -20,6 +20,39 @@
 #include "qemu/module.h"
 
 /*
+ * ISP1020 PCI configuration BARs (see sgi_qlisp.h).  The OS sizes each BAR with
+ * the all-ones probe: it writes 0xffffffff and reads back the size mask with the
+ * BAR's type bits.  A 0 answer means "BAR not implemented" and makes a careful
+ * probe reject the device, so answer with the real size and latch only the
+ * programmable base bits.
+ */
+uint32_t sgi_qlisp_pci_config_read(SGIQLispState *s, unsigned cfg)
+{
+    switch (cfg) {
+    case QLISP_PCI_BAR0_OFF: /* I/O BAR: bit 0 reads 1, size 256 B */
+        return (s->pci_bar[0] & ~(QLISP_BAR0_SIZE - 1)) | 0x1u;
+    case QLISP_PCI_BAR1_OFF: /* memory BAR, type 0: bits [3:1] read 0, size 4 KB */
+        return s->pci_bar[1] & ~(QLISP_BAR1_SIZE - 1);
+    default:
+        return 0;
+    }
+}
+
+void sgi_qlisp_pci_config_write(SGIQLispState *s, unsigned cfg, uint32_t val)
+{
+    switch (cfg) {
+    case QLISP_PCI_BAR0_OFF:
+        s->pci_bar[0] = val & ~(QLISP_BAR0_SIZE - 1);
+        break;
+    case QLISP_PCI_BAR1_OFF:
+        s->pci_bar[1] = val & ~(QLISP_BAR1_SIZE - 1);
+        break;
+    default:
+        break;
+    }
+}
+
+/*
  * Optional device-side trace of the request/status entries, for cross-checking
  * a driver's own request/sr_status on another platform.  Enable with
  * QLISP_DEBUG=1 and -d unimp.  Off by default.
