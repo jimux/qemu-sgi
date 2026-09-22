@@ -169,7 +169,9 @@ typedef struct SGIip6State {
     SCN2681State *duart[2];
     SgiIp6InputState *mouse;
     MemoryRegion gr1_regs;
-    uint32_t gr1_win[0x40];   /* 0x500..0x5ff register window */
+    uint32_t gr1_win[0x800];  /* upper bank 0x8000..0x9fff (2048 words) */
+    uint8_t gr1_bank;         /* mar_msb: bank selected at 0x0e00..0x0e07 */
+    uint8_t gr1_dr[5];        /* dr0..dr4 display registers */
 
     PCNetState *lance;
     DeviceState *lance_dev;
@@ -927,22 +929,64 @@ static const MemoryRegionOps sgi_ip6_duart_ops = {
  * subsequent fault as the only evidence.  The response the firmware expects
  * is to be determined from its own use of the value, not invented here.
  */
+/*
+ * The upper bank (selected by mar_msb, which the firmware writes at 0x0e04)
+ * holds the display registers.  MAME's map is authoritative:
+ *   dr1 0x84c0  dr0 0x84e0  dr4 0x85a0  dr3 0x85c0  dr2 0x85e0
+ * each a byte in lane 3 (umask32(0xff000000)), with the reset values below.
+ * The RAMDAC at 0x8500..0x850f is what the firmware's presence probe actually
+ * pokes (walking value in at 0x8500/0x8508 under bank 4), which is why the
+ * probe window still has to return what was written.
+ */
+static const struct {
+    uint16_t off;             /* bank-relative, lane 3 */
+    uint8_t reset;
+    uint8_t wmask, rmask;
+} gr1_drs[5] = {
+    { 0x84e0, 0x09, 0xf7, 0xff },   /* dr0: GRF1EN | SMALLMON0 */
+    { 0x84c0, 0x08, 0xe7, 0xff },   /* dr1: TURBO */
+    { 0x85e0, 0x00, 0xe7, 0xff },   /* dr2 */
+    { 0x85c0, 0x00, 0xe7, 0xff },   /* dr3 */
+    { 0x85a0, 0x08, 0xe7, 0x9f },   /* dr4: MEGOPT */
+};
+
+/*
+ * Return the display-register index whose lane-3 byte this access touches,
+ * given the effective (bank-relative) offset.  The DR offsets in gr1_drs are
+ * already effective offsets, so they must not be re-based.
+ */
+static int gr1_dr_hit(uint32_t eff, unsigned size)
+{
+    int i;
+
+    for (i = 0; i < 5; i++) {
+        uint32_t b = gr1_drs[i].off + 3;
+
+        if (b >= eff && b < eff + size) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
+    uint32_t base = (uint32_t)s->gr1_bank * 0x2000;
+    uint32_t eff = base + (uint32_t)addr;
     uint64_t val = 0;
+    int i;
 
-    /*
-     * The firmware's presence probe drives a walking value through the
-     * register windows at 0x500/0x508 and 0x5d0/0x5d8 (index register,
-     * then data register) and reads it back, treating a mismatch as "board
-     * absent".  A window that returns what was written is therefore the
-     * coherent response the probe is asking for; it is derived from the
-     * probe's own use of the value rather than an invented ID.  Nothing
-     * else in the region is modelled yet, so it reads as zero.
-     */
-    if (addr >= 0x500 && addr < 0x600) {
-        val = s->gr1_win[(addr - 0x500) >> 2];
+    i = gr1_dr_hit(eff, size);
+    if (i >= 0) {
+        /* Modelled register: returns its own value, not window contents. */
+        val = (uint32_t)s->gr1_dr[i] & gr1_drs[i].rmask;
+    } else if (eff >= 0x8000 && eff < 0xa000) {
+        /*
+         * Upper bank: the RAMDAC/cursor windows the firmware pokes.  These
+         * return what was written (the presence probe's contract).
+         */
+        val = s->gr1_win[(eff - 0x8000) >> 2];
     }
     trace_sgi_ip6_gr1_read((uint32_t)s->cpu->env.active_tc.PC,
                            (uint32_t)addr, (uint32_t)val);
@@ -953,9 +997,21 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned size)
 {
     SGIip6State *s = opaque;
+    uint32_t base = (uint32_t)s->gr1_bank * 0x2000;
+    uint32_t eff = base + (uint32_t)addr;
+    int i;
 
-    if (addr >= 0x500 && addr < 0x600) {
-        s->gr1_win[(addr - 0x500) >> 2] = val;
+    if (addr >= 0x0e00 && addr <= 0x0e07) {
+        /* mar_msb: selects which 0x2000 bank the window shows. */
+        s->gr1_bank = (uint8_t)addr & 7;
+    }
+
+    i = gr1_dr_hit(eff, size);
+    if (i >= 0) {
+        s->gr1_dr[i] = (s->gr1_dr[i] & ~gr1_drs[i].wmask)
+                     | ((uint8_t)val & gr1_drs[i].wmask);
+    } else if (eff >= 0x8000 && eff < 0xa000) {
+        s->gr1_win[(eff - 0x8000) >> 2] = val;
     }
     trace_sgi_ip6_gr1_write((uint32_t)s->cpu->env.active_tc.PC,
                             (uint32_t)addr, (uint32_t)val);
@@ -1569,6 +1625,14 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_init_io(&s->gr1_regs, OBJECT(machine), &sgi_ip6_gr1_ops, s,
                           "sgi-ip6-gr1", 0x8000);
     memory_region_add_subregion(system_memory, 0x1f000000, &s->gr1_regs);
+
+    /* GR1 display-register reset values (MAME sgi_gr1_device::device_reset). */
+    s->gr1_bank = 0;
+    s->gr1_dr[0] = 0x09;
+    s->gr1_dr[1] = 0x08;
+    s->gr1_dr[2] = 0x00;
+    s->gr1_dr[3] = 0x00;
+    s->gr1_dr[4] = 0x08;
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
     create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
     create_unimplemented_device("sgi-ip6-gio", 0x1f400000, 0x400000);
