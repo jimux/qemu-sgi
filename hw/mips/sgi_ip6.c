@@ -175,6 +175,7 @@ typedef struct SGIip6State {
     uint32_t gr1_win[0x800];  /* upper bank 0x8000..0x9fff (2048 words) */
     uint8_t gr1_bank;         /* mar_msb: bank selected at 0x0e00..0x0e07 */
     uint32_t *gr1_code;       /* GE5 microcode store (2 words per uword) */
+    uint32_t *gr1_data_store; /* GE5 data store (space(1), 8 KB byte space) */
     uint8_t gr1_mar;          /* microcode address register (page) */
     uint16_t gr1_pc;          /* microcode PC, read back by the firmware */
     uint32_t gr1_finish[2];
@@ -1045,11 +1046,26 @@ static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
         val = s->gr1_finish[(eff - GR1_FINISH) >> 2];
     } else if (eff >= GR1_BUF && eff < GR1_BUF + 0x400) {
         val = s->gr1_code_data;
+    } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
+        /*
+         * The GE data window (MAME: space(1), map(0x1400,0x17ff), 8 KB RAM).
+         * The address is map-relative and page-selected by mar:
+         *   m_memptr = offset | (mar & 0x3f) << 8
+         * This is a read-back, not an identity word: the guest writes a
+         * data port and reads it back, so the store contents are the
+         * contract.  (Earlier we had no data branch at all, so 0x1560 read
+         * 0 - the graphics suite's poll at 0xbfc089a0.)
+         */
+        uint32_t mp = (eff - GR1_DATA) |
+                      ((uint32_t)(s->gr1_mar & 0x3f) << 8);
+
+        val = s->gr1_data_store[(mp >> 2) & 0x7ff];
     } else if (eff >= 0x8000 && eff < 0xa000) {
         val = s->gr1_win[(eff - 0x8000) >> 2];
     }
     trace_sgi_ip6_gr1_read((uint32_t)s->cpu->env.active_tc.PC,
-                           (uint32_t)addr, (uint32_t)val);
+                           (uint32_t)addr, s->gr1_mar, s->gr1_bank,
+                           (uint32_t)val);
     return val;
 }
 
@@ -1085,7 +1101,10 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
     } else if (eff >= GR1_MAR && eff < GR1_MAR + 0x200) {
         s->gr1_mar = eff & 0x7f;
     } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
-        s->gr1_code_data = val;
+        uint32_t mp = (eff - GR1_DATA) |
+                      ((uint32_t)(s->gr1_mar & 0x3f) << 8);
+
+        s->gr1_data_store[(mp >> 2) & 0x7ff] = val;
     } else if (eff >= GR1_FINISH && eff < GR1_FINISH + 8) {
         s->gr1_finish[(eff - GR1_FINISH) >> 2] = val;
     } else if (eff >= GR1_COMMAND && eff < GR1_COMMAND + 0x144) {
@@ -1111,7 +1130,8 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
         s->gr1_win[(eff - 0x8000) >> 2] = val;
     }
     trace_sgi_ip6_gr1_write((uint32_t)s->cpu->env.active_tc.PC,
-                            (uint32_t)addr, (uint32_t)val);
+                            (uint32_t)addr, s->gr1_mar, s->gr1_bank,
+                            (uint32_t)val);
 }
 
 static const MemoryRegionOps sgi_ip6_gr1_ops = {
@@ -1725,6 +1745,7 @@ static void sgi_ip6_init(MachineState *machine)
 
     /* GR1 display-register reset values (MAME sgi_gr1_device::device_reset). */
     s->gr1_code = g_new0(uint32_t, 0x8000 * 2);
+    s->gr1_data_store = g_new0(uint32_t, 0x800);
     s->gr1_bank = 0;
     s->gr1_dr[0] = 0x09;
     s->gr1_dr[1] = 0x08;
