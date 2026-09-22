@@ -54,6 +54,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
  * 5; the driver polls it before/while draining the token FIFO, so it must read
  * as read-only and empty (0), not as whatever the bus last wrote. */
 #define SGI_GR2_HQ_FIFOSTAT    0x6a040
+#define SGI_GR2_HQ_READY_BIT   0x2     /* bit 1: ucode ready (polled)       */
+#define SGI_GR2_HQ_TOKEN_START 0x4077c /* FIFO token Gr2Start writes to run */
 #define SGI_GR2_HQ_NUMGE       0x6a044
 #define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
 #define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
@@ -66,6 +68,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
  * words) — i.e. immediately below the HQ2 status register at 0x6a040 — not
  * at the 5.3 header's 0x60000 window.  The 6.5 binary is authoritative. */
 #define SGI_GR2_HQ_UC_RAM      0x6a000 /* HQ2 ucode load staging (16 words) */
+
+/* GE7 instruction load/verify.  Gr2DownloadGE7 writes a record for a PC into
+ * the four-word window at ge[0].ram0[0xf8..0xfb] plus the load register
+ * 0x6a064, having first written the PC to gepc (0x6a070); the verify pass
+ * re-selects each PC and reads the words back, so all five words are per-PC
+ * storage addressed by the current gepc.  Values are stored and returned
+ * verbatim (the driver masks with 0x3dfffff itself), never tidied. */
+#define SGI_GR2_GE_WIN_OFF     0x683e0 /* ge[0].ram0[0xf8..0xfb]            */
+#define SGI_GR2_GE_WIN_WORDS   4
+#define SGI_GR2_UCODE_PCS      0x10000 /* PC space the driver walks         */
+#define SGI_GR2_UCODE_WORDS    5       /* 4 window words + 1 load register  */
 #define SGI_GR2_FIN3_OFF    0x6b000 /* HQ2 fin3 register */
 #define SGI_GR2_BDVERS_OFF  0x6c000 /* board version / config / video backend */
 #define SGI_GR2_VC1_OFF     0x6c040 /* VC1 video controller */
@@ -90,6 +103,12 @@ struct SGIGr2State {
     MemoryRegion mmio;
     uint8_t regs[SGI_GR2_REG_SIZE];
     bool present;
+
+    /* GE7 instruction storage, addressed by the current gepc: 5 words per
+     * PC (the ge[0].ram0[0xf8..0xfb] window plus the load register). */
+    uint32_t ucode[SGI_GR2_UCODE_PCS][SGI_GR2_UCODE_WORDS];
+    uint32_t gepc;
+    bool hq_ready;
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */

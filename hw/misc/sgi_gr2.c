@@ -21,6 +21,30 @@
 #include "hw/misc/sgi_gr2.h"
 #include "trace.h"
 
+/* Extract `size` big-endian bytes starting at byte `byte` of a 32-bit word. */
+static uint64_t sgi_gr2_word_read(uint32_t word, unsigned byte, unsigned size)
+{
+    uint64_t val = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        val = (val << 8) | ((word >> (8 * (3 - byte - i))) & 0xff);
+    }
+    return val;
+}
+
+/* Assemble `size` big-endian bytes from `value` into a 32-bit word. */
+static uint32_t sgi_gr2_word_write(uint64_t value, unsigned byte, unsigned size)
+{
+    uint32_t word = 0;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        word |= (uint8_t)(value >> (8 * (size - 1 - i))) << (8 * (3 - byte - i));
+    }
+    return word;
+}
+
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGr2State *s = SGI_GR2(opaque);
@@ -34,6 +58,32 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
     }
     if (offset + size > SGI_GR2_REG_SIZE) {
         return ~0ULL;
+    }
+    /* GE7 instruction load/verify: the four-word window and the load register
+     * are per-PC storage, selected by the last gepc write.  Returned verbatim
+     * (the driver masks with 0x3dfffff itself). */
+    if (offset >= SGI_GR2_GE_WIN_OFF &&
+        offset < SGI_GR2_GE_WIN_OFF + SGI_GR2_GE_WIN_WORDS * 4) {
+        unsigned idx = (offset - SGI_GR2_GE_WIN_OFF) / 4;
+
+        return sgi_gr2_word_read(
+            s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][idx], offset & 3, size);
+    }
+    if (offset >= SGI_GR2_HQ_UCODELOAD &&
+        offset < SGI_GR2_HQ_UCODELOAD + 4) {
+        return sgi_gr2_word_read(
+            s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][4], offset & 3, size);
+    }
+    if (offset >= SGI_GR2_HQ_GEPC && offset < SGI_GR2_HQ_GEPC + 4) {
+        return sgi_gr2_word_read(s->gepc, offset & 3, size);
+    }
+    /* HQ2 status: bit 1 reports "ucode ready" once Gr2Start has kicked the
+     * sequencer with the start token; occupancy stays empty (level 0). */
+    if (offset >= SGI_GR2_HQ_FIFOSTAT &&
+        offset < SGI_GR2_HQ_FIFOSTAT + 4) {
+        uint32_t st = s->hq_ready ? SGI_GR2_HQ_READY_BIT : 0;
+
+        return sgi_gr2_word_read(st, offset & 3, size);
     }
     /* GE units at or above the variant's engine count are not populated, so
      * the driver's GE-count pattern test stops counting there. */
@@ -67,6 +117,40 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (!s->present || offset + size > SGI_GR2_REG_SIZE) {
         return;
     }
+    /* The command/register traffic worth watching (µcode load staging, HQ2,
+     * GE and RE3) is all at or above the HQ2 block; the shram and token FIFO
+     * are huge and mostly idle. */
+    if (offset < 0x40 || offset >= SGI_GR2_HQUCODE_OFF) {
+        trace_sgi_gr2_write(offset, value, size);
+    }
+    /* GE7 instruction load/verify: store the window and load-register words
+     * verbatim into the per-PC slot selected by the last gepc write.  No
+     * masking or tidying — the driver compares against what it wrote. */
+    if (offset >= SGI_GR2_GE_WIN_OFF &&
+        offset < SGI_GR2_GE_WIN_OFF + SGI_GR2_GE_WIN_WORDS * 4) {
+        unsigned idx = (offset - SGI_GR2_GE_WIN_OFF) / 4;
+
+        s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][idx] =
+            sgi_gr2_word_write(value, offset & 3, size);
+        return;
+    }
+    if (offset >= SGI_GR2_HQ_UCODELOAD &&
+        offset < SGI_GR2_HQ_UCODELOAD + 4) {
+        s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][4] =
+            sgi_gr2_word_write(value, offset & 3, size);
+        return;
+    }
+    if (offset >= SGI_GR2_HQ_GEPC && offset < SGI_GR2_HQ_GEPC + 4) {
+        s->gepc = sgi_gr2_word_write(value, offset & 3, size);
+        return;
+    }
+    /* Gr2Start kicks the HQ2 sequencer by writing the start token to the
+     * command FIFO, then polls the "ucode ready" bit; model the sequencer as
+     * ready from that write on.  The token itself is still stored below. */
+    if (offset >= SGI_GR2_HQ_TOKEN_START &&
+        offset < SGI_GR2_HQ_TOKEN_START + 4) {
+        s->hq_ready = true;
+    }
     /* Unpopulated GE units discard writes. */
     if (offset >= SGI_GR2_GE_OFF &&
         offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
@@ -86,9 +170,6 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset >= SGI_GR2_HQ_FIFOSTAT &&
         offset < SGI_GR2_HQ_FIFOSTAT + 4) {
         return;
-    }
-    if (offset < 0x40 || offset >= SGI_GR2_HQUCODE_OFF) {
-        trace_sgi_gr2_write(offset, value, size);
     }
     for (i = 0; i < size; i++) {
         uint8_t byte = (value >> (8 * (size - 1 - i))) & 0xff;
@@ -112,6 +193,9 @@ static void sgi_gr2_reset(DeviceState *dev)
     SGIGr2State *s = SGI_GR2(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->ucode, 0, sizeof(s->ucode));
+    s->gepc = 0;
+    s->hq_ready = false;
 
     /* HQ2 presence magic (32-bit BE) read by Gr2Probe. */
     s->regs[SGI_GR2_HQ_MYSTERY + 0] = (SGI_GR2_HQ_MAGIC >> 24) & 0xff;
