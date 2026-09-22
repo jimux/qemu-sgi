@@ -272,7 +272,8 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
         memcpy(st + 0x20, sense, MIN(sense_len, 32));
     }
 
-    if (s->control_munge) {
+    if (s->control_munge &&
+        !(s->rsp.base >= 0x40000000ULL && s->rsp.base < 0x40010000ULL)) {
         ql_munge(st, sizeof(st));
     }
     dma_memory_write(&address_space_memory,
