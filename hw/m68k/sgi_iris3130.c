@@ -34,7 +34,7 @@ struct IRIS3130MachineState {
     MachineState parent;
 
     M68kCPU cpu;
-    bool irq_pending[2];
+    bool irq_pending[4];
 };
 
 static void iris3130_cpu_reset(void *opaque)
@@ -64,6 +64,8 @@ static const struct {
 } iris3130_ip2_lines[] = {
     { 6, 0x53 },        /* MC146818A RTC periodic -> Xclock (83)      */
     { 5, 0x45 },        /* 2190 disk completion -> multibus 5 (69)    */
+    { 6, 0x50 },        /* DUART0 -> uart0 (80)                       */
+    { 6, 0x51 },        /* DUART1 -> uart1 (81)                       */
 };
 
 static void iris3130_ip2_irq(void *opaque, int n, int level)
@@ -95,6 +97,7 @@ static void iris3130_init(MachineState *machine)
     DeviceState *board;
     MemoryRegion *sys;
     Chardev *serial[4];
+    qemu_irq *irq;
     int i;
 
     object_initialize_child(OBJECT(machine), "cpu", &s->cpu,
@@ -115,13 +118,10 @@ static void iris3130_init(MachineState *machine)
     sys = sgi_ip2_sys_region(board);
 
     /* IP2 interrupt lines -> CPU (level/vector per the U118 vector ROM). */
-    {
-        qemu_irq *irq = qemu_allocate_irqs(iris3130_ip2_irq, s,
-                                           ARRAY_SIZE(iris3130_ip2_lines));
-
-        sysbus_connect_irq(SYS_BUS_DEVICE(board), 0, irq[0]);   /* RTC   */
-        sysbus_connect_irq(SYS_BUS_DEVICE(board), 1, irq[1]);   /* 2190  */
-    }
+    irq = qemu_allocate_irqs(iris3130_ip2_irq, s,
+                             ARRAY_SIZE(iris3130_ip2_lines));
+    sysbus_connect_irq(SYS_BUS_DEVICE(board), 0, irq[0]);       /* RTC   */
+    sysbus_connect_irq(SYS_BUS_DEVICE(board), 1, irq[1]);       /* 2190  */
 
     /* Install the IP2 custom-MMU translation fast path on the CPU. */
     s->cpu.env.ext_tlb_fill = sgi_ip2_ext_tlb_fill;
@@ -148,6 +148,7 @@ static void iris3130_init(MachineState *machine)
         memory_region_add_subregion_overlap(sys,
                                             0x02000000 + i * 0x00800000,
                                             mc68681_mmio_region(d), 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(d), 0, irq[2 + i]);   /* uart0/1 */
     }
 }
 
