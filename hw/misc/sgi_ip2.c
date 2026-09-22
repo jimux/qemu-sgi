@@ -39,6 +39,7 @@
 #define IP2_SEG_TD          0
 #define IP2_SEG_STK         1
 #define IP2_SEG_OS          2
+#define IP2_SEG_MBIO        5
 
 /* status register bits (cpureg.h / mame_ip2.cpp) */
 #define ST_MBINIT           0x0040
@@ -178,6 +179,21 @@ int sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
     (void)mmu_idx;
     (void)probe;
 
+    if (seg == IP2_SEG_MBIO) {
+        /*
+         * Multibus I/O: only the Interphase 2190 registers are modelled.
+         * Real IP2 hardware raises a bus error on any other Multibus I/O
+         * access, and both the PROM's board probe and the kernel's autoconfig
+         * rely on that to conclude a board is absent.  A permissive window
+         * makes autoconfig find a phantom DSD/QIC controller, whose init
+         * busy-waits on a CCB the phantom never clears and then panics.
+         */
+        offset = address & 0x0fffffff;
+        if (offset >= IP2190_PORT && offset <= IP2190_PORT + 3) {
+            return 0;           /* let the MMIO ops handle the 2190 */
+        }
+        return -1;              /* bus error: no board here */
+    }
     if (seg > IP2_SEG_OS) {
         return 0;
     }
