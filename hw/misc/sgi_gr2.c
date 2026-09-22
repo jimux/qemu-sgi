@@ -18,6 +18,7 @@
 #include "qemu/log.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/sgi_gr2.h"
 #include "trace.h"
@@ -118,6 +119,13 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
     if (offset < 0x40 || offset >= SGI_GR2_HQUCODE_OFF) {
         trace_sgi_gr2_read(offset, size, val);
     }
+    /* The HQ2 block is the polled surface: log each access with the reading PC
+     * so the poll loop (and the value it expects) can be read off directly. */
+    if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
+        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+
+        trace_sgi_gr2_hqread(offset, val, pc);
+    }
     return val;
 }
 
@@ -141,6 +149,12 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * the whole register block. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
         trace_sgi_gr2_fifo(offset, value, size);
+    }
+    /* HQ2-block writes (start / DMA control / FIFO thresholds) with the PC. */
+    if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
+        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+
+        trace_sgi_gr2_hqwrite(offset, value, pc);
     }
     /* GE7 instruction load/verify: store the window and load-register words
      * verbatim into the per-PC slot selected by the last gepc write.  No
