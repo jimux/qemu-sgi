@@ -1131,11 +1131,19 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
 
     if (addr >= HPC1_ENET_BASE && addr < HPC1_ENET_BASE + 0x20) {
         int reg = ((addr - HPC1_ENET_BASE) >> 2) & 7;
+        uint8_t sv;
         switch (reg) {
         case 6:
-            return s->seeq_rx_status | 0x80;   /* SEQ_RS_OLD: new status */
+            /* SEQ_RS_OLD is set ON READ, so the value returned is the status
+             * as it stood before this read (HPC3 behaviour) -- otherwise the
+             * driver would never see a fresh (OLD-clear) status. */
+            sv = s->seeq_rx_status;
+            s->seeq_rx_status |= 0x80;
+            return sv;
         case 7:
-            return s->seeq_tx_status | 0x80;
+            sv = s->seeq_tx_status;
+            s->seeq_tx_status |= 0x80;
+            return sv;
         default:
             /*
              * regs 0-5 are the banked union in seeq.h's struct EHIO
@@ -1600,9 +1608,27 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
      * as the HPC3 model does (enet_rx_nbdp = nbdp).  The Seeq status goes in
      * the HIGH byte (shift 8).
      */
+    /* Advance the fill pointer only.  Do NOT touch crbdp: the kernel driver
+     * arms it to ei_rtail ("for ec_watchdog") and its watchdog compares
+     * crbdp against ei_rtail to detect a stuck receiver, so overwriting it
+     * with the filled descriptor breaks that check. */
     s->enet_nrbdp = w2;              /* next to fill */
-    s->enet_crbdp = desc;            /* current (the one just filled) */
     s->seeq_rx_status = st;
+    /*
+     * HPC_STRCVDMA MUST stay set across a receive.  The kernel driver's
+     * ec_watchdog() polls RX and does, on every tick:
+     *
+     *     if (!(hio->rcvstat & HPC_STRCVDMA)) {  // "recovered D"
+     *         ec_init(...);                      // full re-init
+     *     }
+     *     if_ecintr(ei);                         // walk ei_ract / r_own
+     *
+     * so clearing STRCVDMA on a frame makes the driver re-initialise the
+     * interface every watchdog tick -- which is exactly the observed
+     * "NRBDP re-armed to the same head, frame never consumed".  The frame
+     * status is read from the buffer (eh + rlen), not from rcvstat, so the
+     * high byte is informational only.
+     */
     s->enet_rcvstat = (s->enet_rcvstat & HPC1_ENET_STRCVDMA) |
                       ((uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT);
     sgi_hpc1_enet_raise_irq(s);
