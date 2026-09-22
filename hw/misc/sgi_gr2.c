@@ -229,8 +229,35 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
                                    SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
             s->re3_colour_valid = false;
         }
+        /* The generic PUC path: PUC_COLOR chose the colour, PUC_RECTI2D armed
+         * a rectangle, and its three PUC_DATA words are (x0, x1, y0) — one
+         * horizontal span.  The root weave is 1024 of these. */
+        if (s->puc_rect_armed) {
+            s->puc_rect[s->puc_rect_n++] = value;
+            if (s->puc_rect_n == 3) {
+                uint32_t x0 = s->puc_rect[0];
+                uint32_t x1 = s->puc_rect[1];
+                uint32_t y0 = s->puc_rect[2];
+
+                if (x1 >= x0 && x0 < SGI_GR2_SCREEN_W && y0 < SGI_GR2_SCREEN_H) {
+                    uint32_t rgb = sgi_gr2_re3_fill(s, s->puc_colour, x0, y0,
+                                                    x1 - x0 + 1, 1);
+
+                    trace_sgi_gr2_puc_span(s->puc_colour, rgb, x0, x1, y0);
+                }
+                s->puc_rect_armed = false;
+                s->puc_rect_n = 0;
+            }
+        }
         s->last_puc = value;
         s->last_puc_valid = true;
+    }
+    if (size == 4 && offset == SGI_GR2_PUC_COLOR_TOKEN) {
+        s->puc_colour = value & 0xff;
+    }
+    if (size == 4 && offset == SGI_GR2_PUC_RECTI2D_TOKEN) {
+        s->puc_rect_armed = true;
+        s->puc_rect_n = 0;
     }
     /* HQ2-block writes (start / DMA control / FIFO thresholds) with the PC. */
     if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {

@@ -65,6 +65,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_HQ_READY_BIT   0x2     /* bit 1: ucode ready (polled)       */
 #define SGI_GR2_HQ_TOKEN_START 0x4077c /* FIFO token Gr2Start writes to run */
 #define SGI_GR2_RE3_COLOUR_TOKEN 0x40530 /* FIFO token: RE3 pixel colour    */
+#define SGI_GR2_PUC_COLOR_TOKEN   0x40648 /* FIFO token: PUC_COLOR (index 402) */
+#define SGI_GR2_PUC_RECTI2D_TOKEN 0x40654 /* FIFO token: PUC_RECTI2D (405)    */
 #define SGI_GR2_HQ_NUMGE       0x6a044
 #define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
 #define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
@@ -166,6 +168,15 @@ struct SGIGr2State {
     bool re3_colour_valid;
     uint32_t last_puc;    /* previous PUC_DATA word (rect geometry pair)     */
     bool last_puc_valid;
+    /* Generic PUC draw path: PUC_COLOR + PUC_RECTI2D + three PUC_DATA words.
+     * [ASSUMPTION, from the captured root-weave stream: 1024 rects of
+     * (colour, x0, 0x4ff, x0) — colour indices running 96..255 while x0 and the
+     * third word run 0..1023 and the middle word is always 1279, so the three
+     * data words read as a horizontal span (x0, x1, y0).] */
+    uint8_t puc_colour;
+    bool puc_rect_armed;  /* a PUC_RECTI2D is awaiting its three data words  */
+    uint32_t puc_rect[3];
+    unsigned puc_rect_n;  /* data words collected for the armed rectangle    */
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */
