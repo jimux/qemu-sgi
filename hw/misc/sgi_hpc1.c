@@ -1486,7 +1486,13 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
                               MEMTXATTRS_UNSPECIFIED, NULL);
     space = w0 & 0x1fffu;                        /* r_rbcnt: room left */
     bufaddr = HPC1_DMA_ADDR(w1 & 0x0fffffffu);   /* r_rbufptr */
-    used = size + HPC1_ENET_RSPACE;              /* frame + 2 offset + status */
+    /*
+     * The driver arms with r_rbcnt = MAX_RPKT - HPC_RSPACE and derives
+     * rlen = MAX_RPKT - r_rbcnt - HPC_RSPACE (if_ec2.c:870/716), so the
+     * hardware decrements by the frame length only -- RSPACE is already
+     * accounted for by the driver's arm value and its rlen formula.
+     */
+    used = size;
 
     if (used > space) {
         s->enet_ctl |= HPC1_ENET_CTL_RBO;
@@ -1502,16 +1508,22 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
     address_space_write(&address_space_memory, bufaddr + 2 + size,
                         MEMTXATTRS_UNSPECIFIED, &st, 1);
 
-    /* Publish: clear r_rown (bit 31, software now owns it) and decrement the
-     * byte count; the driver derives rlen = MAX_RPKT - r_rbcnt - RSPACE. */
-    newbc = (w0 & ~0x1fffu & ~0x80000000u) | ((space - used) & 0x1fffu);
+    /*
+     * r_rown (bit 31) is hardware ownership: the driver arms the buffer
+     * with r_rown = 0 and spins `while (!rd_chain->r_rown)` waiting for the
+     * hardware to fill it (if_ec2.c:706/870), then sets it back to 1 after
+     * consuming.  So SET r_rown to publish the frame; decrement r_rbcnt.
+     */
+    newbc = (w0 & ~0x1fffu) | 0x80000000u | ((space - used) & 0x1fffu);
     address_space_stl_be(&address_space_memory, desc, newbc,
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
-    /* Advance the ring; the Seeq status goes in the HIGH byte (shift 8). */
+    /* Advance the ring; the Seeq status goes in the HIGH byte (shift 8),
+     * and the channel stays armed (HPC_STRCVDMA) for the next frame. */
     s->enet_crbdp = w2;
     s->seeq_rx_status = st;
-    s->enet_rcvstat = (uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT;
+    s->enet_rcvstat = (s->enet_rcvstat & HPC1_ENET_STRCVDMA) |
+                      ((uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT);
     sgi_hpc1_enet_raise_irq(s);
     return size;
 }
