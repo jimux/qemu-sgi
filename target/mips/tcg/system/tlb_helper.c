@@ -1344,7 +1344,26 @@ void mips_cpu_do_interrupt(CPUState *cs)
         cause = 30;
         offset = 0x100;
  set_EPC:
-        if (!(env->CP0_Status & (1 << CP0St_EXL))) {
+        if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+            /*
+             * MIPS-I (R2000/R3000): there is no EXL/ERL.  Save EPC (and
+             * BadVAddr/BD) on every exception, then push the KU/IE stack
+             * in CP0_Status by shifting it left two bits.
+             */
+            env->CP0_EPC = exception_resume_pc(env);
+            if (update_badinstr) {
+                set_badinstr_registers(env);
+            }
+            if (env->hflags & MIPS_HFLAG_BMASK) {
+                env->CP0_Cause |= (1U << CP0Ca_BD);
+            } else {
+                env->CP0_Cause &= ~(1U << CP0Ca_BD);
+            }
+            env->CP0_Status = (env->CP0_Status & ~R3000_SR_KUIE) |
+                              ((env->CP0_Status << 2) & R3000_SR_KUIEop);
+            env->hflags |= MIPS_HFLAG_CP0;
+            env->hflags &= ~(MIPS_HFLAG_KSU);
+        } else if (!(env->CP0_Status & (1 << CP0St_EXL))) {
             env->CP0_EPC = exception_resume_pc(env);
             if (update_badinstr) {
                 set_badinstr_registers(env);
@@ -1366,7 +1385,26 @@ void mips_cpu_do_interrupt(CPUState *cs)
             env->hflags &= ~(MIPS_HFLAG_KSU);
         }
         env->hflags &= ~MIPS_HFLAG_BMASK;
-        if (env->CP0_Status & (1 << CP0St_BEV)) {
+        if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+            /*
+             * MIPS-I exception vectors: refill at 0x000/0x100, general (and
+             * interrupt) at 0x080/0x180, with BEV selecting the boot ROM.
+             */
+            target_ulong base = (env->CP0_Status & (1 << CP0St_BEV))
+                                ? env->exception_base
+                                : (env->CP0_EBase & ~0xfff);
+            bool refill = (offset == 0x000);
+
+            if (refill) {
+                env->active_tc.PC = base +
+                                    ((env->CP0_Status & (1 << CP0St_BEV))
+                                     ? 0x100 : 0x000);
+            } else {
+                env->active_tc.PC = base +
+                                    ((env->CP0_Status & (1 << CP0St_BEV))
+                                     ? 0x180 : 0x080);
+            }
+        } else if (env->CP0_Status & (1 << CP0St_BEV)) {
             env->active_tc.PC = env->exception_base + 0x200;
         } else if (cause == 30 && !(env->CP0_Config3 & (1 << CP0C3_SC) &&
                                     env->CP0_Config5 & (1 << CP0C5_CV))) {
@@ -1376,7 +1414,8 @@ void mips_cpu_do_interrupt(CPUState *cs)
             env->active_tc.PC = env->CP0_EBase & ~0xfff;
         }
 
-        env->active_tc.PC += offset;
+        env->active_tc.PC += (env->cpu_model->mmu_type == MMU_TYPE_R3000)
+                             ? 0 : offset;
         set_hflags_for_handler(env);
         env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
                          (cause << CP0Ca_EC);

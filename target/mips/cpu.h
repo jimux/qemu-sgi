@@ -783,6 +783,14 @@ typedef struct CPUArchState {
 #define CP0St_ERL   2
 #define CP0St_EXL   1
 #define CP0St_IE    0
+/*
+ * MIPS-I (R2000/R3000) Status[5:0]: the kernel/user + interrupt-enable
+ * stack (IEc,KUc,IEp,KUp,IEo,KUo).  An exception shifts it left by two,
+ * RFE shifts it right by two.
+ */
+#define R3000_SR_KUIE  0x0000003f
+#define R3000_SR_KUIEpc 0x0000000f
+#define R3000_SR_KUIEop 0x0000003c
     int32_t CP0_IntCtl;
 #define CP0IntCtl_IPTI 29
 #define CP0IntCtl_IPPCI 26

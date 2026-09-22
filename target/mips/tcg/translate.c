@@ -8659,6 +8659,21 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
             ctx->base.is_jmp = DISAS_EXIT;
         }
         break;
+    case OPC_RFE:
+        /*
+         * MIPS-I exception return.  RFE was replaced by ERET from MIPS II
+         * onwards, where it is a reserved instruction.
+         */
+        opn = "rfe";
+        if (ctx->insn_flags & ISA_MIPS3) {
+            MIPS_INVAL(opn);
+            gen_reserved_instruction(ctx);
+        } else {
+            check_insn(ctx, ISA_MIPS1);
+            gen_helper_rfe(tcg_env);
+            ctx->base.is_jmp = DISAS_EXIT;
+        }
+        break;
     case OPC_DERET:
         opn = "deret";
         check_insn(ctx, ISA_MIPS_R1);

@@ -127,6 +127,23 @@ void helper_eretnc(CPUMIPSState *env)
     exception_return(env);
 }
 
+/*
+ * MIPS-I exception return (RFE).  The R2000/R3000 have no EXL/ERL; the
+ * kernel/user and interrupt-enable state is a three-deep stack in
+ * CP0_Status bits [5:0] (IEc,KUc,IEp,KUp,IEo,KUo).  An exception entry
+ * shifts it left by two (see mips_cpu_do_interrupt), and RFE shifts it
+ * back right by two, discarding the old level.  Only reachable from a
+ * CPU whose MMU type is MMU_TYPE_R3000.
+ */
+void helper_rfe(CPUMIPSState *env)
+{
+    uint32_t sr = env->CP0_Status;
+
+    sr = (sr & ~R3000_SR_KUIE) | ((sr >> 2) & R3000_SR_KUIEpc);
+    env->CP0_Status = sr & env->CP0_Status_rw_bitmask;
+    compute_hflags(env);
+}
+
 void helper_deret(CPUMIPSState *env)
 {
     debug_pre_eret(env);
