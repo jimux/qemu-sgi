@@ -327,6 +327,7 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   DeviceState *mc_dev;
   DeviceState *hpc3_dev = NULL;
   DeviceState *hpc1_dev = NULL;
+  DeviceState *vino_dev = NULL;
   MIPSCPU *cpu;
   Clock *cpuclk;
   char *filename;
@@ -334,6 +335,7 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   bool is_fullhouse =
       (model == SGI_IP22 || model == SGI_IP26 || model == SGI_IP28);
   bool is_ip20 = (model == SGI_IP20);
+  bool vino_present = false;
 
   /* Validate RAM size */
   if (machine->ram_size > SGI_RAM_MAX) {
@@ -416,10 +418,24 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     }
   }
 
+  /*
+   * Indy (IP24) VINO video input lives in EISA address space.  Create it
+   * before the memory controller so the MC can report EISA presence when the
+   * card is installed: the stock VINO driver gates vino_init() on the MC SYSID
+   * EISA-present bit (0x10), and VINO_PHYS_BASE1 is described as EISA space.
+   * Presence is opt-in and defaults OFF, so a plain `-M indy` is unchanged.
+   */
+  if (model == SGI_IP24) {
+    vino_dev = qdev_new(TYPE_SGI_VINO);
+    object_property_add_child(OBJECT(machine), "vino", OBJECT(vino_dev));
+    vino_present =
+        object_property_get_bool(OBJECT(vino_dev), "present", &error_abort);
+  }
+
   /* Memory Controller at 0x1fa00000 */
   mc_dev = qdev_new(TYPE_SGI_MC);
   qdev_prop_set_uint32(mc_dev, "ram-size", machine->ram_size);
-  if (is_fullhouse) {
+  if (is_fullhouse || vino_present) {
     qdev_prop_set_bit(mc_dev, "has-eisa", true);
   }
   if (model == SGI_IP28) {
@@ -591,15 +607,12 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   }
 
   /*
-   * Indy (IP24) VINO video input at the EISA-space base 0x00080000.
-   * Presence is opt-in and DEFAULTS OFF: with present=off the region reads
-   * all-ones exactly like an unmapped aperture, so a plain `-M indy` boot is
-   * unchanged (the VINO probe still fails, VINO is absent).  present=on is
-   * set with `-global sgi-vino.present=on`.  See hw/misc/sgi_vino.c.
+   * Indy (IP24) VINO video input at the EISA-space base 0x00080000.  The
+   * device was created above (before the MC) so its presence could gate the
+   * MC EISA bit; here it is realized and mapped.  present=off still maps the
+   * region but reads all-ones, so a plain `-M indy` boot is unchanged.
    */
-  if (model == SGI_IP24) {
-    DeviceState *vino_dev = qdev_new(TYPE_SGI_VINO);
-    object_property_add_child(OBJECT(machine), "vino", OBJECT(vino_dev));
+  if (vino_dev) {
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vino_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vino_dev), 0, SGI_EISA_IO_BASE);
   }
