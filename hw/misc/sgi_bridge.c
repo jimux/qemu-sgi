@@ -751,9 +751,11 @@ static void sgi_bridge_ioc3_sio_rx(SGIBRIDGEState *s, const uint8_t *buf,
         }
         entry[0] = buf[i];
         entry[4] = IOC3_RXSB_DATA_VALID;
-        if (dma_memory_write(&address_space_memory, base + prod, entry,
-                             sizeof(entry), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-            break;
+        if (!getenv("SGIBRIDGE_RX_NOWRITE")) {
+            if (dma_memory_write(&address_space_memory, base + prod, entry,
+                                 sizeof(entry), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                break;
+            }
         }
         prod = (prod + sizeof(entry)) & IOC3_SIO_RING_MASK;
         s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRPIR_OFF)] = prod;
