@@ -34,6 +34,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/sgi_vino.h"
 #include "qemu/log.h"
+#include "trace.h"
 
 static uint64_t sgi_vino_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -43,15 +44,18 @@ static uint64_t sgi_vino_read(void *opaque, hwaddr offset, unsigned size)
 
     if (!s->present) {
         /* Absent part: reads look exactly like an unmapped aperture. */
+        trace_sgi_vino_read(offset, size, ~0ULL, 0);
         return ~0ULL;
     }
     if (offset + size > SGI_VINO_REG_SIZE) {
+        trace_sgi_vino_read(offset, size, ~0ULL, 1);
         return ~0ULL;
     }
     /* Big-endian byte assembly, so byte/half/word accesses all agree. */
     for (i = 0; i < size; i++) {
         val = (val << 8) | s->regs[offset + i];
     }
+    trace_sgi_vino_read(offset, size, val, 1);
     return val;
 }
 
@@ -62,8 +66,10 @@ static void sgi_vino_write(void *opaque, hwaddr offset, uint64_t value,
     unsigned i;
 
     if (!s->present || offset + size > SGI_VINO_REG_SIZE) {
+        trace_sgi_vino_write(offset, value, size, s->present ? 1 : 0);
         return;
     }
+    trace_sgi_vino_write(offset, value, size, 1);
     for (i = 0; i < size; i++) {
         s->regs[offset + i] = (value >> (8 * (size - 1 - i))) & 0xff;
     }

@@ -527,3 +527,7 @@ sgi_mace_video_vin_field(int idx, unsigned fmt, unsigned stride, unsigned lines,
 sgi_mace_i2c(int wr, uint64_t reg, uint64_t val) "I2C wr=%d reg 0x%02"PRIx64" = 0x%"PRIx64
 sgi_mace_video_frame(int input, unsigned w, unsigned h, unsigned fourcc, uint64_t len) "video-in%d frame %ux%u fourcc=0x%08x len=%"PRIu64
 sgi_mace_video_vout_field(unsigned fmt, unsigned stride, unsigned lines, uint64_t read, uint64_t total, int interleaved, uint64_t field_off) "VOUT field fmt=%u stride=%u lines=%u read=%"PRIu64"/%"PRIu64" inter=%d foff=0x%"PRIx64
+
+# sgi_vino.c (Indy VINO register shell)
+sgi_vino_read(uint64_t off, unsigned size, uint64_t val, int present) "VINO read off=0x%"PRIx64" size=%u -> 0x%"PRIx64" (present=%d)"
+sgi_vino_write(uint64_t off, uint64_t val, unsigned size, int present) "VINO write off=0x%"PRIx64" val=0x%"PRIx64" size=%u (present=%d)"
