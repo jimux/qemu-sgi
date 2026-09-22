@@ -689,6 +689,13 @@ static uint8_t hpc1_pit_read(SGIHPC1State *s, int reg)
 #define RTC_REG_MONTH      0x0a
 #define RTC_REG_YEAR       0x0b
 #define RTC_REG_DAYOFWEEK  0x0e
+/* Real-time-mode register (word index 1). Bit 3-4 (3<<3) is RTC_RUN: both the
+ * IP20 PROM (libsk/ml/dp8573.c) and the IRIX kernel (ml/IP20.c _clock_func_read)
+ * refuse the time if this bit is clear, declaring "Initializing tod clock" /
+ * "lost battery backup clock" and resetting the guest clock to epoch 0. The low
+ * two bits are the leap-year counter. */
+#define RTC_REG_RTIME1     0x01
+#define RTC_RUN            0x18 /* (3 << 3): clock running */
 
 static uint8_t rtc_to_bcd(int v)
 {
@@ -757,7 +764,9 @@ static uint8_t rtc_reg_read(SGIHPC1State *s, unsigned reg)
         case 0x1d:
             return rtc_to_bcd(tm.tm_mon + 1);
         case RTC_REG_YEAR:
-            return rtc_to_bcd((tm.tm_year + 1900) % 100);
+            /* The DP8573 year counter is 2 BCD digits of years SINCE 1970
+             * (IRIX YRREF = 1970; the kernel/PROM add 1970 back). */
+            return rtc_to_bcd(((tm.tm_year + 1900) - 1970) % 100);
         default: /* day of week: 1-7, Sunday = 1 */
             return rtc_to_bcd(tm.tm_wday + 1);
         }
@@ -794,10 +803,18 @@ static void rtc_reg_write(SGIHPC1State *s, unsigned reg, uint8_t val)
         case RTC_REG_MONTH:
             tm.tm_mon = rtc_from_bcd(val & 0x1f) - 1;
             break;
-        default: /* year: keep the century, replace the 2 digits */
-            tm.tm_year = (tm.tm_year / 100) * 100 +
-                         rtc_from_bcd(val & 0x7f);
+        default: { /* year: 2 BCD digits = years since 1970 (IRIX YRREF) */
+            int full = 1970 + rtc_from_bcd(val & 0x7f);
+            int cur = tm.tm_year + 1900;
+            while (full < cur - 50) {
+                full += 100;
+            }
+            while (full > cur + 50) {
+                full -= 100;
+            }
+            tm.tm_year = full - 1900;
             break;
+        }
         }
         rtc_set_from_tm(s, &tm);
         break;
@@ -817,6 +834,11 @@ static void rtc_reset(SGIHPC1State *s)
     s->rtc_host_base_ms = qemu_clock_get_ms(QEMU_CLOCK_HOST);
     memset(s->rtc, 0, sizeof(s->rtc));
     s->rtc[RTC_REG_MSR] = 0;
+    /* Report the clock as running (virtualization-native: the DP8573's run
+     * state is restored from the host wall clock, not from a battery). Without
+     * this the PROM and kernel treat the clock as dead and re-initialize it to
+     * epoch 0 on every boot. */
+    s->rtc[RTC_REG_RTIME1] = RTC_RUN | ((tm.tm_year + 1900) % 4);
 }
 
 /* ------------------------------------------------------------------ */
