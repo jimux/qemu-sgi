@@ -514,6 +514,186 @@ static NetClientInfo net_sgi_baseio_eth_info = {
     .receive = sgi_baseio_eth_receive,
 };
 
+/*
+ * IOC3 byte-bus time-of-day chip (Dallas DS1386), bridge+0x280000 =
+ * IOC3_BYTEBUS_DEV0.  Offsets, the update-disable/enable protocol and the BCD
+ * encoding are from IRIX ml/SN/klclock.{c,h}; the register map is non-contiguous
+ * (SEC +0x1, MIN +0x2, HOUR +0x4, DAY +0x6, DATE +0x8, MONTH +0x9, YEAR +0xa).
+ * rtodc() autodetects the part by writing 0xff to DAY and checking the
+ * read-back: a DS1386 stores a BCD day and never returns 0xff, so modelling the
+ * Dallas part with a live calendar keeps the autodetect on the Dallas branch.
+ */
+#define SGI_BASEIO_RTC_OFF 0x280000ULL
+#define RTC_DAL_SEC_OFF 0x1
+#define RTC_DAL_MIN_OFF 0x2
+#define RTC_DAL_HOUR_OFF 0x4
+#define RTC_DAL_DAY_OFF 0x6
+#define RTC_DAL_DATE_OFF 0x8
+#define RTC_DAL_MONTH_OFF 0x9
+#define RTC_DAL_YEAR_OFF 0xa
+#define RTC_DAL_CONTROL_OFF 0xb
+#define RTC_DAL_USER_OFF 0xe
+#define RTC_DAL_UPDATE_ENABLE 0x80
+
+static int sgi_baseio_bcd_decode(uint8_t v) {
+  return ((v >> 4) & 0xf) * 10 + (v & 0xf);
+}
+
+static uint8_t sgi_baseio_bcd_encode(int v) {
+  return (uint8_t)(((v / 10) << 4) | (v % 10));
+}
+
+/* Days since 1970-01-01 from a proleptic Gregorian date (Howard Hinnant). */
+static int64_t sgi_baseio_days_from_civil(int y, int m, int d) {
+  int64_t era;
+  int yoe, doy, doe;
+
+  y -= (m <= 2);
+  era = (y >= 0 ? y : y - 399) / 400;
+  yoe = y - (int)era * 400;
+  doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+static void sgi_baseio_civil_from_days(int64_t z, int *y, int *m, int *d) {
+  int64_t era;
+  int doe, yoe, doy, mp;
+
+  z += 719468;
+  era = (z >= 0 ? z : z - 146096) / 146097;
+  doe = (int)(z - era * 146097);
+  yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  *y = (int)(yoe + era * 400);
+  doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  mp = (5 * doy + 2) / 153;
+  *d = doy - (153 * mp + 2) / 5 + 1;
+  *m = mp + (mp < 10 ? 3 : -9);
+  *y += (*m <= 2);
+}
+
+/*
+ * Current calendar fields, derived from the Unix epoch latched at reset plus
+ * elapsed virtual time (so the seconds field genuinely ticks).  `year` is the
+ * full year; `wday` is 1..7 as the DS1386 expects.
+ */
+static void sgi_baseio_tod_fields(SGIBaseIOState *s, int *sec, int *min,
+                                  int *hour, int *wday, int *mday, int *mon,
+                                  int *year) {
+  int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+  int64_t t = s->tod_epoch_sec + (now - s->tod_epoch_ns) / 1000000000LL;
+  int64_t days = t / 86400;
+  int y, mo, d;
+
+  if (t < 0) {
+    t = 0;
+    days = 0;
+  }
+  sgi_baseio_civil_from_days(days, &y, &mo, &d);
+  *sec = (int)(t % 60);
+  *min = (int)((t / 60) % 60);
+  *hour = (int)((t / 3600) % 24);
+  *wday = (int)(((days + 4) % 7 + 7) % 7) + 1; /* 1970-01-01 was a Thursday */
+  *mday = d;
+  *mon = mo;
+  *year = y;
+}
+
+static uint64_t sgi_baseio_tod_read(SGIBaseIOState *s, hwaddr off) {
+  int sec, min, hour, wday, mday, mon, year;
+
+  switch (off) {
+  case RTC_DAL_CONTROL_OFF:
+    return s->tod_control;
+  case RTC_DAL_USER_OFF:
+    return s->tod_user;
+  default:
+    break;
+  }
+  sgi_baseio_tod_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
+  switch (off) {
+  case RTC_DAL_SEC_OFF:
+    return sgi_baseio_bcd_encode(sec);
+  case RTC_DAL_MIN_OFF:
+    return sgi_baseio_bcd_encode(min);
+  case RTC_DAL_HOUR_OFF:
+    return sgi_baseio_bcd_encode(hour);
+  case RTC_DAL_DAY_OFF:
+    return sgi_baseio_bcd_encode(wday);
+  case RTC_DAL_DATE_OFF:
+    return sgi_baseio_bcd_encode(mday);
+  case RTC_DAL_MONTH_OFF:
+    return sgi_baseio_bcd_encode(mon);
+  case RTC_DAL_YEAR_OFF:
+    return sgi_baseio_bcd_encode(year % 100);
+  default:
+    return 0;
+  }
+}
+
+static void sgi_baseio_tod_write(SGIBaseIOState *s, hwaddr off, uint64_t val) {
+  int sec, min, hour, wday, mday, mon, year;
+  int64_t days;
+
+  switch (off) {
+  case RTC_DAL_CONTROL_OFF:
+    s->tod_control = val;
+    return;
+  case RTC_DAL_USER_OFF:
+    s->tod_user = val;
+    return;
+  case RTC_DAL_SEC_OFF:
+  case RTC_DAL_MIN_OFF:
+  case RTC_DAL_HOUR_OFF:
+  case RTC_DAL_DAY_OFF:
+  case RTC_DAL_DATE_OFF:
+  case RTC_DAL_MONTH_OFF:
+  case RTC_DAL_YEAR_OFF:
+    break;
+  default:
+    return;
+  }
+  sgi_baseio_tod_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
+  switch (off) {
+  case RTC_DAL_SEC_OFF:
+    sec = sgi_baseio_bcd_decode(val) % 60;
+    break;
+  case RTC_DAL_MIN_OFF:
+    min = sgi_baseio_bcd_decode(val) % 60;
+    break;
+  case RTC_DAL_HOUR_OFF:
+    hour = sgi_baseio_bcd_decode(val) % 24;
+    break;
+  case RTC_DAL_DAY_OFF:
+    wday = sgi_baseio_bcd_decode(val); /* day-of-week is not part of the date */
+    break;  case RTC_DAL_DATE_OFF:
+    mday = sgi_baseio_bcd_decode(val);
+    if (mday < 1 || mday > 31) {
+      mday = 1;
+    }
+    break;
+  case RTC_DAL_MONTH_OFF:
+    mon = sgi_baseio_bcd_decode(val);
+    if (mon < 1 || mon > 12) {
+      mon = 1;
+    }
+    break;
+  case RTC_DAL_YEAR_OFF: {
+    int yy = sgi_baseio_bcd_decode(val);
+    year = (yy < 70) ? 2000 + yy : 1900 + yy;
+    break;
+  }
+  }
+  /*
+   * Re-base the epoch so later reads reflect the write (wtodc() sets the
+   * calendar field by field, so the epoch must move under it).
+   */
+  (void)wday;
+  days = sgi_baseio_days_from_civil(year, mon, mday);
+  s->tod_epoch_sec = days * 86400 + hour * 3600 + min * 60 + sec;
+  s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
 
@@ -679,6 +859,10 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off == 0x114) {
     return 0;
   }
+  /* IOC3 byte-bus time-of-day chip (Dallas DS1386). */
+  if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
+    return sgi_baseio_tod_read(s, off - SGI_BASEIO_RTC_OFF);
+  }
   qemu_log_mask(LOG_UNIMP,
                 "sgi-baseio: unimplemented read @0x%" HWADDR_PRIx
                 " (size %u)\n",
@@ -787,6 +971,11 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
     s->timer_en = val & 1;
     return;
   }
+  /* IOC3 byte-bus time-of-day chip (Dallas DS1386). */
+  if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
+    sgi_baseio_tod_write(s, off - SGI_BASEIO_RTC_OFF, val);
+    return;
+  }
   qemu_log_mask(LOG_UNIMP,
                 "sgi-baseio: unimplemented write @0x%" HWADDR_PRIx
                 " = 0x%" PRIx64 " (size %u)\n",
@@ -881,6 +1070,16 @@ static void sgi_baseio_reset(DeviceState *dev) {
   s->eth_rxprod = 0;
   s->eth_txcons = 0;
   sgi_baseio_phy_init(s);
+
+  /*
+   * Start the time-of-day chip from the host's clock so it presents a valid,
+   * advancing calendar from the first read (ml/clksupport.c warns otherwise).
+   * CONTROL defaults to update-enable.
+   */
+  s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+  s->tod_epoch_sec = (int64_t)time(NULL);
+  s->tod_control = RTC_DAL_UPDATE_ENABLE;
+  s->tod_user = 0;
 }
 
 static void sgi_baseio_realize(DeviceState *dev, Error **errp) {

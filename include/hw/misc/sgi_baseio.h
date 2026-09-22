@@ -167,6 +167,19 @@ struct SGIBaseIOState {
   /* PCI config-space writes to slot 0 (IOC3), via the bridge config window. */
   uint32_t pci_cfg0[0x40];
 
+  /*
+   * IOC3 byte-bus time-of-day chip (Dallas DS1386) at bridge+0x280000
+   * (IOC3_BYTEBUS_DEV0).  IRIX ml/SN/klclock.c rtodc()/wtodc() read and write
+   * it, and ml/clksupport.c warns if the calendar does not advance, so we
+   * present a ticking BCD calendar.  Only the Dallas register map is modelled;
+   * the autodetect in rtodc() writes 0xff to the day register and treats a
+   * non-0xff read-back as Dallas, which our live calendar always yields.
+   */
+  int64_t tod_epoch_ns;  /* QEMU_CLOCK_VIRTUAL ns when the epoch was last set */
+  int64_t tod_epoch_sec; /* Unix seconds corresponding to tod_epoch_ns */
+  uint8_t tod_control;   /* RTC_DAL_CONTROL (0xb): update enable/disable */
+  uint8_t tod_user;      /* RTC_DAL_USER (0xe) */
+
   /* IOC3 SSRAM diagnostic region (16-bit data + parity bit). */
   MemoryRegion ssram_mr;
   uint32_t ssram[SGI_BASEIO_IOC3_SSRAM_WORDS];
