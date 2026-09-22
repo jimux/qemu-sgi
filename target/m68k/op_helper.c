@@ -71,7 +71,8 @@ throwaway:
             sp += 8;
             break;
         case 7:
-            sp += 52;
+            /* The IP2 board pushes the kernel's 68020 long-bus-fault size. */
+            sp += env->ext_tlb_fill ? 84 : 52;
             break;
         }
     }
@@ -358,7 +359,7 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
              */
             int i;
 
-            for (i = 0; i < 10; i++) {          /* remainder of the frame */
+            for (i = 0; i < 18; i++) {          /* remainder of the frame */
                 sp -= 4;
                 cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
             }
