@@ -96,6 +96,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_XMAP_READY_BIT 0x2
 #define SGI_GR2_XMAP_CTL_OFF  0x6c1a0 /* control/data regs written at init */
 #define SGI_GR2_XMAP_CTL_END  0x6c1b8
+/* RAMDAC colour-map programming, inside the XMAP control window.  The DDX
+ * writes each entry as: the INDEX to 0x6c1b0, a control byte to 0x6c1b4, then a
+ * sliding byte stream on 0x6c1a8 whose bytes are R,G,B of the addressed entry
+ * followed by the R of the next.  Read off the boot device trace: e.g.
+ *   0x6c1b0=0x21 ; 0x6c1b4=0x11 ; 0x6c1a8=0x1414141e  -> entry 0x21 = 0x141414,
+ *   and 0x1e begins entry 0x22 (whose index write follows).  The palette is
+ * therefore BUILT from the guest's own writes, not a static table. */
+#define SGI_GR2_XMAP_PAL_DATA  0x6c1a8 /* R,G,B byte stream (sliding)      */
+#define SGI_GR2_XMAP_PAL_INDEX 0x6c1b0 /* entry index being programmed     */
+#define SGI_GR2_XMAP_PAL_CTL   0x6c1b4 /* control byte written per entry   */
+/* The control byte selects a palette bank.  Replaying both servers' streams
+ * against their own `xwd` oracle showed entries written under control 0x11 are
+ * exactly the installed (scanned-out) map — 4sight 18/18, the default pseudomap
+ * 10/10 — while 0x1c/0x10/0x00/0x01 banks are not, so only 0x11 is committed to
+ * the visible palette.  [ASSUMPTION: 0x11 is the installed bank.] */
+#define SGI_GR2_XMAP_PAL_BANK_INSTALLED 0x11
 #define SGI_GR2_RE3_27_OFF  0x6c200 /* RE3 buffered register set */
 #define SGI_GR2_RE3_24_OFF  0x6c280 /* RE3 unbuffered register set */
 #define SGI_GR2_RE3_32_OFF  0x6c600 /* RE3 32-bit register */
@@ -135,12 +151,17 @@ struct SGIGr2State {
      * mode the guest runs (xwininfo: depth 8 PseudoColor), the RE3 fill colour
      * the DDX writes is a palette INDEX; the RAMDAC maps index -> RGB for
      * scanout.  `scanout` is the framebuffer the RE3 fill writes and VC1 scans
-     * out, so the producer and the output stage meet in one buffer.  The
-     * palette defaults to the stock X colormap READ from the guest with
-     * `xwd -root` (index 1 = red, 2 = green, 3 = yellow, 4 = blue, 5 = magenta,
-     * 6 = cyan, 7 = white, 8..15 = greys, rest black); capturing the DDX's own
-     * RAMDAC programming is future work. */
+     * out, so the producer and the output stage meet in one buffer.
+     *
+     * The palette is BUILT from the guest's own RAMDAC programming (see the
+     * XMAP_PAL_* registers above) rather than a static table: the DDX programs
+     * it at server start, so nothing is assumed and a 4sight pseudomap and a
+     * default pseudomap each come out as the server meant them. */
     uint32_t ramdac[256];
+    uint8_t ramdac_index;      /* entry selected by XMAP_PAL_INDEX          */
+    uint8_t ramdac_ctl;        /* bank select from XMAP_PAL_CTL             */
+    uint8_t ramdac_stage[3];   /* R,G,B bytes accumulating from PAL_DATA     */
+    unsigned ramdac_stage_n;   /* bytes held (0..2)                          */
     uint8_t re3_colour;   /* last colour latched from the RE3 colour token */
     bool re3_colour_valid;
     uint32_t last_puc;    /* previous PUC_DATA word (rect geometry pair)     */

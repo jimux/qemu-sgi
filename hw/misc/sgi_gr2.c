@@ -30,79 +30,9 @@
 #define SGI_GR2_RETRACE_HZ       60
 #define SGI_GR2_RETRACE_PULSE_NS (500 * 1000) /* ~40 scanlines of blanking */
 
-/* Default RAMDAC palette (0x00RRGGBB), READ from the guest's installed X
- * colormap with `xwd -root` on the stock golden (Xsgi :0, depth 8) — measured,
- * not assumed.  Entries 0..15 are the 8 RGB corners (1 = red, 2 = green,
- * 3 = yellow, 4 = blue, 5 = magenta, 6 = cyan, 7 = white) and 8 greys; the
- * server leaves 16..255 black.  In 8-bit mode the RE3 fill colour is an index
- * into this table.  Capturing the DDX's own RAMDAC programming is future work;
- * until then this stock map is what scanout expands indices through. */
-static const uint32_t sgi_gr2_default_ramdac[256] = {
-    0x00000000, 0x00ff0000, 0x0000ff00, 0x00ffff00,
-    0x000000ff, 0x00ff00ff, 0x0000ffff, 0x00ffffff,
-    0x00555555, 0x00c67171, 0x0071c671, 0x008e8e38,
-    0x007171c6, 0x008e388e, 0x00388e8e, 0x00aaaaaa,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    0x00000000, 0x00000000, 0x00000000, 0x00000000,
-};
+/* The RAMDAC palette is not a static table: the guest's DDX programs it
+ * through the XMAP_PAL_* registers at server start, and the model builds
+ * it from that write stream (see the header).  Reset clears it to black. */
 
 /* Extract `size` big-endian bytes starting at byte `byte` of a 32-bit word. */
 static uint64_t sgi_gr2_word_read(uint32_t word, unsigned byte, unsigned size)
@@ -341,6 +271,49 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset >= SGI_GR2_XMAP_CTL_OFF && offset < SGI_GR2_XMAP_CTL_END) {
         s->xmap_ready = true;
     }
+    /* RAMDAC colour-map programming (XMAP_PAL_*): the DDX writes the entry
+     * index to 0x6c1b0, a control byte to 0x6c1b4, and a sliding R,G,B byte
+     * stream to 0x6c1a8 — each 32-bit data write carries this entry's R,G,B
+     * plus the first byte (R) of the next entry, which is why the index for a
+     * completing entry is always written before the write that completes it.
+     * Build the palette from those bytes; nothing is assumed about its values. */
+    if (offset == SGI_GR2_XMAP_PAL_INDEX) {
+        s->ramdac_index = value & 0xff;
+        /* Each entry's bytes start fresh after its index write; a 32-bit data
+         * write carries a 4th byte (the next entry's R) which the following
+         * index write therefore discards.  Validated against the `xwd` oracle:
+         * this framing reproduces it (index 1 = red, 4 = blue, 0x10 =
+         * (0x4c,0x71,0x9e), 0x20..0x37 = the grey ramp). */
+        s->ramdac_stage_n = 0;
+    } else if (offset == SGI_GR2_XMAP_PAL_DATA) {
+        unsigned k;
+
+        for (k = 0; k < size; k++) {
+            uint8_t byte = (value >> (8 * (size - 1 - k))) & 0xff;
+
+            s->ramdac_stage[s->ramdac_stage_n++] = byte;
+            if (s->ramdac_stage_n == 3) {
+                uint32_t rgb = ((uint32_t)s->ramdac_stage[0] << 16) |
+                               ((uint32_t)s->ramdac_stage[1] << 8) |
+                               s->ramdac_stage[2];
+
+                /* Only the control==0x11 bank is the one scanout reads.
+                 * Replaying both servers' streams against their `xwd` oracles
+                 * showed the 0x11 bank matches them exactly (4sight 18/18, the
+                 * default pseudomap 10/10) while 0x1c/0x10/0x00/0x01 do not, so
+                 * entries written under another control must not touch the
+                 * visible palette.  [ASSUMPTION: the control byte is a bank
+                 * select; 0x11 is the installed map.] */
+                if (s->ramdac_ctl == SGI_GR2_XMAP_PAL_BANK_INSTALLED) {
+                    s->ramdac[s->ramdac_index] = rgb;
+                    trace_sgi_gr2_ramdac(s->ramdac_index, rgb);
+                }
+                s->ramdac_stage_n = 0;
+            }
+        }
+    } else if (offset == SGI_GR2_XMAP_PAL_CTL) {
+        s->ramdac_ctl = value & 0xff;
+    }
     /* Unpopulated GE units discard writes. */
     if (offset >= SGI_GR2_GE_OFF &&
         offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
@@ -465,7 +438,10 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->retrace_active = false;
     /* Default RAMDAC palette (measured; see the table) and clear the RE3
      * producer latches. */
-    memcpy(s->ramdac, sgi_gr2_default_ramdac, sizeof(s->ramdac));
+    memset(s->ramdac, 0, sizeof(s->ramdac));
+    s->ramdac_index = 0;
+    s->ramdac_ctl = 0;
+    s->ramdac_stage_n = 0;
     s->re3_colour = 0;
     s->re3_colour_valid = false;
     s->last_puc = 0;
