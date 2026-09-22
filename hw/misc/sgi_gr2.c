@@ -30,6 +30,80 @@
 #define SGI_GR2_RETRACE_HZ       60
 #define SGI_GR2_RETRACE_PULSE_NS (500 * 1000) /* ~40 scanlines of blanking */
 
+/* Default RAMDAC palette (0x00RRGGBB), READ from the guest's installed X
+ * colormap with `xwd -root` on the stock golden (Xsgi :0, depth 8) — measured,
+ * not assumed.  Entries 0..15 are the 8 RGB corners (1 = red, 2 = green,
+ * 3 = yellow, 4 = blue, 5 = magenta, 6 = cyan, 7 = white) and 8 greys; the
+ * server leaves 16..255 black.  In 8-bit mode the RE3 fill colour is an index
+ * into this table.  Capturing the DDX's own RAMDAC programming is future work;
+ * until then this stock map is what scanout expands indices through. */
+static const uint32_t sgi_gr2_default_ramdac[256] = {
+    0x00000000, 0x00ff0000, 0x0000ff00, 0x00ffff00,
+    0x000000ff, 0x00ff00ff, 0x0000ffff, 0x00ffffff,
+    0x00555555, 0x00c67171, 0x0071c671, 0x008e8e38,
+    0x007171c6, 0x008e388e, 0x00388e8e, 0x00aaaaaa,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+};
+
 /* Extract `size` big-endian bytes starting at byte `byte` of a 32-bit word. */
 static uint64_t sgi_gr2_word_read(uint32_t word, unsigned byte, unsigned size)
 {
@@ -52,6 +126,46 @@ static uint32_t sgi_gr2_word_write(uint64_t value, unsigned byte, unsigned size)
         word |= (uint8_t)(value >> (8 * (size - 1 - i))) << (8 * (3 - byte - i));
     }
     return word;
+}
+
+static void sgi_gr2_update_display(void *opaque);
+
+/* RE3 solid-rectangle fill.  In the 8-bit mode the guest runs, the latched
+ * colour is a RAMDAC index, so the fill expands it through the palette and
+ * writes the resulting RGB into `scanout` — the same buffer the display
+ * update reads, so the RE3 producer and the scanout stage meet in one place
+ * and a black screen can only mean the producer wrote nothing.  Returns the
+ * RGB written, for tracing. */
+static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
+                                 int x, int y, int w, int h)
+{
+    uint32_t rgb = s->ramdac[colour];
+    int xx, yy;
+
+    if (!s->scanout) {
+        return rgb;
+    }
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > SGI_GR2_SCREEN_W) {
+        w = SGI_GR2_SCREEN_W - x;
+    }
+    if (y + h > SGI_GR2_SCREEN_H) {
+        h = SGI_GR2_SCREEN_H - y;
+    }
+    for (yy = y; yy < y + h; yy++) {
+        for (xx = x; xx < x + w; xx++) {
+            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = rgb;
+        }
+    }
+    sgi_gr2_update_display(s);
+    return rgb;
 }
 
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
@@ -163,6 +277,30 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * the whole register block. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
         trace_sgi_gr2_fifo(offset, value, size);
+    }
+    /* RE3 producer, 8-bit mode.  The DDX writes the fill colour (a RAMDAC
+     * INDEX) to the RE3 colour token, then pushes the rectangle's geometry as
+     * the last two PUC_DATA words.  [ASSUMPTION, from the one captured
+     * `xsetroot -solid red` stream: its PUC_DATA tail was 0x500 then 0x400 —
+     * 1280 x 1024, the screen size — a full-screen clear; and RED vs BLUE
+     * differed in exactly the colour token, 0x1 vs 0x4.]  So latch the colour,
+     * and on the (w,h) pair fill that rectangle of the scanout buffer. */
+    if (size == 4 && offset == SGI_GR2_RE3_COLOUR_TOKEN) {
+        s->re3_colour = value & 0xff;
+        s->re3_colour_valid = true;
+    }
+    if (size == 4 && offset == SGI_GR2_HQ_TOKEN_START) {
+        if (s->last_puc_valid && s->re3_colour_valid &&
+            s->last_puc == SGI_GR2_SCREEN_W && value == SGI_GR2_SCREEN_H) {
+            uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, 0, 0,
+                                            SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+
+            trace_sgi_gr2_re3_fill(s->re3_colour, rgb,
+                                   SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+            s->re3_colour_valid = false;
+        }
+        s->last_puc = value;
+        s->last_puc_valid = true;
     }
     /* HQ2-block writes (start / DMA control / FIFO thresholds) with the PC. */
     if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
@@ -325,6 +463,13 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->hq_ready = false;
     s->xmap_ready = false;
     s->retrace_active = false;
+    /* Default RAMDAC palette (measured; see the table) and clear the RE3
+     * producer latches. */
+    memcpy(s->ramdac, sgi_gr2_default_ramdac, sizeof(s->ramdac));
+    s->re3_colour = 0;
+    s->re3_colour_valid = false;
+    s->last_puc = 0;
+    s->last_puc_valid = false;
     if (s->irq) {
         qemu_irq_lower(s->irq);
     }
