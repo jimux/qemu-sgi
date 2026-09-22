@@ -622,9 +622,62 @@ static void sgi_ip6_scsi_irq(void *opaque, int n, int level)
     sgi_ip6_lio_update(s);
 }
 
+/*
+ * WD33C93 data request.  The IP6 has no descriptor chain: the CTL1 supplies
+ * a byte address as (dmahi[mapindex] << 12) | (dmalo & 0xfff), and dmalo bit
+ * 15 selects the direction (set = device -> memory, i.e. a SCSI read).  Both
+ * advance per byte; mapindex steps every 4 KB.  MAME services one byte per
+ * DRQ; QEMU's WD33C93 exposes the transfer buffer directly, so we drain it.
+ */
 static void sgi_ip6_scsi_drq(void *opaque, int n, int level)
 {
-    /* SCSI DMA is not wired yet; the PROM's early init does not use it. */
+    SGIip6State *s = opaque;
+    WD33C93State *wdc = s->scsi;
+
+    if (!level || !wdc) {
+        return;
+    }
+
+    while (wdc->async_len > 0) {
+        uint32_t addr = ((uint32_t)s->dmahi[s->mapindex & 0x7ff] << 12) |
+                        (s->dmalo & 0x0fff);
+
+        if (s->dmalo & 0x8000) {
+            /* Device -> memory (SCSI data-in). */
+            address_space_write(&address_space_memory, addr,
+                                MEMTXATTRS_UNSPECIFIED, wdc->async_buf, 1);
+        } else {
+            /* Memory -> device (SCSI data-out). */
+            address_space_read(&address_space_memory, addr,
+                               MEMTXATTRS_UNSPECIFIED, wdc->async_buf, 1);
+        }
+        wdc->async_buf++;
+        wdc->async_len--;
+        if (wdc->transfer_count > 0) {
+            wdc->transfer_count--;
+            wd33c93_set_transfer_count(wdc, wdc->transfer_count);
+        }
+
+        s->dmalo = (s->dmalo + 1) & 0x8fff;
+        if (!(s->dmalo & 0xfff)) {
+            s->mapindex++;
+        }
+    }
+
+    /* Buffer drained: drop DRQ and let the chip continue or complete. */
+    wd33c93_set_drq(wdc, false);
+    if (wdc->current_req && wdc->transfer_count == 0 && wdc->pending_len > 0) {
+        /*
+         * Transfer count exhausted but the SCSI buffer is not fully consumed
+         * (multi-pass DMA): raise unexpected-phase, as the IRIX driver
+         * expects to reprogram TC and issue TRANSFER_INFO.  Left as a known
+         * gap for the disk path; the PROM's early SCSI use does not hit it.
+         */
+        qemu_log_mask(LOG_UNIMP, "sgi-ip6: SCSI DMA TC=0 with %u bytes "
+                      "pending\n", wdc->pending_len);
+    } else if (wdc->current_req) {
+        scsi_req_continue(wdc->current_req);
+    }
 }
 
 /* ---- SCN2681 DUARTs --------------------------------------------------- */
