@@ -101,6 +101,15 @@ config SGI_INDY
     select SERIAL_MM
     select UNIMP
 
+# Personal IRIS (IP6): 4D/20 (R2000) and 4D/25 (R3000). CTL1, Am7990 LANCE,
+# WD33C93, SCN2681 DUARTs, DP8572A RTC, 8254 PIT, 93C56 EEPROM, GR1 graphics.
+config SGI_IP6
+    bool
+    default y
+    depends on MIPS64 && TCG
+    select NMC93XX_EEPROM
+    select UNIMP
+
 # Virtuix (IP55) -- SGI-Indy-derived virtualization-native SMP machine. Built
 # from its OWN device copies (sgi_*_virtuix.c / TYPE_*_VIRTUIX) so changes to
 # Virtuix hardware never touch the authentic Indy devices above.
