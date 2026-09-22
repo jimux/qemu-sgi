@@ -308,7 +308,15 @@ static int sgi_ip6_keycode(QKeyCode q)
     case Q_KEY_CODE_5: return 23;  case Q_KEY_CODE_6: return 30;
     case Q_KEY_CODE_7: return 31;  case Q_KEY_CODE_8: return 38;
     case Q_KEY_CODE_9: return 39;  case Q_KEY_CODE_0: return 46;
-    case Q_KEY_CODE_RET: return 51;        case Q_KEY_CODE_SPC: return 83;
+    /*
+     * MAIN Enter is label 60 ('\n'), NOT 51 -- label 51 is the KEYPAD Enter,
+     * whose string is '\r'.  MEASURED: with '\r' the Command Monitor only
+     * echoed '#' and never terminated the line, so "help"+Enter did nothing;
+     * with '\n' it ran the command and printed its command list.  Labels take
+     * the -1 treatment at the point of use, like every other key.
+     */
+    case Q_KEY_CODE_RET: return 60;        case Q_KEY_CODE_KP_ENTER: return 51;
+    case Q_KEY_CODE_SPC: return 83;
     case Q_KEY_CODE_BACKSPACE: return 61;  case Q_KEY_CODE_ESC: return 7;
     case Q_KEY_CODE_TAB: return 9;
     case Q_KEY_CODE_MINUS: return 47;      case Q_KEY_CODE_EQUAL: return 54;
@@ -346,7 +354,8 @@ static int sgi_ip6_charcode(QKeyCode q)
     /* From the PROM's table, state 0 (unshifted): 51='\r', 61='\x08',
      * 7=ESC, 9='\t', 47='-', 54='=', 53='/', 52='.', 45=',', 43=';',
      * 50='\'', 49='[', 56=']', 57='\\', 55='`'. */
-    case Q_KEY_CODE_RET: return '\r';
+    case Q_KEY_CODE_RET: return '\n';
+    case Q_KEY_CODE_KP_ENTER: return '\r';
     case Q_KEY_CODE_BACKSPACE: return '\x08';
     case Q_KEY_CODE_ESC: return '\x1b';
     case Q_KEY_CODE_TAB: return '\t';
