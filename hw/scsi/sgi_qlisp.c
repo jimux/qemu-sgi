@@ -76,6 +76,16 @@ static void ql_update_irq(SGIQLispState *s)
         isr |= BUS_ISR_RISC_INT;
     }
     level = (isr & BUS_ISR_RISC_INT) ? 1 : 0;
+    if (qlisp_dbg()) {
+        static int prev = -1;
+
+        if (level != prev) {
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: IRQ level=%d isr=0x%04x cmd_pending=%d\n",
+                          level, isr, s->cmd_pending);
+            prev = level;
+        }
+    }
     qemu_set_irq(s->irq, level);
 }
 
