@@ -59,6 +59,9 @@
  * its entry runs there, so this VPN must be TLB-mapped before the jump.
  */
 #define IP27_K2_BASE 0xc000000000000000ULL
+
+/* Highest node/brick tag (in units of 1<<32) aliased back to node-0 RAM (B1). */
+#define IP27_NODE_TAG_MAX 0x3ff
 /*
  * PageMask for a 16 MB page, and EntryLo flags V|D|G|C=5 -- enough to cover
  * the kernel's load at the start of node RAM.  (Encoding mirrors the PROM
@@ -575,6 +578,67 @@ static void ip27_add_ram_banks(MemoryRegion *sysmem, uint64_t space_base,
   memory_region_add_subregion(sysmem, ip27_phys(space_base), c);
 }
 
+/*
+ * IP27 kernel-load relocation region (default-on; see the init).  Forwards the
+ * miniroot/sa loader's seg2 writes up by 0x1000000 so the kernel's RW segment
+ * lands at its link physical address; reads pass through to real RAM.
+ */
+typedef struct IP27Seg2Redir {
+  MemoryRegion mr;
+  MemoryRegion *ram;
+  uint64_t phys;
+  int64_t delta; /* relocation offset added to phys (0 = read-through) */
+} IP27Seg2Redir;
+
+static uint64_t ip27_seg2redir_read(void *opaque, hwaddr off, unsigned size) {
+  IP27Seg2Redir *t = opaque;
+  /*
+   * Never apply the redirect delta on reads: this region overlays ordinary
+   * RAM, and only the loader's seg2 WRITES are relocated.  Reads must see the
+   * real contents at this address (otherwise the PROM memory test writes here
+   * but reads back from +0x1000000 -> miscompare -> ip27_die -> headless).
+   */
+  uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(t->ram) + t->phys + off;
+  switch (size) {
+  case 1: return ldub_p(p);
+  case 2: return lduw_be_p(p);
+  case 4: return ldl_be_p(p);
+  default: return ldq_be_p(p);
+  }
+}
+
+static void ip27_seg2redir_write(void *opaque, hwaddr off, uint64_t val,
+                                unsigned size) {
+  IP27Seg2Redir *t = opaque;
+  int64_t delta = t->delta;
+  CPUMIPSState *e = current_cpu ? cpu_env(current_cpu) : NULL;
+  uint64_t pc = e ? (uint64_t)e->active_tc.PC : 0;
+
+  /*
+   * Redirect mode: only the miniroot/sa flat loader relocates seg2 upward.
+   * This physical range (0x38ea58..) is ordinary RAM that the PROM's memory
+   * test and the kernel also use, so forward the write ONLY when the store
+   * comes from the loader itself (which runs at 0xc000000011c.....); everybody
+   * else must see normal memory, or the power-on memtest miscompares here.
+   */
+  if (delta && !(pc >= 0xc000000011c00000ULL && pc < 0xc000000011d00000ULL)) {
+    delta = 0;
+  }
+  uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(t->ram) + t->phys + delta + off;
+  switch (size) {
+  case 1: stb_p(p, val); break;
+  case 2: stw_be_p(p, val); break;
+  case 4: stl_be_p(p, val); break;
+  default: stq_be_p(p, val); break;
+  }
+}
+
+static const MemoryRegionOps ip27_seg2redir_ops = {
+  .read = ip27_seg2redir_read,
+  .write = ip27_seg2redir_write,
+  .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 static void sgi_ip27_init(MachineState *machine) {
   Clock *cpuclk;
   MemoryRegion *prom;
@@ -658,6 +722,52 @@ static void sgi_ip27_init(MachineState *machine) {
      */
     ip27_add_ram_banks(system_memory, IP27_HSPEC_BASE, ram,
                        machine->ram_size, banksz, "sgi-ip27.ram.hspec");
+  }
+
+  /*
+   * B1: node-tagged physical alias.  On IP27 a physical address carries a
+   * node/brick tag above the local RAM offset (NODE_OFFSET(n) = n <<
+   * NODE_SIZE_BITS; M-mode shift 32).  The IRIX kernel builds its wired PDA
+   * physical address from fpage (CAC-tagged); by the time it reaches EntryLo
+   * it is e.g. 0x1c0004a4000 -- tag 0x1c<<32 with local offset 0x4a4000, which
+   * is valid node-0 RAM.  A single-node machine has no other nodes, so alias
+   * every node-tagged window (k<<32) back to node-0 RAM at the same low
+   * offset.  Untagged low RAM, the CAC/UNCAC/HSPEC containers (phys 0x08../
+   * 0x10../0x12..) and the IO windows are all far outside this range and
+   * unaffected, and the power-on memory test uses untagged low RAM.
+   *
+   * DIVERGENCE: a real multi-node machine would route these to other nodes'
+   * memory; here they all resolve to node 0.
+   */
+  for (i = 1; i <= IP27_NODE_TAG_MAX; i++) {
+    MemoryRegion *na = g_new(MemoryRegion, 1);
+
+    memory_region_init_alias(na, NULL, "sgi-ip27.ram.nodetag", ram, 0,
+                             machine->ram_size);
+    memory_region_add_subregion(system_memory, (uint64_t)i << 32, na);
+  }
+
+  /*
+   * IP27 kernel-load relocation (default ON; IP27_NO_SEG2REDIR disables for
+   * A/B).  The miniroot/sa flat loader places an ELF image at
+   * KERNEL_START_OFFSET + file_offset, ignoring each segment's p_paddr, so the
+   * kernel's RW segment lands at 0x38ea58 instead of its link address
+   * 0x138ea58 (16 MB high).  Overlay this range and forward the loader's
+   * writes up by 0x1000000.  Verified: seg2 content ("bad ista") lands at phys
+   * 0x138ea60 and the stack var at 0x13f3930 reads 0xc0000000013c3fe0.
+   *
+   * The forward is gated on the storing PC being in the loader (see
+   * ip27_seg2redir_write) so that ordinary RAM users -- the PROM memory test,
+   * and the kernel itself -- see normal memory; reads are never relocated.
+   */
+  if (!getenv("IP27_NO_SEG2REDIR")) {
+    IP27Seg2Redir *t = g_new0(IP27Seg2Redir, 1);
+    t->ram = ram;
+    t->phys = 0x38ea58;
+    t->delta = 0x1000000;
+    memory_region_init_io(&t->mr, NULL, &ip27_seg2redir_ops, t,
+                          "sgi-ip27.seg2redir", 0x80000);
+    memory_region_add_subregion_overlap(system_memory, t->phys, &t->mr, 11);
   }
 
 
