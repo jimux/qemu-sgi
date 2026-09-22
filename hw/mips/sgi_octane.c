@@ -88,6 +88,19 @@ static void main_cpu_reset(void *opaque)
 {
     MIPSCPU *cpu = opaque;
     cpu_reset(CPU(cpu));
+    /*
+     * Octane fit R10000 revs 2.6/2.7/3.0 (later R12000).  QEMU's shared R10000
+     * model reports CP0_PRid 0x900 (rev 0.0), which the IP30 kernel rejects:
+     * allowboot() panics when mpconf->pr_id < C0_MAKE_REVID(R10000,2,6), and
+     * the PROM copies CP0_PRid into that MP config block.  Report rev 2.7 --
+     * past the check, and a real Octane part; our R10000 model has no T5 bug,
+     * so 2.7 (no HEART_INVALIDATE_WAR) is truthful rather than claiming 2.6's
+     * errata.  Implementation byte (imp=9) is unchanged, so ABI resolution that
+     * keys on the implementation field is unaffected.  Kept octane-local rather
+     * than editing the shared cpu-defs.c.inc R10000 entry (used by IP28 and
+     * the virtuix machine, which must stay as they are).
+     */
+    cpu->env.CP0_PRid = (0x09 << 8) | (2 << 4) | 7;    /* R10000 rev 2.7 */
 }
 
 /* Load the PROM image into the ROM region. */
