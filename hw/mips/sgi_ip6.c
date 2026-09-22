@@ -27,17 +27,21 @@
 #include "hw/core/qdev.h"
 #include "hw/core/loader.h"
 #include "hw/char/sgi_scn2681.h"
+#include "hw/isa/isa.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/unimp.h"
 #include "hw/nvram/eeprom93xx.h"
 #include "hw/scsi/scsi.h"
 #include "hw/scsi/wd33c93.h"
+#include "hw/timer/i8254_internal.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
+#include "system/memory.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -53,9 +57,14 @@
 #define SGI_IP6_CTL1_CPUCFG 0x80000
 #define SGI_IP6_CTL1_CPUAUX 0xe0000
 
-/* CTL1 DMA address-mapping table */
-#define SGI_IP6_DMA_BASE    0x1f900000ULL
-#define SGI_IP6_DMA_SIZE    0x3000
+/* CTL1 DMA address-mapping registers (MAME ip6.cpp layout):
+ *   0x1f900000  dmalo    (16-bit, resets mapindex to 0 on write)
+ *   0x1f910000  mapindex (8-bit)
+ *   0x1f920000  dmahi    (1024/2048 x 16-bit SRAM, A10 strapping) */
+#define SGI_IP6_DMALO_BASE    0x1f900000ULL
+#define SGI_IP6_MAPINDEX_BASE 0x1f910000ULL
+#define SGI_IP6_DMAHI_BASE    0x1f920000ULL
+#define SGI_IP6_DMAHI_SIZE    0x1000
 
 /* LIO interrupt controller */
 #define SGI_IP6_LIO_BASE    0x1f980000ULL
@@ -84,6 +93,13 @@
 #define SGI_IP6_DUART_BASE  0x1fb80000ULL
 #define SGI_IP6_DUART_SIZE  0x100
 
+/* 8254 PIT: byte registers in the top bus lane, ports 0..3 at +0/+4/+8/+12 */
+#define SGI_IP6_PIT_BASE    0x1fb40000ULL
+
+/* PIT interrupt acknowledge registers (read clears the CPU IRQ line) */
+#define SGI_IP6_TIMER0_ACK  0x1fa20000ULL   /* PIT channel 0 -> CPU IRQ2 */
+#define SGI_IP6_TIMER1_ACK  0x1fa00000ULL   /* PIT channel 1 -> CPU IRQ4 */
+
 /* cpuauxctl bits */
 #define CPUAUX_EEPROM_CS    0x20
 #define CPUAUX_EEPROM_CLK   0x40
@@ -99,10 +115,13 @@
 /* memcfg bits */
 #define MEMCFG_MEMSIZE      0x0f
 #define MEMCFG_4MRAM        0x10
+#define MEMCFG_TIMERDIS     0x20
 
 typedef struct SGIip6State {
     MemoryRegion ctl1;
-    MemoryRegion dma;
+    MemoryRegion dmalo_reg;
+    MemoryRegion mapindex_reg;
+    MemoryRegion dmahi_reg;
     MemoryRegion lio;
     MemoryRegion err;
     MemoryRegion clrerr;
@@ -110,6 +129,12 @@ typedef struct SGIip6State {
     MemoryRegion scsi_regs;
     MemoryRegion scsi_reset;
     MemoryRegion duart_regs;
+    MemoryRegion pit_reg;
+    MemoryRegion timer0_ack;
+    MemoryRegion timer1_ack;
+
+    ISABus *isa;
+    DeviceState *pit;
 
     MIPSCPU *cpu;
     WD33C93State *scsi;
@@ -120,6 +145,8 @@ typedef struct SGIip6State {
     uint8_t rtc_regs[SGI_IP6_RTC_SIZE];
 
     bool lio_int;
+    bool pit0_level;
+    bool pit0_programmed;
 
     uint8_t memcfg;
     uint16_t cpucfg;
@@ -127,10 +154,11 @@ typedef struct SGIip6State {
 
     uint16_t dmalo;
     uint8_t mapindex;
-    uint16_t dmahi[1024];
+    uint16_t dmahi[2048];
 
     uint32_t erradr;
     uint32_t refadr;
+    int64_t ref_load_time;
 
     uint8_t vme_isr;
     uint8_t vme_imr;
@@ -258,42 +286,91 @@ static const MemoryRegionOps sgi_ip6_ctl1_ops = {
     },
 };
 
-/* ---- CTL1 DMA address-mapping table ---------------------------------- */
+/* ---- CTL1 DMA address-mapping registers ------------------------------ */
 
-static uint64_t sgi_ip6_dma_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t sgi_ip6_dmalo_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
-    uint32_t off = addr & (SGI_IP6_DMA_SIZE - 1);
+    uint32_t v = s->dmalo;
 
-    if (off == 0) {
-        return s->dmalo;
-    } else if (off == 0x1000) {
-        return s->mapindex;
-    } else if (off >= 0x2000) {
-        return s->dmahi[(off - 0x2000) >> 1];
+    if (size == 1) {
+        v = (addr & 1) ? (v & 0xff) : ((v >> 8) & 0xff);
     }
-    return 0;
+    return v;
 }
 
-static void sgi_ip6_dma_write(void *opaque, hwaddr addr, uint64_t data,
-                              unsigned size)
+static void sgi_ip6_dmalo_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
 {
     SGIip6State *s = opaque;
-    uint32_t off = addr & (SGI_IP6_DMA_SIZE - 1);
 
-    if (off == 0) {
+    if (size == 1) {
+        if (addr & 1) {
+            s->dmalo = (s->dmalo & 0xff00) | (data & 0xff);
+        } else {
+            s->dmalo = (s->dmalo & 0x00ff) | ((data & 0xff) << 8);
+        }
+    } else {
         s->dmalo = data & 0xffff;
-        s->mapindex = 0;
-    } else if (off == 0x1000) {
-        s->mapindex = data & 0xff;
-    } else if (off >= 0x2000) {
-        s->dmahi[(off - 0x2000) >> 1] = data & 0xffff;
     }
+    s->mapindex = 0;
 }
 
-static const MemoryRegionOps sgi_ip6_dma_ops = {
-    .read = sgi_ip6_dma_read,
-    .write = sgi_ip6_dma_write,
+static const MemoryRegionOps sgi_ip6_dmalo_ops = {
+    .read = sgi_ip6_dmalo_read,
+    .write = sgi_ip6_dmalo_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+};
+
+static uint64_t sgi_ip6_mapindex_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    return s->mapindex;
+}
+
+static void sgi_ip6_mapindex_write(void *opaque, hwaddr addr, uint64_t data,
+                                   unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    s->mapindex = data & 0xff;
+}
+
+static const MemoryRegionOps sgi_ip6_mapindex_ops = {
+    .read = sgi_ip6_mapindex_read,
+    .write = sgi_ip6_mapindex_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+static uint64_t sgi_ip6_dmahi_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint32_t idx = ((addr & (SGI_IP6_DMAHI_SIZE - 1)) >> 1) & 0x7ff;
+
+    return s->dmahi[idx];
+}
+
+static void sgi_ip6_dmahi_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint32_t idx = ((addr & (SGI_IP6_DMAHI_SIZE - 1)) >> 1) & 0x7ff;
+
+    s->dmahi[idx] = data & 0xffff;
+}
+
+static const MemoryRegionOps sgi_ip6_dmahi_ops = {
+    .read = sgi_ip6_dmahi_read,
+    .write = sgi_ip6_dmahi_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 2,
@@ -358,6 +435,17 @@ static uint64_t sgi_ip6_err_read(void *opaque, hwaddr addr, unsigned size)
         /* Reading erradr clears the CPU bus-error interrupt. */
         return s->erradr;
     case 0x04:
+        /*
+         * Refresh address counter.  While the memory timer is enabled it
+         * free-runs: one refresh every 64us (15.625 kHz), each advancing the
+         * address by 4096 words.  The PROM measures delays by watching this.
+         */
+        if (s->memcfg & MEMCFG_TIMERDIS) {
+            int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ref_load_time;
+            uint64_t refreshes = (uint64_t)ns * 15625 / 1000000000ULL;
+
+            return s->refadr + (uint32_t)(refreshes * 4096 * 4);
+        }
         return s->refadr;
     default:
         return 0;
@@ -372,6 +460,7 @@ static void sgi_ip6_err_write(void *opaque, hwaddr addr, uint64_t data,
 
     if (off == 0x04) {
         s->refadr = data;
+        s->ref_load_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     }
 }
 
@@ -583,6 +672,110 @@ static void sgi_ip6_duart_irq(void *opaque, int n, int level)
     sgi_ip6_lio_update(s);
 }
 
+/* ---- 8254 PIT and timer interrupt acknowledge ------------------------- */
+
+static void sgi_ip6_pit_out0(void *opaque, int n, int level)
+{
+    SGIip6State *s = opaque;
+
+    /* The PROM wires the PIT outputs as set-only latches: a rising edge
+     * asserts the CPU IRQ, and only the ack register clears it.  QEMU's PIT
+     * leaves channel 0 toggling out of reset, so wait until the PROM has
+     * actually programmed the chip before propagating edges. */
+    if (level && !s->pit0_level && s->pit0_programmed && s->cpu) {
+        qemu_set_irq(s->cpu->env.irq[2], 1);
+    }
+    s->pit0_level = level;
+}
+
+/*
+ * The 8254 ports sit one per 32-bit bus word (+0/+4/+8/+12), not packed.
+ * Forward each to the ISA PIT's byte ports, and note that software has
+ * begun programming the chip so its reset state stops driving IRQ2.
+ */
+static uint64_t sgi_ip6_pit_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint64_t val = 0;
+    unsigned port = (addr & 0xf) >> 2;
+
+    if (addr & 3) {
+        return 0;
+    }
+    memory_region_dispatch_read(&PIT_COMMON(s->pit)->ioports, port, &val,
+                                size, MEMTXATTRS_UNSPECIFIED);
+    return val;
+}
+
+static void sgi_ip6_pit_write(void *opaque, hwaddr addr, uint64_t data,
+                              unsigned size)
+{
+    SGIip6State *s = opaque;
+    unsigned port = (addr & 0xf) >> 2;
+
+    if (addr & 3) {
+        return;
+    }
+    s->pit0_programmed = true;
+    memory_region_dispatch_write(&PIT_COMMON(s->pit)->ioports, port, data,
+                                 size, MEMTXATTRS_UNSPECIFIED);
+}
+
+static const MemoryRegionOps sgi_ip6_pit_ops = {
+    .read = sgi_ip6_pit_read,
+    .write = sgi_ip6_pit_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+static uint64_t sgi_ip6_timer0_ack_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    if (s->cpu) {
+        qemu_set_irq(s->cpu->env.irq[2], 0);
+    }
+    return 0;
+}
+
+static uint64_t sgi_ip6_timer1_ack_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    if (s->cpu) {
+        qemu_set_irq(s->cpu->env.irq[4], 0);
+    }
+    return 0;
+}
+
+static void sgi_ip6_timer_ack_write(void *opaque, hwaddr addr, uint64_t data,
+                                    unsigned size)
+{
+}
+
+static const MemoryRegionOps sgi_ip6_timer0_ack_ops = {
+    .read = sgi_ip6_timer0_ack_read,
+    .write = sgi_ip6_timer_ack_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static const MemoryRegionOps sgi_ip6_timer1_ack_ops = {
+    .read = sgi_ip6_timer1_ack_read,
+    .write = sgi_ip6_timer_ack_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 /* ---- machine ---------------------------------------------------------- */
 
 static void main_cpu_reset(void *opaque)
@@ -668,9 +861,18 @@ static void sgi_ip6_init(MachineState *machine)
                           "sgi-ip6-ctl1", SGI_IP6_CTL1_SIZE);
     memory_region_add_subregion(system_memory, SGI_IP6_CTL1_BASE, &s->ctl1);
 
-    memory_region_init_io(&s->dma, OBJECT(machine), &sgi_ip6_dma_ops, s,
-                          "sgi-ip6-dma", SGI_IP6_DMA_SIZE);
-    memory_region_add_subregion(system_memory, SGI_IP6_DMA_BASE, &s->dma);
+    memory_region_init_io(&s->dmalo_reg, OBJECT(machine), &sgi_ip6_dmalo_ops, s,
+                          "sgi-ip6-dmalo", 4);
+    memory_region_add_subregion(system_memory, SGI_IP6_DMALO_BASE, &s->dmalo_reg);
+
+    memory_region_init_io(&s->mapindex_reg, OBJECT(machine), &sgi_ip6_mapindex_ops,
+                          s, "sgi-ip6-mapindex", 4);
+    memory_region_add_subregion(system_memory, SGI_IP6_MAPINDEX_BASE,
+                                &s->mapindex_reg);
+
+    memory_region_init_io(&s->dmahi_reg, OBJECT(machine), &sgi_ip6_dmahi_ops, s,
+                          "sgi-ip6-dmahi", SGI_IP6_DMAHI_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_DMAHI_BASE, &s->dmahi_reg);
 
     memory_region_init_io(&s->lio, OBJECT(machine), &sgi_ip6_lio_ops, s,
                           "sgi-ip6-lio", SGI_IP6_LIO_SIZE);
@@ -733,9 +935,29 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_add_subregion(system_memory, SGI_IP6_DUART_BASE,
                                 &s->duart_regs);
 
-    /* Devices not yet implemented: PIT, LANCE and GR1 graphics.  Map them
+    /* 8254 PIT at 0x1fb40000.  Its four byte-wide ports sit one per 32-bit
+     * bus word (+0/+4/+8/+12); channel 0's output drives CPU IRQ2, which the
+     * PROM acknowledges by reading the timer0 ack register. */
+    s->isa = isa_bus_new(NULL, get_system_memory(), get_system_io(),
+                         &error_fatal);
+    s->pit = DEVICE(isa_create_simple(s->isa, TYPE_I8254));
+    qdev_connect_gpio_out(s->pit, 0,
+                          qemu_allocate_irq(sgi_ip6_pit_out0, s, 0));
+    memory_region_init_io(&s->pit_reg, OBJECT(machine), &sgi_ip6_pit_ops, s,
+                          "sgi-ip6-pit", 0x10);
+    memory_region_add_subregion(system_memory, SGI_IP6_PIT_BASE, &s->pit_reg);
+
+    memory_region_init_io(&s->timer0_ack, OBJECT(machine),
+                          &sgi_ip6_timer0_ack_ops, s, "sgi-ip6-timer0-ack", 4);
+    memory_region_add_subregion_overlap(system_memory, SGI_IP6_TIMER0_ACK,
+                                        &s->timer0_ack, 1);
+    memory_region_init_io(&s->timer1_ack, OBJECT(machine),
+                          &sgi_ip6_timer1_ack_ops, s, "sgi-ip6-timer1-ack", 4);
+    memory_region_add_subregion_overlap(system_memory, SGI_IP6_TIMER1_ACK,
+                                        &s->timer1_ack, 1);
+
+    /* Devices not yet implemented: LANCE and GR1 graphics.  Map them
      * as unimplemented so accesses are logged rather than aborting. */
-    create_unimplemented_device("sgi-ip6-pit", 0x1fb40000, 0x10);
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
     create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
     create_unimplemented_device("sgi-ip6-lance", 0x1f950000, 0x20000);
@@ -760,10 +982,13 @@ static void sgi_ip6_init(MachineState *machine)
     memset(s->dmahi, 0, sizeof(s->dmahi));
     s->erradr = 0;
     s->refadr = 0;
+    s->ref_load_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->vme_isr = 0;
     s->vme_imr = 0;
     memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
     s->lio_int = false;
+    s->pit0_level = true;   /* PIT output is high out of reset; see out0 */
+    s->pit0_programmed = false;
     s->lio_isr = 0x3ff;
     s->lio_imr = 0;
 }
