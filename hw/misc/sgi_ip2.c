@@ -62,6 +62,7 @@
 #define REG_MLOC            0x01000000
 #define REG_SWITCH          0x01800000
 #define REG_NVRAM           0x03000000
+#define REG_PGFLTCLR        0x03800000
 #define REG_RTC_CTRL        0x04000000
 #define REG_RTC_DATA        0x05000000
 #define REG_KBASE           0x06000000
@@ -296,6 +297,9 @@ static uint64_t ip2_regs_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     case REG_SWITCH:
         return s->swreg;
+    case REG_PGFLTCLR:
+        ip2_tlb_flush(s);
+        return 0;
     case REG_RTC_CTRL:
         return s->rtc_ctrl;
     case REG_RTC_DATA:
@@ -333,6 +337,9 @@ static void ip2_regs_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case REG_SWITCH:
         s->swreg = data;
+        break;
+    case REG_PGFLTCLR:
+        ip2_tlb_flush(s);
         break;
     case REG_RTC_CTRL:
         s->rtc_ctrl = val;
