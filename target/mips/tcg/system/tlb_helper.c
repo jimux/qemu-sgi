@@ -53,6 +53,7 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
 {
     r4k_tlb_t *tlb;
     uint64_t mask = env->CP0_PageMask >> (TARGET_PAGE_BITS + 1);
+    bool r3k = (env->cpu_model->mmu_type == MMU_TYPE_R3000);
 
     /* XXX: detect conflicting TLBs and raise a MCHECK exception when needed */
     tlb = &env->tlb->mmu.r4k.tlb[idx];
@@ -68,6 +69,36 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
     tlb->ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     tlb->MMID = env->CP0_MemoryMapID;
     tlb->PageMask = env->CP0_PageMask;
+    tlb->XI0 = 0;
+    tlb->RI0 = 0;
+    tlb->XI1 = 0;
+    tlb->RI1 = 0;
+    if (r3k) {
+        /*
+         * MIPS-I R2000/R3000 EntryLo shares its layout with the R4000 only
+         * in the PFN field: the control bits sit at different positions.
+         *      R3000:  PFN[25:6]  N[5]  D[4]  V[3]  G[2]
+         *      R4000:  PFN[27:6]  C[5:3] D[2]  V[1]  G[0]
+         * Decoding the R3000 fields at the R4000 positions makes every
+         * valid MIPS-I entry look invalid (V read from the N bit), so the
+         * MIPS-I interpretation must be used on an MMU_TYPE_R3000 part.
+         * MIPS-I has no XI/RI, so those stay zero.
+         */
+        tlb->G = (env->CP0_EntryLo0 & env->CP0_EntryLo1 & 0x4) != 0;
+        tlb->V0 = (env->CP0_EntryLo0 & 0x8) != 0;
+        tlb->D0 = (env->CP0_EntryLo0 & 0x10) != 0;
+        /* N (bit 5) is the non-cacheable bit: present it as uncached. */
+        tlb->C0 = (env->CP0_EntryLo0 & 0x20) ? 2 : 0;
+        /* MIPS-I PFN is bits 25:6 (20 bits); bits 31:26 are unused. */
+        tlb->PFN[0] = ((get_tlb_pfn_from_entrylo(env->CP0_EntryLo0) & 0xfffff)
+                       & ~mask) << 12;
+        tlb->V1 = (env->CP0_EntryLo1 & 0x8) != 0;
+        tlb->D1 = (env->CP0_EntryLo1 & 0x10) != 0;
+        tlb->C1 = (env->CP0_EntryLo1 & 0x20) ? 2 : 0;
+        tlb->PFN[1] = ((get_tlb_pfn_from_entrylo(env->CP0_EntryLo1) & 0xfffff)
+                       & ~mask) << 12;
+        return;
+    }
     tlb->G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
     tlb->V0 = (env->CP0_EntryLo0 & 2) != 0;
     tlb->D0 = (env->CP0_EntryLo0 & 4) != 0;
@@ -133,13 +164,27 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
     VPN &= env->SEGMask;
 #endif
     EHINV = (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) != 0;
-    G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
-    V0 = (env->CP0_EntryLo0 & 2) != 0;
-    D0 = (env->CP0_EntryLo0 & 4) != 0;
+    /*
+     * The Valid/Dirty/Global bits move between MIPS-I and MIPS III/IV (see
+     * r4k_fill_tlb).  This test only decides whether a cached entry must be
+     * discarded, but it has to read the same bits as the fill or a rewritten
+     * MIPS-I entry could keep a stale translation alive.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        G = (env->CP0_EntryLo0 & env->CP0_EntryLo1 & 0x4) != 0;
+        V0 = (env->CP0_EntryLo0 & 0x8) != 0;
+        D0 = (env->CP0_EntryLo0 & 0x10) != 0;
+        V1 = (env->CP0_EntryLo1 & 0x8) != 0;
+        D1 = (env->CP0_EntryLo1 & 0x10) != 0;
+    } else {
+        G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
+        V0 = (env->CP0_EntryLo0 & 2) != 0;
+        D0 = (env->CP0_EntryLo0 & 4) != 0;
+        V1 = (env->CP0_EntryLo1 & 2) != 0;
+        D1 = (env->CP0_EntryLo1 & 4) != 0;
+    }
     XI0 = (env->CP0_EntryLo0 >> CP0EnLo_XI) &1;
     RI0 = (env->CP0_EntryLo0 >> CP0EnLo_RI) &1;
-    V1 = (env->CP0_EntryLo1 & 2) != 0;
-    D1 = (env->CP0_EntryLo1 & 4) != 0;
     XI1 = (env->CP0_EntryLo1 >> CP0EnLo_XI) &1;
     RI1 = (env->CP0_EntryLo1 >> CP0EnLo_RI) &1;
 
