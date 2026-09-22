@@ -95,7 +95,13 @@ struct SGIGL2State {
     qemu_irq irq;
     QemuConsole *con;
 
-    uint16_t *fb;                 /* colour index per pixel */
+    /*
+     * Bitplane value per pixel.  The UC4 writes planes A/B (colourAB/wrtenAB)
+     * and C/D (colourCD/wrtenCD); the DC4 looks the resulting plane code up
+     * in the colormap.  Storing the code (not the physical planes) is
+     * invisible to the guest, which only reads back through READPIXEL.
+     */
+    uint8_t *fb;
     uint8_t cmap[GL2_NMAP][GL2_NCOLOR][3];
     uint16_t dc_flags;            /* DC4 flag register */
     uint8_t cur_map;              /* DC4 map selected for scanout */
@@ -115,22 +121,46 @@ struct SGIGL2State {
     bool dirty;
 };
 
-static void gl2_set_pixel(SGIGL2State *s, int x, int y, uint16_t color)
+/*
+ * Write the planes selected by a 2-bit write-enable *we* with the matching
+ * bits of *color*, leaving the other planes untouched.  *shift* is 0 for the
+ * A/B group and 2 for the C/D group.  This is what makes an erase that sets
+ * only WE plane B (as the PROM's cursor/erase steps do) leave plane A -- where
+ * the character was drawn -- intact.
+ */
+static uint8_t gl2_blend(uint8_t old, uint16_t color, uint16_t we, int shift)
+{
+    uint16_t mask = (we & 3) << shift;
+
+    return (old & ~mask) | (((color & 3) << shift) & mask);
+}
+
+/* The plane code a FILLRECT/DRAWCHAR/DRAWPIXEL would write for this pixel. */
+static uint8_t gl2_planes(SGIGL2State *s, uint8_t old)
+{
+    old = gl2_blend(old, s->color_ab, s->we_ab, 0);
+    old = gl2_blend(old, s->color_cd, s->we_cd, 2);
+    return old;
+}
+
+static void gl2_set_pixel(SGIGL2State *s, int x, int y, uint8_t val)
 {
     if ((unsigned)x >= GL2_XDIM || (unsigned)y >= GL2_YDIM) {
         return;
     }
-    s->fb[y * GL2_XDIM + x] = color & (GL2_NCOLOR - 1);
+    s->fb[y * GL2_XDIM + x] = val;
 }
 
-static void gl2_fill_rect(SGIGL2State *s, int x0, int y0, int x1, int y1,
-                          uint16_t color)
+static void gl2_fill_rect(SGIGL2State *s, int x0, int y0, int x1, int y1)
 {
     int x, y;
 
     for (y = y0; y <= y1; y++) {
         for (x = x0; x <= x1; x++) {
-            gl2_set_pixel(s, x, y, color);
+            if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
+                gl2_set_pixel(s, x, y,
+                              gl2_planes(s, s->fb[y * GL2_XDIM + x]));
+            }
         }
     }
 }
@@ -141,7 +171,7 @@ static void gl2_fill_rect(SGIGL2State *s, int x0, int y0, int x1, int y1,
  * byte is the leftmost pixel.  Glyph cells are 8 wide by 16 tall
  * (CHARWIDTH/CHARHEIGHT).
  */
-static void gl2_drawchar(SGIGL2State *s, uint16_t color)
+static void gl2_drawchar(SGIGL2State *s)
 {
     /*
      * The PROM loads the glyph's font address straight into the FMAB buffer
@@ -154,12 +184,13 @@ static void gl2_drawchar(SGIGL2State *s, uint16_t color)
     for (gy = 0; gy < 16; gy++) {
         for (gx = 0; gx < 8; gx++) {
             uint16_t w = s->font[(addr + gy) % GL2_FONT_WORDS];
+            int px = (int16_t)s->buf[UC_XSB] + gx;
+            int py = (int16_t)s->buf[UC_YSB] + gy;
+
             bit = (w >> (15 - gx)) & 1;
-            if (bit) {
-                gl2_set_pixel(s,
-                              (int16_t)s->buf[UC_XSB] + gx,
-                              (int16_t)s->buf[UC_YSB] + gy,
-                              color);
+            if (bit && (unsigned)px < GL2_XDIM && (unsigned)py < GL2_YDIM) {
+                gl2_set_pixel(s, px, py,
+                              gl2_planes(s, s->fb[py * GL2_XDIM + px]));
             }
         }
     }
@@ -167,8 +198,6 @@ static void gl2_drawchar(SGIGL2State *s, uint16_t color)
 
 static void gl2_exec(SGIGL2State *s, unsigned cmd, uint16_t val)
 {
-    uint16_t color = s->color_ab;
-
     if (s->trace) {
         fprintf(stderr, "gl2: cmd=0x%02x val=0x%04x ab=0x%04x we=0x%04x "
                 "box=(%d,%d)-(%d,%d) fmaddr=0x%x fmab=0x%x\n", cmd, val,
@@ -204,19 +233,33 @@ static void gl2_exec(SGIGL2State *s, unsigned cmd, uint16_t val)
         break;
     case UC_FILLRECT:
         gl2_fill_rect(s, (int16_t)s->buf[UC_XSB], (int16_t)s->buf[UC_YSB],
-                      (int16_t)s->buf[UC_XEB], (int16_t)s->buf[UC_YEB], color);
+                      (int16_t)s->buf[UC_XEB], (int16_t)s->buf[UC_YEB]);
         break;
     case UC_DRAWCHAR:
-        gl2_drawchar(s, color);
+        gl2_drawchar(s);
         break;
-    case UC_DRAWPIXELAB:
-        gl2_set_pixel(s, (int16_t)s->buf[UC_XSB], (int16_t)s->buf[UC_YSB],
-                      color);
+    case UC_DRAWPIXELAB: {
+        int x = (int16_t)s->buf[UC_XSB], y = (int16_t)s->buf[UC_YSB];
+
+        if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
+            uint8_t old = s->fb[y * GL2_XDIM + x];
+
+            old = gl2_blend(old, s->color_ab, s->we_ab, 0);
+            gl2_set_pixel(s, x, y, old);
+        }
         break;
-    case UC_DRAWPIXELCD:
-        gl2_set_pixel(s, (int16_t)s->buf[UC_XSB], (int16_t)s->buf[UC_YSB],
-                      s->color_cd);
+    }
+    case UC_DRAWPIXELCD: {
+        int x = (int16_t)s->buf[UC_XSB], y = (int16_t)s->buf[UC_YSB];
+
+        if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
+            uint8_t old = s->fb[y * GL2_XDIM + x];
+
+            old = gl2_blend(old, s->color_cd, s->we_cd, 2);
+            gl2_set_pixel(s, x, y, old);
+        }
         break;
+    }
     case UC_READFONT:
     case UC_READREPEAT:
     case UC_SAVEWORD:
@@ -354,7 +397,7 @@ static void gl2_gfx_update(void *opaque)
     dest = (uint32_t *)surface_data(surface);
     for (y = 0; y < GL2_YDIM; y++) {
         for (x = 0; x < GL2_XDIM; x++) {
-            uint16_t c = s->fb[y * GL2_XDIM + x] & (GL2_NCOLOR - 1);
+            uint8_t c = s->fb[y * GL2_XDIM + x];
             uint8_t *rgb = s->cmap[s->cur_map][c];
             dest[y * GL2_XDIM + x] = rgb_to_pixel32(rgb[0], rgb[1], rgb[2]);
         }
@@ -393,7 +436,7 @@ static void gl2_test_pattern(SGIGL2State *s)
 
     for (y = 0; y < GL2_YDIM; y++) {
         for (x = 0; x < GL2_XDIM; x++) {
-            uint16_t c;
+            uint8_t c;
             if (y < GL2_YDIM / 4) {
                 c = (x / 64) & 0x0f;                 /* vertical bars   */
             } else if (y < GL2_YDIM / 2) {
@@ -430,7 +473,7 @@ static void gl2_reset(DeviceState *dev)
     s->fbc_data = 0;
     s->cur_map = 0;
     if (s->fb) {
-        memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint16_t));
+        memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
     }
     memset(s->font, 0, sizeof(s->font));
     gl2_cmap_default(s);
@@ -453,7 +496,7 @@ static void gl2_init(Object *obj)
     SGIGL2State *s = SGI_GL2(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint16_t));
+    s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
     memory_region_init_io(&s->mmio, obj, &gl2_ops, s, "sgi-gl2",
                           GL2_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
