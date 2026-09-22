@@ -802,9 +802,13 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
                     val = 0; /* header type 0, single function */
                     break;
                 case 0x10:
-                    val = isp->pci_bar[0];
+                    /* BAR0: I/O space, 256-byte decode.  Bit 0 reads back
+                     * set (I/O indicator); the sizing probe returns the size
+                     * mask | 0x1 = 0xffffff01. */
+                    val = isp->pci_bar[0] | 0x1;
                     break;
                 case 0x14:
+                    /* BAR1: memory space, 4 KB decode (0xfffff000). */
                     val = isp->pci_bar[1];
                     break;
                 default:
@@ -966,16 +970,15 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                     isp->pci_cmd = val;
                     break;
                 case 0x10:
-                    /* PCI BAR size mask, 1 MB per BAR.  Measured from the guest
-                     * (BRIDGECFG trace): it does the all-ones size probe (write
-                     * 0xffffffff, read back the mask) and allocates sequentially
-                     * by the probed size.  Two 1 MB BARs fill a device's 2 MB
-                     * DevIO window, landing dev0 at 0x200000 and dev1 at 0x400000
-                     * -- their BRIDGE_DEVIO windows (sys/PCI/bridge.h). */
-                    isp->pci_bar[0] = val & 0xfff00000;
+                    /* BAR0: I/O space, 256 bytes.  The implemented bits are
+                     * [15:8]; bits [7:1] read back as the size mask (zero for
+                     * 256 B) and bit 0 is the I/O indicator (added on read).
+                     * The all-ones probe therefore returns 0xffffff01. */
+                    isp->pci_bar[0] = val & 0xffffff00;
                     break;
                 case 0x14:
-                    isp->pci_bar[1] = val & 0xfff00000;
+                    /* BAR1: memory space, 4 KB decode -> mask 0xfffff000. */
+                    isp->pci_bar[1] = val & 0xfffff000;
                     break;
                 default:
                     break;
