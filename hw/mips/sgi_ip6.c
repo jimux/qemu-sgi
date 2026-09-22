@@ -107,7 +107,9 @@
 #define SGI_IP6_SCSIRST_BASE 0x1fa80000ULL
 #define SGI_IP6_SCSIRST_SIZE 0x10
 
-/* LIO interrupt bits */
+/* LIO interrupt bits (MAME ip6.cpp lio_int_number) */
+#define LIO_GE              6   /* ge interrupt: asserted by the GE5 */
+#define LIO_FIFO            7
 #define LIO_SCSI            4
 #define LIO_ENET            5
 
@@ -178,6 +180,7 @@ typedef struct SGIip6State {
     uint32_t gr1_finish[2];
     uint32_t gr1_code_data;   /* data/buffer FIFO (simplified) */
     bool gr1_kicked;
+    QEMUTimer *gr1_ge_timer;   /* releases the GE LIO bit when it completes */
     uint8_t gr1_dr[5];        /* dr0..dr4 display registers */
 
     PCNetState *lance;
@@ -1000,6 +1003,19 @@ static int gr1_dr_hit(uint32_t eff, unsigned size)
 #define GR1_COMMAND   0x8640u
 #define GR1_PC_REG    0x8740u
 
+/*
+ * The engine "completes": release the LIO ge bit so the status returns to
+ * idle.  We do not execute microcode, but a completion edge is the visible
+ * contract the firmware expects.
+ */
+static void sgi_ip6_gr1_ge_done(void *opaque)
+{
+    SGIip6State *s = opaque;
+
+    s->lio_isr |= (1u << LIO_GE);
+    sgi_ip6_lio_update(s);
+}
+
 static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
@@ -1077,6 +1093,16 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
          * instrument rule.
          */
         s->gr1_kicked = true;
+        /*
+         * The engine signals completion with the LIO ge interrupt.  We do
+         * not execute the microcode, but the firmware's contract is that a
+         * kicked engine asserts this bit, so satisfy the visible contract
+         * rather than the engine's internals.
+         */
+        s->lio_isr &= ~(1u << LIO_GE);
+        sgi_ip6_lio_update(s);
+        timer_mod(s->gr1_ge_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2 * NANOSECONDS_PER_SECOND / 1000);
         qemu_log_mask(LOG_UNIMP, "sgi-ip6-gr1: GE5 command 0x%" PRIx64
                       " accepted; no microcode interpreter modelled\n", val);
     } else if (eff >= 0x8000 && eff < 0xa000) {
@@ -1706,6 +1732,7 @@ static void sgi_ip6_init(MachineState *machine)
     s->gr1_mar = 0;
     s->gr1_pc = 0;
     s->gr1_kicked = false;
+    s->gr1_ge_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_ip6_gr1_ge_done, s);
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
     create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
     create_unimplemented_device("sgi-ip6-gio", 0x1f400000, 0x400000);
@@ -1737,6 +1764,13 @@ static void sgi_ip6_init(MachineState *machine)
     s->lio_int = false;
     s->pit0_level = true;   /* PIT output is high out of reset; see out0 */
     s->pit0_programmed = false;
+    /*
+     * LIO status bits are active low: set = idle, clear = asserted.  The GE
+     * bit is asserted only while the graphics engine is working: the
+     * firmware's download routine kicks the engine and reads the bit to
+     * decide whether it responded, then the engine releases it again, so it
+     * must be transient rather than held.
+     */
     s->lio_isr = 0x3ff;
     s->lio_imr = 0;
 }
