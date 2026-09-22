@@ -22,6 +22,7 @@
 #include "qapi/error.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -72,6 +73,34 @@
 #define REG_STKBASE         0x0e000000
 #define REG_STKLIMIT        0x0f000000
 
+/* Multibus: 1 MB memory window, 1 MB map registers, 64 KB I/O (cpureg.h) */
+#define IP2_MB_MEM_BASE     0x40000000
+#define IP2_MB_REG_BASE     0x40100000
+#define IP2_MB_IO_BASE      0x50000000
+#define IP2_MB_MAP_ENTRIES  1024
+
+/* Interphase 2190 SMD controller in Multibus I/O space (iphreg.h) */
+#define IP2190_PORT         0x7010
+#define IP2190_R1           (IP2190_PORT + 0)
+#define IP2190_R0           (IP2190_PORT + 1)
+#define IP2190_R3           (IP2190_PORT + 2)
+#define IP2190_R2           (IP2190_PORT + 3)
+#define IP2190_GO           0x21
+#define IP2190_CLEAR        0x22
+#define IP2190_BUSY         0x01
+#define IP2190_DONE         0x02
+#define IP2190_S_OK         0x80
+#define IP2190_S_ERROR      0x82
+#define IP2190_C_READ       0x81
+#define IP2190_C_WRITE      0x82
+#define IP2190_C_VERIFY     0x83
+#define IP2190_C_INIT       0x87
+#define IP2190_C_RESTORE    0x89
+#define IP2190_C_SEEK       0x8a
+#define IP2190_C_READABS    0x93
+#define IP2190_C_READNOCACHE 0x94
+#define IP2190_SECTOR       512
+
 typedef struct SGIIP2Seg {
     struct SGIIP2State *s;
     int seg;
@@ -88,9 +117,21 @@ struct SGIIP2State {
     MemoryRegion page;
     MemoryRegion seg[3];
     SGIIP2Seg seg_ctx[3];
+    MemoryRegion mbmem;
+    MemoryRegion mbreg;
+    MemoryRegion mbio;
 
     uint8_t *ram;
     uint32_t page_tbl[IP2_PAGE_ENTRIES];
+    uint16_t mb_map[IP2_MB_MAP_ENTRIES];
+
+    /* Interphase 2190 state */
+    uint8_t ip_iopb_addr[3];
+    uint8_t ip_reg0;
+    bool ip_done;
+    uint8_t ip_heads;
+    uint8_t ip_spt;
+    BlockBackend *disk;
 
     uint16_t base[3];
     uint16_t limit[3];
@@ -346,6 +387,221 @@ static const MemoryRegionOps ip2_page_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * Multibus memory access by a card (the 2190 DMA engine). A 24-bit Multibus
+ * address is translated through the map registers into system RAM, mirroring
+ * what a CPU access to the segment-4 window does.
+ */
+static void ip2_mb_xfer(SGIIP2State *s, uint32_t mbaddr, uint8_t *buf,
+                        int len, bool write)
+{
+    int i;
+
+    for (i = 0; i < len; i++) {
+        uint32_t a = mbaddr + i;
+        uint32_t page = s->mb_map[(a >> 12) & (IP2_MB_MAP_ENTRIES - 1)] & 0x3fff;
+        uint32_t phys = (page << 12) | (a & 0xfff);
+
+        if (write) {
+            ip2_ram_write(s, phys, buf[i], 1);
+        } else {
+            buf[i] = ip2_ram_read(s, phys, 1);
+        }
+    }
+}
+
+static uint64_t ip2_mbmem_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIIP2State *s = opaque;
+    uint32_t page = s->mb_map[(addr >> 12) & (IP2_MB_MAP_ENTRIES - 1)] & 0x3fff;
+    uint32_t phys = (page << 12) | (addr & 0xfff);
+
+    return ip2_ram_read(s, phys, size);
+}
+
+static void ip2_mbmem_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    SGIIP2State *s = opaque;
+    uint32_t page = s->mb_map[(addr >> 12) & (IP2_MB_MAP_ENTRIES - 1)] & 0x3fff;
+    uint32_t phys = (page << 12) | (addr & 0xfff);
+
+    ip2_ram_write(s, phys, val, size);
+}
+
+static const MemoryRegionOps ip2_mbmem_ops = {
+    .read = ip2_mbmem_read,
+    .write = ip2_mbmem_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static uint64_t ip2_mbreg_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIIP2State *s = opaque;
+
+    return s->mb_map[(addr >> 12) & (IP2_MB_MAP_ENTRIES - 1)];
+}
+
+static void ip2_mbreg_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    SGIIP2State *s = opaque;
+
+    s->mb_map[(addr >> 12) & (IP2_MB_MAP_ENTRIES - 1)] = val;
+}
+
+static const MemoryRegionOps ip2_mbreg_ops = {
+    .read = ip2_mbreg_read,
+    .write = ip2_mbreg_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * Interphase 2190 SMD controller. The driver (stand/lib/dev/iph.c and the
+ * kernel's sys/multibus/iph.c) builds an IOPB in Multibus memory, points the
+ * controller at it with R1/R2/R3, then writes IP_GO to R0 and polls the IOPB
+ * status and R0's DONE bit. Commands complete synchronously here.
+ */
+static void ip2190_go(SGIIP2State *s)
+{
+    uint32_t iopb_mb = ((uint32_t)(s->ip_iopb_addr[0] & 0x0f) << 16) |
+                       ((uint32_t)s->ip_iopb_addr[1] << 8) |
+                       s->ip_iopb_addr[2];
+    uint8_t iopb[24];
+    uint8_t cmd, head, status = IP2190_S_OK, error = 0;
+    uint16_t cyl, sec, cnt;
+    uint32_t buf;
+    uint8_t heads, spt;
+    uint64_t lba;
+    int len;
+
+    ip2_mb_xfer(s, iopb_mb, iopb, sizeof(iopb), false);
+    /*
+     * The 2190 sees the IOPB through 16-bit words, so each byte pair is
+     * swapped relative to the m68k's struct layout; the field offsets in
+     * iphreg.h are the controller's. CPU offsets are one earlier in each
+     * pair (cmd at 1, status at 3, unit at 5, bufh at 0xc, ...).
+     */
+    cmd = iopb[1];
+    head = iopb[4];
+    cyl = (iopb[7] << 8) | iopb[6];
+    sec = (iopb[9] << 8) | iopb[8];
+    cnt = (iopb[0xb] << 8) | iopb[0xa];
+    buf = ((uint32_t)iopb[0xc] << 16) | ((uint32_t)iopb[0xf] << 8) | iopb[0xe];
+
+    switch (cmd) {
+    case IP2190_C_INIT: {
+        uint8_t uib[2];
+
+        ip2_mb_xfer(s, buf, uib, sizeof(uib), false);
+        s->ip_heads = uib[1];   /* struct uib order: spt@0, hds@1 */
+        s->ip_spt = uib[0];
+        if (!s->ip_heads || !s->ip_spt) {
+            s->ip_heads = 1;
+            s->ip_spt = 64;
+        }
+        break;
+    }
+    case IP2190_C_READ:
+    case IP2190_C_READABS:
+    case IP2190_C_READNOCACHE:
+    case IP2190_C_VERIFY:
+    case IP2190_C_WRITE: {
+        uint8_t *tmp;
+
+        heads = s->ip_heads ? s->ip_heads : 1;
+        spt = s->ip_spt ? s->ip_spt : 64;
+        lba = (uint64_t)((uint32_t)cyl * heads + head) * spt + sec;
+        len = (int)cnt * IP2190_SECTOR;
+        if (len <= 0 || len > 64 * 1024) {
+            status = IP2190_S_ERROR;
+            error = 0x16; /* invalid sector in command */
+            break;
+        }
+        tmp = g_malloc(len);
+        if (!s->disk) {
+            status = IP2190_S_ERROR;
+            error = 0x10; /* disk not ready */
+        } else if (cmd == IP2190_C_WRITE) {
+            ip2_mb_xfer(s, buf, tmp, len, false);
+            if (blk_pwrite(s->disk, lba * IP2190_SECTOR, len, tmp, 0) < 0) {
+                status = IP2190_S_ERROR;
+                error = 0x18; /* bus timeout */
+            }
+        } else if (blk_pread(s->disk, lba * IP2190_SECTOR, len, tmp, 0) < 0) {
+            status = IP2190_S_ERROR;
+            error = 0x10;
+        } else if (cmd != IP2190_C_VERIFY) {
+            ip2_mb_xfer(s, buf, tmp, len, true);
+        }
+        g_free(tmp);
+        break;
+    }
+    case IP2190_C_RESTORE:
+    case IP2190_C_SEEK:
+        break;
+    default:
+        status = IP2190_S_ERROR;
+        error = 0x14; /* invalid command code */
+        break;
+    }
+
+    iopb[3] = status;   /* controller i_status */
+    iopb[2] = error;    /* controller i_error  */
+    ip2_mb_xfer(s, iopb_mb, iopb, sizeof(iopb), true);
+    s->ip_done = true;
+}
+
+static uint64_t ip2_mbio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIIP2State *s = opaque;
+
+    if (addr == IP2190_R0) {
+        return s->ip_done ? IP2190_DONE : 0;
+    }
+    return 0;
+}
+
+static void ip2_mbio_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    SGIIP2State *s = opaque;
+
+    switch (addr) {
+    case IP2190_R0:
+        if (val == IP2190_CLEAR) {
+            s->ip_done = false;
+        } else if (val == IP2190_GO) {
+            s->ip_done = false;
+            ip2190_go(s);
+        }
+        break;
+    case IP2190_R1:
+        s->ip_iopb_addr[0] = val;
+        break;
+    case IP2190_R3:
+        s->ip_iopb_addr[2] = val;
+        break;
+    case IP2190_R2:
+        s->ip_iopb_addr[1] = val;
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps ip2_mbio_ops = {
+    .read = ip2_mbio_read,
+    .write = ip2_mbio_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void ip2_load_prom(SGIIP2State *s, Error **errp)
 {
     g_autofree gchar *data = NULL;
@@ -413,6 +669,19 @@ static void ip2_realize(DeviceState *dev, Error **errp)
                                             (hwaddr)i * IP2_SYS_SIZE,
                                             &s->seg[i], (i == 0) ? 0 : 1);
     }
+
+    memory_region_init_io(&s->mbmem, OBJECT(s), &ip2_mbmem_ops, s,
+                          "ip2.mbmem", 0x100000);
+    memory_region_add_subregion(get_system_memory(), IP2_MB_MEM_BASE,
+                                &s->mbmem);
+    memory_region_init_io(&s->mbreg, OBJECT(s), &ip2_mbreg_ops, s,
+                          "ip2.mbreg", 0x100000);
+    memory_region_add_subregion(get_system_memory(), IP2_MB_REG_BASE,
+                                &s->mbreg);
+    memory_region_init_io(&s->mbio, OBJECT(s), &ip2_mbio_ops, s,
+                          "ip2.mbio", 0x10000);
+    memory_region_add_subregion(get_system_memory(), IP2_MB_IO_BASE,
+                                &s->mbio);
 }
 
 static void ip2_reset(DeviceState *dev)
@@ -425,6 +694,11 @@ static void ip2_reset(DeviceState *dev)
     s->rtc_ctrl = 0;
     s->rtc_addr = 0;
     memset(s->page_tbl, 0, sizeof(s->page_tbl));
+    memset(s->mb_map, 0, sizeof(s->mb_map));
+    s->ip_iopb_addr[0] = s->ip_iopb_addr[1] = s->ip_iopb_addr[2] = 0;
+    s->ip_done = false;
+    s->ip_heads = 0;
+    s->ip_spt = 0;
     if (s->ram) {
         memset(s->ram, 0, IP2_RAM_SIZE);
     }
@@ -439,6 +713,7 @@ MemoryRegion *sgi_ip2_sys_region(DeviceState *dev)
 static const Property ip2_properties[] = {
     DEFINE_PROP_STRING("prom", SGIIP2State, prom_file),
     DEFINE_PROP_UINT16("swreg", SGIIP2State, swreg, 0x0005),
+    DEFINE_PROP_DRIVE("drive", SGIIP2State, disk),
 };
 
 static void ip2_class_init(ObjectClass *oc, const void *data)

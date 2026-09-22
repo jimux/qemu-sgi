@@ -14,6 +14,8 @@
 #include "qemu/units.h"
 #include "system/system.h"
 #include "system/reset.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "exec/cpu-common.h"
 #include "cpu.h"
 #include "hw/core/boards.h"
@@ -63,6 +65,12 @@ static void iris3130_init(MachineState *machine)
     board = qdev_new(TYPE_SGI_IP2);
     qdev_prop_set_string(board, "prom",
                          machine->firmware ? machine->firmware : "");
+
+    DriveInfo *dinfo = drive_get(IF_NONE, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive(board, "drive", blk_by_legacy_dinfo(dinfo));
+    }
+
     sysbus_realize(SYS_BUS_DEVICE(board), &error_fatal);
     sys = sgi_ip2_sys_region(board);
 
