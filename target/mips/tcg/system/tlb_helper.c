@@ -1244,8 +1244,15 @@ void mips_cpu_do_interrupt(CPUState *cs)
     case EXCP_TLBL:
         cause = 2;
         update_badinstr = !(env->error_code & EXCP_INST_NOTAVAIL);
+        /*
+         * On the R2000/R3000 there is no EXL: bit 1 of Status is KUc (the
+         * pushed previous-mode bit, see cpu.h), so testing CP0St_EXL would
+         * read KUc and misroute a user-mode miss to the general vector.  A
+         * MIPS-I refill is selected purely by the no-match flag.
+         */
         if ((env->error_code & EXCP_TLB_NOMATCH) &&
-            !(env->CP0_Status & (1 << CP0St_EXL))) {
+            (env->cpu_model->mmu_type == MMU_TYPE_R3000 ||
+             !(env->CP0_Status & (1 << CP0St_EXL)))) {
 #if defined(TARGET_MIPS64)
             int R = env->CP0_BadVAddr >> 62;
             int UX = (env->CP0_Status & (1 << CP0St_UX)) != 0;
@@ -1265,8 +1272,15 @@ void mips_cpu_do_interrupt(CPUState *cs)
     case EXCP_TLBS:
         cause = 3;
         update_badinstr = 1;
+        /*
+         * On the R2000/R3000 there is no EXL: bit 1 of Status is KUc (the
+         * pushed previous-mode bit, see cpu.h), so testing CP0St_EXL would
+         * read KUc and misroute a user-mode miss to the general vector.  A
+         * MIPS-I refill is selected purely by the no-match flag.
+         */
         if ((env->error_code & EXCP_TLB_NOMATCH) &&
-            !(env->CP0_Status & (1 << CP0St_EXL))) {
+            (env->cpu_model->mmu_type == MMU_TYPE_R3000 ||
+             !(env->CP0_Status & (1 << CP0St_EXL)))) {
 #if defined(TARGET_MIPS64)
             int R = env->CP0_BadVAddr >> 62;
             int UX = (env->CP0_Status & (1 << CP0St_UX)) != 0;
