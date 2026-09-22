@@ -43,7 +43,7 @@
 #define KBD_CMD_GET_ID          0xF2    /* get keyboard ID */
 #define KBD_CMD_SET_RATE        0xF3    /* Set typematic rate */
 #define KBD_CMD_ENABLE          0xF4    /* Enable scanning */
-#define KBD_CMD_RESET_DISABLE   0xF5    /* reset and disable scanning */
+#define KBD_CMD_RESET_DISABLE   0xF5    /* disable scanning (keeps scan code set) */
 #define KBD_CMD_RESET_ENABLE    0xF6    /* reset and enable scanning */
 #define KBD_CMD_RESET           0xFF    /* Reset */
 #define KBD_CMD_SET_MAKE_BREAK  0xFC    /* Set Make and Break mode */
@@ -629,7 +629,16 @@ void ps2_write_keyboard(PS2KbdState *s, int val)
             ps2_cqueue_1(ps2, KBD_REPLY_ACK);
             break;
         case KBD_CMD_RESET_DISABLE:
-            ps2_reset_keyboard(s);
+            /*
+             * Disable scanning only.  Per the IBM PS/2 keyboard command set
+             * this does NOT reset the device: in particular the currently
+             * selected scan code set must survive (0xF6 "Set Default" and
+             * 0xFF "Reset" are the commands that restore set 2).  IRIX's O2
+             * pckm selects set 3 once during attach and relies on it
+             * persisting across the 0xF5 that precedes its re-init; resetting
+             * the device here left our model emitting set-2 codes to a driver
+             * decoding set 3 (0x14 = LCtrl in set 2 is Caps Lock in set 3).
+             */
             s->scan_enabled = 0;
             ps2_cqueue_1(ps2, KBD_REPLY_ACK);
             break;
