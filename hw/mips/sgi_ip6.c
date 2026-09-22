@@ -27,6 +27,7 @@
 #include "hw/core/qdev.h"
 #include "hw/core/loader.h"
 #include "hw/char/sgi_scn2681.h"
+#include "hw/misc/sgi_ip6_input.h"
 #include "hw/isa/isa.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/unimp.h"
@@ -165,6 +166,7 @@ typedef struct SGIip6State {
     MIPSCPU *cpu;
     WD33C93State *scsi;
     SCN2681State *duart[2];
+    SgiIp6InputState *mouse;
 
     PCNetState *lance;
     DeviceState *lance_dev;
@@ -1434,16 +1436,24 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_add_subregion(system_memory, SGI_IP6_SCSIRST_BASE,
                                 &s->scsi_reset);
 
+    /* IP6 mouse: Mouse Systems peer on DUART0-B (serial chardevs unused). */
+    s->mouse = SGI_IP6_INPUT(qdev_new(TYPE_SGI_IP6_INPUT));
+    qdev_realize(DEVICE(s->mouse), NULL, &error_fatal);
+
     /* Two SCN2681 DUARTs: 0 = keyboard/mouse, 1 = serial ports. */
     for (int i = 0; i < 2; i++) {
         int ch;
 
         s->duart[i] = SGI_SCN2681(qdev_new(TYPE_SGI_SCN2681));
         for (ch = 0; ch < 2; ch++) {
-            if (serial_hd(i * 2 + ch)) {
+            Chardev *chr = serial_hd(i * 2 + ch);
+
+            if (i == 0 && ch == 1) {
+                chr = sgi_ip6_input_chardev(s->mouse);
+            }
+            if (chr) {
                 qdev_prop_set_chr(DEVICE(s->duart[i]),
-                                  ch ? "chardev-b" : "chardev-a",
-                                  serial_hd(i * 2 + ch));
+                                  ch ? "chardev-b" : "chardev-a", chr);
             }
         }
         qdev_realize(DEVICE(s->duart[i]), NULL, &error_fatal);

@@ -1,3 +1,7 @@
 # malta.c
 malta_fpga_leds(const char *text) "LEDs %s"
 malta_fpga_display(const char *text) "ASCII '%s'"
+
+# sgi_ip6_input.c
+sgi_ip6_input_report(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4) "mouse report %02x %02x %02x %02x %02x"
+sgi_ip6_input_drain(int n) "mouse peer drained %d byte(s) to the DUART"

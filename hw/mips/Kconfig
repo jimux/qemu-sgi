@@ -110,7 +110,13 @@ config SGI_IP6
     select NMC93XX_EEPROM
     select WD33C93
     select SGI_SCN2681
+    select SGI_IP6_INPUT
     select UNIMP
+
+# IP6 serial keyboard/mouse HLE: the mouse is a Mouse Systems peer on
+# DUART0-B (the keyboard, DUART0-A, is 600-8-O-1 and still to come).
+config SGI_IP6_INPUT
+    bool
 
 # Virtuix (IP55) -- SGI-Indy-derived virtualization-native SMP machine. Built
 # from its OWN device copies (sgi_*_virtuix.c / TYPE_*_VIRTUIX) so changes to
