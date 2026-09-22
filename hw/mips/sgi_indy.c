@@ -49,6 +49,7 @@
 #include "hw/misc/sgi_hpc3.h"
 #include "hw/misc/sgi_mc.h"
 #include "hw/misc/sgi_vino.h"
+#include "hw/misc/sgi_gr2.h"
 #include "hw/misc/unimp.h"
 #include "hw/scsi/scsi.h"
 #include "qapi/error.h"
@@ -328,6 +329,7 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   DeviceState *hpc3_dev = NULL;
   DeviceState *hpc1_dev = NULL;
   DeviceState *vino_dev = NULL;
+  DeviceState *gr2_dev = NULL;
   MIPSCPU *cpu;
   Clock *cpuclk;
   char *filename;
@@ -336,6 +338,7 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
       (model == SGI_IP22 || model == SGI_IP26 || model == SGI_IP28);
   bool is_ip20 = (model == SGI_IP20);
   bool vino_present = false;
+  bool gr2_present = false;
 
   /* Validate RAM size */
   if (machine->ram_size > SGI_RAM_MAX) {
@@ -452,6 +455,19 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
       g_free(helper);
     }
   }
+
+  /*
+   * GR2 / "Express" graphics (Indy XZ, Indigo XS/XZ, Indigo2, Everest).  On
+   * this machine the GIO graphics slot normally holds Newport; GR2 is opt-in
+   * and defaults OFF so a plain `-M indy` boot is unchanged.  When present it
+   * overlays the low part of the GIO graphics slot (0x1f000000, below the
+   * Newport REX3 window at 0x1f0f0000) so the stock kernel `gr2` driver's
+   * probe finds the HQ2 presence magic.
+   */
+  gr2_dev = qdev_new(TYPE_SGI_GR2);
+  object_property_add_child(OBJECT(machine), "gr2", OBJECT(gr2_dev));
+  gr2_present =
+      object_property_get_bool(OBJECT(gr2_dev), "present", &error_abort);
 
   /* Memory Controller at 0x1fa00000 */
   mc_dev = qdev_new(TYPE_SGI_MC);
@@ -613,6 +629,22 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     create_gio_empty_slot(system_memory, "gio-gfx-high",
                           SGI_GIO_GFX_BASE + REX3_REG_OFFSET + REX3_REG_SIZE,
                           4 * MiB - REX3_REG_OFFSET - REX3_REG_SIZE);
+  }
+
+  /*
+   * GR2 / Express board shell (opt-in).  present=off leaves the empty-slot
+   * stub above untouched, so a plain `-M indy` boot is unchanged.  present=on
+   * overlays the low GIO graphics slot with the GR2 register window; Newport's
+   * REX3 window at 0x1f0f0000 is above it and is unaffected.
+   */
+  /* Realize always: the machine asserts every child device was realized at
+   * finalize.  With present=off the region is simply never mapped, so the
+   * GIO slot still reads all-ones and a plain `-M indy` is unchanged. */
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(gr2_dev), &error_fatal);
+  if (gr2_present) {
+    memory_region_add_subregion_overlap(
+        system_memory, SGI_GIO_GFX_BASE,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(gr2_dev), 0), 1);
   }
 
   create_gio_empty_slot(system_memory, "gio-exp0", SGI_GIO_EXP0_BASE, 2 * MiB);
