@@ -126,6 +126,13 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 
         trace_sgi_gr2_hqread(offset, val, pc);
     }
+    /* The token FIFO is written as the command channel; any READ of it is the
+     * board's read-back/consumption contract, so log those with the PC too. */
+    if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
+        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+
+        trace_sgi_gr2_fiforead(offset, val, pc);
+    }
     return val;
 }
 
