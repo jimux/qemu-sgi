@@ -28,6 +28,7 @@
 #include "hw/core/loader.h"
 #include "hw/char/sgi_scn2681.h"
 #include "hw/misc/sgi_ip6_input.h"
+#include "trace.h"
 #include "hw/isa/isa.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/unimp.h"
@@ -167,6 +168,8 @@ typedef struct SGIip6State {
     WD33C93State *scsi;
     SCN2681State *duart[2];
     SgiIp6InputState *mouse;
+    MemoryRegion gr1_regs;
+    uint32_t gr1_win[0x40];   /* 0x500..0x5ff register window */
 
     PCNetState *lance;
     DeviceState *lance_dev;
@@ -915,6 +918,59 @@ static const MemoryRegionOps sgi_ip6_duart_ops = {
     },
 };
 
+/*
+ * ---- GR1 ("Eclipse") graphics: probe instrument ----------------------
+ *
+ * No registers are modelled yet.  Every access is traced with the guest PC
+ * and the value returned, on the read path as well as the write path, so a
+ * probe that still sees zero says so in the trace rather than leaving the
+ * subsequent fault as the only evidence.  The response the firmware expects
+ * is to be determined from its own use of the value, not invented here.
+ */
+static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint64_t val = 0;
+
+    /*
+     * The firmware's presence probe drives a walking value through the
+     * register windows at 0x500/0x508 and 0x5d0/0x5d8 (index register,
+     * then data register) and reads it back, treating a mismatch as "board
+     * absent".  A window that returns what was written is therefore the
+     * coherent response the probe is asking for; it is derived from the
+     * probe's own use of the value rather than an invented ID.  Nothing
+     * else in the region is modelled yet, so it reads as zero.
+     */
+    if (addr >= 0x500 && addr < 0x600) {
+        val = s->gr1_win[(addr - 0x500) >> 2];
+    }
+    trace_sgi_ip6_gr1_read((uint32_t)s->cpu->env.active_tc.PC,
+                           (uint32_t)addr, (uint32_t)val);
+    return val;
+}
+
+static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    if (addr >= 0x500 && addr < 0x600) {
+        s->gr1_win[(addr - 0x500) >> 2] = val;
+    }
+    trace_sgi_ip6_gr1_write((uint32_t)s->cpu->env.active_tc.PC,
+                            (uint32_t)addr, (uint32_t)val);
+}
+
+static const MemoryRegionOps sgi_ip6_gr1_ops = {
+    .read = sgi_ip6_gr1_read,
+    .write = sgi_ip6_gr1_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static void sgi_ip6_duart_irq(void *opaque, int n, int level)
 {
     SGIip6State *s = opaque;
@@ -1510,7 +1566,9 @@ static void sgi_ip6_init(MachineState *machine)
      * as unimplemented so accesses are logged rather than aborting. */
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
     create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
-    create_unimplemented_device("sgi-ip6-gr1", 0x1f000000, 0x8000);
+    memory_region_init_io(&s->gr1_regs, OBJECT(machine), &sgi_ip6_gr1_ops, s,
+                          "sgi-ip6-gr1", 0x8000);
+    memory_region_add_subregion(system_memory, 0x1f000000, &s->gr1_regs);
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
     create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
     create_unimplemented_device("sgi-ip6-gio", 0x1f400000, 0x400000);
