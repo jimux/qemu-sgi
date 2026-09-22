@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <inttypes.h>
 #include "cpu.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
@@ -171,6 +172,12 @@ typedef struct SGIip6State {
     MemoryRegion gr1_regs;
     uint32_t gr1_win[0x800];  /* upper bank 0x8000..0x9fff (2048 words) */
     uint8_t gr1_bank;         /* mar_msb: bank selected at 0x0e00..0x0e07 */
+    uint32_t *gr1_code;       /* GE5 microcode store (2 words per uword) */
+    uint8_t gr1_mar;          /* microcode address register (page) */
+    uint16_t gr1_pc;          /* microcode PC, read back by the firmware */
+    uint32_t gr1_finish[2];
+    uint32_t gr1_code_data;   /* data/buffer FIFO (simplified) */
+    bool gr1_kicked;
     uint8_t gr1_dr[5];        /* dr0..dr4 display registers */
 
     PCNetState *lance;
@@ -969,6 +976,30 @@ static int gr1_dr_hit(uint32_t eff, unsigned size)
     return -1;
 }
 
+/*
+ * ---- GE5 microcode download path (stage 2, bounded experiment) ----------
+ *
+ * Only the download is modelled: the microcode store, the address register
+ * "mar" (a page: m_pc = offset | (mar & 0x7f) << 8), the PC the firmware
+ * reads back, and the command write that kicks the engine.  There is no
+ * instruction interpreter yet - the experiment is whether the firmware's
+ * test only needs the download to land and the read-back to move, or
+ * whether it executes microcode and needs the real engine.
+ *
+ * code_w has High/Low halves carrying a second instruction word; MAME
+ * forces the secondary-instruction bit on the High write (its FIXME, kept
+ * verbatim because it is documented behaviour rather than a bug).
+ */
+#define GR1_CODE_LO   0x0000u   /* bank-relative */
+#define GR1_BUF       0x0800u
+#define GR1_MAR       0x0c00u
+#define GR1_MAR_MSB   0x0e00u
+#define GR1_DATA      0x1400u
+#define GR1_FINISH    0x2000u
+#define GR1_CODE_HI   0x8000u
+#define GR1_COMMAND   0x8640u
+#define GR1_PC_REG    0x8740u
+
 static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
@@ -979,13 +1010,22 @@ static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
 
     i = gr1_dr_hit(eff, size);
     if (i >= 0) {
-        /* Modelled register: returns its own value, not window contents. */
         val = (uint32_t)s->gr1_dr[i] & gr1_drs[i].rmask;
+    } else if (eff < GR1_CODE_LO + 0x400) {
+        uint16_t pc = eff | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
+
+        val = s->gr1_code[pc * 2];
+    } else if (eff >= GR1_CODE_HI && eff < GR1_CODE_HI + 0x400) {
+        uint16_t pc = (eff - GR1_CODE_HI) | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
+
+        val = s->gr1_code[pc * 2 + 1];
+    } else if (eff >= GR1_PC_REG && eff < GR1_PC_REG + 4) {
+        val = s->gr1_pc;
+    } else if (eff >= GR1_FINISH && eff < GR1_FINISH + 8) {
+        val = s->gr1_finish[(eff - GR1_FINISH) >> 2];
+    } else if (eff >= GR1_BUF && eff < GR1_BUF + 0x400) {
+        val = s->gr1_code_data;
     } else if (eff >= 0x8000 && eff < 0xa000) {
-        /*
-         * Upper bank: the RAMDAC/cursor windows the firmware pokes.  These
-         * return what was written (the presence probe's contract).
-         */
         val = s->gr1_win[(eff - 0x8000) >> 2];
     }
     trace_sgi_ip6_gr1_read((uint32_t)s->cpu->env.active_tc.PC,
@@ -1001,8 +1041,7 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
     uint32_t eff = base + (uint32_t)addr;
     int i;
 
-    if (addr >= 0x0e00 && addr <= 0x0e07) {
-        /* mar_msb: selects which 0x2000 bank the window shows. */
+    if (addr >= GR1_MAR_MSB && addr <= GR1_MAR_MSB + 7) {
         s->gr1_bank = (uint8_t)addr & 7;
     }
 
@@ -1010,6 +1049,36 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
     if (i >= 0) {
         s->gr1_dr[i] = (s->gr1_dr[i] & ~gr1_drs[i].wmask)
                      | ((uint8_t)val & gr1_drs[i].wmask);
+    } else if (eff < GR1_CODE_LO + 0x400) {
+        uint16_t pc = eff | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
+
+        s->gr1_code[pc * 2] = val;
+    } else if (eff >= GR1_CODE_HI && eff < GR1_CODE_HI + 0x400) {
+        uint16_t pc = (eff - GR1_CODE_HI) | ((uint16_t)(s->gr1_mar & 0x7f) << 8);
+        uint32_t data = val;
+
+        /* MAME's FIXME, verbatim: force the secondary instruction bit. */
+        if ((data & 0x100) && !(data & 0x10)) {
+            data |= 0x10;
+        }
+        s->gr1_code[pc * 2 + 1] = data;
+    } else if (eff >= GR1_MAR && eff < GR1_MAR + 0x200) {
+        s->gr1_mar = eff & 0x7f;
+    } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
+        s->gr1_code_data = val;
+    } else if (eff >= GR1_FINISH && eff < GR1_FINISH + 8) {
+        s->gr1_finish[(eff - GR1_FINISH) >> 2] = val;
+    } else if (eff >= GR1_COMMAND && eff < GR1_COMMAND + 0x144) {
+        /*
+         * Command write kicks the engine.  With no interpreter the only
+         * honest statement is that the command was accepted; completion is
+         * observable through pc/finish, and the trace shows what the
+         * firmware reads afterwards.  Traced on both paths per the
+         * instrument rule.
+         */
+        s->gr1_kicked = true;
+        qemu_log_mask(LOG_UNIMP, "sgi-ip6-gr1: GE5 command 0x%" PRIx64
+                      " accepted; no microcode interpreter modelled\n", val);
     } else if (eff >= 0x8000 && eff < 0xa000) {
         s->gr1_win[(eff - 0x8000) >> 2] = val;
     }
@@ -1627,12 +1696,16 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_add_subregion(system_memory, 0x1f000000, &s->gr1_regs);
 
     /* GR1 display-register reset values (MAME sgi_gr1_device::device_reset). */
+    s->gr1_code = g_new0(uint32_t, 0x8000 * 2);
     s->gr1_bank = 0;
     s->gr1_dr[0] = 0x09;
     s->gr1_dr[1] = 0x08;
     s->gr1_dr[2] = 0x00;
     s->gr1_dr[3] = 0x00;
     s->gr1_dr[4] = 0x08;
+    s->gr1_mar = 0;
+    s->gr1_pc = 0;
+    s->gr1_kicked = false;
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
     create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
     create_unimplemented_device("sgi-ip6-gio", 0x1f400000, 0x400000);
