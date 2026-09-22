@@ -550,7 +550,16 @@ static void ip2190_go(SGIIP2State *s)
         spt = s->ip_spt ? s->ip_spt : 64;
         lba = (uint64_t)((uint32_t)cyl * heads + head) * spt + sec;
         len = (int)cnt * IP2190_SECTOR;
-        if (len <= 0 || len > 64 * 1024) {
+        /*
+         * cnt is the IOPB's 16-bit sector count, so the controller places no
+         * upper bound tighter than that; only a zero-length transfer is
+         * invalid.  The stand's aligned fsread path DMAs a whole block run
+         * straight into the load address (vmunix: 247/248/146 sectors
+         * = 126464/126976/74752 bytes), so a 64 KB cap silently refused the
+         * load -- _devread returns b_bcount unconditionally and never saw
+         * the error.
+         */
+        if (len <= 0) {
             status = IP2190_S_ERROR;
             error = 0x16; /* invalid sector in command */
             break;
