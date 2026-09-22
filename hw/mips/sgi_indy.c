@@ -48,6 +48,7 @@
 #include "hw/misc/sgi_hpc1.h"
 #include "hw/misc/sgi_hpc3.h"
 #include "hw/misc/sgi_mc.h"
+#include "hw/misc/sgi_vino.h"
 #include "hw/misc/unimp.h"
 #include "hw/scsi/scsi.h"
 #include "qapi/error.h"
@@ -587,6 +588,20 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   if (is_fullhouse) {
     create_gio_empty_slot(system_memory, "eisa-io", SGI_EISA_IO_BASE,
                           SGI_EISA_IO_SIZE);
+  }
+
+  /*
+   * Indy (IP24) VINO video input at the EISA-space base 0x00080000.
+   * Presence is opt-in and DEFAULTS OFF: with present=off the region reads
+   * all-ones exactly like an unmapped aperture, so a plain `-M indy` boot is
+   * unchanged (the VINO probe still fails, VINO is absent).  present=on is
+   * set with `-global sgi-vino.present=on`.  See hw/misc/sgi_vino.c.
+   */
+  if (model == SGI_IP24) {
+    DeviceState *vino_dev = qdev_new(TYPE_SGI_VINO);
+    object_property_add_child(OBJECT(machine), "vino", OBJECT(vino_dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(vino_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(vino_dev), 0, SGI_EISA_IO_BASE);
   }
 
   /*
