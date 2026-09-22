@@ -66,38 +66,41 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
         offset < SGI_GR2_GE_WIN_OFF + SGI_GR2_GE_WIN_WORDS * 4) {
         unsigned idx = (offset - SGI_GR2_GE_WIN_OFF) / 4;
 
-        return sgi_gr2_word_read(
+        val = sgi_gr2_word_read(
             s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][idx], offset & 3, size);
-    }
-    if (offset >= SGI_GR2_HQ_UCODELOAD &&
-        offset < SGI_GR2_HQ_UCODELOAD + 4) {
-        return sgi_gr2_word_read(
+    } else if (offset >= SGI_GR2_HQ_UCODELOAD &&
+               offset < SGI_GR2_HQ_UCODELOAD + 4) {
+        val = sgi_gr2_word_read(
             s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][4], offset & 3, size);
-    }
-    if (offset >= SGI_GR2_HQ_GEPC && offset < SGI_GR2_HQ_GEPC + 4) {
-        return sgi_gr2_word_read(s->gepc, offset & 3, size);
-    }
-    /* HQ2 status: bit 1 reports "ucode ready" once Gr2Start has kicked the
-     * sequencer with the start token; occupancy stays empty (level 0). */
-    if (offset >= SGI_GR2_HQ_FIFOSTAT &&
-        offset < SGI_GR2_HQ_FIFOSTAT + 4) {
-        uint32_t st = s->hq_ready ? SGI_GR2_HQ_READY_BIT : 0;
+    } else if (offset >= SGI_GR2_HQ_GEPC && offset < SGI_GR2_HQ_GEPC + 4) {
+        val = sgi_gr2_word_read(s->gepc, offset & 3, size);
+    } else if (offset >= SGI_GR2_HQ_FIFOSTAT &&
+               offset < SGI_GR2_HQ_FIFOSTAT + 4) {
+        /* HQ2 status: bit 1 reports "ucode ready" once Gr2Start has kicked
+         * the sequencer with the start token; occupancy stays empty. */
+        val = sgi_gr2_word_read(s->hq_ready ? SGI_GR2_HQ_READY_BIT : 0,
+                                offset & 3, size);
+    } else if (offset >= SGI_GR2_XMAP_STATUS &&
+               offset < SGI_GR2_XMAP_STATUS + 4) {
+        /* XMAP status: bit 1 reports "ready"; _Gr2XMAPInit3 spins on it.
+         * The driver byte-reads this (lbu), so the bit must appear in the
+         * addressed byte lane, not as bit 1 of the whole 32-bit word. */
+        val = s->xmap_ready ? SGI_GR2_XMAP_READY_BIT : 0;
+    } else {
+        /* GE units at or above the variant's engine count are not populated,
+         * so the driver's GE-count pattern test stops counting there. */
+        if (offset >= SGI_GR2_GE_OFF &&
+            offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
+            unsigned unit = (offset - SGI_GR2_GE_OFF) / SGI_GR2_GE_STRIDE;
 
-        return sgi_gr2_word_read(st, offset & 3, size);
-    }
-    /* GE units at or above the variant's engine count are not populated, so
-     * the driver's GE-count pattern test stops counting there. */
-    if (offset >= SGI_GR2_GE_OFF &&
-        offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
-        unsigned unit = (offset - SGI_GR2_GE_OFF) / SGI_GR2_GE_STRIDE;
-
-        if (unit >= s->ges) {
-            return ~0ULL;
+            if (unit >= s->ges) {
+                return ~0ULL;
+            }
         }
-    }
-    /* Big-endian byte assembly so byte/half/word accesses agree. */
-    for (i = 0; i < size; i++) {
-        val = (val << 8) | s->regs[offset + i];
+        /* Big-endian byte assembly so byte/half/word accesses agree. */
+        for (i = 0; i < size; i++) {
+            val = (val << 8) | s->regs[offset + i];
+        }
     }
     /* The command/register traffic worth watching (µcode load staging, HQ2,
      * GE and RE3) is all at or above the HQ2 block; the shram and token FIFO
@@ -151,6 +154,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         offset < SGI_GR2_HQ_TOKEN_START + 4) {
         s->hq_ready = true;
     }
+    /* Programming the XMAP control registers makes the mode generator ready
+     * for the driver's poll. */
+    if (offset >= SGI_GR2_XMAP_CTL_OFF && offset < SGI_GR2_XMAP_CTL_END) {
+        s->xmap_ready = true;
+    }
     /* Unpopulated GE units discard writes. */
     if (offset >= SGI_GR2_GE_OFF &&
         offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
@@ -196,6 +204,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     memset(s->ucode, 0, sizeof(s->ucode));
     s->gepc = 0;
     s->hq_ready = false;
+    s->xmap_ready = false;
 
     /* HQ2 presence magic (32-bit BE) read by Gr2Probe. */
     s->regs[SGI_GR2_HQ_MYSTERY + 0] = (SGI_GR2_HQ_MAGIC >> 24) & 0xff;

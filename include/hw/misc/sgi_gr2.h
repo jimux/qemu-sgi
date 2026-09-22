@@ -83,6 +83,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_BDVERS_OFF  0x6c000 /* board version / config / video backend */
 #define SGI_GR2_VC1_OFF     0x6c040 /* VC1 video controller */
 #define SGI_GR2_XMAP_OFF    0x6c100 /* XMAP5 display-mode generators */
+#define SGI_GR2_XMAP_STATUS 0x6c11c /* bit 1 = XMAP ready (polled)       */
+#define SGI_GR2_XMAP_READY_BIT 0x2
+#define SGI_GR2_XMAP_CTL_OFF  0x6c1a0 /* control/data regs written at init */
+#define SGI_GR2_XMAP_CTL_END  0x6c1b8
 #define SGI_GR2_RE3_27_OFF  0x6c200 /* RE3 buffered register set */
 #define SGI_GR2_RE3_24_OFF  0x6c280 /* RE3 unbuffered register set */
 #define SGI_GR2_RE3_32_OFF  0x6c600 /* RE3 32-bit register */
@@ -109,6 +113,7 @@ struct SGIGr2State {
     uint32_t ucode[SGI_GR2_UCODE_PCS][SGI_GR2_UCODE_WORDS];
     uint32_t gepc;
     bool hq_ready;
+    bool xmap_ready;
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */
