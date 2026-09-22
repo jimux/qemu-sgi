@@ -177,6 +177,14 @@ typedef struct SGIip6State {
     WD33C93State *scsi;
     SCN2681State *duart[2];
     SgiIp6InputState *mouse;
+    /*
+     * Keyboard HLE.  Only attached when the machine is told a keyboard is
+     * plugged in (kbd=on): on the real machine duart[0]-A is whatever is
+     * plugged into that DIN-8, so a keyboard and a serial terminal are
+     * mutually exclusive there and the choice is a machine property.
+     */
+    SgiIp6InputState *keyboard;
+    bool kbd;
     /* GR1 "Eclipse" graphics board (hw/display/sgi_gr1.c) */
     DeviceState *gr1;
     MemoryRegion gr1_mirror;
@@ -1539,6 +1547,20 @@ static void sgi_ip6_init(MachineState *machine)
     s->mouse = SGI_IP6_INPUT(qdev_new(TYPE_SGI_IP6_INPUT));
     qdev_realize(DEVICE(s->mouse), NULL, &error_fatal);
 
+    /*
+     * kbd=on models a keyboard plugged into duart[0]-A, so the keyboard HLE
+     * takes that line.  kbd=off (the default) leaves serial_hd(0) there
+     * exactly as before, so every existing harness and the serial Command
+     * Monitor are unchanged.  On the real machine that DIN-8 takes either a
+     * keyboard or a serial terminal, never both, which is why this is a
+     * machine property.
+     */
+    if (s->kbd) {
+        s->keyboard = SGI_IP6_INPUT(qdev_new(TYPE_SGI_IP6_INPUT));
+        qdev_prop_set_bit(DEVICE(s->keyboard), "keyboard", true);
+        qdev_realize(DEVICE(s->keyboard), NULL, &error_fatal);
+    }
+
     /* Two SCN2681 DUARTs: 0 = keyboard/mouse, 1 = serial ports. */
     for (int i = 0; i < 2; i++) {
         int ch;
@@ -1549,6 +1571,8 @@ static void sgi_ip6_init(MachineState *machine)
 
             if (i == 0 && ch == 1) {
                 chr = sgi_ip6_input_chardev(s->mouse);
+            } else if (i == 0 && ch == 0 && s->kbd) {
+                chr = sgi_ip6_input_chardev(s->keyboard);
             }
             if (chr) {
                 qdev_prop_set_chr(DEVICE(s->duart[i]),
@@ -1665,8 +1689,25 @@ static void sgi_ip6_init(MachineState *machine)
     s->lio_imr = 0;
 }
 
+static bool sgi_ip6_kbd_get(Object *obj, Error **errp)
+{
+    return ip6_state.kbd;
+}
+
+static void sgi_ip6_kbd_set(Object *obj, bool value, Error **errp)
+{
+    ip6_state.kbd = value;
+}
+
 static void sgi_ip6_machine_init(MachineClass *mc)
 {
+    object_class_property_add_bool(OBJECT_CLASS(mc), "kbd",
+                                   sgi_ip6_kbd_get, sgi_ip6_kbd_set);
+    object_class_property_set_description(OBJECT_CLASS(mc), "kbd",
+        "on: a keyboard is plugged into duart[0]-A -- the keyboard HLE takes "
+        "that line and the console is the graphics console. "
+        "off (default): duart[0]-A stays the serial console, as before.");
+
     mc->desc = "SGI Personal IRIS 4D/25 (IP6, R3000)";
     mc->init = sgi_ip6_init;
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R3000");

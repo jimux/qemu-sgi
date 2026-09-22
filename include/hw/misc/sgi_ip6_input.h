@@ -31,6 +31,16 @@ struct SgiIp6InputState {
     /* Bytes waiting to go back to the guest (backend -> frontend). */
     uint8_t rx_buf[16];
     int rx_pos, rx_len;
+
+    /*
+     * This instance is the KEYBOARD HLE rather than the mouse.  Same peer
+     * plumbing, different protocol: the guest writes command bytes and we
+     * answer / stream key events, instead of emitting mouse reports.
+     */
+    bool keyboard;
+
+    /* Number of guest command bytes seen (bring-up aid). */
+    unsigned kb_cmds;
 };
 
 Chardev *sgi_ip6_input_chardev(SgiIp6InputState *s);
