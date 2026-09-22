@@ -19,6 +19,7 @@
 #define HW_MISC_SGI_VINO_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_VINO "sgi-vino"
@@ -140,6 +141,19 @@ struct SGIVinoState {
      * the driver programmed (channel A next_4_desc / B mirror). */
     uint32_t dma_base[2];
     uint32_t desc[2][SGI_VINO_DESC_PER_FETCH];
+
+    /* Capture DMA engine state, one per channel (A = 0, B = 1).  The
+     * hardware keeps a four-entry descriptor cache per channel and fetches
+     * the next group of four from next_4_desc (auto-advancing by 16 bytes);
+     * each descriptor names a 4K page that capture DMA fills.  A field ends
+     * with a field-count increment and an EOF interrupt, a stop descriptor
+     * with an EOD interrupt. */
+    QEMUTimer *field_timer;
+    bool dma_en[2];
+    bool cache_valid[2];
+    int cache_pos[2];
+    uint32_t next_desc[2];              /* auto-advancing fetch pointer */
+    uint32_t field_count[2];
 };
 
 
