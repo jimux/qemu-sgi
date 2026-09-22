@@ -134,6 +134,12 @@ static int sgi_ip6_peer_write(Chardev *chr, const uint8_t *buf, int len)
                 qemu_log_mask(LOG_UNIMP,
                               "sgi-ip6-kbd: queueing ACK %02x\n", reply);
                 sgi_ip6_input_queue(s, &reply, 1);
+                if (!s->kb_handshaked) {
+                    s->kb_handshaked = true;
+                    qemu_log_mask(LOG_UNIMP,
+                                  "sgi-ip6-kbd: handshake accepted -> "
+                                  "switching to KEY EVENT input\n");
+                }
             }
         }
         return len;
@@ -266,6 +272,41 @@ static const QemuInputHandler sgi_ip6_mouse_handler = {
  * else is DROPPED rather than guessed, because an invented scancode is a
  * fabricated response.
  */
+/* Host key -> the PROM's keycode (scancode), from the same extracted table. */
+static int sgi_ip6_keycode(QKeyCode q)
+{
+    switch (q) {
+    case Q_KEY_CODE_Q: return 10;  case Q_KEY_CODE_W: return 16;
+    case Q_KEY_CODE_E: return 17;  case Q_KEY_CODE_R: return 24;
+    case Q_KEY_CODE_T: return 25;  case Q_KEY_CODE_Y: return 32;
+    case Q_KEY_CODE_U: return 33;  case Q_KEY_CODE_I: return 40;
+    case Q_KEY_CODE_O: return 41;  case Q_KEY_CODE_P: return 48;
+    case Q_KEY_CODE_A: return 11;  case Q_KEY_CODE_S: return 12;
+    case Q_KEY_CODE_D: return 18;  case Q_KEY_CODE_F: return 19;
+    case Q_KEY_CODE_G: return 26;  case Q_KEY_CODE_H: return 27;
+    case Q_KEY_CODE_J: return 34;  case Q_KEY_CODE_K: return 35;
+    case Q_KEY_CODE_L: return 42;  case Q_KEY_CODE_Z: return 20;
+    case Q_KEY_CODE_X: return 21;  case Q_KEY_CODE_C: return 28;
+    case Q_KEY_CODE_V: return 29;  case Q_KEY_CODE_B: return 36;
+    case Q_KEY_CODE_N: return 37;  case Q_KEY_CODE_M: return 44;
+    case Q_KEY_CODE_1: return 8;   case Q_KEY_CODE_2: return 14;
+    case Q_KEY_CODE_3: return 15;  case Q_KEY_CODE_4: return 22;
+    case Q_KEY_CODE_5: return 23;  case Q_KEY_CODE_6: return 30;
+    case Q_KEY_CODE_7: return 31;  case Q_KEY_CODE_8: return 38;
+    case Q_KEY_CODE_9: return 39;  case Q_KEY_CODE_0: return 46;
+    case Q_KEY_CODE_RET: return 51;        case Q_KEY_CODE_SPC: return 83;
+    case Q_KEY_CODE_BACKSPACE: return 61;  case Q_KEY_CODE_ESC: return 7;
+    case Q_KEY_CODE_TAB: return 9;
+    case Q_KEY_CODE_MINUS: return 47;      case Q_KEY_CODE_EQUAL: return 54;
+    case Q_KEY_CODE_SLASH: return 53;      case Q_KEY_CODE_DOT: return 52;
+    case Q_KEY_CODE_COMMA: return 45;      case Q_KEY_CODE_SEMICOLON: return 43;
+    case Q_KEY_CODE_APOSTROPHE: return 50; case Q_KEY_CODE_BRACKET_LEFT: return 49;
+    case Q_KEY_CODE_BRACKET_RIGHT: return 56; case Q_KEY_CODE_BACKSLASH: return 57;
+    case Q_KEY_CODE_GRAVE_ACCENT: return 55;
+    default: return -1;   /* DROP: never invent a scancode */
+    }
+}
+
 static int sgi_ip6_charcode(QKeyCode q)
 {
     switch (q) {
@@ -327,6 +368,26 @@ static void sgi_ip6_kbd_event(DeviceState *dev, QemuConsole *src,
     if (key->key->type != KEY_VALUE_KIND_QCODE) {
         return;
     }
+    /*
+     * TWO MEASURED MODES on this one line.  AFTER the PROM has accepted our
+     * ACK it reads KEY EVENTS: one byte, bit 7 = up(1)/down(0), bits 6:0 =
+     * keycode.  BEFORE that it drives the line as a character console and
+     * consumes characters.  So the mode follows kb_handshaked.
+     */
+    if (s->kb_handshaked) {
+        code = sgi_ip6_keycode(key->key->u.qcode.data);
+        if (code < 0) {
+            return;
+        }
+        b = (key->down ? 0x00 : 0x80) | (code & 0x7f);
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-ip6-kbd: key event qcode=%d code=%d %s -> %02x\n",
+                      key->key->u.qcode.data, code,
+                      key->down ? "down" : "up", b);
+        sgi_ip6_input_queue(s, &b, 1);
+        return;
+    }
+
     code = sgi_ip6_charcode(key->key->u.qcode.data);
     if (code < 0) {
         return;

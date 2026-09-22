@@ -41,6 +41,14 @@ struct SgiIp6InputState {
 
     /* Number of guest command bytes seen (bring-up aid). */
     unsigned kb_cmds;
+
+    /*
+     * The PROM wants TWO input behaviours on this one line, measured:
+     * BEFORE it has accepted the keyboard it drives the line as a character
+     * console and consumes characters; AFTER we ACK its 0x10 it switches to
+     * key events.  So the mode is latched when we answer the handshake.
+     */
+    bool kb_handshaked;
 };
 
 Chardev *sgi_ip6_input_chardev(SgiIp6InputState *s);
