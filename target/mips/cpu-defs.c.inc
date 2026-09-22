@@ -546,6 +546,53 @@ const mips_def_t mips_defs[] =
                       ASE_DSP | ASE_DSP_R2 | ASE_DSP_R3,
         .mmu_type = MMU_TYPE_R4000,
     },
+    {
+        /*
+         * MIPS R2000 (MIPS-I).  Used with the R2010 FPU in the SGI Personal
+         * IRIS 4D/20 (IP6 board).  No Config/Count/Compare/Wired registers;
+         * 64-entry TLB with fixed 4 KiB page pairs.  PRId and FCR0 follow
+         * MAME's mips1 core (r2000: cpurev 0x0120, fcr0 0x0320).
+         */
+        .name = "R2000",
+        .CP0_PRid = 0x00000120,
+        .CP0_Config0 = 0,
+        .CP0_Config1 = (1 << CP0C1_FP) | (63 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 16,
+        .CCRes = 1,
+        .CP0_Status_rw_bitmask = 0xF27FFF3F,
+        .CP1_fcr0 = (0x03 << FCR0_PRID) | (0x20 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 32,
+        .PABITS = 32,
+        .insn_flags = CPU_MIPS1,
+        .mmu_type = MMU_TYPE_R3000,
+    },
+    {
+        /*
+         * MIPS R3000 (MIPS-I).  Used with the R3010 FPU in the SGI Personal
+         * IRIS 4D/25 (IP6 board).  PRId/FCR0 follow MAME's mips1 core
+         * (r3000: cpurev 0x0220, fcr0 0x0320 for the R3010).
+         */
+        .name = "R3000",
+        .CP0_PRid = 0x00000220,
+        .CP0_Config0 = 0,
+        .CP0_Config1 = (1 << CP0C1_FP) | (63 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 16,
+        .CCRes = 1,
+        .CP0_Status_rw_bitmask = 0xF27FFF3F,
+        .CP1_fcr0 = (0x03 << FCR0_PRID) | (0x20 << FCR0_REV),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 32,
+        .PABITS = 32,
+        .insn_flags = CPU_MIPS1,
+        .mmu_type = MMU_TYPE_R3000,
+    },
 #if defined(TARGET_MIPS64)
     {
         .name = "R4000",

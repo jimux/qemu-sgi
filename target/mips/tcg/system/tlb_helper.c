@@ -468,6 +468,28 @@ static void r4k_mmu_init(CPUMIPSState *env, const mips_def_t *def)
     env->tlb->helper_tlbinvf = r4k_helper_tlbinvf;
 }
 
+/*
+ * MIPS-I R2000/R3000 MMU.  The TLB is the R4000's ancestor: 64 fixed
+ * entries, each covering a pair of 4 KiB pages (VA[12] selects odd/even),
+ * 8-bit ASID, no Wired register (Random spans all 64) and no PageMask
+ * (the entry pair is always 8 KiB).  With CP0_PageMask held at 0 and the
+ * R3000 having no Config5/MI, the r4k entry helpers already express
+ * exactly this behaviour, so re-use them with a fixed 64-entry size.
+ * This path is selected only by a CPU whose mmu_type is MMU_TYPE_R3000;
+ * it leaves every MIPS III/IV (MMU_TYPE_R4000) machine untouched.
+ */
+static void r3k_mmu_init(CPUMIPSState *env, const mips_def_t *def)
+{
+    env->tlb->nb_tlb = 64;
+    env->tlb->map_address = &r4k_map_address;
+    env->tlb->helper_tlbwi = r4k_helper_tlbwi;
+    env->tlb->helper_tlbwr = r4k_helper_tlbwr;
+    env->tlb->helper_tlbp = r4k_helper_tlbp;
+    env->tlb->helper_tlbr = r4k_helper_tlbr;
+    env->tlb->helper_tlbinv = r4k_helper_tlbinv;
+    env->tlb->helper_tlbinvf = r4k_helper_tlbinvf;
+}
+
 void mmu_init(CPUMIPSState *env, const mips_def_t *def)
 {
     env->tlb = g_malloc0(sizeof(CPUMIPSTLBContext));
@@ -483,6 +505,8 @@ void mmu_init(CPUMIPSState *env, const mips_def_t *def)
         fixed_mmu_init(env, def);
         break;
     case MMU_TYPE_R3000:
+        r3k_mmu_init(env, def);
+        break;
     case MMU_TYPE_R6000:
     case MMU_TYPE_R8000:
     default:
