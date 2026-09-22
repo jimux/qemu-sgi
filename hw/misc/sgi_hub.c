@@ -163,16 +163,29 @@ static void sgi_hub_reset_bh(void *opaque);
 #define NSRI_CHIPID_SHFT 0
 #define NSRI_LINKUP (1ULL << 29)
 
-/* HUB_REV_2_0 = 2 */
-#define SGI_HUB_REV 2
+/*
+ * Hub revision reported in NI_STATUS_REV_ID.  sys/SN/SN0/hub.h numbers these
+ * HUB_REV_1_0=1, HUB_REV_2_0=2, HUB_REV_2_1=3, ...; ml/SN/klgraph.c warns
+ * "INVALID CUSTOMER CONFIGURATION - DOWNREV Hub ASIC" when the revision is
+ * below HUB_REV_2_1, and the same field drives mp.c's force_fire_and_forget
+ * (PIO conveyor-belt) decision, so report 2.1 rather than 2.0.
+ */
+#define SGI_HUB_REV 3
 #define SGI_HUB_CHIPID_HUB 0
 
 /* PI_INT_PEND_MOD: bit 8 selects "set"; otherwise the value is a clear mask. */
 #define PI_INT_PEND_SET_BIT 0x100
 
-/* The hub RTC is a free-running counter; model it at 1 MHz (microseconds). */
+/* The hub RTC is a free-running counter; an IP27 runs it at 1.25 MHz, i.e.
+ * 800 ns per tick.  The IRIX kernel hard-codes that rate: us_delay() waits
+ * us * 1250000 / 1000000 RT_COUNT ticks and tstoclock() converts nanoseconds to
+ * ticks by dividing by 800, so the period must be right, not merely monotonic.
+ * (The "RTC frequency incorrect" panic is a separate, config-table comparison
+ * in ml/SN/mp.c, not a measurement of this counter.) */
+#define SGI_HUB_RTC_HZ 1250000
 static uint64_t sgi_hub_rtc_count(void) {
-  return (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000);
+  return (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+                    (1000000000ULL / SGI_HUB_RTC_HZ));
 }
 
 /* Latch PI_RT_PEND_x once a freshly armed, enabled COMPARE_x is reached. */
