@@ -170,9 +170,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 
 /* status entry completion status (ql_standalone.h) */
 #define QL_SCS_COMPLETE          0x0000
+#define QL_SCS_INCOMPLETE        0x0001
 #define QL_SCS_TRANSPORT_ERROR   0x0003
-#define QL_SS_GOT_STATUS         0x1000
-#define QL_SS_TRANSFER_COMPLETE  0x4000
+#define QL_SS_GOT_TARGET         0x0200   /* state flag */
+#define QL_SS_GOT_STATUS         0x1000   /* state flag */
+#define QL_SS_TRANSFER_COMPLETE  0x4000   /* state flag */
+#define QL_SST_TIMEOUT           0x0040   /* status flag: selection timeout */
 
 typedef struct QLQueue {
     uint64_t base;      /* host physical base address */

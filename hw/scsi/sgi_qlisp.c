@@ -162,6 +162,12 @@ static uint64_t ql_dma_to_phys(SGIQLispState *s, uint64_t a)
     return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
 }
 
+/* True when `a` lies in the BRIDGE's ATE-mapped PCI DMA window. */
+static bool ql_addr_is_ate(SGIQLispState *s, uint64_t a)
+{
+    return s->dma_xlate && s->dma_xlate(s->dma_xlate_arg, a) != a;
+}
+
 /* Read a 64-byte queue entry, returning the un-munged copy in `e`. */
 static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
                          uint8_t *e)
@@ -171,7 +177,7 @@ static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return false;
     }
-    if (qlisp_dbg() && addr >= 0x40000000ULL && addr < 0x40010000ULL) {
+    if (qlisp_dbg() && ql_addr_is_ate(s, addr)) {
         static unsigned n;
         if (n < 20) {
             qemu_log_mask(LOG_UNIMP,
@@ -191,7 +197,7 @@ static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
      * CONTROL_STREAM path) is written in natural order.  Un-munge only the
      * former.
      */
-    if (s->control_munge && !(addr >= 0x40000000ULL && addr < 0x40010000ULL)) {
+    if (s->control_munge && !ql_addr_is_ate(s, addr)) {
         ql_munge(e, QL_ENTRY_SIZE);
     }
     return true;
@@ -249,7 +255,8 @@ static bool ql_sg_move(SGIQLispState *s, uint8_t *buf, uint32_t len,
 
 /* Post a status entry to the response ring; raise the RISC interrupt. */
 static void ql_write_status(SGIQLispState *s, uint16_t completion,
-                            uint16_t scsi_status, uint32_t residual,
+                            uint16_t scsi_status, uint16_t status_flags,
+                            uint32_t residual,
                             const uint8_t *sense, uint32_t sense_len)
 {
     uint8_t st[QL_ENTRY_SIZE];
@@ -263,7 +270,7 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
     stl_be_p(st + 0x04, s->cur_handle);
     stw_be_p(st + 0x08, completion);
     stw_be_p(st + 0x0a, scsi_status);
-    stw_be_p(st + 0x0c, 0);          /* status_flags */
+    stw_be_p(st + 0x0c, status_flags);
     stw_be_p(st + 0x0e, QL_SS_GOT_STATUS | QL_SS_TRANSFER_COMPLETE);
     stw_be_p(st + 0x10, sense_len);
     stw_be_p(st + 0x12, 0);          /* time */
@@ -272,8 +279,7 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
         memcpy(st + 0x20, sense, MIN(sense_len, 32));
     }
 
-    if (s->control_munge &&
-        !(s->rsp.base >= 0x40000000ULL && s->rsp.base < 0x40010000ULL)) {
+    if (s->control_munge && !ql_addr_is_ate(s, s->rsp.base)) {
         ql_munge(st, sizeof(st));
     }
     dma_memory_write(&address_space_memory,
@@ -357,7 +363,7 @@ static void ql_scsi_command_complete(SCSIRequest *req, size_t residual)
     SGIQLispState *s = req->hba_private;
 
     s->cur_req = NULL;
-    ql_write_status(s, QL_SCS_COMPLETE, req->status, residual,
+    ql_write_status(s, QL_SCS_COMPLETE, req->status, 0, residual,
                     req->sense, req->sense_len);
     scsi_req_unref(req);
     ql_process_requests(s);
@@ -504,7 +510,15 @@ static void ql_process_requests(SGIQLispState *s)
 
         sdev = scsi_device_find(&s->bus, 0, e[0x0a], e[0x0b]);
         if (!sdev) {
-            ql_write_status(s, QL_SCS_TRANSPORT_ERROR, 0, 0, NULL, 0);
+            /*
+             * An unpopulated target: report the SCSI condition a real ISP
+             * produces when nothing answers selection -- SCS_INCOMPLETE with
+             * SS_GOT_TARGET clear and SST_TIMEOUT set.  The driver logs
+             * "Selection timeout" and records SC_TIMEOUT, a soft outcome; a
+             * transport error here would wrongly read as "device broke".
+             */
+            ql_write_status(s, QL_SCS_INCOMPLETE, 0, QL_SST_TIMEOUT, 0,
+                            NULL, 0);
             continue;
         }
         s->cur_req = scsi_req_new(sdev, 0, e[0x0b], cdb, cdb_len, s);
