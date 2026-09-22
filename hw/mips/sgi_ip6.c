@@ -52,6 +52,17 @@
 #define SGI_IP6_PROM_SIZE   (256 * KiB)
 #define SGI_IP6_RAM_MAX     (256 * MiB)
 
+/*
+ * Memory decode (CTL1), modelled on MAME ip6.cpp / ctl1.cpp.  The guest
+ * configures memcfg, which installs RAM per bank at b * conf_size, each
+ * bank holding min(host SIMM size, conf_size) with the same host RAM
+ * mirrored to fill the conf_size window.  Anything not covered reads 0
+ * (MAME's noprw placeholder) - the PROM's sizing probe relies on that.
+ */
+#define SGI_IP6_RAM_WINDOW     (256 * MiB)
+#define SGI_IP6_HOST_SIMM_SIZE (16 * MiB)
+#define SGI_IP6_RAM_ALIAS_MAX  128
+
 /* CTL1 control register block */
 #define SGI_IP6_CTL1_BASE   0x1f800000ULL
 #define SGI_IP6_CTL1_SIZE   0x100000
@@ -127,6 +138,11 @@
 
 typedef struct SGIip6State {
     MemoryRegion ctl1;
+    MemoryRegion ram_win;
+    MemoryRegion ram_zero;
+    MemoryRegion bank_alias[SGI_IP6_RAM_ALIAS_MAX];
+    unsigned bank_alias_count;
+    uint64_t ram_size;
     MemoryRegion dmalo_reg;
     MemoryRegion mapindex_reg;
     MemoryRegion dmahi_reg;
@@ -184,6 +200,78 @@ typedef struct SGIip6State {
 static SGIip6State ip6_state;
 
 static void sgi_ip6_lio_update(SGIip6State *s);
+
+/* ---- Memory decode (CTL1) -------------------------------------------- */
+
+/* MAME's noprw placeholder: uncovered RAM addresses read 0, writes ignored,
+ * and never fault - the PROM/IDE sizing probe depends on that tolerance. */
+static uint64_t sgi_ip6_ram_zero_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void sgi_ip6_ram_zero_write(void *opaque, hwaddr addr, uint64_t data,
+                                   unsigned size)
+{
+}
+
+static const MemoryRegionOps sgi_ip6_ram_zero_ops = {
+    .read = sgi_ip6_ram_zero_read,
+    .write = sgi_ip6_ram_zero_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+/*
+ * (Re)install the RAM decode from memcfg.  The bank geometry (count and
+ * conf_size) is guest-supplied via memcfg; the per-bank population is
+ * host-supplied (SGI_IP6_HOST_SIMM_SIZE).  A bank is installed at
+ * b * conf_size, its host RAM sized min(host SIMM, conf_size) and mirrored
+ * to fill the conf_size window.  The caller must undecode first.
+ */
+static void sgi_ip6_ram_decode(SGIip6State *s)
+{
+    uint64_t conf_size = (s->memcfg & MEMCFG_4MRAM) ? 16 * MiB : 4 * MiB;
+    unsigned banks = (s->memcfg & MEMCFG_MEMSIZE) + 1;
+    unsigned i = 0, b;
+
+    for (b = 0; b < banks; b++) {
+        uint64_t host_off = (uint64_t)b * SGI_IP6_HOST_SIMM_SIZE;
+        uint64_t size, base, addr;
+
+        if (host_off >= s->ram_size) {
+            break;
+        }
+        size = MIN(conf_size, s->ram_size - host_off);
+        base = (uint64_t)b * conf_size;
+        for (addr = base; addr + size <= base + conf_size; addr += size) {
+            MemoryRegion *a;
+
+            if (i >= SGI_IP6_RAM_ALIAS_MAX || addr + size > SGI_IP6_RAM_WINDOW) {
+                break;
+            }
+            a = &s->bank_alias[i];
+            memory_region_set_alias_offset(a, host_off);
+            memory_region_set_size(a, size);
+            memory_region_add_subregion_overlap(&s->ram_win, addr, a, 1);
+            i++;
+        }
+    }
+    s->bank_alias_count = i;
+}
+
+static void sgi_ip6_ram_undecode(SGIip6State *s)
+{
+    unsigned i;
+
+    for (i = 0; i < s->bank_alias_count; i++) {
+        memory_region_del_subregion(&s->ram_win, &s->bank_alias[i]);
+    }
+    s->bank_alias_count = 0;
+}
 
 /* ---- CTL1 control registers ------------------------------------------ */
 
@@ -247,6 +335,9 @@ static void sgi_ip6_ctl1_write(void *opaque, hwaddr addr, uint64_t data,
     switch (off) {
     case SGI_IP6_CTL1_MEMCFG:
         s->memcfg = (val >> 24) & 0xff;
+        /* The guest programs the memory decode through memcfg. */
+        sgi_ip6_ram_undecode(s);
+        sgi_ip6_ram_decode(s);
         break;
     case SGI_IP6_CTL1_CPUCFG: {
         uint16_t cfg = val & 0xffff;
@@ -1190,6 +1281,7 @@ static void sgi_ip6_init(MachineState *machine)
     int bios_size;
     unsigned ram_mb = machine->ram_size / MiB;
     uint8_t memcfg;
+    unsigned ai;
 
     if (machine->ram_size > SGI_IP6_RAM_MAX) {
         error_report("RAM size more than 256MB is not supported");
@@ -1210,9 +1302,31 @@ static void sgi_ip6_init(MachineState *machine)
     qemu_register_reset(main_cpu_reset, cpu);
     s->cpu = cpu;
 
-    /* Flat RAM at physical 0 (KSEG0/KSEG1 map onto it). The CTL1's per-bank
-     * mapping is approximated by mapping all RAM. */
-    memory_region_add_subregion(system_memory, 0, machine->ram);
+    /*
+     * CTL1 memory decode, as MAME models it: a RAM window whose covered
+     * banks are aliases of the host RAM, with a read-0/write-ignore
+     * placeholder for everything else (MAME's noprw).  machine->ram is NOT
+     * mapped flat - sgi_ip6_ram_decode() installs the guest-configured
+     * geometry, so the PROM/IDE sizing probe sees the real per-bank decode
+     * (and no bus error above installed RAM) instead of a flat alias.
+     */
+    s->ram_size = machine->ram_size;
+    memory_region_init(&s->ram_win, OBJECT(machine), "sgi-ip6-ramwin",
+                       SGI_IP6_RAM_WINDOW);
+    memory_region_init_io(&s->ram_zero, OBJECT(machine), &sgi_ip6_ram_zero_ops,
+                          s, "sgi-ip6-ramzero", SGI_IP6_RAM_WINDOW);
+    memory_region_add_subregion_overlap(&s->ram_win, 0, &s->ram_zero, -1);
+    for (ai = 0; ai < SGI_IP6_RAM_ALIAS_MAX; ai++) {
+        char name[32];
+
+        snprintf(name, sizeof(name), "sgi-ip6-bank%u", ai);
+        memory_region_init_alias(&s->bank_alias[ai], OBJECT(machine), name,
+                                 machine->ram, 0,
+                                 MIN((uint64_t)SGI_IP6_HOST_SIMM_SIZE,
+                                     s->ram_size));
+    }
+    memory_region_add_subregion(system_memory, 0, &s->ram_win);
+    sgi_ip6_ram_decode(s);
 
     /* Boot PROM at 0x1fc00000 */
     memory_region_init_rom(prom, NULL, "sgi-ip6.prom", SGI_IP6_PROM_SIZE,
