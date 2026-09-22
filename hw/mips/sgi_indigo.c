@@ -218,13 +218,6 @@ static void sgi_indigo_init(MachineState *machine)
     hpc1_dev = qdev_new(TYPE_SGI_HPC1);
     qdev_prop_set_chr(hpc1_dev, "chardev", serial_hd(0));
     qdev_prop_set_string(hpc1_dev, "nvram", "sgi_indigo_nvram.bin");
-    /* Wire the ethernet NIC (SEEQ 8003) from the command line (-nic) */
-    {
-        NICInfo *nd = qemu_find_nic_info(TYPE_SGI_HPC1, true, NULL);
-        if (nd) {
-            qdev_set_nic_properties(hpc1_dev, nd);
-        }
-    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(hpc1_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(hpc1_dev), 0, SGI_HPC1_BASE);
 

@@ -28,7 +28,6 @@
 #include "chardev/char-fe.h"
 #include "hw/core/sysbus.h"
 #include "hw/scsi/wd33c93.h"
-#include "net/net.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_HPC1 "sgi-hpc1"
@@ -155,10 +154,6 @@ struct SGIHPC1State {
     uint32_t enet_crbp;
     uint32_t enet_nrbdp;
     uint32_t enet_crbdp;
-
-    /* QEMU NIC (SEEQ 8003 EDLC, DMA through HPC1) */
-    NICState *nic;
-    NICConf enet_conf;
 
     /* WD33C93 SCSI controller */
     WD33C93State *scsi;
