@@ -72,6 +72,9 @@ struct SCN2681State {
     uint8_t isr;
     uint8_t ctur;
     uint8_t ctlr;
+    uint8_t ivr;
+    uint8_t opcr;
+    uint8_t opr;
 
     qemu_irq irq;
 };

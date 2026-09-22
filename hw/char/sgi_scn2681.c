@@ -33,6 +33,12 @@
 #define SCN2681_REG_CRB    0xa
 #define SCN2681_REG_THRB   0xb
 #define SCN2681_REG_RHRB   0xb
+#define SCN2681_REG_IVR    0xc
+#define SCN2681_REG_OPCR   0xd
+#define SCN2681_REG_IP     0xd
+#define SCN2681_REG_OP_SET 0xe
+#define SCN2681_REG_OP_RST 0xf
+#define SCN2681_REG_START  0xe
 
 static void scn2681_update_irq(SCN2681State *s)
 {
@@ -138,6 +144,16 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
         s->isr &= ~SCN2681_ISR_RXRDYB;
         scn2681_update_irq(s);
         break;
+    case SCN2681_REG_IVR:
+        ret = s->ivr;
+        break;
+    case SCN2681_REG_IP:
+        ret = 0xff; /* input port idle (pulled high) */
+        break;
+    case SCN2681_REG_OP_SET:
+    case SCN2681_REG_OP_RST:
+        ret = 0;
+        break;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "sgi-scn2681: read of reserved register 0x%x\n", reg);
@@ -196,6 +212,18 @@ void scn2681_write(SCN2681State *s, int reg, uint8_t val)
         break;
     case SCN2681_REG_THRB:
         scn2681_tx(s, 1, val);
+        break;
+    case SCN2681_REG_IVR:
+        s->ivr = val;
+        break;
+    case SCN2681_REG_OPCR:
+        s->opcr = val;
+        break;
+    case SCN2681_REG_OP_SET:
+        s->opr |= val;
+        break;
+    case SCN2681_REG_OP_RST:
+        s->opr &= ~val;
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
