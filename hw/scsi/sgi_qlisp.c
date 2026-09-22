@@ -254,6 +254,36 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
 
 static void ql_process_requests(SGIQLispState *s);
 
+/*
+ * QLISP_DEBUG helper: log the first 16 bytes of a data-in/out buffer for the
+ * commands whose payload we care about (INQUIRY/MODE_SENSE/READ_10).  FILE
+ * logs the buffer as the device holds it; DMG logs it after the optional
+ * control_munge, i.e. the bytes actually delivered to the host -- on IP27
+ * (control_munge clear) FILE and DMG differ by the word-reverse, which is what
+ * distinguishes "response arrived reversed" from "response arrived natural".
+ */
+static void ql_dbg_data(const char *tag, SCSIRequest *req, uint8_t *buf,
+                        uint32_t len)
+{
+    unsigned n, i;
+    char hx[16 * 2 + 1];
+
+    if (!getenv("QLISP_DEBUG")) {
+        return;
+    }
+    if (req->cmd.buf[0] != 0x12 && req->cmd.buf[0] != 0x1a &&
+        req->cmd.buf[0] != 0x28) {
+        return;
+    }
+    n = MIN(len, 16);
+    for (i = 0; i < n; i++) {
+        snprintf(hx + i * 2, 3, "%02x", buf[i]);
+    }
+    hx[n * 2] = '\0';
+    qemu_log_mask(LOG_UNIMP, "sgi-qlisp: %s cdb=%02x len=%u buf=%s\n",
+                  tag, req->cmd.buf[0], len, hx);
+}
+
 static void ql_scsi_transfer_data(SCSIRequest *req, uint32_t len)
 {
     SGIQLispState *s = req->hba_private;
@@ -268,22 +298,11 @@ static void ql_scsi_transfer_data(SCSIRequest *req, uint32_t len)
      * un-munge what it picks up.  ql_munge is its own inverse, so applying it
      * symmetrically in both directions is correct.
      */
-    if (getenv("QLISP_DEBUG") && (req->cmd.buf[0] == 0x12 ||
-                                  req->cmd.buf[0] == 0x1a ||
-                                  req->cmd.buf[0] == 0x28)) {
-        unsigned n = MIN(len, 16), i;
-        char hx[16 * 2 + 1];
-        for (i = 0; i < n; i++) {
-            snprintf(hx + i * 2, 3, "%02x", buf[i]);
-        }
-        hx[n * 2] = '\0';
-        qemu_log_mask(LOG_UNIMP,
-                      "sgi-qlisp: DATA cdb=%02x len=%u buf=%s\n",
-                      req->cmd.buf[0], len, hx);
-    }
+    ql_dbg_data("FILE", req, buf, len);
     if (!s->control_munge) {
         ql_munge(buf, len);
     }
+    ql_dbg_data("DMG", req, buf, len);
     ql_sg_move(s, buf, len, to_host);
     scsi_req_continue(req);
 }
