@@ -503,6 +503,46 @@ static void ql_process_requests(SGIQLispState *s)
                 ql_get_dseg(ce, cont_dseg, cj, a64, &s->sg[s->nsg++]);
             }
         }
+        /*
+         * Write-side probe (Leg 6): for a data-out (WRITE) command, sample the
+         * first dseg's physical address and the bytes the device will read from
+         * it.  This is the payload source the disk receives; if it reads zeros
+         * here, the source buffer was never populated (upstream of the ql),
+         * which localises the empty-write fault without assuming which segment
+         * or source built the running binary.  Lane-local, read-only, and it
+         * does not alter the memory map.
+         */
+        if (qlisp_dbg() && s->nsg > 0 && (cdb[0] & 0x1f) == 0x0a) {
+            uint64_t raw = s->sg[0].addr;
+            uint64_t wsrc = ql_dma_to_phys(s, raw);
+            uint8_t ws[8], wdm[8], wk1[8];
+            dma_memory_read(&address_space_memory, wsrc, ws, sizeof(ws),
+                            MEMTXATTRS_UNSPECIFIED);
+            /*
+             * A/B the two candidate decodings of a bridge DMA address, because
+             * on this machine (RAM at 0x20000000) the direct-map range
+             * (phys+0x80000000 = 0xa0000000..0xb0000000) OVERLAPS the K1 range,
+             * so a raw 0xa... address is ambiguous.  dm = direct-map reading
+             * (raw - 0x80000000); k1 = K1 reading (raw - 0xa0000000).
+             */
+            dma_memory_read(&address_space_memory, raw - 0x80000000ULL, wdm,
+                            sizeof(wdm), MEMTXATTRS_UNSPECIFIED);
+            dma_memory_read(&address_space_memory, raw - 0xa0000000ULL, wk1,
+                            sizeof(wk1), MEMTXATTRS_UNSPECIFIED);
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: WRITESRC op=0x%02x raw=0x%llx "
+                          "cur=0x%llx ates=%d len=%u "
+                          "sample_cur=%02x%02x%02x%02x "
+                          "sample_dm=%02x%02x%02x%02x "
+                          "sample_k1=%02x%02x%02x%02x\n",
+                          cdb[0], (unsigned long long)raw,
+                          (unsigned long long)wsrc, ql_addr_is_ate(s, raw),
+                          (unsigned)s->sg[0].len,
+                          ws[0], ws[1], ws[2], ws[3],
+                          wdm[0], wdm[1], wdm[2], wdm[3],
+                          wk1[0], wk1[1], wk1[2], wk1[3]);
+        }
+
         /* Each continuation entry holds cont_segs dsegs. */
         ncont = seg_cnt > iocb_segs ?
                 (seg_cnt - iocb_segs + cont_segs - 1) / cont_segs : 0;

@@ -36,6 +36,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/misc/sgi_bridge.h"
 #include "hw/misc/sgi_heart.h"
@@ -506,6 +507,11 @@ static void sgi_bridge_phy_init(SGIBRIDGEState *s)
     s->phy_read_data = 0;
 }
 
+/* SGIBRIDGE_RXTRACE=1: per-delivered-frame [RXTRACE] line (see install-leg.md
+ * cont18t). Field names are shared verbatim with sgi_baseio.c's mirror so the
+ * two map-free net lanes can be compared per-field. Zero cost when off. */
+static int sgi_bridge_rxtrace = -1;
+
 static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
                                    size_t len)
 {
@@ -513,21 +519,57 @@ static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
     uint32_t rxoff = ((emcr & IOC3_EMCR_RXOFF_MASK) >> IOC3_EMCR_RXOFF_SHIFT) * 2;
     uint64_t erbr = ioc3_dma_addr(((uint64_t)s->eth_regs[IOC3_ERBR_H] << 32) |
                                   s->eth_regs[IOC3_ERBR_L]);
-    uint64_t slot = 0;
+    uint64_t slot = 0, raw_desc = 0, xlated = 0;
     uint32_t w0, err;
     uint8_t frame[2048];
+    const char *reason = "deliver";
+    bool ok = true;
 
-    if (!(emcr & IOC3_EMCR_RXEN) || erbr == 0 || len > sizeof(frame)) {
-        return;
+    /*
+     * Log EVERY exit, including the refusal paths -- an instrument positioned
+     * downstream of a drop reports a clean run (fleet note #2378).  If a
+     * branch refuses a frame we must be able to see it.
+     */
+    if (sgi_bridge_rxtrace < 0) {
+        sgi_bridge_rxtrace = getenv("SGIBRIDGE_RXTRACE") != NULL;
     }
 
-    if (dma_memory_read(&address_space_memory,
-                        erbr + s->eth_rxprod, &slot, sizeof(slot),
-                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
-        slot == 0) {
+    if (!(emcr & IOC3_EMCR_RXEN)) {
+        reason = "refused:RXDISABLED"; ok = false;
+    } else if (erbr == 0) {
+        reason = "refused:ERBR0"; ok = false;
+    } else if (len > sizeof(frame)) {
+        reason = "refused:LEN>2048"; ok = false;
+    } else if (dma_memory_read(&address_space_memory,
+                               erbr + s->eth_rxprod, &slot, sizeof(slot),
+                               MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+        reason = "refused:DESCREAD"; ok = false;
+    } else if (slot == 0) {
+        reason = "refused:SLOT0"; ok = false;
+    } else {
+        raw_desc = be64_to_cpu(slot);
+        xlated = ioc3_dma_addr(raw_desc);
+        slot = xlated;
+    }
+
+    if (sgi_bridge_rxtrace) {
+        uint64_t ram_size = MACHINE(qdev_get_machine())->ram_size;
+
+        fprintf(stderr,
+                "[RXTRACE] %s prod=%u ringbase=0x%llx slotoff=0x%x "
+                "raw_desc=0x%llx xlated_phys=0x%llx len=%u "
+                "inram=%d (ram_size=0x%llx) "
+                "guest_ercir=0x%x guest_erpir=0x%x emcr=0x%x rxoff=0x%x\n",
+                reason, s->eth_rxprod, (unsigned long long)erbr, s->eth_rxprod,
+                (unsigned long long)raw_desc, (unsigned long long)xlated,
+                (unsigned)len,
+                (xlated != 0) && (xlated + len) <= ram_size,
+                (unsigned long long)ram_size,
+                s->guest_ercir, s->guest_erpir, emcr, rxoff);
+    }
+    if (!ok) {
         return;
     }
-    slot = ioc3_dma_addr(be64_to_cpu(slot));
 
     w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
     err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
@@ -999,6 +1041,12 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                     }
                     /* Management ops complete instantly (BUSY stays clear). */
                     s->eth_regs[idx] = val & ~IOC3_MICR_BUSY;
+                } else if (idx == IOC3_ERPIR) {
+                    s->guest_erpir = val;
+                    s->eth_regs[idx] = val;
+                } else if (idx == IOC3_ERCIR) {
+                    s->guest_ercir = val;
+                    s->eth_regs[idx] = val;
                 } else {
                     s->eth_regs[idx] = val;
                 }

@@ -171,6 +171,13 @@ struct SGIBRIDGEState {
     uint32_t eth_regs[SGI_BRIDGE_ETH_NREGS];
     uint32_t eth_rxprod;  /* hardware RX produce, byte offset into the ring */
     uint32_t eth_txcons;  /* hardware TX consume, byte offset into the ring */
+    /*
+     * Last values the GUEST wrote to ERPIR/ERCIR.  Kept separately because
+     * deliver() overwrites eth_regs[IOC3_ERPIR] with eth_rxprod, so the
+     * register no longer reflects the guest's own index.  For [RXTRACE] only.
+     */
+    uint32_t guest_erpir;
+    uint32_t guest_ercir;
 
     /*
      * MII management PHY (IOC3 MICR/MIDR). A single IEEE 802.3 PHY at
