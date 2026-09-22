@@ -1518,10 +1518,15 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
     uint32_t desc, w0, w1, w2, bufaddr, space, used, newbc;
     uint8_t st = HPC1_ENET_SEQ_RXS_GOOD | HPC1_ENET_SEQ_RXS_END;
 
-    if (!(s->enet_rcvstat & HPC1_ENET_STRCVDMA) || !s->enet_crbdp) {
+    if (!(s->enet_rcvstat & HPC1_ENET_STRCVDMA) || !s->enet_nrbdp) {
         return -1;
     }
-    desc = HPC1_DMA_ADDR(s->enet_crbdp);
+    /*
+     * Deliver into the descriptor the driver ARMED for the next fill
+     * (NRBDP), exactly as the HPC3 model delivers into enet_rx_nbdp.
+     * CRBDP is the driver's own "current" marker, not the fill target.
+     */
+    desc = HPC1_DMA_ADDR(s->enet_nrbdp);
     w0 = address_space_ldl_be(&address_space_memory, desc,
                               MEMTXATTRS_UNSPECIFIED, NULL);
     w1 = address_space_ldl_be(&address_space_memory, desc + 4,
@@ -1579,12 +1584,11 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
     /*
-     * Do NOT advance crbdp past the descriptor just filled: the driver reads
-     * CRBDP to find the buffer the controller filled, and it re-arms/resets
-     * CRBDP itself after consuming.  Advancing here made the driver read the
-     * NEXT (unarmed) descriptor and conclude there was no frame.
-     * The Seeq status goes in the HIGH byte (shift 8).
+     * Advance the fill pointer to the descriptor's own next pointer, exactly
+     * as the HPC3 model does (enet_rx_nbdp = nbdp).  The Seeq status goes in
+     * the HIGH byte (shift 8).
      */
+    s->enet_nrbdp = w2;
     s->seeq_rx_status = st;
     s->enet_rcvstat = (s->enet_rcvstat & HPC1_ENET_STRCVDMA) |
                       ((uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT);
