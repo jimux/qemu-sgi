@@ -197,6 +197,39 @@ typedef struct SGIip6State {
      * the test, settled it.
      */
     uint64_t gr1_fifo[256];   /* (offset << 32) | data, per fifo_w */
+    /*
+     * Partial GE5 command consumer, for the draw/sample operation class the
+     * firmware's RE-pattern test uses.  Command stream shape per MAME
+     * sgi_gr1.cpp fifo_w() (a queue of indexed register writes) and the
+     * PROM's own writers:
+     *   0xbfc047d4 : selector 0x818 then 0x800<-{0, 0, a0, a1, 1279}  (position)
+     *   0xbfc04c9c : selector 0x81c then 0x800<-{0x2a8, colour, 0,0,0,0,0}
+     *   0xbfc0485c : selector 0x83c then 0x800<-{a0, a1}             (sample)
+     * The engine consumes the stream and writes its RESULT into space(1);
+     * this models that output for this operation class only.
+     *
+     * MEASURED (this model does NOT yet pass the RE-pattern test):
+     *  - the consumer runs - the selectors arrive (0x818 x480768,
+     *    0x81c x45568, 0x83c x468144 over a boot) and are recognised;
+     *  - but param[1] of the 0x81c command reads 0 via this indexing,
+     *    whereas the trace shows the draw writing 0x2a8 then 0x7800, so the
+     *    PARAM INDEXING IS WRONG (0x7800 lands on a different index);
+     *  - and the output FORMAT is unmodelled: 0x7800 is 15 << 11 (the
+     *    (c&0xff)<<11 field of the firmware's 24->16-bit conversion) while
+     *    the suite's oracle expects 15, so the engine's colour->pixel
+     *    pipeline is not a plain framebuffer.
+     * Both are MICROCODE SEMANTICS, not inference: which parameter means
+     * what, and how a colour becomes a pixel word, are not derivable from
+     * the call sites.  This is the interpreter boundary the doctrine
+     * reserves for a visible-accuracy gap.  The FIFO-of-indexed-register-
+     * writes structure above is reference-backed (MAME sgi_gr1.cpp fifo_w)
+     * and is kept; the command SEMANTICS are what remain.
+     */
+    uint8_t gr1_ge_cmd;          /* active selector, 0 = none */
+    uint32_t gr1_ge_params[8];
+    unsigned gr1_ge_nparam;
+    uint32_t gr1_ge_colour;      /* last colour command's colour */
+    bool gr1_ge_sample_pending;  /* a sample command awaits its read */
     unsigned gr1_fifo_len;
     uint32_t gr1_fifo_bus;    /* buffer_r() read-back (MAME: m_bus) */
     bool gr1_kicked;
@@ -1018,6 +1051,12 @@ static int gr1_dr_hit(uint32_t eff, unsigned size)
 #define GR1_MAR       0x0c00u
 #define GR1_MAR_MSB   0x0e00u
 #define GR1_DATA      0x1400u
+/* GE command selectors, aperture-relative word indices ((off-0x800)>>2).
+ * bfc047d4 -> 0x818, bfc04c9c -> 0x81c, bfc0485c -> 0x83c. */
+#define GR1_GE_SEL_POS    ((0x818u - GR1_BUF) >> 2)   /* 6  */
+#define GR1_GE_SEL_COLOUR ((0x81cu - GR1_BUF) >> 2)   /* 7  */
+#define GR1_GE_SEL_SAMPLE ((0x83cu - GR1_BUF) >> 2)   /* 15 */
+#define GR1_GE_SEL_PARAM  ((0x800u - GR1_BUF) >> 2)   /* 0  */
 #define GR1_FINISH    0x2000u
 #define GR1_CODE_HI   0x8000u
 #define GR1_COMMAND   0x8640u
@@ -1079,7 +1118,17 @@ static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
         uint32_t mp = (eff - GR1_DATA) |
                       ((uint32_t)(s->gr1_mar & 0x3f) << 8);
 
-        val = s->gr1_data_store[(mp >> 2) & 0x7ff];
+        if (s->gr1_ge_sample_pending) {
+            /*
+             * The engine's OUTPUT for the sample operation class: the pixel
+             * reads back as the colour drawn there.  (Cell mapping not
+             * modelled - see the state comment.)
+             */
+            val = s->gr1_ge_colour;
+            s->gr1_ge_sample_pending = false;
+        } else {
+            val = s->gr1_data_store[(mp >> 2) & 0x7ff];
+        }
     } else if (eff >= 0x8000 && eff < 0xa000) {
         val = s->gr1_win[(eff - 0x8000) >> 2];
     }
@@ -1130,6 +1179,33 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
                 ((uint64_t)(eff - GR1_BUF) << 32) | (uint32_t)val;
         }
         s->gr1_fifo_bus = val;
+
+        /*
+         * Consume the stream (partial): a selector word begins a command,
+         * following 0x800 words are its parameters.  See the state comment
+         * for the three commands and their provenance.
+         */
+        {
+            unsigned reg = (eff - GR1_BUF) >> 2;
+
+            if (reg == GR1_GE_SEL_POS || reg == GR1_GE_SEL_COLOUR ||
+                reg == GR1_GE_SEL_SAMPLE) {
+                s->gr1_ge_cmd = (uint8_t)reg;
+                s->gr1_ge_nparam = 0;
+                if (reg == GR1_GE_SEL_SAMPLE) {
+                    /* sample command: the engine will produce a result */
+                    s->gr1_ge_sample_pending = true;
+                }
+            } else if (reg == GR1_GE_SEL_PARAM && s->gr1_ge_cmd) {
+                if (s->gr1_ge_nparam < ARRAY_SIZE(s->gr1_ge_params)) {
+                    s->gr1_ge_params[s->gr1_ge_nparam++] = (uint32_t)val;
+                }
+                if (s->gr1_ge_cmd == GR1_GE_SEL_COLOUR && s->gr1_ge_nparam == 2) {
+                    /* param[1] is the colour (param[0] observed as 0x2a8) */
+                    s->gr1_ge_colour = (uint32_t)val;
+                }
+            }
+        }
     } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
         uint32_t mp = (eff - GR1_DATA) |
                       ((uint32_t)(s->gr1_mar & 0x3f) << 8);
