@@ -55,10 +55,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_24_OFF  0x6c280 /* RE3 unbuffered register set */
 #define SGI_GR2_RE3_32_OFF  0x6c600 /* RE3 32-bit register */
 
-/* Board-version bytes: board rev (active-low) at 0x6c000, config at
- * 0x6c004.  These pick the XZ (2 GE, 24-bit + Z, SGI-GR5 rev). */
-#define SGI_GR2_BDVERS0     0x06 /* -> rev = (~0x06) & 0xf = 9 */
-#define SGI_GR2_BDVERS1     0x33 /* low2=3 (probe pass), bit4=24-bit, bit5=Z */
+/* Board-version bytes, one per 32-bit slot at 0x6c000/4/8/c.  The probe reads
+ * the byte at 0x6c000 for the revision (active-low nibble) and the byte at
+ * 0x6c004 for the config: its low two bits must NOT be 3 (or the probe
+ * rejects the board), bit 4 selects 24-bit and bit 5 selects the Z buffer.
+ * Values below pick the XZ (2 GE, 24-bit + Z) configuration. */
+#define SGI_GR2_BDVERS0     0x06 /* rev slot: -> rev = (~0x06) & 0xf = 9 */
+#define SGI_GR2_BDVERS1     0x30 /* cfg slot: low2=0, bit4=24-bit, bit5=Z */
 #define SGI_GR2_BDVERS2     0x00
 #define SGI_GR2_BDVERS3     0x00
 

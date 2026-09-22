@@ -34,6 +34,16 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
     if (offset + size > SGI_GR2_REG_SIZE) {
         return ~0ULL;
     }
+    /* GE units at or above the variant's engine count are not populated, so
+     * the driver's GE-count pattern test stops counting there. */
+    if (offset >= SGI_GR2_GE_OFF &&
+        offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
+        unsigned unit = (offset - SGI_GR2_GE_OFF) / SGI_GR2_GE_STRIDE;
+
+        if (unit >= s->ges) {
+            return ~0ULL;
+        }
+    }
     /* Big-endian byte assembly so byte/half/word accesses agree. */
     for (i = 0; i < size; i++) {
         val = (val << 8) | s->regs[offset + i];
@@ -49,6 +59,15 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (!s->present || offset + size > SGI_GR2_REG_SIZE) {
         return;
+    }
+    /* Unpopulated GE units discard writes. */
+    if (offset >= SGI_GR2_GE_OFF &&
+        offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
+        unsigned unit = (offset - SGI_GR2_GE_OFF) / SGI_GR2_GE_STRIDE;
+
+        if (unit >= s->ges) {
+            return;
+        }
     }
     /* The presence magic and the board-version register latch nothing from
      * the bus; ignore writes there. */
@@ -84,11 +103,12 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->regs[SGI_GR2_HQ_MYSTERY + 2] = (SGI_GR2_HQ_MAGIC >> 8) & 0xff;
     s->regs[SGI_GR2_HQ_MYSTERY + 3] = SGI_GR2_HQ_MAGIC & 0xff;
 
-    /* Board version / config bytes decoded by Gr2Probe. */
+    /* Board version / config bytes decoded by Gr2Probe: one byte per 32-bit
+     * slot at 0x6c000/4/8/c. */
     s->regs[SGI_GR2_BDVERS_OFF + 0] = SGI_GR2_BDVERS0;
-    s->regs[SGI_GR2_BDVERS_OFF + 1] = SGI_GR2_BDVERS1;
-    s->regs[SGI_GR2_BDVERS_OFF + 2] = SGI_GR2_BDVERS2;
-    s->regs[SGI_GR2_BDVERS_OFF + 3] = SGI_GR2_BDVERS3;
+    s->regs[SGI_GR2_BDVERS_OFF + 4] = SGI_GR2_BDVERS1;
+    s->regs[SGI_GR2_BDVERS_OFF + 8] = SGI_GR2_BDVERS2;
+    s->regs[SGI_GR2_BDVERS_OFF + 12] = SGI_GR2_BDVERS3;
 
     /* HQ2 revision register (read >> 16 into gr2_info.HQ2Rev). */
     s->regs[SGI_GR2_HQ_OFF + 0x6c + 0] = 0x00;
