@@ -43,6 +43,45 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHPC1State, SGI_HPC1)
 #define HPC1_DUART_BASE  0x0d00
 #define HPC1_RTC_BASE    0x0e00
 
+/*
+ * HPC1 ethernet (SEEQ 8003) DMA / status registers.
+ *
+ * Layout is `struct EHIO` from SGI's own driver header
+ * (references/stand/arcs/include/net/seeq.h, the `#if IP20` branch), which
+ * documents both the HPC1 and HPC3 variants.  Note the HPC1 quirk: the
+ * receive status sits in the HIGH byte (RCVSTAT_SHIFT 8) and the transmit
+ * status / "dma started" bits sit in the high half -- unlike HPC3, which
+ * uses the low bits and adds a piocfg/dmacfg indirection HPC1 does not have.
+ */
+#define HPC1_ENET_XCOUNT   0x0008  /* hpc debug */
+#define HPC1_ENET_CXBP     0x000c  /* current xmit buffer pointer */
+#define HPC1_ENET_NXBDP    0x0010  /* next xmit buffer descriptor pointer */
+#define HPC1_ENET_XBC      0x0014  /* xmit byte count */
+#define HPC1_ENET_CXBDP    0x0020  /* current xmit buffer descriptor ptr */
+#define HPC1_ENET_CPFXBDP  0x0024  /* current packet 1st xmit desc ptr */
+#define HPC1_ENET_PPFXBDP  0x0028  /* previous packet 1st xmit desc ptr */
+#define HPC1_ENET_INTDELAY 0x002c  /* interrupt delay count */
+#define HPC1_ENET_TRSTAT   0x0034  /* xmit status */
+#define HPC1_ENET_RCVSTAT  0x0038  /* receive status */
+#define HPC1_ENET_CTL      0x003c  /* interrupt / channel reset / buf oflow */
+#define HPC1_ENET_RBC      0x0048  /* receive byte count */
+#define HPC1_ENET_CRBP     0x004c  /* current receive buffer pointer */
+#define HPC1_ENET_NRBDP    0x0050  /* next receive buffer descriptor pointer */
+#define HPC1_ENET_CRBDP    0x0054  /* current receive buffer descriptor ptr */
+
+/* HPC1 enet control register bits (seeq.h, `#else` of IP22/26/28) */
+#define HPC1_ENET_CTL_RBO      0x08  /* receive buffer overflow */
+#define HPC1_ENET_CTL_MODNORM  0x04  /* mode: 0=loopback, 1=normal */
+#define HPC1_ENET_CTL_INTPEND  0x02  /* interrupt pending (write 1 clears) */
+#define HPC1_ENET_CTL_ERST     0x01  /* ethernet channel reset */
+
+/* HPC1 status placement (high half/byte, unlike HPC3) */
+#define HPC1_ENET_RCVSTAT_SHIFT   8
+#define HPC1_ENET_STRCVDMA        0x00004000  /* receive dma started */
+#define HPC1_ENET_STTRDMA         0x00400000  /* xmit dma started (0x40<<16) */
+#define HPC1_ENET_SEQ_XS_OLD      0x00800000  /* xmit old status (0x80<<16) */
+#define HPC1_ENET_SEQ_XS_SUCCESS  0x00080000  /* xmit success (0x08<<16) */
+
 #define HPC1_NUM_DUARTS  3
 #define HPC1_DUART_CH   2
 #define HPC1_RX_FIFO_SIZE 16
@@ -94,6 +133,27 @@ struct SGIHPC1State {
     uint8_t seeq_tx_cmd;
     uint8_t seeq_rx_status;
     uint8_t seeq_tx_status;
+
+    /*
+     * HPC1 ethernet DMA / status registers (struct EHIO, seeq.h IP20 branch).
+     * Register file only so far; the descriptor DMA engine, the NICState and
+     * the INT2 LIO0 Ethernet interrupt are the next increment (LEG44).
+     */
+    uint32_t enet_xcount;
+    uint32_t enet_cxbp;
+    uint32_t enet_nxbdp;
+    uint32_t enet_xbc;
+    uint32_t enet_cxbdp;
+    uint32_t enet_cpfxbdp;
+    uint32_t enet_ppfxbdp;
+    uint32_t enet_intdelay;
+    uint32_t enet_trstat;
+    uint32_t enet_rcvstat;
+    uint32_t enet_ctl;
+    uint32_t enet_rbc;
+    uint32_t enet_crbp;
+    uint32_t enet_nrbdp;
+    uint32_t enet_crbdp;
 
     /* WD33C93 SCSI controller */
     WD33C93State *scsi;
