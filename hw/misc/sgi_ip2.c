@@ -104,6 +104,9 @@
 #define IP2190_R0           (IP2190_PORT + 1)
 #define IP2190_R3           (IP2190_PORT + 2)
 #define IP2190_R2           (IP2190_PORT + 3)
+/* GL2 graphics register window inside the Multibus I/O segment. */
+#define IP2_GL2_BASE        0x2000
+#define IP2_GL2_SIZE        0x3000
 #define IP2190_GO           0x21
 #define IP2190_CLEAR        0x22
 #define IP2190_BUSY         0x01
@@ -212,6 +215,15 @@ int sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
         offset = address & 0x0fffffff;
         if (offset >= IP2190_PORT && offset <= IP2190_PORT + 3) {
             return 0;           /* let the MMIO ops handle the 2190 */
+        }
+        /*
+         * The GL2 graphics window (GF2/FBC, UC4 and DC4) is owned by the
+         * sgi-gl2 device, which the machine places inside this region.  Let
+         * these accesses reach the memory map; the PROM's gl2_probe() reads
+         * FBCflags here and the kernel textport writes UC4/DC4.
+         */
+        if (offset >= IP2_GL2_BASE && offset < IP2_GL2_BASE + IP2_GL2_SIZE) {
+            return 0;
         }
         return -1;              /* bus error: no board here */
     }
@@ -903,6 +915,11 @@ static void ip2_reset(DeviceState *dev)
 MemoryRegion *sgi_ip2_sys_region(DeviceState *dev)
 {
     return &SGI_IP2(dev)->sys;
+}
+
+MemoryRegion *sgi_ip2_mbio_region(DeviceState *dev)
+{
+    return &SGI_IP2(dev)->mbio;
 }
 
 void sgi_ip2_set_cpu(DeviceState *dev, CPUState *cpu)

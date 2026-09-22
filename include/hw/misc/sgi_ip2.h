@@ -24,6 +24,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIIP2State, SGI_IP2)
 MemoryRegion *sgi_ip2_sys_region(DeviceState *dev);
 
 /*
+ * The Multibus I/O segment (64 KB). Board subregions -- the 2190 disk and the
+ * GL2 graphics window -- are placed inside it by the machine.
+ */
+MemoryRegion *sgi_ip2_mbio_region(DeviceState *dev);
+
+/*
  * The board's custom-MMU translation, installed on the CPU by the machine
  * (which can see the target's CPUM68KState) via sgi_ip2_set_cpu().
  */

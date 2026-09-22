@@ -149,6 +149,7 @@ system_ss.add(when: 'CONFIG_SGI_NEWPORT_VIRTUIX', if_true: files('sgi_newport_vi
 system_ss.add(when: 'CONFIG_SGI_GBE', if_true: files('sgi_gbe.c'))
 system_ss.add(when: 'CONFIG_SGI_MACE_VIDEO', if_true: files('saa7111.c', 'saa7185.c'))
 system_ss.add(when: 'CONFIG_SGI_GLACCEL', if_true: files('sgi_glaccel.c'))
+system_ss.add(when: 'CONFIG_SGI_GL2', if_true: files('sgi_gl2.c'))
 system_ss.add(when: 'CONFIG_SGI_PVREX3', if_true: files('sgi_pvrex3.c'))
 
 modules += { 'hw-display': hw_display_modules }

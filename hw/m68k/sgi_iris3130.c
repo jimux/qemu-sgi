@@ -25,6 +25,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/mc68681.h"
 #include "hw/misc/sgi_ip2.h"
+#include "hw/display/sgi_gl2.h"
 #include "qapi/error.h"
 
 #define TYPE_IRIS3130_MACHINE MACHINE_TYPE_NAME("iris3130")
@@ -149,6 +150,21 @@ static void iris3130_init(MachineState *machine)
                                             0x02000000 + i * 0x00800000,
                                             mc68681_mmio_region(d), 1);
         sysbus_connect_irq(SYS_BUS_DEVICE(d), 0, irq[2 + i]);   /* uart0/1 */
+    }
+
+    /*
+     * GL2 graphics: the GF2/UC4/DC4 register window lives in the Multibus
+     * I/O segment at MBIO + 0x2000. The keyboard (DUART0 channel A) is what
+     * makes the PROM open this console (see stand/mon/init.c con_config).
+     */
+    {
+        DeviceState *gl2 = qdev_new(TYPE_SGI_GL2);
+
+        object_property_add_child(OBJECT(machine), "gl2", OBJECT(gl2));
+        sysbus_realize(SYS_BUS_DEVICE(gl2), &error_fatal);
+        memory_region_add_subregion_overlap(sgi_ip2_mbio_region(board),
+                                            0x2000,
+                                            sgi_gl2_mmio_region(gl2), 1);
     }
 }
 

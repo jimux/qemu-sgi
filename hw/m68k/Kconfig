@@ -41,6 +41,7 @@ config IRIS3130
     default y
     depends on M68K
     select SGI_IP2
+    select SGI_GL2
     select MC68681
 
 config M68K_VIRT
