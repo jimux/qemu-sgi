@@ -809,7 +809,9 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          * ql module) completes without polling bus_isr first.
          */
         if (getenv("QLISP_DEBUG")) {
-            fprintf(stderr, "sgi-qlisp: MBOX4 wr in=%u (req ring)\n", val & 0xffff);
+            fprintf(stderr, "sgi-qlisp: MBOX4 wr in=%u fw=%d cnt=%u out=%u cur=%d base=0x%llx (req ring)\n",
+                    val & 0xffff, s->firmware_running, s->req.count, s->req.out,
+                    s->cur_req != NULL, (unsigned long long)s->req.base);
         }
         ql_reg_put(s, off, val & 0xffff);
         ql_process_requests(s);
