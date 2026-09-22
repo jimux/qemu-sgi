@@ -93,6 +93,43 @@
 #define IOC3_SSCR_SELFCLR     (IOC3_SSCR_RX_DRAIN | IOC3_SSCR_RESET)
 
 /*
+ * IOC3 serial DMA TX ring (the kernel console data path).
+ *
+ * io/sio_ioc3.c do_ioc3_write() packs console bytes into a 4K ring in guest
+ * RAM, one 8-byte entry (4 data bytes + 4 status/control) at a time, then
+ * stores the new producer index in stpir and enables the SIO interrupt.  The
+ * hardware is expected to consume the entries (advancing stcir) and, when the
+ * ring drains, raise SIO_IR_SA_TX_MT; ioc3_wrflush() spins on that bit and the
+ * TX ISR (ioc3_serial_intr) uses it to wake the blocked console output.  Hb
+ * the spec/IRIX, the ring base comes from sbbr_h/sbbr_l and the serial
+ * interrupt is bridge bvec 4 -> HEART vector IP30_HVEC_IOC3_SERIAL (16).
+ */
+#define IOC3_SIO_IR_OFF       0x60001c
+#define IOC3_SIO_IES_OFF      0x600020
+#define IOC3_SIO_IEC_OFF      0x600024
+#define IOC3_SBBR_H_OFF       0x6000b0
+#define IOC3_SBBR_L_OFF       0x6000b4
+#define IOC3_PORT_A_STPIR_OFF 0x6000bc
+#define IOC3_PORT_A_STCIR_OFF 0x6000c0
+#define IOC3_PORT_B_STPIR_OFF 0x6000d8
+#define IOC3_PORT_B_STCIR_OFF 0x6000dc
+
+#define IOC3_SIO_IR_SA_TX_MT        0x00000001u /* port A TX empty         */
+#define IOC3_SIO_IR_SA_TX_EXPLICIT  0x00000080u /* port A explicit TX intr */
+#define IOC3_SIO_IR_SB_TX_MT        0x00000200u /* port B TX empty         */
+#define IOC3_SIO_IR_SB_TX_EXPLICIT  0x00010000u /* port B explicit TX intr */
+
+#define IOC3_SBBR_L_SIZE      0x00000001u /* 1 = 4K rings (not 1K)          */
+#define IOC3_TXCB_VALID       0x40        /* ring SC: byte is valid        */
+#define IOC3_TXCB_INT_WHEN_DONE 0x20      /* ring SC: interrupt when sent  */
+#define IOC3_SIO_RING_BYTES   4096        /* RING_BUF_SIZE                 */
+#define IOC3_SIO_RING_MASK    0x0ff8u     /* PROD_CONS_MASK (4K)           */
+#define IOC3_SIO_PORT_B_RING  8192        /* TX_B is the 3rd 4K ring       */
+
+/* Bridge bvec for the IOC3 serial (IP30_BVEC_IOC3_SERIAL = BRIDGE_IOC3_SPKM_ID). */
+#define BRIDGE_BVEC_IOC3_SERIAL 4
+
+/*
  * IOC3 UART custom MemoryRegion ops.
  *
  * Physical byte offset → standard 16550 register: std_reg = offset ^ 3
@@ -500,6 +537,92 @@ static uint64_t ioc3_dma_addr(uint64_t a)
     return a;
 }
 
+/* ioc3_regs[] is indexed by (IOC3 devio offset - 0x600000) / 4. */
+#define IOC3_IDX(off) (((off) - 0x600000) >> 2)
+
+/*
+ * SIO TX-ring base.  hardware_init() programs sbbr_h/sbbr_l from
+ * pciio_dmatrans_addr(); on IP30 the result is XIO-tagged (top word
+ * 0x80000000) with the system physical address in the low word.  sbbr_l bit 0
+ * is SBBR_L_SIZE, not address.
+ */
+static uint64_t ioc3_sio_ring_phys(uint32_t h, uint32_t l)
+{
+    uint64_t a = ((uint64_t)h << 32) | (l & ~IOC3_SBBR_L_SIZE);
+
+    if (a >> 32) {
+        a &= 0xffffffffULL;
+    }
+    return ioc3_dma_addr(a);
+}
+
+static void sgi_bridge_dev_irq(void *opaque, int n, int level);
+
+/*
+ * IOC3 serial DMA, TX half.  do_ioc3_write() packs console bytes into a ring
+ * in guest RAM (8-byte entries: 4 data + 4 status/control) and stores the new
+ * producer in stpir; the hardware consumes the entries (advancing stcir) and,
+ * once drained, reports TX-empty (SIO_IR_SA_TX_MT).  The kernel's console
+ * output blocks until that happens -- ioc3_wrflush() spins on the bit and the
+ * TX ISR wakes the output queue -- so without this the first kernel printf
+ * after the console switches to interrupt-driven output stalls every thread.
+ */
+static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
+{
+    uint32_t pending = s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] & s->ioc3_sio_ienb;
+    int level = pending != 0;
+
+    if (level != s->ioc3_sio_irq_level) {
+        s->ioc3_sio_irq_level = level;
+        sgi_bridge_dev_irq(s, BRIDGE_BVEC_IOC3_SERIAL, level);
+    }
+}
+
+static void sgi_bridge_ioc3_sio_tx_drain(SGIBRIDGEState *s, int port)
+{
+    uint32_t stpir_off = port ? IOC3_PORT_B_STPIR_OFF : IOC3_PORT_A_STPIR_OFF;
+    uint32_t stcir_off = port ? IOC3_PORT_B_STCIR_OFF : IOC3_PORT_A_STCIR_OFF;
+    uint32_t tx_mt = port ? IOC3_SIO_IR_SB_TX_MT : IOC3_SIO_IR_SA_TX_MT;
+    uint32_t explicit_bit = port ? IOC3_SIO_IR_SB_TX_EXPLICIT :
+                                   IOC3_SIO_IR_SA_TX_EXPLICIT;
+    uint32_t prod = s->ioc3_regs[IOC3_IDX(stpir_off)] & IOC3_SIO_RING_MASK;
+    uint32_t cons = s->ioc3_regs[IOC3_IDX(stcir_off)] & IOC3_SIO_RING_MASK;
+    uint64_t base = ioc3_sio_ring_phys(s->ioc3_regs[IOC3_IDX(IOC3_SBBR_H_OFF)],
+                                       s->ioc3_regs[IOC3_IDX(IOC3_SBBR_L_OFF)]);
+    uint32_t irq = 0;
+    int guard;
+
+    if (port) {
+        base += IOC3_SIO_PORT_B_RING;
+    }
+
+    for (guard = 0; cons != prod && guard < 4096; guard++) {
+        uint8_t entry[8];
+        int x;
+
+        if (dma_memory_read(&address_space_memory, base + cons, entry,
+                            sizeof(entry), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            break;
+        }
+        for (x = 0; x < 4; x++) {
+            if (entry[4 + x] & IOC3_TXCB_VALID) {
+                serial_io_ops.write(&s->ioc3_uart, 0, entry[x], 1);
+            }
+        }
+        if (entry[4] & IOC3_TXCB_INT_WHEN_DONE) {
+            irq |= explicit_bit;
+        }
+        cons = (cons + sizeof(entry)) & IOC3_SIO_RING_MASK;
+    }
+
+    s->ioc3_regs[IOC3_IDX(stcir_off)] = cons;
+    if (cons == prod) {
+        irq |= tx_mt;   /* transmitter idle */
+    }
+    s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] |= irq;
+    sgi_bridge_ioc3_sio_irq_update(s);
+}
+
 /* MII management interface (IOC3 MICR/MIDR) and IEEE 802.3 PHY bits. */
 #define IOC3_MICR_REGADDR_MASK   0x0000001f
 #define IOC3_MICR_PHYADDR_MASK   0x000003e0
@@ -712,6 +835,14 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
      */
     if (offset >= 0x500000 && offset < 0x520000) {
         offset += 0x100000;
+    }
+
+    if (getenv("IOC3_SIO_DEBUG") && offset >= 0x600000 && offset < 0x600100) {
+        static unsigned long rdburst;
+        if ((rdburst++ & 0x3ffff) == 0) {
+            fprintf(stderr, "IOC3SIO R rd#%lu [%06llx]\n",
+                    rdburst, (unsigned long long)offset);
+        }
     }
 
     switch (offset) {
@@ -969,6 +1100,11 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         offset += 0x100000;
     }
 
+    if (getenv("IOC3_SIO_DEBUG") && offset >= 0x600000 && offset < 0x600100) {
+        fprintf(stderr, "IOC3SIO W [%06llx] = %08llx size=%u\n",
+                (unsigned long long)offset, (unsigned long long)val, size);
+    }
+
     switch (offset) {
     case 0x0104:
         /* Interrupt status is read-only. */
@@ -1054,6 +1190,23 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         if (offset == 0x600030) {
             /* IOC3 MCR: 1-wire line to the MAC-address EEPROM. */
             sgi_bridge_ds_line_write(&s->ioc3_ds, val);
+        } else if (offset == IOC3_SIO_IR_OFF) {
+            /* SIO_IR is 1-to-clear: the ISR acks its source bits by writing. */
+            s->ioc3_regs[IOC3_IDX(offset)] &= ~val;
+            sgi_bridge_ioc3_sio_irq_update(s);
+        } else if (offset == IOC3_SIO_IES_OFF) {
+            s->ioc3_sio_ienb |= val;    /* SuperIO interrupt enable set   */
+            s->ioc3_regs[IOC3_IDX(offset)] = s->ioc3_sio_ienb;
+            sgi_bridge_ioc3_sio_irq_update(s);
+        } else if (offset == IOC3_SIO_IEC_OFF) {
+            s->ioc3_sio_ienb &= ~val;   /* SuperIO interrupt enable clear */
+            s->ioc3_regs[IOC3_IDX(offset)] = s->ioc3_sio_ienb;
+            sgi_bridge_ioc3_sio_irq_update(s);
+        } else if (offset == IOC3_PORT_A_STPIR_OFF ||
+                   offset == IOC3_PORT_B_STPIR_OFF) {
+            /* Serial TX producer index: drain the ring to stcir. */
+            s->ioc3_regs[IOC3_IDX(offset)] = val;
+            sgi_bridge_ioc3_sio_tx_drain(s, offset == IOC3_PORT_B_STPIR_OFF);
         } else if (offset != 0x600028) {
             if (offset >= SGI_BRIDGE_ETH_OFF &&
                 offset < SGI_BRIDGE_ETH_OFF + SGI_BRIDGE_ETH_SIZE) {

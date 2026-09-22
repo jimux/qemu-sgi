@@ -142,6 +142,16 @@ struct SGIBRIDGEState {
     uint32_t ioc3_regs[0x8000];
 
     /*
+     * IOC3 serial (SIO) interrupt state.  sio_ir lives in ioc3_regs, but its
+     * write is 1-to-clear, and a pending bit (sio_ir & ienables) is delivered
+     * to the HEART as bridge bvec 4.  ioc3_sio_ienb is the enable set/cleared
+     * through sio_ies/sio_iec; ioc3_sio_irq_level tracks the asserted level so
+     * the bvec is raised/relaxed on transitions.
+     */
+    uint32_t ioc3_sio_ienb;
+    int ioc3_sio_irq_level;
+
+    /*
      * IOC3 SuperIO index/data register pair (BRIDGE+0x6A0000 index,
      * +0x6C0000 data), a PC-style bank of 8-bit SuperIO registers.
      */
