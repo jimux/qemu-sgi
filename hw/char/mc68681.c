@@ -14,6 +14,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/char/mc68681.h"
@@ -78,11 +80,33 @@ struct MC68681State {
     uint8_t ctu;
     uint8_t ctl;
     uint8_t iport;
+
+    /*
+     * Counter/timer.  The SCN2681 START/STOP commands are issued by
+     * READING addresses 0xe / 0xf (writes there are Set/Reset Output Port
+     * Bits).  The 16-bit preload lives in CTU/CTL (0x6/0x7); reads return
+     * the live count while running and the frozen count once stopped.
+     * The IP2 kernel's start-up delay calibration (sys/streams/sduart.c
+     * buzztest()) writes ACR=0xbb, preloads 0xffff, reads 0xe to start,
+     * busy-loops, reads 0xf to stop, then subtracts CTU/CTL -- so a
+     * counter that never runs reads back the preload and the kernel
+     * divides by zero.
+     */
+    QEMUTimer *ct_timer;
+    uint16_t ct_reload;
+    uint16_t ct_frozen;
+    uint32_t ct_period;
+    int64_t ct_start_ns;
+    bool ct_half;
+    bool ct_int;
 };
 
 static void mc68681_update_irq(MC68681State *s)
 {
     s->isr = 0;
+    if (s->ct_int) {
+        s->isr |= ISR_COUNTER;
+    }
     if (s->sr[0] & SR_TXRDY) {
         s->isr |= ISR_TXA;
     }
@@ -173,6 +197,12 @@ static void mc68681_do_command(MC68681State *s, int ch, uint8_t cmd)
     switch (cmd & 3) {
     case 1: /* enable receiver */
         s->rx_enabled[ch] = true;
+        /*
+         * The receiver was disabled when the backend last asked, so the
+         * chardev is holding input; tell it the RX holding register is
+         * free again, or the first byte never arrives.
+         */
+        qemu_chr_fe_accept_input(&s->chr[ch]);
         break;
     case 2: /* disable receiver */
         s->rx_enabled[ch] = false;
@@ -184,11 +214,144 @@ static void mc68681_do_command(MC68681State *s, int ch, uint8_t cmd)
     mc68681_update_irq(s);
 }
 
+/*
+ * The SCN2681 is clocked by the board X1/CLK; 3.6864 MHz is the standard
+ * part clock.  ACR bit 6 selects timer (1) vs counter (0) mode and ACR bits
+ * 5:4 the clock source, matching the verified personal-iris sgi_scn2681
+ * model.  The IP2 kernel's calibration writes ACR=0xbb = counter mode,
+ * X1/CLK/16 = 230.4 kHz.  An ACR write only latches: the counter is started
+ * and stopped by reads of 0xe/0xf, never auto-started by ACR (MAME's
+ * auto-start ran against firmware intent).
+ */
+#define MC68681_X1_HZ 3686400
+
+static uint32_t mc68681_ct_rate(MC68681State *s)
+{
+    uint8_t acr = s->acr;
+
+    if (acr & 0x40) {                   /* timer mode */
+        switch ((acr >> 4) & 3) {
+        case 0:
+        case 1:
+        case 2:
+            return MC68681_X1_HZ;       /* IP2 / IP2-16 / X1 */
+        default:
+            return MC68681_X1_HZ / 16;  /* X1/CLK / 16 */
+        }
+    }
+
+    switch ((acr >> 4) & 3) {           /* counter mode */
+    case 0:
+        return MC68681_X1_HZ;
+    case 3:
+        return MC68681_X1_HZ / 16;
+    default:
+        /*
+         * Clocked from TxCA/TxCB.  Our channels transfer immediately and
+         * model no baud timing, so the counter cannot be clocked
+         * faithfully; say so rather than run it at an invented rate.
+         */
+        qemu_log_mask(LOG_UNIMP, "mc68681: counter clocked from a channel "
+                      "rate (ACR 0x%02x) is not modelled\n", s->acr);
+        return 0;
+    }
+}
+
+static uint16_t mc68681_ct_count(MC68681State *s)
+{
+    uint32_t rate = mc68681_ct_rate(s);
+    uint64_t ticks;
+
+    if (!rate) {
+        return s->ct_reload;
+    }
+    if (!s->ct_timer || !timer_pending(s->ct_timer)) {
+        return s->ct_frozen;    /* stopped: the counter holds its last value */
+    }
+    ticks = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ct_start_ns)
+            * rate / NANOSECONDS_PER_SECOND;
+    if (ticks >= s->ct_period) {
+        return 0;
+    }
+    return (s->ct_period - (uint32_t)ticks) & 0xffff;
+}
+
+static void mc68681_ct_rearm(MC68681State *s, uint32_t count)
+{
+    uint32_t rate = mc68681_ct_rate(s);
+
+    s->ct_reload = count & 0xffff;
+    /* A 16-bit down-counter loaded with zero runs 65536 counts, not 1. */
+    s->ct_period = count ? count : 0x10000;
+    s->ct_frozen = s->ct_reload;
+    s->ct_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!rate) {
+        timer_del(s->ct_timer);
+        return;
+    }
+    timer_mod(s->ct_timer, s->ct_start_ns +
+              (int64_t)s->ct_period * NANOSECONDS_PER_SECOND / rate);
+}
+
+static void mc68681_ct_start(MC68681State *s)
+{
+    s->ct_half = false;
+    mc68681_ct_rearm(s, ((uint32_t)s->ctu << 8) | s->ctl);
+}
+
+static void mc68681_ct_stop(MC68681State *s)
+{
+    if (s->ct_timer && timer_pending(s->ct_timer)) {
+        s->ct_frozen = mc68681_ct_count(s);
+        timer_del(s->ct_timer);
+    }
+    s->ct_int = false;
+    mc68681_update_irq(s);
+}
+
+static void mc68681_ct_cb(void *opaque)
+{
+    MC68681State *s = opaque;
+
+    if (s->acr & 0x40) {
+        /* Timer mode: a square wave, reloading every half period. */
+        s->ct_half = !s->ct_half;
+        if (!s->ct_half) {
+            s->ct_int = true;
+            mc68681_update_irq(s);
+        }
+        mc68681_ct_rearm(s, ((uint32_t)s->ctu << 8) | s->ctl);
+    } else {
+        /* Counter mode: free-running, reloading 0xffff when it wraps. */
+        s->ct_int = true;
+        mc68681_update_irq(s);
+        mc68681_ct_rearm(s, 0xffff);
+    }
+}
+
 static uint64_t mc68681_read(void *opaque, hwaddr addr, unsigned size)
 {
     MC68681State *s = opaque;
     int ch = (addr >> 3) & 1;
     int reg = addr & 7;
+    uint16_t count;
+
+    /*
+     * Direction-distinguished chip quirk: READS of 0xe/0xf are the
+     * START/STOP Counter commands; writes there are Set/Reset Output Port
+     * Bits.  The IP2 kernel's calibration reads 0xe to start and 0xf to
+     * stop.
+     */
+    switch (addr & 0xf) {
+    case 0xe:
+        mc68681_ct_start(s);
+        return 0;
+    case 0xf:
+        mc68681_ct_stop(s);
+        return 0;
+    default:
+        break;
+    }
 
     switch (reg) {
     case 0:
@@ -204,9 +367,11 @@ static uint64_t mc68681_read(void *opaque, hwaddr addr, unsigned size)
     case 5:
         return ch == 0 ? s->isr : s->iport;
     case 6:
-        return s->ctu;
+        count = mc68681_ct_count(s);
+        return count >> 8;
     case 7:
-        return s->ctl;
+        count = mc68681_ct_count(s);
+        return count & 0xff;
     default:
         return 0;
     }
@@ -218,6 +383,15 @@ static void mc68681_write(void *opaque, hwaddr addr, uint64_t val, unsigned size
     int ch = (addr >> 3) & 1;
     int reg = addr & 7;
     uint8_t data = val;
+
+    /*
+     * Writes to 0xe/0xf are Set/Reset Output Port Bits, the counterpart of
+     * the READ START/STOP commands handled in mc68681_read().  They must
+     * not be mistaken for CTU/CTL (which share the low three address bits).
+     */
+    if ((addr & 0xf) == 0xe || (addr & 0xf) == 0xf) {
+        return;
+    }
 
     switch (reg) {
     case 0:
@@ -311,6 +485,15 @@ static void mc68681_reset(DeviceState *dev)
     s->acr = s->opcr = s->imr = s->isr = s->ipcr = 0;
     s->ctu = s->ctl = 0;
     s->iport = 0;
+    if (s->ct_timer) {
+        timer_del(s->ct_timer);
+    }
+    s->ct_reload = 0;
+    s->ct_frozen = 0;
+    s->ct_period = 0x10000;
+    s->ct_start_ns = 0;
+    s->ct_half = false;
+    s->ct_int = false;
     mc68681_update_irq(s);
 }
 
@@ -318,6 +501,8 @@ static void mc68681_realize(DeviceState *dev, Error **errp)
 {
     MC68681State *s = MC68681(dev);
     int ch;
+
+    s->ct_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mc68681_ct_cb, s);
 
     for (ch = 0; ch < 2; ch++) {
         s->rx_opaque[ch].s = s;
