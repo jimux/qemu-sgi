@@ -23,10 +23,14 @@
 #include "cpu.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev.h"
 #include "hw/core/loader.h"
 #include "hw/mips/mips.h"
 #include "hw/misc/unimp.h"
 #include "hw/nvram/eeprom93xx.h"
+#include "hw/scsi/scsi.h"
+#include "hw/scsi/wd33c93.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
@@ -65,6 +69,15 @@
 #define SGI_IP6_RTC_BASE    0x1fbc0000ULL
 #define SGI_IP6_RTC_SIZE    0x80
 
+/* WD33C93 SCSI (indirect address/data ports) and its reset lines */
+#define SGI_IP6_SCSI_BASE   0x1fb00000ULL
+#define SGI_IP6_SCSI_SIZE   0x200
+#define SGI_IP6_SCSIRST_BASE 0x1fa80000ULL
+#define SGI_IP6_SCSIRST_SIZE 0x10
+
+/* LIO interrupt bits */
+#define LIO_SCSI            4
+
 /* cpuauxctl bits */
 #define CPUAUX_EEPROM_CS    0x20
 #define CPUAUX_EEPROM_CLK   0x40
@@ -88,10 +101,17 @@ typedef struct SGIip6State {
     MemoryRegion err;
     MemoryRegion clrerr;
     MemoryRegion rtc;
+    MemoryRegion scsi_regs;
+    MemoryRegion scsi_reset;
+
+    MIPSCPU *cpu;
+    WD33C93State *scsi;
 
     eeprom_t *eeprom;
 
     uint8_t rtc_regs[SGI_IP6_RTC_SIZE];
+
+    bool lio_int;
 
     uint8_t memcfg;
     uint16_t cpucfg;
@@ -109,6 +129,8 @@ typedef struct SGIip6State {
 } SGIip6State;
 
 static SGIip6State ip6_state;
+
+static void sgi_ip6_lio_update(SGIip6State *s);
 
 /* ---- CTL1 control registers ------------------------------------------ */
 
@@ -277,6 +299,7 @@ static void sgi_ip6_lio_write(void *opaque, hwaddr addr, uint64_t data,
 
     if ((addr & 0xf) == 8) {
         s->lio_imr = data & 0xff;
+        sgi_ip6_lio_update(s);
     }
 }
 
@@ -382,6 +405,105 @@ static const MemoryRegionOps sgi_ip6_rtc_ops = {
     },
 };
 
+/* ---- LIO interrupt line ---------------------------------------------- */
+
+static void sgi_ip6_lio_update(SGIip6State *s)
+{
+    bool level = (~s->lio_isr) & s->lio_imr;
+
+    if (level != s->lio_int && s->cpu) {
+        s->lio_int = level;
+        qemu_set_irq(s->cpu->env.irq[1], level);
+    }
+}
+
+/* ---- WD33C93 SCSI ----------------------------------------------------- */
+
+static uint64_t sgi_ip6_scsi_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint32_t off = addr & (SGI_IP6_SCSI_SIZE - 1);
+
+    if (off < 0x100) {
+        return wd33c93_addr_read(s->scsi);   /* address port: ASR */
+    }
+    return wd33c93_data_read(s->scsi);       /* data port */
+}
+
+static void sgi_ip6_scsi_write(void *opaque, hwaddr addr, uint64_t data,
+                               unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint32_t off = addr & (SGI_IP6_SCSI_SIZE - 1);
+
+    if (off < 0x100) {
+        wd33c93_addr_write(s->scsi, data & 0xff);
+    } else {
+        wd33c93_data_write(s->scsi, data & 0xff);
+    }
+}
+
+static const MemoryRegionOps sgi_ip6_scsi_ops = {
+    .read = sgi_ip6_scsi_read,
+    .write = sgi_ip6_scsi_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/*
+ * SCSI control lines: 0x1fa80004 asserts reset, 0x1fa80000 releases it.
+ * The WD33C93 hardware reset raises the reset-status interrupt (MAME
+ * wd33c9x device_reset pushes SCSI_STATUS_RESET), which the PROM waits for
+ * by polling ASR bit 7.  QEMU's wd33c93 device reset leaves the interrupt
+ * clear, so drive the chip's own reset command, which does set it.
+ */
+static uint64_t sgi_ip6_scsi_reset_read(void *opaque, hwaddr addr,
+                                        unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    if ((addr & (SGI_IP6_SCSIRST_SIZE - 1)) == 0x4) {
+        wd33c93_addr_write(s->scsi, WD_COMMAND);
+        wd33c93_data_write(s->scsi, CMD_RESET);
+    }
+    return 0;
+}
+
+static void sgi_ip6_scsi_reset_write(void *opaque, hwaddr addr, uint64_t data,
+                                     unsigned size)
+{
+}
+
+static const MemoryRegionOps sgi_ip6_scsi_reset_ops = {
+    .read = sgi_ip6_scsi_reset_read,
+    .write = sgi_ip6_scsi_reset_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+static void sgi_ip6_scsi_irq(void *opaque, int n, int level)
+{
+    SGIip6State *s = opaque;
+
+    if (level) {
+        s->lio_isr |= (1u << LIO_SCSI);
+    } else {
+        s->lio_isr &= ~(1u << LIO_SCSI);
+    }
+    sgi_ip6_lio_update(s);
+}
+
+static void sgi_ip6_scsi_drq(void *opaque, int n, int level)
+{
+    /* SCSI DMA is not wired yet; the PROM's early init does not use it. */
+}
+
 /* ---- machine ---------------------------------------------------------- */
 
 static void main_cpu_reset(void *opaque)
@@ -420,6 +542,7 @@ static void sgi_ip6_init(MachineState *machine)
     cpu_mips_irq_init_cpu(cpu);
     cpu_mips_clock_init(cpu);
     qemu_register_reset(main_cpu_reset, cpu);
+    s->cpu = cpu;
 
     /* Flat RAM at physical 0 (KSEG0/KSEG1 map onto it). The CTL1's per-bank
      * mapping is approximated by mapping all RAM. */
@@ -487,17 +610,39 @@ static void sgi_ip6_init(MachineState *machine)
                           "sgi-ip6-rtc", SGI_IP6_RTC_SIZE);
     memory_region_add_subregion(system_memory, SGI_IP6_RTC_BASE, &s->rtc);
 
-    /* Devices not yet implemented: PIT, WD33C93, SCN2681 DUARTs, LANCE and
-     * GR1 graphics.  Map them as unimplemented so accesses are logged
-     * rather than aborting. */
+    /* WD33C93 SCSI controller. */
+    s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
+    qdev_realize(DEVICE(s->scsi), NULL, &error_fatal);
+    scsi_bus_legacy_handle_cmdline(&s->scsi->bus);
+    qdev_connect_gpio_out_named(DEVICE(s->scsi), "irq", 0,
+                                qemu_allocate_irq(sgi_ip6_scsi_irq, s, 0));
+    qdev_connect_gpio_out_named(DEVICE(s->scsi), "drq", 0,
+                                qemu_allocate_irq(sgi_ip6_scsi_drq, s, 0));
+
+    memory_region_init_io(&s->scsi_regs, OBJECT(machine), &sgi_ip6_scsi_ops,
+                          s, "sgi-ip6-scsi", SGI_IP6_SCSI_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_SCSI_BASE,
+                                &s->scsi_regs);
+
+    memory_region_init_io(&s->scsi_reset, OBJECT(machine),
+                          &sgi_ip6_scsi_reset_ops, s, "sgi-ip6-scsirst",
+                          SGI_IP6_SCSIRST_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_SCSIRST_BASE,
+                                &s->scsi_reset);
+
+    /* Devices not yet implemented: PIT, SCN2681 DUARTs, LANCE and GR1
+     * graphics.  Map them as unimplemented so accesses are logged rather
+     * than aborting. */
     create_unimplemented_device("sgi-ip6-pit", 0x1fb40000, 0x10);
-    create_unimplemented_device("sgi-ip6-scsi", 0x1fb00000, 0x800);
-    create_unimplemented_device("sgi-ip6-scsictl", 0x1fa80000, 0x10);
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
     create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
     create_unimplemented_device("sgi-ip6-duart", 0x1fb80000, 0x100);
     create_unimplemented_device("sgi-ip6-lance", 0x1f950000, 0x20000);
     create_unimplemented_device("sgi-ip6-gr1", 0x1f000000, 0x8000);
+    create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
+    create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
+    create_unimplemented_device("sgi-ip6-gio", 0x1f400000, 0x400000);
+    create_unimplemented_device("sgi-ip6-vme", 0x1fa60000, 0x20000);
 
     /* memcfg defaults to the populated banks (4 MB SIMMs). */
     if (ram_mb >= 64) {
@@ -515,6 +660,7 @@ static void sgi_ip6_init(MachineState *machine)
     s->erradr = 0;
     s->refadr = 0;
     memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
+    s->lio_int = false;
     s->lio_isr = 0x3ff;
     s->lio_imr = 0;
 }
