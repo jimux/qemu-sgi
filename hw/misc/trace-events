@@ -537,3 +537,7 @@ sgi_vino_desc(int ch, uint64_t addr, uint32_t d0, uint32_t d1, uint32_t d2, uint
 sgi_vino_field(int ch, uint32_t count, uint32_t bytes) "VINO ch%d field=%u captured %u bytes"
 sgi_vino_frame(uint32_t w, uint32_t h, uint32_t fourcc, size_t len) "VINO host frame %ux%u fourcc=0x%x len=%zu"
 sgi_vino_field_src(int ch, uint32_t row_bytes, size_t frame_len, int use_frame) "VINO ch%d field row_bytes=%u frame_len=%zu use_frame=%d"
+
+# sgi_gr2.c (Indy XZ GR2 / "Express" register shell)
+sgi_gr2_read(uint64_t off, unsigned size, uint64_t val) "GR2 read  off=0x%05"PRIx64" size=%u -> 0x%"PRIx64
+sgi_gr2_write(uint64_t off, uint64_t val, unsigned size) "GR2 write off=0x%05"PRIx64" val=0x%"PRIx64" size=%u"

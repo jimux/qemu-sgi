@@ -47,6 +47,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
 #define SGI_GR2_HQ_MYSTERY  0x6a07c /* presence magic, read by Gr2Probe */
 #define SGI_GR2_HQ_MAGIC    0xdeadbeefu
+
+/* HQ2 registers, from the 6.5 gr2_init.o disassembly (Gr2FIFOHandler,
+ * _Gr2HQ2RegInit, Gr2DownloadHQ2/GE7).  The FIFO status at 0x6a040 carries
+ * the current occupancy in bits 6..12 (mask 0x1fc0) and an error flag in bit
+ * 5; the driver polls it before/while draining the token FIFO, so it must read
+ * as read-only and empty (0), not as whatever the bus last wrote. */
+#define SGI_GR2_HQ_FIFOSTAT    0x6a040
+#define SGI_GR2_HQ_NUMGE       0x6a044
+#define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
+#define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
+#define SGI_GR2_HQ_FIFO_FULL   0x6a05c /* level at which the FIFO is "full" */
+#define SGI_GR2_HQ_FIFO_EMPTY  0x6a060 /* level at which the FIFO is "empty"*/
+#define SGI_GR2_HQ_UCODELOAD   0x6a064 /* GE7 ucode load data register      */
+#define SGI_GR2_HQ_VERSION     0x6a06c /* HQ2 revision, read >> 16          */
+#define SGI_GR2_HQ_GEPC        0x6a070 /* GE7 program counter / load address*/
+/* The 6.5 driver stages the HQ2 microcode through 0x6a000..0x6a03f (16
+ * words) — i.e. immediately below the HQ2 status register at 0x6a040 — not
+ * at the 5.3 header's 0x60000 window.  The 6.5 binary is authoritative. */
+#define SGI_GR2_HQ_UC_RAM      0x6a000 /* HQ2 ucode load staging (16 words) */
 #define SGI_GR2_FIN3_OFF    0x6b000 /* HQ2 fin3 register */
 #define SGI_GR2_BDVERS_OFF  0x6c000 /* board version / config / video backend */
 #define SGI_GR2_VC1_OFF     0x6c040 /* VC1 video controller */

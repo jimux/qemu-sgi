@@ -19,6 +19,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/sgi_gr2.h"
+#include "trace.h"
 
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -48,6 +49,12 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
     for (i = 0; i < size; i++) {
         val = (val << 8) | s->regs[offset + i];
     }
+    /* The command/register traffic worth watching (µcode load staging, HQ2,
+     * GE and RE3) is all at or above the HQ2 block; the shram and token FIFO
+     * are huge and mostly idle. */
+    if (offset < 0x40 || offset >= SGI_GR2_HQUCODE_OFF) {
+        trace_sgi_gr2_read(offset, size, val);
+    }
     return val;
 }
 
@@ -73,6 +80,15 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * the bus; ignore writes there. */
     if (offset < SGI_GR2_HQ_MYSTERY + 4 && offset + size > SGI_GR2_HQ_MYSTERY) {
         return;
+    }
+    /* The HQ2 FIFO occupancy/status register is read-only (the driver only
+     * polls it); a stray write must not corrupt the level/error bits. */
+    if (offset >= SGI_GR2_HQ_FIFOSTAT &&
+        offset < SGI_GR2_HQ_FIFOSTAT + 4) {
+        return;
+    }
+    if (offset < 0x40 || offset >= SGI_GR2_HQUCODE_OFF) {
+        trace_sgi_gr2_write(offset, value, size);
     }
     for (i = 0; i < size; i++) {
         uint8_t byte = (value >> (8 * (size - 1 - i))) & 0xff;
