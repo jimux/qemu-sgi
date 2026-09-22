@@ -64,6 +64,16 @@ static void sgi_hub_reset_bh(void *opaque);
 /* --- Hub MD (memory/directory) offsets --- */
 #define MD_MEMORY_CONFIG 0x200018
 #define MD_REFRESH_CONTROL 0x200020
+/* MD error-status / clear block (hubmd.h).  No errors pending; reads return 0
+ * and writes are the "clear" side-effects, which we absorb. */
+#define MD_DIR_ERROR_CLR 0x200058
+#define MD_PROTOCOL_ERROR 0x200060
+#define MD_PROTOCOL_ERROR_CLR 0x200068
+#define MD_MEM_ERROR_CLR 0x200078
+#define MD_MISC_ERROR_CLR 0x200088
+/* DIMM-mode init pair at the end of the same walk (hubmd.h). */
+#define MD_MEM_DIMM_INIT 0x200090
+#define MD_DIR_DIMM_INIT 0x200098
 /*
  * MicroLAN (1-wire) control.  The PROM bit-bangs the hub NIC EEPROM through
  * this register: it writes PULSE<19:10>/SAMPLE<9:2>, then spins on DONE
@@ -221,6 +231,12 @@ static uint64_t sgi_hub_pi_read(SGIHubState *s, hwaddr off) {
   case PI_CPU_ENABLE_B:
     return s->cpu_enable[1];
   case PI_INT_PEND0:
+    return s->int_pend0;
+  case PI_INT_PEND_MOD:
+    /*
+     * Write-only modify register per hubpi.h, but firmware polls it here;
+     * return the current INT_PEND0 state so the poll makes progress.
+     */
     return s->int_pend0;
   case PI_INT_PEND1:
     return s->int_pend1;
@@ -662,6 +678,14 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
     /* uController/UART and MLAN registers: state held, semantic model later. */
     return 0;
   }
+  if (off >= 0x200040 && off < 0x2000a0) {
+    /*
+     * MD error-status/clear walk (hubmd.h): the PROM reads each status
+     * register then writes its clear.  No directory/protocol/mem/misc/DIMM-init
+     * errors are ever pending, so reads return 0 and clears are no-ops.
+     */
+    return 0;
+  }
   qemu_log_mask(LOG_UNIMP, "sgi-hub: unimplemented MD read @0x%" HWADDR_PRIx
                            "\n",
                 off);
@@ -696,6 +720,10 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
   }
   if ((off >= MD_UREG0_0 && off <= MD_UREG0_7) ||
       (off >= MD_UREG1_0 && off <= MD_UREG1_15)) {
+    return;
+  }
+  if (off >= 0x200040 && off < 0x2000a0) {
+    /* MD error-status/clear walk (see the read side): clears absorbed. */
     return;
   }
   qemu_log_mask(LOG_UNIMP, "sgi-hub: unimplemented MD write @0x%" HWADDR_PRIx
@@ -864,6 +892,9 @@ static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
     break;
   case NI_VECTOR_CLEAR:
     s->ni_vector_status = 0;
+    break;
+  case NI_VECTOR_READ_DATA:
+    /* Write-only vector-PIO probe (hubni.h); fire-and-forget, no readback. */
     break;
   case NI_AGE_CPU0_MEMORY:
     s->ni_age[0] = val;
