@@ -515,15 +515,21 @@ static NetClientInfo net_sgi_baseio_eth_info = {
 };
 
 /*
- * IOC3 byte-bus time-of-day chip (Dallas DS1386), bridge+0x280000 =
- * IOC3_BYTEBUS_DEV0.  Offsets, the update-disable/enable protocol and the BCD
- * encoding are from IRIX ml/SN/klclock.{c,h}; the register map is non-contiguous
+ * IOC3 byte-bus time-of-day chip (Dallas DS1386).  Its register block is the
+ * IOC3's SIO RTC: IOC3_SIO_RTC_BASE = IOC3_SIO_BASE(0x20000) + 0x168 (see
+ * sys/PCI/ioc3.h), and the IOC3 sits at bridge+0x200000, so it lands here.
+ * Offsets, the update-disable/enable protocol and the BCD encoding are from
+ * IRIX ml/SN/klclock.{c,h}; the register map is non-contiguous
  * (SEC +0x1, MIN +0x2, HOUR +0x4, DAY +0x6, DATE +0x8, MONTH +0x9, YEAR +0xa).
  * rtodc() autodetects the part by writing 0xff to DAY and checking the
  * read-back: a DS1386 stores a BCD day and never returns 0xff, so modelling the
  * Dallas part with a live calendar keeps the autodetect on the Dallas branch.
+ *
+ * NOTE: bridge+0x280000 is NOT the RTC -- it is the IOC3 byte-bus SRAM window
+ * (IOC3_BYTEBUS_DEV0 = 0x80000 within the IOC3, DEV0..3 spanning 512 KB), which
+ * ARCS sizes and memory-tests; see the SGI_BASEIO_BR_SSRAM_* handling.
  */
-#define SGI_BASEIO_RTC_OFF 0x280000ULL
+#define SGI_BASEIO_RTC_OFF 0x220168ULL
 #define RTC_DAL_SEC_OFF 0x1
 #define RTC_DAL_MIN_OFF 0x2
 #define RTC_DAL_HOUR_OFF 0x4
@@ -882,7 +888,28 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off == 0x114) {
     return 0;
   }
-  /* IOC3 byte-bus time-of-day chip (Dallas DS1386). */
+  /*
+   * Bridge external SSRAM / IOC3 byte-bus SRAM window at bridge+0x280000
+   * (IOC3_BYTEBUS_DEV0 = 0x80000 within the IOC3, DEV0..3 spanning 512 KB).  On
+   * IP27 ARCS size_bridge_ssram() writes a size marker at [0]/[64k]/[128k] and
+   * reads it back to pick the fitted size, then runs an alternating-pattern
+   * memory test over the array.  Back the window with storage so those accesses
+   * persist; without it they read back 0, the SSRAM looks absent, and the kernel
+   * loops forever.  It is pure SRAM -- the RTC is a different IOC3 register (see
+   * SGI_BASEIO_RTC_OFF).
+   */
+  if (off >= SGI_BASEIO_BR_SSRAM_OFF &&
+      off < SGI_BASEIO_BR_SSRAM_OFF + SGI_BASEIO_BR_SSRAM_SIZE) {
+    hwaddr o = off - SGI_BASEIO_BR_SSRAM_OFF;
+    unsigned n;
+    uint64_t v = 0;
+
+    for (n = 0; n < size; n++) {
+      v |= (uint64_t)s->br_ssram[o + n] << (8 * n);
+    }
+    return v;
+  }
+  /* IOC3 SIO RTC (Dallas DS1386) at IOC3_SIO_RTC_BASE. */
   if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
     return sgi_baseio_tod_read(s, off - SGI_BASEIO_RTC_OFF);
   }
@@ -1014,6 +1041,22 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
     return;
   }
   /* IOC3 byte-bus time-of-day chip (Dallas DS1386). */
+  /*
+   * Bridge external SSRAM / IOC3 byte-bus SRAM window (see the read side).
+   * Writes land in the backing storage so the ARCS size probe and pattern test
+   * hold; the RTC is a separate IOC3 register (see SGI_BASEIO_RTC_OFF).
+   */
+  if (off >= SGI_BASEIO_BR_SSRAM_OFF &&
+      off < SGI_BASEIO_BR_SSRAM_OFF + SGI_BASEIO_BR_SSRAM_SIZE) {
+    hwaddr o = off - SGI_BASEIO_BR_SSRAM_OFF;
+    unsigned n;
+
+    for (n = 0; n < size; n++) {
+      s->br_ssram[o + n] = (val >> (8 * n)) & 0xff;
+    }
+    return;
+  }
+  /* IOC3 SIO RTC (Dallas DS1386) at IOC3_SIO_RTC_BASE. */
   if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
     sgi_baseio_tod_write(s, off - SGI_BASEIO_RTC_OFF, val);
     return;

@@ -74,6 +74,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 #define SGI_BASEIO_ETH_NREGS 25
 #define SGI_BASEIO_ETH_SIZE (SGI_BASEIO_ETH_NREGS * 4)
 
+/*
+ * Bridge external SSRAM window at DEVIO0 (0x200000) + 0x80000 = bridge+0x280000,
+ * up to 512 KB (BRIDGE_EXT_SSRAM in sys/PCI/bridge.h).  ARCS sizes it and runs a
+ * pattern test over it; backed with storage (see SGIBaseIOState.br_ssram).
+ */
+#define SGI_BASEIO_BR_SSRAM_OFF 0x280000ULL
+#define SGI_BASEIO_BR_SSRAM_SIZE 0x80000
+
 /* Register word indices (from IOC3 offset 0x0F0). */
 #define SGI_IOC3_EMCR 0
 #define SGI_IOC3_EISR 1
@@ -166,6 +174,16 @@ struct SGIBaseIOState {
 
   /* PCI config-space writes to slot 0 (IOC3), via the bridge config window. */
   uint32_t pci_cfg0[0x40];
+
+  /*
+   * Bridge external SSRAM (BRIDGE_EXT_SSRAM) backing storage, at DEVIO0+0x80000
+   * = bridge+0x280000.  On IP27 (non-RPROM) ARCS size_bridge_ssram() writes a
+   * size marker and reads it back to pick the fitted size, then exercises the
+   * array with alternating a5a5/5a5a patterns; without storage those reads
+   * return 0, the bridge is mistreated as having no SSRAM, and the kernel loops
+   * forever.  Same contract octane models for IP30 (hw/misc/sgi_bridge.c).
+   */
+  uint8_t br_ssram[SGI_BASEIO_BR_SSRAM_SIZE];
 
   /*
    * IOC3 byte-bus time-of-day chip (Dallas DS1386) at bridge+0x280000
