@@ -26,6 +26,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
+#include "net/net.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -83,6 +84,8 @@ static int scc_console_channel(const SGIHPC1State *s, int d, int c)
 }
 
 static void scc_update_irq(SGIHPC1State *s);
+static void sgi_hpc1_enet_tx(SGIHPC1State *s);
+static void sgi_hpc1_enet_reset(SGIHPC1State *s);
 
 static void scc_tx(SGIHPC1State *s, int d, int c, uint8_t data)
 {
@@ -1103,20 +1106,39 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
                          : wd33c93_addr_read(s->scsi);
     }
 
+    if (addr >= HPC1_ENET_XCOUNT && addr < 0x60) {
+        uint32_t v;
+        switch (addr & ~3ULL) {
+        case HPC1_ENET_XCOUNT:   v = s->enet_xcount; break;
+        case HPC1_ENET_CXBP:     v = s->enet_cxbp; break;
+        case HPC1_ENET_NXBDP:    v = s->enet_nxbdp; break;
+        case HPC1_ENET_XBC:      v = s->enet_xbc; break;
+        case HPC1_ENET_CXBDP:    v = s->enet_cxbdp; break;
+        case HPC1_ENET_CPFXBDP:  v = s->enet_cpfxbdp; break;
+        case HPC1_ENET_PPFXBDP:  v = s->enet_ppfxbdp; break;
+        case HPC1_ENET_INTDELAY: v = s->enet_intdelay; break;
+        case HPC1_ENET_TRSTAT:   v = s->enet_trstat; break;
+        case HPC1_ENET_RCVSTAT:  v = s->enet_rcvstat; break;
+        case HPC1_ENET_CTL:      v = s->enet_ctl; break;
+        case HPC1_ENET_RBC:      v = s->enet_rbc; break;
+        case HPC1_ENET_CRBP:     v = s->enet_crbp; break;
+        case HPC1_ENET_NRBDP:    v = s->enet_nrbdp; break;
+        case HPC1_ENET_CRBDP:    v = s->enet_crbdp; break;
+        default:                 v = 0; break;
+        }
+        return v;
+    }
+
     if (addr >= HPC1_ENET_BASE && addr < HPC1_ENET_BASE + 0x20) {
         int reg = ((addr - HPC1_ENET_BASE) >> 2) & 7;
         switch (reg) {
         case 6:
-            val8 = s->seeq_rx_status | 0x80;
-            break;
+            return s->seeq_rx_status | 0x80;   /* SEQ_RS_OLD: new status */
         case 7:
-            val8 = s->seeq_tx_status | 0x80;
-            break;
+            return s->seeq_tx_status | 0x80;
         default:
-            val8 = 0;
-            break;
+            return 0;
         }
-        return val8;
     }
 
     /*
@@ -1237,6 +1259,57 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
         return;
     }
 
+    if (addr >= HPC1_ENET_XCOUNT && addr < 0x60) {
+        /*
+         * The enet DMA register file is fully writable: the driver
+         * programs a pointer/status register and reads it back (e.g.
+         * CXBDP after arming RX).  Dropping any write makes the read
+         * return 0 and the driver dereferences a NULL descriptor ->
+         * guest Data Bus Error, so every register stores its value.
+         */
+        switch (addr & ~3ULL) {
+        case HPC1_ENET_XCOUNT:   s->enet_xcount = value; break;
+        case HPC1_ENET_CXBP:     s->enet_cxbp = value; break;
+        case HPC1_ENET_NXBDP:    s->enet_nxbdp = value; break;
+        case HPC1_ENET_XBC:      s->enet_xbc = value; break;
+        case HPC1_ENET_CXBDP:    s->enet_cxbdp = value; break;
+        case HPC1_ENET_CPFXBDP:  s->enet_cpfxbdp = value; break;
+        case HPC1_ENET_PPFXBDP:  s->enet_ppfxbdp = value; break;
+        case HPC1_ENET_INTDELAY: s->enet_intdelay = value; break;
+        case HPC1_ENET_TRSTAT:
+            /* Writing HPC_STTRDMA starts the transmit channel. */
+            s->enet_trstat = value;
+            if (value & HPC1_ENET_STTRDMA) {
+                sgi_hpc1_enet_tx(s);
+            }
+            break;
+        case HPC1_ENET_RCVSTAT:
+            /* HPC_STRCVDMA arms the receive channel. */
+            s->enet_rcvstat = value;
+            break;
+        case HPC1_ENET_CTL:
+            /* INTPEND is write-1-to-clear; ERST resets the channel (the
+             * driver asserts it then clears it during init). */
+            if (value & HPC1_ENET_CTL_ERST) {
+                s->enet_trstat = 0;
+                s->enet_rcvstat = 0;
+                s->enet_ctl = HPC1_ENET_CTL_MODNORM;
+            }
+            if (value & HPC1_ENET_CTL_INTPEND) {
+                s->enet_ctl &= ~HPC1_ENET_CTL_INTPEND;
+                s->lio_status[0] &= ~LIO0_ETHERNET;
+                scc_update_irq(s);
+            }
+            break;
+        case HPC1_ENET_RBC:      s->enet_rbc = value; break;
+        case HPC1_ENET_CRBP:     s->enet_crbp = value; break;
+        case HPC1_ENET_NRBDP:    s->enet_nrbdp = value; break;
+        case HPC1_ENET_CRBDP:    s->enet_crbdp = value; break;
+        default:                 break;
+        }
+        return;
+    }
+
     if (addr >= HPC1_ENET_BASE && addr < HPC1_ENET_BASE + 0x20) {
         int reg = ((addr - HPC1_ENET_BASE) >> 2) & 7;
         switch (reg) {
@@ -1244,11 +1317,20 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
             s->seeq_rx_cmd = val8;
             break;
         case 7:
-            s->seeq_tx_cmd = val8;
+            s->seeq_tx_cmd = val8;   /* bits [6:5] select the register bank */
             break;
         default:
             if (reg < 6) {
-                s->seeq_station_addr[reg] = val8;
+                /*
+                 * Banked writes (SEEQ_TXC_BANK_MASK): bank 0 holds the
+                 * station address; banks 0x20/0x40 the multicast filter and
+                 * control.  Without the bank check the driver's hash writes
+                 * silently overwrite the MAC, which drops every unicast
+                 * packet (the HPC3 lesson, blog_ethernet_bank_selection.md).
+                 */
+                if ((s->seeq_tx_cmd & 0x60) == 0x00) {
+                    s->seeq_station_addr[reg] = val8;
+                }
             }
             break;
         }
@@ -1302,6 +1384,157 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     }
 }
+
+/* =====================================================================
+ * HPC1 ethernet — SEEQ 8003 EDLC with HPC1-provided DMA.
+ *
+ * Layout, descriptor format and bit placement come from SGI's own driver
+ * header references/stand/arcs/include/net/seeq.h (the `#if IP20` EHIO
+ * branch) and the driver references/stand/arcs/lib/libsk/net/if_ec2.c.
+ * HPC1 differs from HPC3 in ways this code depends on:
+ *   - RX status is in the HIGH byte (RCVSTAT_SHIFT 8);
+ *   - "dma started" and TX status bits are in the HIGH half;
+ *   - no piocfg/dmacfg indirection (if_ec2.c: ENET_READ(reg) is a plain
+ *     dereference on IP20, vs the piocfg indirection on IP22/26/28);
+ *   - descriptors are 4 words (16 bytes), not HPC3's 3-word form.
+ * ===================================================================== */
+
+#define HPC1_DMA_ADDR(x)        ((x) & 0x1fffffffu)
+#define HPC1_ENET_MAXPKT        1536
+#define HPC1_ENET_RSPACE        3u    /* 2-byte offset + 1 status byte */
+#define HPC1_ENET_SEQ_RXS_GOOD  0x20  /* SEQ_RS_GOOD */
+#define HPC1_ENET_SEQ_RXS_END   0x10  /* SEQ_RS_END */
+
+static void sgi_hpc1_enet_raise_irq(SGIHPC1State *s)
+{
+    s->enet_ctl |= HPC1_ENET_CTL_INTPEND;
+    s->lio_status[0] |= LIO0_ETHERNET;
+    scc_update_irq(s);
+}
+
+/* TX: walk the 4-word xd_desc chain from nxbdp, assembling and sending. */
+static void sgi_hpc1_enet_tx(SGIHPC1State *s)
+{
+    uint8_t packet[HPC1_ENET_MAXPKT];
+    int plen = 0;
+    uint32_t desc = HPC1_DMA_ADDR(s->enet_nxbdp);
+
+    if (!desc) {
+        return;
+    }
+    s->enet_cpfxbdp = s->enet_nxbdp;
+
+    while (desc) {
+        uint32_t w0 = address_space_ldl_be(&address_space_memory, desc,
+                                           MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t w1 = address_space_ldl_be(&address_space_memory, desc + 4,
+                                           MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t w2 = address_space_ldl_be(&address_space_memory, desc + 8,
+                                           MEMTXATTRS_UNSPECIFIED, NULL);
+        bool eoxp = (w0 >> 31) & 1;        /* last descriptor in the chain */
+        bool eox  = (w1 >> 31) & 1;        /* last buffer of this packet */
+        unsigned len = w0 & 0x1fffu;       /* x_xbcnt */
+        uint32_t buf = HPC1_DMA_ADDR(w1 & 0x0fffffffu);  /* x_xbufptr */
+
+        if (len && plen + (int)len <= (int)sizeof(packet)) {
+            address_space_read(&address_space_memory, buf,
+                               MEMTXATTRS_UNSPECIFIED, packet + plen, len);
+            plen += len;
+        }
+        if (eox) {
+            if (plen >= 60) {
+                qemu_send_packet(qemu_get_queue(s->nic), packet, plen);
+            }
+            plen = 0;
+        }
+        s->enet_nxbdp = w2;
+        if (eoxp) {
+            break;
+        }
+        desc = HPC1_DMA_ADDR(w2);
+    }
+
+    /* Channel done: clear "dma started" and report success (driver polls). */
+    s->enet_trstat = HPC1_ENET_SEQ_XS_OLD | HPC1_ENET_SEQ_XS_SUCCESS;
+    sgi_hpc1_enet_raise_irq(s);
+}
+
+static bool sgi_hpc1_enet_can_receive(NetClientState *nc)
+{
+    SGIHPC1State *s = qemu_get_nic_opaque(nc);
+
+    return (s->enet_rcvstat & HPC1_ENET_STRCVDMA) != 0;
+}
+
+/* RX: QEMU delivered a frame — write it into the crbdp/nrbdp ring. */
+static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
+                                     const uint8_t *buf, size_t size)
+{
+    SGIHPC1State *s = qemu_get_nic_opaque(nc);
+    uint32_t desc, w0, w1, w2, bufaddr, space, used, newbc;
+    uint8_t st = HPC1_ENET_SEQ_RXS_GOOD | HPC1_ENET_SEQ_RXS_END;
+
+    if (!(s->enet_rcvstat & HPC1_ENET_STRCVDMA) || !s->enet_crbdp) {
+        return -1;
+    }
+    desc = HPC1_DMA_ADDR(s->enet_crbdp);
+    w0 = address_space_ldl_be(&address_space_memory, desc,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    w1 = address_space_ldl_be(&address_space_memory, desc + 4,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    w2 = address_space_ldl_be(&address_space_memory, desc + 8,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+    space = w0 & 0x1fffu;                        /* r_rbcnt: room left */
+    bufaddr = HPC1_DMA_ADDR(w1 & 0x0fffffffu);   /* r_rbufptr */
+    used = size + HPC1_ENET_RSPACE;              /* frame + 2 offset + status */
+
+    if (used > space) {
+        s->enet_ctl |= HPC1_ENET_CTL_RBO;
+        s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
+        sgi_hpc1_enet_raise_irq(s);
+        return size;
+    }
+
+    /* Frame at buf+2 (so the IP header at frame+14 stays 32-bit aligned);
+     * the Seeq status byte follows the frame. */
+    address_space_write(&address_space_memory, bufaddr + 2,
+                        MEMTXATTRS_UNSPECIFIED, buf, size);
+    address_space_write(&address_space_memory, bufaddr + 2 + size,
+                        MEMTXATTRS_UNSPECIFIED, &st, 1);
+
+    /* Publish: clear r_rown (bit 31, software now owns it) and decrement the
+     * byte count; the driver derives rlen = MAX_RPKT - r_rbcnt - RSPACE. */
+    newbc = (w0 & ~0x1fffu & ~0x80000000u) | ((space - used) & 0x1fffu);
+    address_space_stl_be(&address_space_memory, desc, newbc,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+
+    /* Advance the ring; the Seeq status goes in the HIGH byte (shift 8). */
+    s->enet_crbdp = w2;
+    s->seeq_rx_status = st;
+    s->enet_rcvstat = (uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT;
+    sgi_hpc1_enet_raise_irq(s);
+    return size;
+}
+
+static void sgi_hpc1_enet_reset(SGIHPC1State *s)
+{
+    s->enet_xcount = s->enet_cxbp = s->enet_nxbdp = s->enet_xbc = 0;
+    s->enet_cxbdp = s->enet_cpfxbdp = s->enet_ppfxbdp = 0;
+    s->enet_intdelay = s->enet_trstat = s->enet_rcvstat = 0;
+    s->enet_rbc = s->enet_crbp = s->enet_nrbdp = s->enet_crbdp = 0;
+    s->enet_ctl = HPC1_ENET_CTL_MODNORM;
+    s->seeq_rx_cmd = s->seeq_tx_cmd = 0;
+    s->seeq_rx_status = s->seeq_tx_status = 0;
+    memset(s->seeq_station_addr, 0, sizeof(s->seeq_station_addr));
+    s->lio_status[0] &= ~LIO0_ETHERNET;
+}
+
+static const NetClientInfo sgi_hpc1_enet_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = sgi_hpc1_enet_can_receive,
+    .receive = sgi_hpc1_enet_receive,
+};
 
 static const MemoryRegionOps sgi_hpc1_ops = {
     .read = sgi_hpc1_read,
@@ -1395,6 +1628,7 @@ static void sgi_hpc1_reset(DeviceState *dev)
     for (i = 0; i < 6; i++) {
         s->seeq_station_addr[i] = 0;
     }
+    sgi_hpc1_enet_reset(s);
     s->lio_status[0] = s->lio_status[1] = 0;
     s->lio_mask[0] = s->lio_mask[1] = 0;
     s->vme_status = 0;
@@ -1456,6 +1690,14 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     hpc1_nvram_init_defaults(s);
     hpc1_nvram_load(s);
 
+    /* SEEQ 8003 ethernet NIC (DMA through HPC1) */
+    qemu_macaddr_default_if_unset(&s->enet_conf.macaddr);
+    s->nic = qemu_new_nic(&sgi_hpc1_enet_net_info, &s->enet_conf,
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
+    qemu_format_nic_info_str(qemu_get_queue(s->nic),
+                             s->enet_conf.macaddr.a);
+
     /* PIT interrupt timers (timer0 -> IP4, timer1 -> IP5) */
     s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer0_cb, s);
     s->pit_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL, hpc1_pit_timer1_cb, s);
@@ -1472,6 +1714,7 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
 static const Property sgi_hpc1_properties[] = {
     DEFINE_PROP_CHR("chardev", SGIHPC1State, serial),
     DEFINE_PROP_STRING("nvram", SGIHPC1State, nvram_filename),
+    DEFINE_NIC_PROPERTIES(SGIHPC1State, enet_conf),
 };
 
 static const VMStateDescription vmstate_sgihpc1_uart = {
@@ -1537,6 +1780,18 @@ static const VMStateDescription vmstate_sgi_hpc1 = {
         VMSTATE_UINT8(seeq_tx_cmd, SGIHPC1State),
         VMSTATE_UINT8(seeq_rx_status, SGIHPC1State),
         VMSTATE_UINT8(seeq_tx_status, SGIHPC1State),
+        /* HPC1 ethernet DMA engine */
+        VMSTATE_UINT32(enet_nxbdp, SGIHPC1State),
+        VMSTATE_UINT32(enet_xbc, SGIHPC1State),
+        VMSTATE_UINT32(enet_crbp, SGIHPC1State),
+        VMSTATE_UINT32(enet_nrbdp, SGIHPC1State),
+        VMSTATE_UINT32(enet_crbdp, SGIHPC1State),
+        VMSTATE_UINT32(enet_cpfxbdp, SGIHPC1State),
+        VMSTATE_UINT32(enet_ppfxbdp, SGIHPC1State),
+        VMSTATE_UINT32(enet_intdelay, SGIHPC1State),
+        VMSTATE_UINT32(enet_trstat, SGIHPC1State),
+        VMSTATE_UINT32(enet_rcvstat, SGIHPC1State),
+        VMSTATE_UINT32(enet_ctl, SGIHPC1State),
         VMSTATE_UINT8(aux, SGIHPC1State),
         VMSTATE_UINT16_ARRAY(nvram, SGIHPC1State, 128),
         VMSTATE_UINT8(nv_cs, SGIHPC1State),
