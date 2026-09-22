@@ -78,9 +78,16 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
         fprintf(stderr, "cp0timer: BIG wait=%u compare=0x%08x count=0x%08x delta=%d\n",
                 wait, env->CP0_Compare, cnt, (int32_t)(env->CP0_Compare - cnt));
     }
-    /* Clamp interval to overflow if virtual time had not progressed */
-    if (!wait) {
-        wait = UINT32_MAX;
+    /*
+     * If the deadline has already passed (Compare is at or behind the current
+     * Count), the timer interrupt is pending *now*.  The unsigned subtraction
+     * above would otherwise underflow to ~2^32 and defer the interrupt by a
+     * full 32-bit wrap.  IRIX writes a Compare that is a few counts past-due
+     * on its lateness corrections, so this must fire immediately (wait == 1)
+     * rather than wait a whole wrap for the Count to come back around.
+     */
+    if (wait == 0 || wait > 0x7fffffffu) {
+        wait = 1;
     }
     next_ns = now_ns + clock_ticks_to_ns(env->count_clock, wait);
     timer_mod(env->timer, next_ns);
