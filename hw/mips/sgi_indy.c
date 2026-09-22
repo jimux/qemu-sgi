@@ -430,6 +430,27 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     object_property_add_child(OBJECT(machine), "vino", OBJECT(vino_dev));
     vino_present =
         object_property_get_bool(OBJECT(vino_dev), "present", &error_abort);
+    if (vino_present) {
+      /*
+       * Convenience: default the host video-decoder wrapper from the
+       * environment, mirroring sgi_glaccel's GLRENDER_SO.  The wrapper finds
+       * vin_helper.py beside itself, so only its own path is needed.  An
+       * explicit -global sgi-vino.video-helper=<wrapper> still wins, and with
+       * the variable unset the behaviour is unchanged (the seam is opt-in).
+       */
+      char *helper = object_property_get_str(OBJECT(vino_dev),
+                                             "video-helper", NULL);
+
+      if (!helper || !helper[0]) {
+        const char *env = getenv("SGI_VIN_HELPER");
+
+        if (env && env[0]) {
+          object_property_set_str(OBJECT(vino_dev), "video-helper", env,
+                                  &error_fatal);
+        }
+      }
+      g_free(helper);
+    }
   }
 
   /* Memory Controller at 0x1fa00000 */
