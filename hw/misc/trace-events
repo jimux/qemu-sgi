@@ -531,3 +531,4 @@ sgi_mace_video_vout_field(unsigned fmt, unsigned stride, unsigned lines, uint64_
 # sgi_vino.c (Indy VINO register shell)
 sgi_vino_read(uint64_t off, unsigned size, uint64_t val, int present) "VINO read off=0x%"PRIx64" size=%u -> 0x%"PRIx64" (present=%d)"
 sgi_vino_write(uint64_t off, uint64_t val, unsigned size, int present) "VINO write off=0x%"PRIx64" val=0x%"PRIx64" size=%u (present=%d)"
+sgi_vino_desc(int ch, uint64_t addr, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) "VINO ch%d next_4_desc=0x%"PRIx64" desc=%08x %08x %08x %08x"

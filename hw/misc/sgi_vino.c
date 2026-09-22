@@ -34,7 +34,24 @@
 #include "hw/core/sysbus.h"
 #include "hw/misc/sgi_vino.h"
 #include "qemu/log.h"
+#include "system/address-spaces.h"
 #include "trace.h"
+
+/* The VINO DMA engine reads its descriptor table from guest memory.  Fetch
+ * the four 32-bit descriptors pointed at by next_4_desc and record them so
+ * the driver's real table can be checked against the spec. */
+static void sgi_vino_fetch_desc(SGIVinoState *s, int ch, uint32_t addr)
+{
+    int i;
+
+    for (i = 0; i < SGI_VINO_DESC_PER_FETCH; i++) {
+        s->desc[ch][i] = address_space_ldl_be(&address_space_memory,
+                                              (hwaddr)addr + 4 * i,
+                                              MEMTXATTRS_UNSPECIFIED, NULL);
+    }
+    trace_sgi_vino_desc(ch, addr, s->desc[ch][0], s->desc[ch][1],
+                        s->desc[ch][2], s->desc[ch][3]);
+}
 
 static uint64_t sgi_vino_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -106,6 +123,19 @@ static void sgi_vino_write(void *opaque, hwaddr offset, uint64_t value,
     for (i = 0; i < size; i++) {
         s->regs[offset + i] = (value >> (8 * (size - 1 - i))) & 0xff;
     }
+    if (offset == SGI_VINO_CH_A_BASE + SGI_VINO_CH_NEXT4DESC ||
+        offset == SGI_VINO_CH_B_BASE + SGI_VINO_CH_NEXT4DESC) {
+        int ch = offset >= SGI_VINO_CH_B_BASE ? 1 : 0;
+        uint32_t addr = 0;
+
+        for (i = 0; i < 4; i++) {
+            addr = (addr << 8) | s->regs[offset + i];
+        }
+        s->dma_base[ch] = addr;
+        if (addr) {
+            sgi_vino_fetch_desc(s, ch, addr);
+        }
+    }
 }
 
 static const MemoryRegionOps sgi_vino_ops = {
@@ -123,6 +153,8 @@ static void sgi_vino_reset(DeviceState *dev)
     SGIVinoState *s = SGI_VINO(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->dma_base, 0, sizeof(s->dma_base));
+    memset(s->desc, 0, sizeof(s->desc));
     memset(s->i2c_dec, 0, sizeof(s->i2c_dec));
     memset(s->i2c_alt, 0, sizeof(s->i2c_alt));
     s->i2c_ptr = 0;
