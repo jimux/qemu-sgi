@@ -133,6 +133,13 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 
         trace_sgi_gr2_fiforead(offset, val, pc);
     }
+    /* VC1 / XMAP / RE3 / GE / bdvers reads with the PC: the last surface that
+     * could hold the "display is up" gate the DDX waits on. */
+    if (offset >= SGI_GR2_HQUCODE_OFF) {
+        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+
+        trace_sgi_gr2_regread(offset, val, pc);
+    }
     return val;
 }
 
