@@ -157,6 +157,7 @@ struct SGIGL2State {
 
     /* Kernel textport state (FBCcharposnabs / FBCdrawchars). */
     int16_t char_x, char_y;
+    uint16_t font_base;           /* FBCbaseaddress: added to glyph offsets */
 
     bool testpattern;
     bool trace;
@@ -534,7 +535,7 @@ static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
     int hit = 0;
 
     for (gy = 0; gy < h; gy++) {
-        uint16_t wd = s->font[(offset + gy) % GL2_FONT_WORDS];
+        uint16_t wd = s->font[(s->font_base + offset + gy) % GL2_FONT_WORDS];
 
         for (gx = 0; gx < 8; gx++) {
             int px, py;
@@ -623,6 +624,12 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
             for (i = 1; i < nargs; i++) {
                 s->font[addr++ % GL2_FONT_WORDS] = args[i];
             }
+        }
+        break;
+
+    case 0x09:                          /* FBCbaseaddress: font RAM base */
+        if (nargs >= 1) {
+            s->font_base = args[0];
         }
         break;
 
@@ -964,6 +971,7 @@ static void gl2_reset(DeviceState *dev)
     s->ge_cmd = 0;
     memset(s->ge_args, 0, sizeof(s->ge_args));
     s->char_x = s->char_y = 0;
+    s->font_base = 0;
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
     if (s->fb) {
