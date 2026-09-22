@@ -56,7 +56,14 @@
 
 #define SGI_IP6_PROM_BASE   0x1fc00000ULL
 #define SGI_IP6_PROM_SIZE   (256 * KiB)
-#define SGI_IP6_RAM_MAX     (256 * MiB)
+/*
+ * The PROM sizes memory by probing 0xa1000000..0xa8000000 (16..128 MB) in
+ * 4 MB steps, so a machine larger than 128 MB cannot be described to the
+ * guest: hinv saturates at 128 MB no matter how much host RAM is attached.
+ * Bound the machine to that ceiling and reject more, rather than silently
+ * handing the guest a size it will under-report.
+ */
+#define SGI_IP6_RAM_MAX     (128 * MiB)
 
 /*
  * Memory decode (CTL1), modelled on MAME ip6.cpp / ctl1.cpp.  The guest
@@ -1393,7 +1400,9 @@ static void sgi_ip6_init(MachineState *machine)
     unsigned ai;
 
     if (machine->ram_size > SGI_IP6_RAM_MAX) {
-        error_report("RAM size more than 256MB is not supported");
+        error_report("IP6 supports at most %u MB of RAM (the PROM's memory "
+                     "probe covers 16..128 MB); %u MB requested",
+                     (unsigned)(SGI_IP6_RAM_MAX / MiB), ram_mb);
         exit(EXIT_FAILURE);
     }
 
