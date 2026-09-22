@@ -642,6 +642,16 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
     SGIBRIDGEState *s = opaque;
     uint64_t val = 0;
 
+    /*
+     * The PCI I/O aperture (a device's I/O BAR mapped via pciio_piotrans_addr)
+     * aliases the on-board IOC3 devio window: the IRIX ethernet driver reaches
+     * the IOC3 MCR/SIO_CR/GPCR_S at 0x500030/0x500028/0x500034 and spins on the
+     * MCR DONE bit.  Fold the aperture onto the 0x600000 register block.
+     */
+    if (offset >= 0x500000 && offset < 0x520000) {
+        offset += 0x100000;
+    }
+
     switch (offset) {
     /*
      * BRIDGE widget ID (w_id, XIO config register at +4): part 0xc002 at
@@ -875,6 +885,11 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                              unsigned size)
 {
     SGIBRIDGEState *s = opaque;
+
+    /* PCI I/O aperture aliases the IOC3 devio window (see sgi_bridge_read). */
+    if (offset >= 0x500000 && offset < 0x520000) {
+        offset += 0x100000;
+    }
 
     switch (offset) {
     case 0x0104:
