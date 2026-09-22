@@ -964,6 +964,20 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     int ret;
     target_ulong page_size;
 
+    if (env->ext_tlb_fill) {
+        hwaddr ext_physical;
+        int ext_prot;
+
+        if (env->ext_tlb_fill(env->ext_tlb_opaque, address, size,
+                              qemu_access_type, mmu_idx, probe,
+                              &ext_physical, &ext_prot)) {
+            tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                         ext_physical & TARGET_PAGE_MASK, ext_prot,
+                         mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
+    }
+
     if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
         /* MMU disabled */
         tlb_set_page(cs, address & TARGET_PAGE_MASK,

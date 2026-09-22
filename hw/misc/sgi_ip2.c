@@ -23,6 +23,7 @@
 #include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
+#include "exec/cputlb.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -101,11 +102,6 @@
 #define IP2190_C_READNOCACHE 0x94
 #define IP2190_SECTOR       512
 
-typedef struct SGIIP2Seg {
-    struct SGIIP2State *s;
-    int seg;
-} SGIIP2Seg;
-
 struct SGIIP2State {
     SysBusDevice parent_obj;
 
@@ -115,8 +111,7 @@ struct SGIIP2State {
     MemoryRegion regs;
     MemoryRegion nvram;
     MemoryRegion page;
-    MemoryRegion seg[3];
-    SGIIP2Seg seg_ctx[3];
+    MemoryRegion ram_mr;
     MemoryRegion mbmem;
     MemoryRegion mbreg;
     MemoryRegion mbio;
@@ -137,6 +132,8 @@ struct SGIIP2State {
     uint16_t limit[3];
     uint16_t swreg;
     uint16_t status;
+    bool boot_enabled;
+    CPUState *cpu;
     uint8_t pctrl;
     uint8_t mbprot;
     uint8_t rtcregs[64];
@@ -146,9 +143,87 @@ struct SGIIP2State {
     char *prom_file;
 };
 
+static void ip2_tlb_flush(SGIIP2State *s)
+{
+    if (s->cpu) {
+        tlb_flush(s->cpu);
+    }
+}
+
 static void ip2_set_boot(SGIIP2State *s, bool enabled)
 {
     memory_region_set_enabled(&s->boot, enabled);
+    s->boot_enabled = enabled;
+    ip2_tlb_flush(s);
+}
+
+/*
+ * Board-provided translation for the IP2's custom page-table MMU, consulted
+ * by m68k_cpu_tlb_fill before the default path. Only segments 0/1/2 are MMU
+ * controlled; segment 0 is left to the boot mirror while it is enabled, and
+ * segments >= 3 are left to the memory map.
+ */
+bool sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
+                          MMUAccessType access_type, int mmu_idx, bool probe,
+                          hwaddr *physical, int *prot)
+{
+    SGIIP2State *s = opaque;
+    int seg = (address >> 28) & 0xf;
+    uint32_t offset, page, page_number, pte;
+    int p = 0;
+
+    (void)size;
+    (void)access_type;
+    (void)mmu_idx;
+    (void)probe;
+
+    if (seg > IP2_SEG_OS) {
+        return false;
+    }
+    if (seg == IP2_SEG_TD && s->boot_enabled) {
+        return false;
+    }
+
+    offset = address & 0x0fffffff;
+    if (seg == IP2_SEG_STK) {
+        page = extract32(offset, 12, 14) ^ 0x3fff;
+        if (s->limit[seg] && page > s->limit[seg]) {
+            return false;
+        }
+        page_number = s->base[seg] - page;
+    } else {
+        page = extract32(offset, 12, 14);
+        if (s->limit[seg] && page > s->limit[seg]) {
+            return false;
+        }
+        page_number = s->base[seg] + page;
+    }
+
+    pte = s->page_tbl[page_number & (IP2_PAGE_ENTRIES - 1)];
+    switch (pte & PAGE_PROT) {
+    case 0x10000000:            /* read only */
+        p = PAGE_READ;
+        break;
+    case 0x20000000:            /* system only */
+        /*
+         * User/supervisor separation is deferred: distinguishing it needs a
+         * target-specific MMU index, and the monitor and kernel both run in
+         * supervisor mode. Revisit with P4's userland.
+         */
+        p = PAGE_READ | PAGE_WRITE;
+        break;
+    case 0x30000000:            /* read/write */
+        p = PAGE_READ | PAGE_WRITE;
+        break;
+    default:                    /* no access */
+        return false;
+    }
+    if (p & PAGE_READ) {
+        p |= PAGE_EXEC;
+    }
+    *physical = (hwaddr)(((pte & PAGE_PFNUM) << 12) | (offset & 0xfff));
+    *prot = p;
+    return true;
 }
 
 static uint32_t ip2_ram_read(SGIIP2State *s, uint32_t phys, unsigned size)
@@ -184,67 +259,6 @@ static void ip2_ram_write(SGIIP2State *s, uint32_t phys, uint32_t val,
         break;
     }
 }
-
-static bool ip2_translate(SGIIP2State *s, int seg, uint32_t offset,
-                          uint32_t *phys)
-{
-    uint16_t page, page_number;
-    uint32_t pte;
-
-    if (seg == IP2_SEG_STK) {
-        page = extract32(offset, 12, 14) ^ 0x3fff;
-        if (s->limit[seg] && page > s->limit[seg]) {
-            return false;
-        }
-        page_number = s->base[seg] - page;
-    } else {
-        page = extract32(offset, 12, 14);
-        if (s->limit[seg] && page > s->limit[seg]) {
-            return false;
-        }
-        page_number = s->base[seg] + page;
-    }
-
-    pte = s->page_tbl[page_number & (IP2_PAGE_ENTRIES - 1)];
-    if ((pte & PAGE_PROT) == 0) {
-        return false;
-    }
-    *phys = ((pte & PAGE_PFNUM) << 12) | (offset & 0xfff);
-    return true;
-}
-
-static uint64_t ip2_seg_read(void *opaque, hwaddr addr, unsigned size)
-{
-    SGIIP2Seg *ctx = opaque;
-    SGIIP2State *s = ctx->s;
-    uint32_t phys;
-
-    if (!ip2_translate(s, ctx->seg, addr, &phys)) {
-        return 0;
-    }
-    return ip2_ram_read(s, phys, size);
-}
-
-static void ip2_seg_write(void *opaque, hwaddr addr, uint64_t val,
-                          unsigned size)
-{
-    SGIIP2Seg *ctx = opaque;
-    SGIIP2State *s = ctx->s;
-    uint32_t phys;
-
-    if (!ip2_translate(s, ctx->seg, addr, &phys)) {
-        return;
-    }
-    ip2_ram_write(s, phys, val, size);
-}
-
-static const MemoryRegionOps ip2_seg_ops = {
-    .read = ip2_seg_read,
-    .write = ip2_seg_write,
-    .endianness = DEVICE_BIG_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
 
 static uint8_t ip2_rtc_direct_read(SGIIP2State *s, uint8_t addr)
 {
@@ -326,6 +340,7 @@ static void ip2_regs_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case REG_KBASE:
         s->base[IP2_SEG_OS] = (uint16_t)val << 8;
+        ip2_tlb_flush(s);
         break;
     case REG_STATUS:
         if ((data ^ s->status) & ST_BOOT_) {
@@ -341,15 +356,19 @@ static void ip2_regs_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case REG_TDBASE:
         s->base[IP2_SEG_TD] = data;
+        ip2_tlb_flush(s);
         break;
     case REG_TDLIMIT:
         s->limit[IP2_SEG_TD] = data;
+        ip2_tlb_flush(s);
         break;
     case REG_STKBASE:
         s->base[IP2_SEG_STK] = data;
+        ip2_tlb_flush(s);
         break;
     case REG_STKLIMIT:
         s->limit[IP2_SEG_STK] = data;
+        ip2_tlb_flush(s);
         break;
     default:
         break;
@@ -377,6 +396,7 @@ static void ip2_page_write(void *opaque, hwaddr addr, uint64_t val,
     SGIIP2State *s = opaque;
 
     s->page_tbl[(addr >> 2) & (IP2_PAGE_ENTRIES - 1)] = val & PAGE_ALL;
+    ip2_tlb_flush(s);
 }
 
 static const MemoryRegionOps ip2_page_ops = {
@@ -631,7 +651,6 @@ static void ip2_load_prom(SGIIP2State *s, Error **errp)
 static void ip2_realize(DeviceState *dev, Error **errp)
 {
     SGIIP2State *s = SGI_IP2(dev);
-    int i;
 
     s->ram = g_malloc0(IP2_RAM_SIZE);
 
@@ -660,15 +679,14 @@ static void ip2_realize(DeviceState *dev, Error **errp)
                              IP2_SYS_SIZE);
     memory_region_add_subregion_overlap(get_system_memory(), 0, &s->boot, 1);
 
-    for (i = 0; i < 3; i++) {
-        s->seg_ctx[i].s = s;
-        s->seg_ctx[i].seg = i;
-        memory_region_init_io(&s->seg[i], OBJECT(s), &ip2_seg_ops,
-                              &s->seg_ctx[i], "ip2.seg", IP2_SYS_SIZE);
-        memory_region_add_subregion_overlap(get_system_memory(),
-                                            (hwaddr)i * IP2_SYS_SIZE,
-                                            &s->seg[i], (i == 0) ? 0 : 1);
-    }
+    /*
+     * Physical RAM, reachable by the CPU through the translation fast path
+     * (sgi_ip2_ext_tlb_fill), which fills the TLB with the pte-resolved
+     * physical addresses. The boot mirror above it shadows this while enabled.
+     */
+    memory_region_init_ram_ptr(&s->ram_mr, OBJECT(s), "ip2.ram",
+                               IP2_RAM_SIZE, s->ram);
+    memory_region_add_subregion_overlap(get_system_memory(), 0, &s->ram_mr, 0);
 
     memory_region_init_io(&s->mbmem, OBJECT(s), &ip2_mbmem_ops, s,
                           "ip2.mbmem", 0x100000);
@@ -708,6 +726,14 @@ static void ip2_reset(DeviceState *dev)
 MemoryRegion *sgi_ip2_sys_region(DeviceState *dev)
 {
     return &SGI_IP2(dev)->sys;
+}
+
+void sgi_ip2_set_cpu(DeviceState *dev, CPUState *cpu)
+{
+    SGIIP2State *s = SGI_IP2(dev);
+
+    s->cpu = cpu;
+    tlb_flush(cpu);
 }
 
 static const Property ip2_properties[] = {

@@ -155,6 +155,17 @@ typedef struct CPUArchState {
 
     /* Fields from here on are preserved across CPU reset. */
     uint64_t features;
+
+    /*
+     * Optional board-provided address translation, used by machines with a
+     * custom MMU that is not the Motorola one (e.g. SGI IRIS IP2). Consulted
+     * first by m68k_cpu_tlb_fill; returns true and fills physical/prot on a
+     * valid translation, false to fall through to the default path.
+     */
+    bool (*ext_tlb_fill)(void *opaque, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx, bool probe,
+                         hwaddr *physical, int *prot);
+    void *ext_tlb_opaque;
 } CPUM68KState;
 
 /*

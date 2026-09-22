@@ -74,6 +74,11 @@ static void iris3130_init(MachineState *machine)
     sysbus_realize(SYS_BUS_DEVICE(board), &error_fatal);
     sys = sgi_ip2_sys_region(board);
 
+    /* Install the IP2 custom-MMU translation fast path on the CPU. */
+    s->cpu.env.ext_tlb_fill = sgi_ip2_ext_tlb_fill;
+    s->cpu.env.ext_tlb_opaque = SGI_IP2(board);
+    sgi_ip2_set_cpu(board, CPU(&s->cpu));
+
     /*
      * tty0 is DUART0 channel A (keyboard), tty1 DUART0 channel B (the
      * diagnostic/serial console), tty2/tty3 DUART1 A/B.
