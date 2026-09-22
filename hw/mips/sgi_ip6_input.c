@@ -242,39 +242,42 @@ static const QemuInputHandler sgi_ip6_mouse_handler = {
  * else is DROPPED rather than guessed, because an invented scancode is a
  * fabricated response.
  */
-static int sgi_ip6_keycode(QKeyCode q)
+static int sgi_ip6_charcode(QKeyCode q)
 {
     switch (q) {
-    case Q_KEY_CODE_Q: return 10;   case Q_KEY_CODE_W: return 16;
-    case Q_KEY_CODE_E: return 17;   case Q_KEY_CODE_R: return 24;
-    case Q_KEY_CODE_T: return 25;   case Q_KEY_CODE_Y: return 32;
-    case Q_KEY_CODE_U: return 33;   case Q_KEY_CODE_I: return 40;
-    case Q_KEY_CODE_O: return 41;   case Q_KEY_CODE_P: return 48;
-    case Q_KEY_CODE_A: return 11;   case Q_KEY_CODE_S: return 12;
-    case Q_KEY_CODE_D: return 18;   case Q_KEY_CODE_F: return 19;
-    case Q_KEY_CODE_G: return 26;   case Q_KEY_CODE_H: return 27;
-    case Q_KEY_CODE_J: return 34;   case Q_KEY_CODE_K: return 35;
-    case Q_KEY_CODE_L: return 42;   case Q_KEY_CODE_Z: return 20;
-    case Q_KEY_CODE_X: return 21;   case Q_KEY_CODE_C: return 28;
-    case Q_KEY_CODE_V: return 29;   case Q_KEY_CODE_B: return 36;
-    case Q_KEY_CODE_N: return 37;   case Q_KEY_CODE_M: return 44;
-    case Q_KEY_CODE_1: return 8;    case Q_KEY_CODE_2: return 14;
-    case Q_KEY_CODE_3: return 15;   case Q_KEY_CODE_4: return 22;
-    case Q_KEY_CODE_5: return 23;   case Q_KEY_CODE_6: return 30;
-    case Q_KEY_CODE_7: return 31;   case Q_KEY_CODE_8: return 38;
-    case Q_KEY_CODE_9: return 39;   case Q_KEY_CODE_0: return 46;
-    case Q_KEY_CODE_RET: return 51;         /* Enter */
-    case Q_KEY_CODE_SPC: return 83;         /* Space */
-    case Q_KEY_CODE_BACKSPACE: return 61;
-    case Q_KEY_CODE_ESC: return 7;
-    case Q_KEY_CODE_TAB: return 9;
-    case Q_KEY_CODE_MINUS: return 47;       case Q_KEY_CODE_EQUAL: return 54;
-    case Q_KEY_CODE_SLASH: return 53;       case Q_KEY_CODE_DOT: return 52;
-    case Q_KEY_CODE_COMMA: return 45;       case Q_KEY_CODE_SEMICOLON: return 43;
-    case Q_KEY_CODE_APOSTROPHE: return 50;  case Q_KEY_CODE_BRACKET_LEFT: return 49;
-    case Q_KEY_CODE_BRACKET_RIGHT: return 56; case Q_KEY_CODE_BACKSLASH: return 57;
-    case Q_KEY_CODE_GRAVE_ACCENT: return 55;
-    default: return -1;                     /* DROP: never invent a scancode */
+    case Q_KEY_CODE_A: return 'a';  case Q_KEY_CODE_B: return 'b';
+    case Q_KEY_CODE_C: return 'c';  case Q_KEY_CODE_D: return 'd';
+    case Q_KEY_CODE_E: return 'e';  case Q_KEY_CODE_F: return 'f';
+    case Q_KEY_CODE_G: return 'g';  case Q_KEY_CODE_H: return 'h';
+    case Q_KEY_CODE_I: return 'i';  case Q_KEY_CODE_J: return 'j';
+    case Q_KEY_CODE_K: return 'k';  case Q_KEY_CODE_L: return 'l';
+    case Q_KEY_CODE_M: return 'm';  case Q_KEY_CODE_N: return 'n';
+    case Q_KEY_CODE_O: return 'o';  case Q_KEY_CODE_P: return 'p';
+    case Q_KEY_CODE_Q: return 'q';  case Q_KEY_CODE_R: return 'r';
+    case Q_KEY_CODE_S: return 's';  case Q_KEY_CODE_T: return 't';
+    case Q_KEY_CODE_U: return 'u';  case Q_KEY_CODE_V: return 'v';
+    case Q_KEY_CODE_W: return 'w';  case Q_KEY_CODE_X: return 'x';
+    case Q_KEY_CODE_Y: return 'y';  case Q_KEY_CODE_Z: return 'z';
+    case Q_KEY_CODE_0: return '0';  case Q_KEY_CODE_1: return '1';
+    case Q_KEY_CODE_2: return '2';  case Q_KEY_CODE_3: return '3';
+    case Q_KEY_CODE_4: return '4';  case Q_KEY_CODE_5: return '5';
+    case Q_KEY_CODE_6: return '6';  case Q_KEY_CODE_7: return '7';
+    case Q_KEY_CODE_8: return '8';  case Q_KEY_CODE_9: return '9';
+    case Q_KEY_CODE_SPC: return ' ';
+    /* From the PROM's table, state 0 (unshifted): 51='\r', 61='\x08',
+     * 7=ESC, 9='\t', 47='-', 54='=', 53='/', 52='.', 45=',', 43=';',
+     * 50='\'', 49='[', 56=']', 57='\\', 55='`'. */
+    case Q_KEY_CODE_RET: return '\r';
+    case Q_KEY_CODE_BACKSPACE: return '\x08';
+    case Q_KEY_CODE_ESC: return '\x1b';
+    case Q_KEY_CODE_TAB: return '\t';
+    case Q_KEY_CODE_MINUS: return '-';       case Q_KEY_CODE_EQUAL: return '=';
+    case Q_KEY_CODE_SLASH: return '/';       case Q_KEY_CODE_DOT: return '.';
+    case Q_KEY_CODE_COMMA: return ',';       case Q_KEY_CODE_SEMICOLON: return ';';
+    case Q_KEY_CODE_APOSTROPHE: return '\''; case Q_KEY_CODE_BRACKET_LEFT: return '[';
+    case Q_KEY_CODE_BRACKET_RIGHT: return ']'; case Q_KEY_CODE_BACKSLASH: return '\\';
+    case Q_KEY_CODE_GRAVE_ACCENT: return '`';
+    default: return -1;   /* DROP: never invent a character */
     }
 }
 
@@ -300,13 +303,30 @@ static void sgi_ip6_kbd_event(DeviceState *dev, QemuConsole *src,
     if (key->key->type != KEY_VALUE_KIND_QCODE) {
         return;
     }
-    code = sgi_ip6_keycode(key->key->u.qcode.data);
+    code = sgi_ip6_charcode(key->key->u.qcode.data);
     if (code < 0) {
         return;
     }
-    b = (key->down ? 0x00 : 0x80) | (code & 0x7f);
-    qemu_log_mask(LOG_UNIMP, "sgi-ip6-kbd: host key qcode=%d code=%d %s -> %02x\n",
-                  key->key->u.qcode.data, code, key->down ? "down" : "up", b);
+    /*
+     * MEASURED: this line is a CHARACTER console, not a key-event line.
+     * Emitting the PROM's key-event byte (either polarity) is echoed back
+     * raw and changes nothing, while emitting the ASCII character the key
+     * produces drives the PROM's menu correctly ("Option? 5" -> Command
+     * Monitor, clean echo).  So we emit the character for the key's
+     * unshifted layout entry, on key-down only -- a serial terminal sends
+     * nothing on release.  The character comes from the PROM's own US table
+     * (state 0), so nothing is invented.
+     *
+     * Shift handling is deliberately NOT implemented yet: an unshifted
+     * character is what the table's state 0 gives, and guessing the shifted
+     * form without measuring it would be fabrication.
+     */
+    if (!key->down) {
+        return;
+    }
+    b = (uint8_t)code;      /* code now carries the character */
+    qemu_log_mask(LOG_UNIMP, "sgi-ip6-kbd: host key qcode=%d char=%02x\n",
+                  key->key->u.qcode.data, b);
     sgi_ip6_input_queue(s, &b, 1);
 }
 
