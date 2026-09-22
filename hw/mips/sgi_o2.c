@@ -1064,6 +1064,21 @@ static void sgi_o2_init(MachineState *machine) {
    * MACE handler. This gives us proper TX buffering and chardev interaction
    * that the custom MACE serial code lacks.
    *
+   * @@SEMANTICS@@ This shadowing is total for port 0.  The subregion
+   * claims 0x1F390000-0x1F3907ff, i.e. all eight 16550 registers, and
+   * `info mtree` shows the MACE container split around it (its range
+   * resumes at 0x1F390800 = register index 8, which the MACE handler
+   * rejects).  The MACE's own sgi_mace_serial_read/write(port == 0) are
+   * therefore unreachable, from guest PIO and from the ISA serial DMA
+   * engine (which reaches the UART through the memory bus).  The port-0
+   * divider state in SGIMACEState is never written and the guest's
+   * `ser1` console is QEMU's SerialState, not the MACE model.  Verified
+   * with temporary hit counters: 0 port-0 hits / 16 port-1 hits over a
+   * full O2 boot to login plus console I/O.  This is not harmful — the
+   * console works and the two models never disagree, because each port
+   * is served by exactly one of them — but do not mistake the MACE
+   * port-0 code for a live fallback.
+   *
    * Serial port 0 is at MACE_BASE + 0x390000 = physical 0x1F390000.
    */
   if (serial_hd(0)) {

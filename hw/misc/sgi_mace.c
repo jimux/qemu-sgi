@@ -25,8 +25,27 @@
  *
  * In QEMU's physical address space, serial port 0 registers are at:
  *   0x1F390000 + N*256 + 7  (byte access)
- * (sgi_o2.c overlays a serial_mm device on this window, which the ISA
- * serial DMA engine reaches through the memory bus.)
+ *
+ * @@SEMANTICS@@ Serial port 0 is NOT served by this file's handler.
+ * sgi_o2.c calls serial_mm_init(mace_mr, MACE_SER1_OFFSET, ...), which
+ * adds QEMU's 16550 SerialState as a SUBREGION of the MACE container at
+ * 0x1F390000.  A subregion is rendered over the container's own ops in
+ * the flatview, so the whole 0x1F390000-0x1F3907ff window (all eight
+ * 16550 registers) is claimed by `serial` and the MACE container is
+ * split around it (observed with `info mtree`: the MACE range resumes
+ * at 0x1F390800, i.e. register index >= 8, which this handler rejects).
+ * Consequence: sgi_mace_serial_read/write(port == 0) are unreachable
+ * from guest PIO *and* from the ISA serial DMA engine, which reaches
+ * the UART via the memory bus (sgi_mace_uart_bus_read/write) and so
+ * also lands on serial_mm.  The port-0 side of serial_port[0] (dll/dlh/
+ * ier/lsr/...) is therefore never written, and the guest's `ser1`
+ * console is QEMU's SerialState, not this model.  Measured on the O2
+ * golden: with temporary hit counters on both ports, a full boot to
+ * login plus console I/O produced 0 port-0 hits and 16 port-1 hits.
+ * Serial port 1 (SER2, 0x1F398000) is the opposite: no serial_mm
+ * subregion exists there, so it is served entirely by this handler.
+ * Do not "fix" the port-0 path by deleting it without also removing the
+ * serial_mm overlay — the divider state is dead, not broken.
  *
  * Reference:
  *   - MACE ASIC spec, ISA Bus Interface chapter (§5)
@@ -3151,6 +3170,11 @@ static uint64_t sgi_mace_read(void *opaque, hwaddr offset, unsigned size)
      * Within each serial block, registers are at 256-byte intervals.
      * The actual byte is at offset +7 within each 8-byte doubleword.
      * We accept any access within the 256-byte block for a given register.
+     *
+     * @@SEMANTICS@@ The port-0 branch below is dead: sgi_o2.c's
+     * serial_mm subregion shadows 0x1F390000-0x1F3907ff (see the file
+     * header).  Kept deliberately so the model stays complete; do not
+     * read this as a live path.  Port 1 (SER2) is live.
      */
     if (offset >= MACE_SER1_OFFSET &&
         offset < MACE_SER1_OFFSET + MACE_SERIAL_SIZE) {
