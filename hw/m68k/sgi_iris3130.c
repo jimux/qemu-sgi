@@ -20,6 +20,7 @@
 #include "cpu.h"
 #include "hw/core/boards.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/char/mc68681.h"
@@ -33,6 +34,7 @@ struct IRIS3130MachineState {
     MachineState parent;
 
     M68kCPU cpu;
+    bool irq_pending[2];
 };
 
 static void iris3130_cpu_reset(void *opaque)
@@ -47,6 +49,44 @@ static void iris3130_cpu_reset(void *opaque)
      */
     cpu->env.aregs[7] = ldl_phys(cs->as, 0);
     cpu->env.pc = ldl_phys(cs->as, 4);
+}
+
+/*
+ * The IP2 has no autovectored interrupt controller: every source gets a
+ * user-defined vector from the U118 vector ROM (sys/ipII/evec.h) and asserts
+ * a CPU IPL. The m68k CPU tracks only one pending interrupt, so keep per-line
+ * state here and hand it the highest asserted source -- a lower line
+ * deasserting must not clear a higher one.
+ */
+static const struct {
+    int level;
+    uint8_t vector;
+} iris3130_ip2_lines[] = {
+    { 6, 0x53 },        /* MC146818A RTC periodic -> Xclock (83)      */
+    { 5, 0x45 },        /* 2190 disk completion -> multibus 5 (69)    */
+};
+
+static void iris3130_ip2_irq(void *opaque, int n, int level)
+{
+    IRIS3130MachineState *s = opaque;
+    int best = -1;
+    int i;
+
+    s->irq_pending[n] = level != 0;
+
+    for (i = 0; i < ARRAY_SIZE(iris3130_ip2_lines); i++) {
+        if (s->irq_pending[i] &&
+            (best < 0 ||
+             iris3130_ip2_lines[i].level > iris3130_ip2_lines[best].level)) {
+            best = i;
+        }
+    }
+    if (best < 0) {
+        m68k_set_irq_level(&s->cpu, 0, 0);
+    } else {
+        m68k_set_irq_level(&s->cpu, iris3130_ip2_lines[best].level,
+                           iris3130_ip2_lines[best].vector);
+    }
 }
 
 static void iris3130_init(MachineState *machine)
@@ -73,6 +113,15 @@ static void iris3130_init(MachineState *machine)
 
     sysbus_realize(SYS_BUS_DEVICE(board), &error_fatal);
     sys = sgi_ip2_sys_region(board);
+
+    /* IP2 interrupt lines -> CPU (level/vector per the U118 vector ROM). */
+    {
+        qemu_irq *irq = qemu_allocate_irqs(iris3130_ip2_irq, s,
+                                           ARRAY_SIZE(iris3130_ip2_lines));
+
+        sysbus_connect_irq(SYS_BUS_DEVICE(board), 0, irq[0]);   /* RTC   */
+        sysbus_connect_irq(SYS_BUS_DEVICE(board), 1, irq[1]);   /* 2190  */
+    }
 
     /* Install the IP2 custom-MMU translation fast path on the CPU. */
     s->cpu.env.ext_tlb_fill = sgi_ip2_ext_tlb_fill;

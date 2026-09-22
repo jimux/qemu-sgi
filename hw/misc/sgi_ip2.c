@@ -27,6 +27,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
+#include "hw/rtc/mc146818rtc_regs.h"
 #include "hw/misc/sgi_ip2.h"
 
 #define IP2_PROM_BASE       0x30000000
@@ -42,6 +43,8 @@
 #define IP2_SEG_MBIO        5
 
 /* status register bits (cpureg.h / mame_ip2.cpp) */
+#define ST_EXINTR           0x0010  /* enable external (multibus) interrupts */
+#define ST_EINTR            0x0020  /* enable interrupts */
 #define ST_MBINIT           0x0040
 #define ST_BOOT_            0x0080
 #define ST_SYS_SEG_ONLY     0x0080  /* ST_SYSSEG_ on the 3.x board */
@@ -58,6 +61,16 @@
 #define RTC_DS              0x02
 #define RTC_RE              0x04
 #define RTC_CE              0x08
+
+/*
+ * IP2 interrupt levels and user vectors. The U118 vector ROM gives every
+ * source a user-defined vector rather than an autovector (sys/ipII/evec.h,
+ * "interrupt auto vectors: not used on the IP2"). The MC146818A RTC shares
+ * CPU IRQ level 6 with multibus 6 and the DUARTs and appears as vector 0x53
+ * (83) = Xclock, the kernel's periodic clock interrupt.
+ */
+#define IP2_IRQ_RTC         6
+#define IP2_VEC_RTC         0x53
 
 #define REG_MBTN            0x00800000
 #define REG_MLOC            0x01000000
@@ -141,6 +154,11 @@ struct SGIIP2State {
     uint8_t rtcregs[64];
     uint8_t rtc_ctrl;
     uint8_t rtc_addr;
+    QEMUTimer *rtc_timer;
+    bool rtc_pf;                 /* reg C periodic flag */
+    bool rtc_irq;                /* RTC interrupt pending */
+    qemu_irq rtc_irq_out;        /* -> machine, which maps it to level 6 / 0x53 */
+    qemu_irq ip_irq_out;         /* 2190 Multibus completion -> level 5 / 0x45 */
 
     char *prom_file;
 };
@@ -283,15 +301,81 @@ static void ip2_ram_write(SGIIP2State *s, uint32_t phys, uint32_t val,
     }
 }
 
+/*
+ * MC146818A periodic clock. The RTC is the system tick source: the kernel's
+ * tod.c programs reg A for the 32.768 kHz base and a 64 Hz rate, sets PIE in
+ * reg B, then counts HZ=64 ticks per second. PF is latched on each tick and
+ * cleared when the kernel reads reg C (todintrclr()); the CPU interrupt
+ * follows PF*PIE and is delivered as IRQ level 6, vector 0x53 (Xclock).
+ */
+static int64_t ip2_rtc_period_ns(SGIIP2State *s)
+{
+    if (!(s->rtcregs[RTC_REG_B] & REG_B_PIE)) {
+        return 0;
+    }
+    return periodic_clock_to_ns(periodic_period_to_clock(s->rtcregs[RTC_REG_A] & 0x0f));
+}
+
+static void ip2_update_cpu_irq(SGIIP2State *s)
+{
+    /* The CPU level/vector is the machine's business (it owns the CPU). */
+    qemu_set_irq(s->rtc_irq_out, s->rtc_irq && (s->status & ST_EINTR));
+}
+
+static void ip2_rtc_update_irq(SGIIP2State *s)
+{
+    bool level = s->rtc_pf && (s->rtcregs[RTC_REG_B] & REG_B_PIE);
+
+    if (level != s->rtc_irq) {
+        s->rtc_irq = level;
+        ip2_update_cpu_irq(s);
+    }
+}
+
+static void ip2_rtc_periodic_update(SGIIP2State *s)
+{
+    int64_t ns = ip2_rtc_period_ns(s);
+
+    if (ns <= 0) {
+        timer_del(s->rtc_timer);
+        return;
+    }
+    timer_mod(s->rtc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+}
+
+static void ip2_rtc_periodic_timer(void *opaque)
+{
+    SGIIP2State *s = opaque;
+
+    s->rtc_pf = true;
+    s->rtcregs[RTC_REG_C] |= REG_C_PF;
+    if (s->rtcregs[RTC_REG_B] & REG_B_PIE) {
+        s->rtcregs[RTC_REG_C] |= REG_C_IRQF;
+    }
+    ip2_rtc_update_irq(s);
+    ip2_rtc_periodic_update(s);
+}
+
 static uint8_t ip2_rtc_direct_read(SGIIP2State *s, uint8_t addr)
 {
     switch (addr & 0x3f) {
-    case 0x0a:                      /* register A */
-        return 0x26;
-    case 0x0c:                      /* register C: keep the periodic flag up */
-        return 0x40;
-    case 0x0d:                      /* register D: valid RAM and time */
-        return 0x80;
+    case RTC_REG_A:
+        return s->rtcregs[RTC_REG_A] & ~0x80;   /* UIP never set */
+    case RTC_REG_C:
+        /*
+         * Reading reg C latches out and clears PF/IRQF (mc146818rtc.c);
+         * this is the kernel's todintrclr() and it drops the interrupt.
+         */
+        {
+            uint8_t v = s->rtcregs[RTC_REG_C] & 0xf0;
+
+            s->rtcregs[RTC_REG_C] = 0;
+            s->rtc_pf = false;
+            ip2_rtc_update_irq(s);
+            return v;
+        }
+    case RTC_REG_D:
+        return 0x80;                            /* VRT: valid RAM and time */
     default:
         return s->rtcregs[addr & 0x3f];
     }
@@ -299,7 +383,13 @@ static uint8_t ip2_rtc_direct_read(SGIIP2State *s, uint8_t addr)
 
 static void ip2_rtc_direct_write(SGIIP2State *s, uint8_t addr, uint8_t val)
 {
-    s->rtcregs[addr & 0x3f] = val;
+    addr &= 0x3f;
+    s->rtcregs[addr] = val;
+
+    if (addr == RTC_REG_A || addr == RTC_REG_B) {
+        ip2_rtc_periodic_update(s);
+        ip2_rtc_update_irq(s);
+    }
 }
 
 static uint64_t ip2_regs_read(void *opaque, hwaddr addr, unsigned size)
@@ -376,6 +466,7 @@ static void ip2_regs_write(void *opaque, hwaddr addr, uint64_t val,
             ip2_set_boot(s, !(data & ST_BOOT_));
         }
         s->status = data;
+        ip2_update_cpu_irq(s);
         break;
     case REG_PARITY:
         s->pctrl = val;
@@ -612,6 +703,11 @@ static void ip2190_go(SGIIP2State *s)
     iopb[2] = error;    /* controller i_error  */
     ip2_mb_xfer(s, iopb_mb, iopb, sizeof(iopb), true);
     s->ip_done = true;
+    /*
+     * The 2190 raises its Multibus interrupt on completion; NOWAIT commands
+     * rely on it (ipintr -> iodone), only the probe's WAIT commands poll.
+     */
+    qemu_set_irq(s->ip_irq_out, 1);
 }
 
 static uint64_t ip2_mbio_read(void *opaque, hwaddr addr, unsigned size)
@@ -633,8 +729,10 @@ static void ip2_mbio_write(void *opaque, hwaddr addr, uint64_t val,
     case IP2190_R0:
         if (val == IP2190_CLEAR) {
             s->ip_done = false;
+            qemu_set_irq(s->ip_irq_out, 0);
         } else if (val == IP2190_GO) {
             s->ip_done = false;
+            qemu_set_irq(s->ip_irq_out, 0);
             ip2190_go(s);
         }
         break;
@@ -691,6 +789,18 @@ static void ip2_realize(DeviceState *dev, Error **errp)
     SGIIP2State *s = SGI_IP2(dev);
 
     s->ram = g_malloc0(IP2_RAM_SIZE);
+    if (s->disk) {
+        /*
+         * The guest writes the disk (swap, then ordinary file writes), so
+         * the drive needs write permission; the probe-only read path hid
+         * this until swapinit wrote the first sector.
+         */
+        blk_set_perm(s->disk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                     BLK_PERM_ALL, &error_abort);
+    }
+    s->rtc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ip2_rtc_periodic_timer, s);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->rtc_irq_out);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->ip_irq_out);
 
     ip2_load_prom(s, errp);
     if (*errp) {
@@ -749,6 +859,14 @@ static void ip2_reset(DeviceState *dev)
     s->limit[0] = s->limit[1] = s->limit[2] = 0;
     s->rtc_ctrl = 0;
     s->rtc_addr = 0;
+    s->rtc_pf = false;
+    s->rtc_irq = false;
+    memset(s->rtcregs, 0, sizeof(s->rtcregs));
+    if (s->rtc_timer) {
+        timer_del(s->rtc_timer);
+    }
+    qemu_set_irq(s->rtc_irq_out, 0);
+    qemu_set_irq(s->ip_irq_out, 0);
     memset(s->page_tbl, 0, sizeof(s->page_tbl));
     memset(s->mb_map, 0, sizeof(s->mb_map));
     s->ip_iopb_addr[0] = s->ip_iopb_addr[1] = s->ip_iopb_addr[2] = 0;
