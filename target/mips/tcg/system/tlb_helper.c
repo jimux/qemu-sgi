@@ -147,8 +147,6 @@ void mips_cpu_pin_kernel_mapping(uint64_t vpn, uint64_t paddr,
 static void r4k_repin_if_kernel_entry(CPUMIPSState *env, int idx,
                                       target_ulong VPN)
 {
-    uint64_t page;
-
     if (!pinned_vpn || VPN != pinned_vpn) {
         return;
     }
@@ -158,10 +156,23 @@ static void r4k_repin_if_kernel_entry(CPUMIPSState *env, int idx,
     if ((env->CP0_EntryLo0 & 2) || (env->CP0_EntryLo1 & 2)) {
         return;
     }
-    page = pinned_pagemask ? ((uint64_t)pinned_pagemask + 0x2000) / 2 : 0x1000;
+    /*
+     * The mapped kernel splits K2 into an RO text page and an RW data page
+     * (MAPPED_KERN_RW_BASE = K2BASE + MAPPED_KERN_PAGE_SIZE), but BOTH convert
+     * to physical via MAPPED_KERN_*_TO_PHYS(x) = (KDM_TO_PHYS(x) & 0xffffff)
+     * | base: bit 24 is masked off, so the two virtual 16 MB halves alias the
+     * SAME physical 16 MB page (the loader places both segments flat at
+     * VA & 0xffffff).  Observed on the IP27 netboot path: the loader wrote
+     * eintstack at flat phys 0x3f3930, so the odd half MUST map to 0x3f3930.
+     * A paddr+page (contiguous) model sent the odd half to phys 0x1000000,
+     * making the RW globals read as zero -- the VA-8 null-sp fault.
+     */
     env->CP0_PageMask = pinned_pagemask;
     env->CP0_EntryLo0 = ((pinned_paddr >> 12) << 6) | pinned_flags;
-    env->CP0_EntryLo1 = (((pinned_paddr + page) >> 12) << 6) | pinned_flags;
+    env->CP0_EntryLo1 = ((pinned_paddr >> 12) << 6) | pinned_flags;
+    trace_mips_tlb_install(2, idx, env->CP0_EntryHi, env->CP0_EntryLo0,
+                           env->CP0_EntryLo1, env->CP0_PageMask,
+                           (uint64_t)env->active_tc.PC);
     r4k_fill_tlb(env, idx);
 }
 
@@ -210,6 +221,11 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
     }
 
     r4k_invalidate_tlb(env, idx, 0);
+    if ((env->CP0_EntryHi >> 32) == 0xc0000000ULL) {
+        trace_mips_tlb_install(0, idx, env->CP0_EntryHi, env->CP0_EntryLo0,
+                               env->CP0_EntryLo1, env->CP0_PageMask,
+                               (uint64_t)env->active_tc.PC);
+    }
     r4k_fill_tlb(env, idx);
     r4k_repin_if_kernel_entry(env, idx, VPN);
 }
@@ -219,6 +235,11 @@ static void r4k_helper_tlbwr(CPUMIPSState *env)
     int r = cpu_mips_get_random(env);
 
     r4k_invalidate_tlb(env, r, 1);
+    if ((env->CP0_EntryHi >> 32) == 0xc0000000ULL) {
+        trace_mips_tlb_install(1, r, env->CP0_EntryHi, env->CP0_EntryLo0,
+                               env->CP0_EntryLo1, env->CP0_PageMask,
+                               (uint64_t)env->active_tc.PC);
+    }
     r4k_fill_tlb(env, r);
 }
 

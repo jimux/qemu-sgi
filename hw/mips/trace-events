@@ -1,3 +1,6 @@
 # malta.c
 malta_fpga_leds(const char *text) "LEDs %s"
 malta_fpga_display(const char *text) "ASCII '%s'"
+
+# sgi_ip27.c — first-write watch window (IP27_WATCH=1): names the seg2 placer.
+sgi_ip27_watch(uint64_t paddr, uint64_t pc, uint64_t val, unsigned size) "watch paddr=0x%016"PRIx64" pc=0x%016"PRIx64" val=0x%016"PRIx64" size=%u"

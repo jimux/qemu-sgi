@@ -43,6 +43,8 @@
 #include "system/reset.h"
 #include "system/system.h"
 
+#include "trace.h"
+
 /*
  * SN0 address spaces (XKPHYS).  These are direct-mapped segments; the space
  * is selected by address bits [58:56], which is why the CPU must form physical
@@ -648,6 +650,54 @@ static const MemoryRegionOps ip27_seg2redir_ops = {
   .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+/*
+ * Diagnostic watch window (IP27_WATCH=1).  Overlays one page of flat RAM with
+ * an IO region that forwards every access to real RAM unchanged, but traces
+ * each write with the guest PC.  Purpose: identify the PLACER -- the code that
+ * writes the kernel's RW bytes at the flat page 0x3f3928 -- by catching its
+ * store.  Read-through/write-through means behaviour is identical to plain RAM
+ * (important: the kernel image must still land where it always did).
+ */
+typedef struct IP27Watch {
+  MemoryRegion mr;
+  MemoryRegion *ram;
+  uint64_t phys;
+} IP27Watch;
+
+static uint64_t ip27_watch_read(void *opaque, hwaddr off, unsigned size) {
+  IP27Watch *t = opaque;
+  uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(t->ram) + t->phys + off;
+
+  switch (size) {
+  case 1: return ldub_p(p);
+  case 2: return lduw_be_p(p);
+  case 4: return ldl_be_p(p);
+  default: return ldq_be_p(p);
+  }
+}
+
+static void ip27_watch_write(void *opaque, hwaddr off, uint64_t val,
+                             unsigned size) {
+  IP27Watch *t = opaque;
+  CPUMIPSState *e = current_cpu ? cpu_env(current_cpu) : NULL;
+  uint64_t pc = e ? (uint64_t)e->active_tc.PC : 0;
+  uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(t->ram) + t->phys + off;
+
+  trace_sgi_ip27_watch(t->phys + off, pc, val, size);
+  switch (size) {
+  case 1: stb_p(p, val); break;
+  case 2: stw_be_p(p, val); break;
+  case 4: stl_be_p(p, val); break;
+  default: stq_be_p(p, val); break;
+  }
+}
+
+static const MemoryRegionOps ip27_watch_ops = {
+  .read = ip27_watch_read,
+  .write = ip27_watch_write,
+  .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
 static void sgi_ip27_init(MachineState *machine) {
   Clock *cpuclk;
   MemoryRegion *prom;
@@ -701,13 +751,14 @@ static void sgi_ip27_init(MachineState *machine) {
   /*
    * Emulation accommodation: on real IP27 the loader leaves the kernel's K2
    * entry (0xc000000000000000) mapped to its load physical address before
-   * jumping in.  Our executed ARCS/ELF path never installs it (the PROM
-   * contains no tlbwr, and the ELF loader's kdmtolocal() is the identity), so
-   * the kernel-entry code takes TLBL before it can map itself.  Pin the region
-   * to the start of node RAM -- a 16 MB page covers the kernel's load at
-   * ~0x19000 -- re-asserted whenever the guest invalidates that VPN.  A valid
-   * write by the kernel's own mapped_kernel_setup_tlb then supersedes it.
-   * Latent on every other machine (pinned_vpn stays 0).
+   * jumping in.  Our executed path never installs it -- the PROM's K2 routine
+   * at 0x1fc058e0 only *flushes* the entry (dmtc0 zero,EntryLo0/1; tlbwi over
+   * indices 63..0).  Pin the K2 region, re-asserted whenever the guest writes
+   * that invalidating entry; a valid write by the kernel's own
+   * mapped_kernel_setup_tlb then supersedes it.  The mapping MUST be bit-24
+   * aliased (both 16 MB halves -> the same flat physical page) or the RW
+   * globals land at the wrong phys and read zero -- see
+   * r4k_repin_if_kernel_entry.  Latent on every other machine (pinned_vpn 0).
    */
   mips_cpu_pin_kernel_mapping(IP27_K2_BASE, 0, IP27_K2_PAGEMASK,
                               IP27_K2_FLAGS);
@@ -770,6 +821,14 @@ static void sgi_ip27_init(MachineState *machine) {
    * different physical pages, ra read back as 0, and jr ra went to PC 0.  That
    * null-PC is the redirect's bug, not evidence for it.
    *
+   * CORRECTION (measured, one run): the loader IS right to place seg2 flat --
+   * a watch on phys 0x3f3928 caught the loader (pc 0xc000000011c7ed7c) writing
+   * the bytes there byte-by-byte.  The actual offender was the K2 machine pin
+   * (mips_cpu_pin_kernel_mapping), which mapped the odd 16 MB half to phys
+   * 0x1000000 instead of aliasing it onto the same flat page; fixed in
+   * r4k_repin_if_kernel_entry.  So the flat placement and the comment above
+   * are correct; the pin was what disagreed with MAPPED_KERN_RW_TO_PHYS.
+   *
    * Kept reachable for A/B only.  The ON path gated the forward on the
    * storing PC being in the loader (see ip27_seg2redir_write) so ordinary RAM
    * users saw normal memory; reads were never relocated.
@@ -782,6 +841,16 @@ static void sgi_ip27_init(MachineState *machine) {
     memory_region_init_io(&t->mr, NULL, &ip27_seg2redir_ops, t,
                           "sgi-ip27.seg2redir", 0x80000);
     memory_region_add_subregion_overlap(system_memory, t->phys, &t->mr, 11);
+  }
+
+  /* IP27_WATCH=1: watch-window over the flat RW page (diagnostic, see above). */
+  if (getenv("IP27_WATCH")) {
+    IP27Watch *w = g_new0(IP27Watch, 1);
+    w->ram = ram;
+    w->phys = 0x3f3000;
+    memory_region_init_io(&w->mr, NULL, &ip27_watch_ops, w,
+                          "sgi-ip27.watch", 0x1000);
+    memory_region_add_subregion_overlap(system_memory, w->phys, &w->mr, 12);
   }
 
 
