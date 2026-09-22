@@ -25,6 +25,7 @@
 #include "chardev/char-fe.h"
 #include "hw/core/qdev.h"
 #include "hw/core/irq.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_SCN2681 "sgi-scn2681"
@@ -77,6 +78,19 @@ struct SCN2681State {
     uint8_t opr;
 
     qemu_irq irq;
+
+    /*
+     * Counter/timer: a 16-bit down-counter reloaded from ctur:ctlr, clocked
+     * from QEMU_CLOCK_VIRTUAL at the rate the ACR selects.  Started by a
+     * *read* of register 0xe and stopped by a read of 0xf (the chip's
+     * start/stop counter commands); writes to those registers are the
+     * output-port set/reset commands instead.
+     */
+    QEMUTimer *ct_timer;
+    bool ct_half;             /* timer mode: half-period toggle */
+    uint16_t ct_reload;       /* reload value, as read back on CTU/CTL */
+    uint32_t ct_period;       /* counts per period (a reload of 0 means 65536) */
+    int64_t ct_start_ns;      /* when the current period started */
 };
 
 uint8_t scn2681_read(SCN2681State *s, int reg);

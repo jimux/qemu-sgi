@@ -93,6 +93,99 @@ static void scn2681_cmd(SCN2681State *s, int chn, uint8_t data)
     }
 }
 
+
+/* ---- Counter/timer ---------------------------------------------------- */
+
+#define SCN2681_CLOCK_HZ 3686400
+
+static uint32_t scn2681_ct_rate(SCN2681State *s)
+{
+    if (s->acr & 0x40) {                 /* timer mode */
+        switch ((s->acr >> 4) & 3) {
+        case 0:
+        case 1:                          /* IP2, IP2/16: no IP2 pin wired */
+        case 2:                          /* X1/CLK */
+            return SCN2681_CLOCK_HZ;
+        default:                         /* X1/CLK / 16 */
+            return SCN2681_CLOCK_HZ / 16;
+        }
+    }
+
+    switch ((s->acr >> 4) & 3) {         /* counter mode */
+    case 0:
+        return SCN2681_CLOCK_HZ;         /* IP2 */
+    case 3:
+        return SCN2681_CLOCK_HZ / 16;    /* X1/CLK / 16 */
+    default:
+        /*
+         * TxCA/TxCB.  Our channels transfer immediately and model no baud
+         * timing, so the counter cannot be clocked faithfully from them;
+         * say so rather than run it at an invented rate.
+         */
+        qemu_log_mask(LOG_UNIMP, "sgi-scn2681: counter clocked from a "
+                      "channel rate (ACR 0x%02x) is not modelled\n", s->acr);
+        return 0;
+    }
+}
+
+static uint16_t scn2681_ct_count(SCN2681State *s)
+{
+    uint32_t rate = scn2681_ct_rate(s);
+    uint64_t ticks;
+
+    if (!rate || !timer_pending(s->ct_timer)) {
+        return s->ct_reload;
+    }
+    ticks = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ct_start_ns)
+            * (uint64_t)rate / NANOSECONDS_PER_SECOND;
+    if (ticks >= s->ct_period) {
+        return 0;
+    }
+    return (s->ct_period - (uint32_t)ticks) & 0xffff;
+}
+
+static void scn2681_ct_rearm(SCN2681State *s, uint32_t count)
+{
+    uint32_t rate = scn2681_ct_rate(s);
+
+    s->ct_reload = count & 0xffff;
+    /* A 16-bit down-counter loaded with zero runs 65536 counts. */
+    s->ct_period = count ? count : 0x10000;
+    s->ct_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!rate) {
+        timer_del(s->ct_timer);
+        return;
+    }
+    timer_mod(s->ct_timer, s->ct_start_ns +
+              (int64_t)s->ct_period * NANOSECONDS_PER_SECOND / rate);
+}
+
+static void scn2681_ct_start(SCN2681State *s)
+{
+    s->ct_half = false;
+    scn2681_ct_rearm(s, (s->ctur << 8) | s->ctlr);
+}
+
+static void scn2681_ct_cb(void *opaque)
+{
+    SCN2681State *s = opaque;
+
+    if (s->acr & 0x40) {
+        /* Timer mode: a square wave, reloading every half period. */
+        s->ct_half = !s->ct_half;
+        if (!s->ct_half) {
+            s->isr |= SCN2681_ISR_CNTR;
+            scn2681_update_irq(s);
+        }
+        scn2681_ct_rearm(s, (s->ctur << 8) | s->ctlr);
+    } else {
+        /* Counter mode: free-running, reloading at 0xffff when it wraps. */
+        s->isr |= SCN2681_ISR_CNTR;
+        scn2681_update_irq(s);
+        scn2681_ct_rearm(s, 0xffff);
+    }
+}
+
 uint8_t scn2681_read(SCN2681State *s, int reg)
 {
     uint8_t ret = 0;
@@ -128,10 +221,10 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
         ret = s->isr;
         break;
     case SCN2681_REG_CTUR:
-        ret = s->ctur;
+        ret = scn2681_ct_count(s) >> 8;
         break;
     case SCN2681_REG_CTLR:
-        ret = s->ctlr;
+        ret = scn2681_ct_count(s) & 0xff;
         break;
     case SCN2681_REG_MR1B:
         if (!s->ch[1].mr_ptr) {
@@ -158,8 +251,14 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
     case SCN2681_REG_IP:
         ret = 0xff; /* input port idle (pulled high) */
         break;
-    case SCN2681_REG_OP_SET:
-    case SCN2681_REG_OP_RST:
+    case SCN2681_REG_OP_SET:  /* read = start counter command */
+        scn2681_ct_start(s);
+        ret = 0;
+        break;
+    case SCN2681_REG_OP_RST:  /* read = stop counter command */
+        timer_del(s->ct_timer);
+        s->isr &= ~SCN2681_ISR_CNTR;
+        scn2681_update_irq(s);
         ret = 0;
         break;
     default:
@@ -297,6 +396,11 @@ static void scn2681_reset(DeviceState *dev)
     s->isr = 0;
     s->ctur = 0;
     s->ctlr = 0;
+    if (s->ct_timer) {
+        timer_del(s->ct_timer);
+    }
+    s->ct_reload = 0;
+    s->ct_half = false;
 }
 
 static void scn2681_realize(DeviceState *dev, Error **errp)
@@ -304,6 +408,7 @@ static void scn2681_realize(DeviceState *dev, Error **errp)
     SCN2681State *s = SGI_SCN2681(dev);
 
     qdev_init_gpio_out_named(dev, &s->irq, "irq", 1);
+    s->ct_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, scn2681_ct_cb, s);
 
     if (qemu_chr_fe_backend_connected(&s->chr_a)) {
         qemu_chr_fe_set_handlers(&s->chr_a, scn2681_can_receive,
