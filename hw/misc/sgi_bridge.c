@@ -80,6 +80,7 @@
  */
 #define IOC3_PORT_A_SSCR_OFF  0x6000b8
 #define IOC3_PORT_B_SSCR_OFF  0x6000d4
+#define IOC3_SSCR_DMA_EN      0x10000000u /* enable ring buffer DMA         */
 #define IOC3_SSCR_DMA_PAUSE   0x20000000u /* pause the DMA channel          */
 #define IOC3_SSCR_PAUSE_STATE 0x40000000u /* sets when pause takes effect   */
 /*
@@ -115,9 +116,24 @@
 #define IOC3_PORT_B_STCIR_OFF 0x6000dc
 
 #define IOC3_SIO_IR_SA_TX_MT        0x00000001u /* port A TX empty         */
+#define IOC3_SIO_IR_SA_RX_HIGH      0x00000004u /* port A RX hi-water      */
+#define IOC3_SIO_IR_SA_RX_TIMER     0x00000008u /* port A RX timeout       */
 #define IOC3_SIO_IR_SA_TX_EXPLICIT  0x00000080u /* port A explicit TX intr */
 #define IOC3_SIO_IR_SB_TX_MT        0x00000200u /* port B TX empty         */
 #define IOC3_SIO_IR_SB_TX_EXPLICIT  0x00010000u /* port B explicit TX intr */
+
+/*
+ * IOC3 serial RX ring (port A console input).  Same shape as the TX half but
+ * the hardware is the producer: received bytes are written into 8-byte entries
+ * (4 data + 4 status) at srpir and the guest consumes them via srcir
+ * (io/sio_ioc3.c ioc3_read()).  RX_A is the second 4K ring (struct ring_buffer
+ * is TX_A, RX_A, TX_B, RX_B), and RXSB_DATA_VALID marks a byte.
+ */
+#define IOC3_PORT_A_SRPIR_OFF 0x6000c4
+#define IOC3_PORT_A_SRCIR_OFF 0x6000c8
+#define IOC3_SRCIR_ARM        0x80000000u /* arm RX timer                   */
+#define IOC3_RXSB_DATA_VALID  0x80u       /* ring SC: data byte is valid    */
+#define IOC3_SIO_RX_RING      4096        /* RX_A is the 2nd 4K ring        */
 
 #define IOC3_SBBR_L_SIZE      0x00000001u /* 1 = 4K rings (not 1K)          */
 #define IOC3_TXCB_VALID       0x40        /* ring SC: byte is valid        */
@@ -570,10 +586,14 @@ static void sgi_bridge_dev_irq(void *opaque, int n, int level);
 static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
 {
     uint32_t pending = s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] & s->ioc3_sio_ienb;
-    int level = pending != 0;
+    int level;
 
     /*
-     * The TX-completion interrupt is NOT raised by default.
+     * The RX (input) interrupts ARE delivered by default: the console tty's
+     * reader sleeps until RX_TIMER/RX_HIGH wakes it, and unlike TX that cannot
+     * be covered by the guest polling.
+     *
+     * The TX-completion interrupts are NOT delivered by default.
      *
      * This model drains the TX ring synchronously, so the transmitter is
      * instantly "empty" after every write and SIO_IR_SA_TX_MT / _TX_EXPLICIT
@@ -591,8 +611,10 @@ static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
      * SGIBRIDGE_SIO_IRQ=1 to deliver it anyway (investigation only).
      */
     if (!getenv("SGIBRIDGE_SIO_IRQ")) {
-        return;
+        pending &= ~(IOC3_SIO_IR_SA_TX_MT | IOC3_SIO_IR_SA_TX_EXPLICIT |
+                     IOC3_SIO_IR_SB_TX_MT | IOC3_SIO_IR_SB_TX_EXPLICIT);
     }
+    level = pending != 0;
     if (level != s->ioc3_sio_irq_level) {
         s->ioc3_sio_irq_level = level;
         sgi_bridge_dev_irq(s, BRIDGE_BVEC_IOC3_SERIAL, level);
@@ -603,14 +625,10 @@ static void sgi_bridge_ioc3_sio_tx_drain(SGIBRIDGEState *s, int port)
 {
     uint32_t stpir_off = port ? IOC3_PORT_B_STPIR_OFF : IOC3_PORT_A_STPIR_OFF;
     uint32_t stcir_off = port ? IOC3_PORT_B_STCIR_OFF : IOC3_PORT_A_STCIR_OFF;
-    uint32_t tx_mt = port ? IOC3_SIO_IR_SB_TX_MT : IOC3_SIO_IR_SA_TX_MT;
-    uint32_t explicit_bit = port ? IOC3_SIO_IR_SB_TX_EXPLICIT :
-                                   IOC3_SIO_IR_SA_TX_EXPLICIT;
     uint32_t prod = s->ioc3_regs[IOC3_IDX(stpir_off)] & IOC3_SIO_RING_MASK;
     uint32_t cons = s->ioc3_regs[IOC3_IDX(stcir_off)] & IOC3_SIO_RING_MASK;
     uint64_t base = ioc3_sio_ring_phys(s->ioc3_regs[IOC3_IDX(IOC3_SBBR_H_OFF)],
                                        s->ioc3_regs[IOC3_IDX(IOC3_SBBR_L_OFF)]);
-    uint32_t irq = 0;
     int guard;
 
     if (port) {
@@ -630,18 +648,127 @@ static void sgi_bridge_ioc3_sio_tx_drain(SGIBRIDGEState *s, int port)
                 serial_io_ops.write(&s->ioc3_uart, 0, entry[x], 1);
             }
         }
-        if (entry[4] & IOC3_TXCB_INT_WHEN_DONE) {
-            irq |= explicit_bit;
-        }
         cons = (cons + sizeof(entry)) & IOC3_SIO_RING_MASK;
     }
 
     s->ioc3_regs[IOC3_IDX(stcir_off)] = cons;
     if (cons == prod) {
-        irq |= tx_mt;   /* transmitter idle */
+        /*
+         * Transmitter idle.  The hardware signals this with SIO_IR TX_MT and
+         * its ISR disables DMA; only the DMA disable is delivered here.
+         *
+         * Why TX_MT is NOT latched (measured, install-leg.md cont18bv): the
+         * guest's ISR reads the TX condition out of sio_ir, so latching TX_MT
+         * -- which a synchronous drain makes true after EVERY write -- makes
+         * the ISR run its lowat upcall (UP_OUTPUT_LOWAT -> csio_output_lowat
+         * -> sv_broadcast) on every console interrupt.  With no sleeping writer
+         * to consume it, the tty's sv semaphore overflows (kernel assertion
+         * sema.c "s_st.count < SHRT_MAX") as soon as any RX interrupt runs the
+         * ISR.  ioc3_wrflush() accepts EITHER TX_MT or DMA disabled, so the
+         * slow-polled path is still satisfied.  A faithful TX_MT wants an
+         * asynchronous (baud-paced) drain so it fires once per real idle
+         * transition rather than once per write; that remains the queued debt.
+         */
+        uint32_t sscr_off = port ? IOC3_PORT_B_SSCR_OFF : IOC3_PORT_A_SSCR_OFF;
+
+        s->ioc3_regs[IOC3_IDX(sscr_off)] &= ~IOC3_SSCR_DMA_EN;
     }
-    s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] |= irq;
-    sgi_bridge_ioc3_sio_irq_update(s);
+}
+
+/*
+ * IOC3 serial DMA, RX half: console input.
+ *
+ * The kernel's console input path (io/sio_ioc3.c ioc3_read) drains the SIO RX
+ * ring, NOT the 16550 RBR.  Bytes arriving on the shared chardev are written
+ * as one entry per byte (RXSB_DATA_VALID) at srpir and the producer advances;
+ * the RX_TIMER condition is what wakes the reader (the guest acks it by
+ * writing sio_ir and re-arms via srcir).  Only port A (the console) is fed.
+ * The gate is a configured ring (nonzero sbbr base): the PROM leaves it zero
+ * and reads the 16550, so nothing steals its input.
+ *
+ * Simplification: the datasheet drains fewer than 4 packed bytes when the RX
+ * timer expires; here the byte is written immediately and RX_TIMER is raised
+ * with it (no srtr interval modelled).  Console input is not latency-critical,
+ * and the condition the guest services is the same one.
+ */
+static void sgi_bridge_ioc3_sio_rx(SGIBRIDGEState *s, const uint8_t *buf,
+                                   int size)
+{
+    uint32_t sscr = s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SSCR_OFF)];
+    uint32_t cons, prod, irq = 0;
+    uint64_t base;
+    int i;
+
+    if (getenv("SGIBRIDGE_RXDBG")) {
+        fprintf(stderr, "RXDBG byte=%02x sscr=%08x base_h=%08x base_l=%08x "
+                "ienb=%08x sir=%08x srpir=%08x srcir=%08x\n",
+                size > 0 ? buf[0] : 0, sscr,
+                s->ioc3_regs[IOC3_IDX(IOC3_SBBR_H_OFF)],
+                s->ioc3_regs[IOC3_IDX(IOC3_SBBR_L_OFF)], s->ioc3_sio_ienb,
+                s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)],
+                s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRPIR_OFF)],
+                s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRCIR_OFF)]);
+    }
+    /*
+     * Gate on the ring being configured, NOT on SSCR_DMA_EN: the transmitter's
+     * idle transition clears DMA_EN (see the TX drain), and the PROM runs with
+     * the ring base zero.  A zero base means the kernel has not set up the RX
+     * ring yet, so the 16550 keeps the input.
+     */
+    base = ioc3_sio_ring_phys(s->ioc3_regs[IOC3_IDX(IOC3_SBBR_H_OFF)],
+                              s->ioc3_regs[IOC3_IDX(IOC3_SBBR_L_OFF)]);
+    if (!base) {
+        return;
+    }
+    base += IOC3_SIO_RX_RING;
+    prod = s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRPIR_OFF)] & IOC3_SIO_RING_MASK;
+
+    for (i = 0; i < size; i++) {
+        uint8_t entry[8] = { 0 };
+
+        cons = s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRCIR_OFF)] & IOC3_SIO_RING_MASK;
+        /*
+         * A pointer-only ring cannot distinguish full from empty by equality:
+         * prod == cons means EMPTY (the guest reads while prod != cons, see
+         * ioc3_read).  It is full when the next slot would collide with cons.
+         */
+        if (((prod + (uint32_t)sizeof(entry)) & IOC3_SIO_RING_MASK) == cons) {
+            break;              /* ring full: drop, as the hardware would */
+        }
+        entry[0] = buf[i];
+        entry[4] = IOC3_RXSB_DATA_VALID;
+        if (dma_memory_write(&address_space_memory, base + prod, entry,
+                             sizeof(entry), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            break;
+        }
+        prod = (prod + sizeof(entry)) & IOC3_SIO_RING_MASK;
+        s->ioc3_regs[IOC3_IDX(IOC3_PORT_A_SRPIR_OFF)] = prod;
+        irq |= IOC3_SIO_IR_SA_RX_TIMER;
+    }
+
+    if (irq) {
+        s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] |= irq;
+        sgi_bridge_ioc3_sio_irq_update(s);
+    }
+}
+
+static int sgi_bridge_serial_can_receive(void *opaque)
+{
+    return 1;
+}
+
+static void sgi_bridge_serial_receive(void *opaque, const uint8_t *buf,
+                                      int size)
+{
+    SGIBRIDGEState *s = opaque;
+
+    serial_receive_bytes(&s->ioc3_uart, buf, size); /* PROM 16550 console */
+    sgi_bridge_ioc3_sio_rx(s, buf, size);           /* kernel SIO RX ring */
+}
+
+static void sgi_bridge_serial_event(void *opaque, QEMUChrEvent event)
+{
+    /* Input is delivered through sgi_bridge_serial_receive; no events needed. */
 }
 
 /* MII management interface (IOC3 MICR/MIDR) and IEEE 802.3 PHY bits. */
@@ -1516,6 +1643,19 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
     if (!qdev_realize(DEVICE(&s->ioc3_uart), NULL, errp)) {
         return;
     }
+
+    /*
+     * Re-register the 16550's chardev handlers on the same frontend so ONE
+     * backend feeds both consumers of console input: the 16550 (the PROM menu
+     * reads its RBR) and the IOC3 SIO RX ring (the kernel reads that after
+     * boot).  A chardev has a single frontend, so the 16550's handlers
+     * (serial_receive1) cannot remain registered alongside ours; we override
+     * them and forward bytes to serial_receive_bytes().  Any 'ser0'/fallback
+     * chardev given to the UART above is picked up here.
+     */
+    qemu_chr_fe_set_handlers(&s->ioc3_uart.chr, sgi_bridge_serial_can_receive,
+                             sgi_bridge_serial_receive, sgi_bridge_serial_event,
+                             NULL, s, NULL, true);
 
     /*
      * Map the IOC3 UART at BRIDGE offsets 0x620170 (UART B; the PROM console)

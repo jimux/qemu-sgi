@@ -152,6 +152,15 @@ struct SGIBRIDGEState {
     int ioc3_sio_irq_level;
 
     /*
+     * IOC3 serial RX path (port A console input).  The kernel's console input
+     * does NOT read the 16550 RBR: after boot it reads the SIO RX DMA ring
+     * (io/sio_ioc3.c ioc3_read(), producer srpir, consumer srcir).  The chardev
+     * backend therefore feeds both the 16550 (so the PROM menu keeps working)
+     * and that ring; see sgi_bridge_serial_receive().  No extra state beyond
+     * ioc3_regs: the producers live in srpir/srcir and the gate is SSCR_DMA_EN.
+     */
+
+    /*
      * IOC3 SuperIO index/data register pair (BRIDGE+0x6A0000 index,
      * +0x6C0000 data), a PC-style bank of 8-bit SuperIO registers.
      */
