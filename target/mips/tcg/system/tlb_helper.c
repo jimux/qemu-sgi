@@ -444,6 +444,27 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
     return TLBRET_NOMATCH;
 }
 
+/*
+ * MIPS-I R2000/R3000 address translation.  The R3000 TLB is refilled by
+ * software and has no separate "invalid entry" exception: a lookup that
+ * matches an entry whose Valid bit is clear is a *miss*, which must take
+ * the TLB-refill vector (0x80000000) so the software handler can refill it.
+ * The R4000 (which shares r4k_map_address) instead reports TLBRET_INVALID
+ * and vectors to the general handler, which is correct for that part but
+ * sends R3000 refill traps to the wrong vector.  Map the invalid case to a
+ * miss for MMU_TYPE_R3000 only.
+ */
+static int r3k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
+                           target_ulong address, MMUAccessType access_type)
+{
+    int ret = r4k_map_address(env, physical, prot, address, access_type);
+
+    if (ret == TLBRET_INVALID) {
+        return TLBRET_NOMATCH;
+    }
+    return ret;
+}
+
 static void no_mmu_init(CPUMIPSState *env, const mips_def_t *def)
 {
     env->tlb->nb_tlb = 1;
@@ -481,7 +502,7 @@ static void r4k_mmu_init(CPUMIPSState *env, const mips_def_t *def)
 static void r3k_mmu_init(CPUMIPSState *env, const mips_def_t *def)
 {
     env->tlb->nb_tlb = 64;
-    env->tlb->map_address = &r4k_map_address;
+    env->tlb->map_address = &r3k_map_address;
     env->tlb->helper_tlbwi = r4k_helper_tlbwi;
     env->tlb->helper_tlbwr = r4k_helper_tlbwr;
     env->tlb->helper_tlbp = r4k_helper_tlbp;
