@@ -1270,7 +1270,9 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
         switch (addr & ~3ULL) {
         case HPC1_ENET_XCOUNT:   s->enet_xcount = value; break;
         case HPC1_ENET_CXBP:     s->enet_cxbp = value; break;
-        case HPC1_ENET_NXBDP:    s->enet_nxbdp = value; break;
+        case HPC1_ENET_NXBDP:
+            s->enet_nxbdp = value;
+            break;
         case HPC1_ENET_XBC:      s->enet_xbc = value; break;
         case HPC1_ENET_CXBDP:    s->enet_cxbdp = value; break;
         case HPC1_ENET_CPFXBDP:  s->enet_cpfxbdp = value; break;
@@ -1303,8 +1305,12 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
             break;
         case HPC1_ENET_RBC:      s->enet_rbc = value; break;
         case HPC1_ENET_CRBP:     s->enet_crbp = value; break;
-        case HPC1_ENET_NRBDP:    s->enet_nrbdp = value; break;
-        case HPC1_ENET_CRBDP:    s->enet_crbdp = value; break;
+        case HPC1_ENET_NRBDP:
+            s->enet_nrbdp = value;
+            break;
+        case HPC1_ENET_CRBDP:
+            s->enet_crbdp = value;
+            break;
         default:                 break;
         }
         return;
@@ -1494,6 +1500,21 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
      */
     used = size;
 
+    /*
+     * Ownership: the driver arms a buffer with r_own (bit 31) set and the
+     * hardware clears it when it fills the buffer.  Deliver only into an
+     * armed descriptor.  If the driver has not armed this one yet the ring
+     * is full: report it and STOP here -- do not write the frame into an
+     * unowned buffer and do not advance past it (that is how the model was
+     * clobbering descriptors with buf=0).
+     */
+    if (!(w0 & 0x80000000u)) {
+        s->enet_ctl |= HPC1_ENET_CTL_RBO;
+        s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
+        sgi_hpc1_enet_raise_irq(s);
+        return size;
+    }
+
     if (used > space) {
         s->enet_ctl |= HPC1_ENET_CTL_RBO;
         s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
@@ -1519,19 +1540,16 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
     address_space_stl_be(&address_space_memory, desc, newbc,
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
-    /* Advance the ring; the Seeq status goes in the HIGH byte (shift 8),
-     * and the channel stays armed (HPC_STRCVDMA) for the next frame. */
-    s->enet_crbdp = w2;
+    /*
+     * Do NOT advance crbdp past the descriptor just filled: the driver reads
+     * CRBDP to find the buffer the controller filled, and it re-arms/resets
+     * CRBDP itself after consuming.  Advancing here made the driver read the
+     * NEXT (unarmed) descriptor and conclude there was no frame.
+     * The Seeq status goes in the HIGH byte (shift 8).
+     */
     s->seeq_rx_status = st;
     s->enet_rcvstat = (s->enet_rcvstat & HPC1_ENET_STRCVDMA) |
                       ((uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT);
-    /*
-     * r_eor ends the receive chain: deactivate the channel so the driver
-     * re-arms it, exactly as the HPC3 model clears RXC_CA at EOX.
-     */
-    if (w1 & 0x80000000u) {
-        s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
-    }
     sgi_hpc1_enet_raise_irq(s);
     return size;
 }
