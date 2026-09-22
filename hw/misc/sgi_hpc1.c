@@ -1137,6 +1137,30 @@ static uint64_t sgi_hpc1_read(void *opaque, hwaddr addr, unsigned size)
         case 7:
             return s->seeq_tx_status | 0x80;
         default:
+            /*
+             * regs 0-5 are the banked union in seeq.h's struct EHIO
+             * (seq_reg.sr): bank 0 = eaddr[6] (station address), bank 1
+             * (0x20) = mcast_lsb[6], bank 2 (0x40) = seq_write
+             * { mcast_msb[2], pktgap, ctl }.  The driver writes the MAC in
+             * bank 0 and the multicast hash in banks 1/2, and reads them
+             * back, so the bank must be honoured on the read side too.
+             */
+            if (reg < 6) {
+                switch (s->seeq_tx_cmd & 0x60) {
+                case 0x00:
+                    return s->seeq_station_addr[reg];
+                case 0x20:
+                    return s->seeq_mcast_lsb[reg];
+                default:                    /* 0x40: bank 2 */
+                    switch (reg) {
+                    case 0:  return s->seeq_mcast_msb[0];
+                    case 1:  return s->seeq_mcast_msb[1];
+                    case 2:  return s->seeq_pktgap;
+                    case 3:  return s->seeq_seeqctl;
+                    default: return 0;
+                    }
+                }
+            }
             return 0;
         }
     }
@@ -1334,8 +1358,22 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
                  * silently overwrite the MAC, which drops every unicast
                  * packet (the HPC3 lesson, blog_ethernet_bank_selection.md).
                  */
-                if ((s->seeq_tx_cmd & 0x60) == 0x00) {
+                switch (s->seeq_tx_cmd & 0x60) {
+                case 0x00:                      /* bank 0: station address */
                     s->seeq_station_addr[reg] = val8;
+                    break;
+                case 0x20:                      /* bank 1: mcast lsb */
+                    s->seeq_mcast_lsb[reg] = val8;
+                    break;
+                default:                        /* 0x40: bank 2 */
+                    switch (reg) {
+                    case 0: s->seeq_mcast_msb[0] = val8; break;
+                    case 1: s->seeq_mcast_msb[1] = val8; break;
+                    case 2: s->seeq_pktgap = val8; break;
+                    case 3: s->seeq_seeqctl = val8; break;
+                    default: break;
+                    }
+                    break;
                 }
             }
             break;
@@ -1562,6 +1600,9 @@ static void sgi_hpc1_enet_reset(SGIHPC1State *s)
     s->enet_rbc = s->enet_crbp = s->enet_nrbdp = s->enet_crbdp = 0;
     s->enet_ctl = HPC1_ENET_CTL_MODNORM;
     s->seeq_rx_cmd = s->seeq_tx_cmd = 0;
+    memset(s->seeq_mcast_lsb, 0, sizeof(s->seeq_mcast_lsb));
+    memset(s->seeq_mcast_msb, 0, sizeof(s->seeq_mcast_msb));
+    s->seeq_pktgap = s->seeq_seeqctl = 0;
     s->seeq_rx_status = s->seeq_tx_status = 0;
     memset(s->seeq_station_addr, 0, sizeof(s->seeq_station_addr));
     s->lio_status[0] &= ~LIO0_ETHERNET;
@@ -1665,6 +1706,7 @@ static void sgi_hpc1_reset(DeviceState *dev)
     s->nv_writable = 0;
     for (i = 0; i < 6; i++) {
         s->seeq_station_addr[i] = 0;
+        s->seeq_mcast_lsb[i] = 0;
     }
     sgi_hpc1_enet_reset(s);
     s->lio_status[0] = s->lio_status[1] = 0;
@@ -1814,6 +1856,10 @@ static const VMStateDescription vmstate_sgi_hpc1 = {
         VMSTATE_INT64(rtc_host_base_ms, SGIHPC1State),
         VMSTATE_INT64(rtc_guest_base_ms, SGIHPC1State),
         VMSTATE_UINT8_ARRAY(seeq_station_addr, SGIHPC1State, 6),
+        VMSTATE_UINT8_ARRAY(seeq_mcast_lsb, SGIHPC1State, 6),
+        VMSTATE_UINT8_ARRAY(seeq_mcast_msb, SGIHPC1State, 2),
+        VMSTATE_UINT8(seeq_pktgap, SGIHPC1State),
+        VMSTATE_UINT8(seeq_seeqctl, SGIHPC1State),
         VMSTATE_UINT8(seeq_rx_cmd, SGIHPC1State),
         VMSTATE_UINT8(seeq_tx_cmd, SGIHPC1State),
         VMSTATE_UINT8(seeq_rx_status, SGIHPC1State),

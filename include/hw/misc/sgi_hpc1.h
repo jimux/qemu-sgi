@@ -130,6 +130,12 @@ struct SGIHPC1State {
 
     /* SEEQ 8003 registers (read side only, TX/RX DMA is a later stage) */
     uint8_t seeq_station_addr[6];
+    /* Banked Seeq union (seeq.h EHIO seq_reg.sr): bank1 = mcast_lsb[6],
+     * bank2 = seq_write { mcast_msb[2], pktgap, ctl }. */
+    uint8_t seeq_mcast_lsb[6];
+    uint8_t seeq_mcast_msb[2];
+    uint8_t seeq_pktgap;
+    uint8_t seeq_seeqctl;
     uint8_t seeq_rx_cmd;
     uint8_t seeq_tx_cmd;
     uint8_t seeq_rx_status;
