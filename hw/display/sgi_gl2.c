@@ -116,6 +116,20 @@ struct SGIGL2State {
     uint16_t font[GL2_FONT_WORDS];
     uint16_t fbc_data;            /* FBC data latch */
 
+    /*
+     * GF2 FBC microstore and host interface.  The kernel uploads 4096 states
+     * x 4 slices (64-bit microword) through FBDATA, with the slice in GEflags
+     * bits 13-14 and the state's high 3 bits (block) in GEflags bits 10-12;
+     * the low 9 bits come from the FBDATA word address.
+     */
+    uint16_t microram[4][4096];
+    uint8_t micro_slice;
+    uint8_t micro_block;
+    bool micro_access;            /* FBC in WRITEMICRO/READMICRO mode */
+    uint16_t fbc_flags;           /* last FBCflags command */
+    uint16_t fbc_out;             /* FBC output register (reset/version) */
+    uint16_t ge_flags;
+
     bool testpattern;
     bool trace;
     bool dirty;
@@ -278,15 +292,25 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
     unsigned off = addr;
 
     if (off < R_UC) {
+        if (s->trace) {
+            fprintf(stderr, "gl2: FBC RD off=0x%x\n", off);
+        }
         switch (off & ~0x3ff) {
         case R_FBC_PIXEL & ~0x3ff:
             return 0;
         case R_FBC_FLAGS & ~0x3ff:
             return 0;
-        case R_FBC_DATA & ~0x3ff:
-            return s->fbc_data;
+        case R_FBC_DATA & ~0x3ff: {
+            unsigned low = (off & 0x3ff) >> 1;
+            unsigned idx = s->micro_block * 512 + low;
+
+            if (s->micro_access) {
+                return idx < 4096 ? s->microram[s->micro_slice][idx] : 0;
+            }
+            return s->fbc_out;
+        }
         default:
-            return 0;
+            return 0;           /* GEflags reads as 0 when idle */
         }
     }
     if (off < R_DC) {
@@ -332,9 +356,47 @@ static void gl2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     uint16_t v = val & 0xffff;
 
     if (off < R_UC) {
+        if (s->trace) {
+            fprintf(stderr, "gl2: FBC WR off=0x%x val=0x%04x\n", off, v);
+        }
         switch (off & ~0x3ff) {
-        case R_FBC_DATA & ~0x3ff:
-            s->fbc_data = v;
+        case R_FBC_PIXEL & ~0x3ff:
+            break;              /* clear interrupt / misc */
+        case R_FBC_FLAGS & ~0x3ff:
+            s->fbc_flags = v;
+            s->micro_access = (v == 0xfe || v == 0xff); /* WRITE/READMICRO */
+            break;
+        case R_FBC_DATA & ~0x3ff: {
+            unsigned low = (off & 0x3ff) >> 1;
+            unsigned idx = s->micro_block * 512 + low;
+
+            if (s->micro_access) {
+                if (idx < 4096) {
+                    s->microram[s->micro_slice][idx] = v;
+                }
+            } else {
+                /*
+                 * Output register: the reset/version queries the kernel
+                 * writes (8 = scratch size, 7 = microcode version).
+                 */
+                switch (v) {
+                case 8:
+                    s->fbc_out = 0xfff;
+                    break;
+                case 7:
+                    s->fbc_out = 0x0200;
+                    break;
+                default:
+                    s->fbc_out = v;
+                    break;
+                }
+            }
+            break;
+        }
+        case R_GE_FLAGS & ~0x3ff:
+            s->ge_flags = v;
+            s->micro_slice = (v >> 13) & 3;
+            s->micro_block = (v >> 10) & 7;
             break;
         default:
             break;
@@ -471,6 +533,12 @@ static void gl2_reset(DeviceState *dev)
     s->scrmaskx = s->scrmasky = 0;
     s->fmaddr = 0;
     s->fbc_data = 0;
+    s->micro_access = false;
+    s->micro_slice = s->micro_block = 0;
+    s->fbc_flags = 0;
+    s->fbc_out = 0;
+    s->ge_flags = 0;
+    memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
     if (s->fb) {
         memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
