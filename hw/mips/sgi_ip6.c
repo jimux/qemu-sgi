@@ -34,6 +34,8 @@
 #include "hw/scsi/scsi.h"
 #include "hw/scsi/wd33c93.h"
 #include "hw/timer/i8254_internal.h"
+#include "net/net.h"
+#include "hw/net/pcnet.h"
 #include "qapi/error.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
@@ -80,14 +82,20 @@
 #define SGI_IP6_RTC_BASE    0x1fbc0000ULL
 #define SGI_IP6_RTC_SIZE    0x80
 
-/* WD33C93 SCSI (indirect address/data ports) and its reset lines */
-#define SGI_IP6_SCSI_BASE   0x1fb00000ULL
+/* Am7990 LANCE Ethernet (registers and reset lines) */
+#define SGI_IP6_LANCE_BASE      0x1f950000ULL
+#define SGI_IP6_LANCE_REG_SIZE  0x200
+#define SGI_IP6_LANCE_RST_BASE  0x1f960000ULL
+#define SGI_IP6_LANCE_RST_SIZE  0x8
+
+/* WD33C93 SCSI (indirect address/data ports) and its reset lines */#define SGI_IP6_SCSI_BASE   0x1fb00000ULL
 #define SGI_IP6_SCSI_SIZE   0x200
 #define SGI_IP6_SCSIRST_BASE 0x1fa80000ULL
 #define SGI_IP6_SCSIRST_SIZE 0x10
 
 /* LIO interrupt bits */
 #define LIO_SCSI            4
+#define LIO_ENET            5
 
 /* SCN2681 DUARTs */
 #define SGI_IP6_DUART_BASE  0x1fb80000ULL
@@ -129,6 +137,8 @@ typedef struct SGIip6State {
     MemoryRegion scsi_regs;
     MemoryRegion scsi_reset;
     MemoryRegion duart_regs;
+    MemoryRegion lance_regs;
+    MemoryRegion lance_reset;
     MemoryRegion pit_reg;
     MemoryRegion timer0_ack;
     MemoryRegion timer1_ack;
@@ -139,6 +149,9 @@ typedef struct SGIip6State {
     MIPSCPU *cpu;
     WD33C93State *scsi;
     SCN2681State *duart[2];
+
+    PCNetState *lance;
+    DeviceState *lance_dev;
 
     eeprom_t *eeprom;
 
@@ -829,6 +842,210 @@ static const MemoryRegionOps sgi_ip6_timer1_ack_ops = {
     },
 };
 
+/* ---- Am7990 LANCE (Ethernet) ----------------------------------------- */
+
+#define TYPE_SGI_IP6_LANCE "sgi-ip6-lance"
+OBJECT_DECLARE_SIMPLE_TYPE(SGIip6LanceState, SGI_IP6_LANCE)
+
+struct SGIip6LanceState {
+    DeviceState parent_obj;
+    PCNetState net;
+};
+
+/*
+ * The LANCE DMAs through the CTL1 address-mapping table: its top 256 entries
+ * (dmahi[0x200..0x2ff]) map the LANCE's 4 KB pages, so the physical address is
+ * (dmahi[0x200 + ((addr >> 12) & 0xff)] << 12) | (addr & 0xfff).  Each 16-bit
+ * word is translated separately, as MAME does.  When the driver leaves BSWP
+ * clear the LANCE's byte order differs from the host's, so swap in that case.
+ */
+static void sgi_ip6_lance_dma_read(void *opaque, hwaddr addr, uint8_t *buf,
+                                   int len, int do_bswap)
+{
+    SGIip6State *s = &ip6_state;
+    int i;
+
+    for (i = 0; i + 1 < len; i += 2) {
+        hwaddr a = addr + i;
+        unsigned page = 0x200 + ((a >> 12) & 0xff);
+        hwaddr pa = ((hwaddr)s->dmahi[page & 0x7ff] << 12) | (a & 0xfff);
+
+        address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                           buf + i, 2);
+    }
+    if (!do_bswap) {
+        for (i = 0; i + 1 < len; i += 2) {
+            bswap16s((uint16_t *)(buf + i));
+        }
+    }
+}
+
+static void sgi_ip6_lance_dma_write(void *opaque, hwaddr addr, uint8_t *buf,
+                                    int len, int do_bswap)
+{
+    SGIip6State *s = &ip6_state;
+    int i;
+
+    if (!do_bswap) {
+        for (i = 0; i + 1 < len; i += 2) {
+            bswap16s((uint16_t *)(buf + i));
+        }
+    }
+    for (i = 0; i + 1 < len; i += 2) {
+        hwaddr a = addr + i;
+        unsigned page = 0x200 + ((a >> 12) & 0xff);
+        hwaddr pa = ((hwaddr)s->dmahi[page & 0x7ff] << 12) | (a & 0xfff);
+
+        address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                            buf + i, 2);
+    }
+}
+
+static void sgi_ip6_lance_irq(void *opaque, int n, int level)
+{
+    SGIip6State *s = opaque;
+
+    /* LIO status bits are active low: set = idle, clear = pending. */
+    if (level) {
+        s->lio_isr &= ~(1u << LIO_ENET);
+    } else {
+        s->lio_isr |= (1u << LIO_ENET);
+    }
+    sgi_ip6_lio_update(s);
+}
+
+static NetClientInfo net_sgi_ip6_lance_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = pcnet_receive,
+    .link_status_changed = pcnet_set_link_status,
+};
+
+static void sgi_ip6_lance_realize(DeviceState *dev, Error **errp)
+{
+    SGIip6LanceState *l = SGI_IP6_LANCE(dev);
+    PCNetState *s = &l->net;
+
+    s->phys_mem_read = sgi_ip6_lance_dma_read;
+    s->phys_mem_write = sgi_ip6_lance_dma_write;
+    s->irq = qemu_allocate_irq(sgi_ip6_lance_irq, &ip6_state, 0);
+
+    pcnet_common_init(dev, s, &net_sgi_ip6_lance_info);
+}
+
+static void sgi_ip6_lance_reset(DeviceState *dev)
+{
+    pcnet_h_reset(&SGI_IP6_LANCE(dev)->net);
+}
+
+static const Property sgi_ip6_lance_props[] = {
+    DEFINE_NIC_PROPERTIES(SGIip6LanceState, net.conf),
+};
+
+static void sgi_ip6_lance_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = sgi_ip6_lance_realize;
+    device_class_set_legacy_reset(dc, sgi_ip6_lance_reset);
+    device_class_set_props(dc, sgi_ip6_lance_props);
+    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
+}
+
+static const TypeInfo sgi_ip6_lance_type = {
+    .name = TYPE_SGI_IP6_LANCE,
+    .parent = TYPE_DEVICE,
+    .instance_size = sizeof(SGIip6LanceState),
+    .class_init = sgi_ip6_lance_class_init,
+};
+
+static void sgi_ip6_lance_register_types(void)
+{
+    type_register_static(&sgi_ip6_lance_type);
+}
+
+type_init(sgi_ip6_lance_register_types)
+
+/*
+ * Am7990 register access: RDP at +0x000 and RAP at +0x100 (MAME maps the
+ * block 0x1f950000-0x1f9501ff), with the 16-bit register in the high bus
+ * lane.  Translate to the PCnet ioport model's RDP (0x00) / RAP (0x02).
+ */
+static unsigned sgi_ip6_lance_port(hwaddr addr)
+{
+    return (addr & 0x100) ? 0x02 : 0x00;
+}
+
+static uint64_t sgi_ip6_lance_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint32_t v = pcnet_ioport_readw(s->lance, sgi_ip6_lance_port(addr));
+
+    if (size == 1) {
+        v = (addr & 1) ? (v & 0xff) : ((v >> 8) & 0xff);
+    }
+    return v;
+}
+
+static void sgi_ip6_lance_write(void *opaque, hwaddr addr, uint64_t data,
+                                unsigned size)
+{
+    SGIip6State *s = opaque;
+    unsigned port = sgi_ip6_lance_port(addr);
+    uint32_t v = data & 0xffff;
+
+    if (size == 1) {
+        uint16_t cur = pcnet_ioport_readw(s->lance, port);
+
+        if (addr & 1) {
+            v = (cur & 0xff00) | (data & 0xff);
+        } else {
+            v = (cur & 0x00ff) | ((data & 0xff) << 8);
+        }
+    }
+    pcnet_ioport_writew(s->lance, port, v);
+}
+
+static const MemoryRegionOps sgi_ip6_lance_ops = {
+    .read = sgi_ip6_lance_read,
+    .write = sgi_ip6_lance_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 2,
+    },
+};
+
+/*
+ * Ethernet reset lines: reading 0x1f960000 asserts hardware reset and reading
+ * 0x1f960004 releases it (MAME ip6.cpp etherrdy/etherrst).
+ */
+static uint64_t sgi_ip6_lance_reset_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    if ((addr & (SGI_IP6_LANCE_RST_SIZE - 1)) == 0) {
+        pcnet_h_reset(s->lance);
+    }
+    return 0;
+}
+
+static void sgi_ip6_lance_reset_write(void *opaque, hwaddr addr, uint64_t data,
+                                      unsigned size)
+{
+}
+
+static const MemoryRegionOps sgi_ip6_lance_reset_ops = {
+    .read = sgi_ip6_lance_reset_read,
+    .write = sgi_ip6_lance_reset_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 /* ---- machine ---------------------------------------------------------- */
 
 static void main_cpu_reset(void *opaque)
@@ -988,6 +1205,23 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_add_subregion(system_memory, SGI_IP6_DUART_BASE,
                                 &s->duart_regs);
 
+    /* Am7990 LANCE: PCnet-backed NIC whose DMA goes through the CTL1. */
+    s->lance_dev = qdev_new(TYPE_SGI_IP6_LANCE);
+    qemu_configure_nic_device(s->lance_dev, true, NULL);
+    qdev_realize(s->lance_dev, NULL, &error_fatal);
+    s->lance = &SGI_IP6_LANCE(s->lance_dev)->net;
+
+    memory_region_init_io(&s->lance_regs, OBJECT(machine), &sgi_ip6_lance_ops,
+                          s, "sgi-ip6-lance", SGI_IP6_LANCE_REG_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_LANCE_BASE,
+                                &s->lance_regs);
+
+    memory_region_init_io(&s->lance_reset, OBJECT(machine),
+                          &sgi_ip6_lance_reset_ops, s, "sgi-ip6-lance-rst",
+                          SGI_IP6_LANCE_RST_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_LANCE_RST_BASE,
+                                &s->lance_reset);
+
     /* 8254 PIT at 0x1fb40000.  Its four byte-wide ports sit one per 32-bit
      * bus word (+0/+4/+8/+12); channel 0's output drives CPU IRQ2, which the
      * PROM acknowledges by reading the timer0 ack register. */
@@ -1013,7 +1247,6 @@ static void sgi_ip6_init(MachineState *machine)
      * as unimplemented so accesses are logged rather than aborting. */
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
     create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
-    create_unimplemented_device("sgi-ip6-lance", 0x1f950000, 0x20000);
     create_unimplemented_device("sgi-ip6-gr1", 0x1f000000, 0x8000);
     create_unimplemented_device("sgi-ip6-audio", 0x1f9c0000, 0x40000);
     create_unimplemented_device("sgi-ip6-dmaflush", 0x1f940000, 0x1000);
