@@ -36,6 +36,13 @@ config Q800
     select IOSB
     select ASC
 
+config IRIS3130
+    bool
+    default y
+    depends on M68K
+    select SGI_IP2
+    select MC68681
+
 config M68K_VIRT
     bool
     default y

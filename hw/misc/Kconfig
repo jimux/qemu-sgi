@@ -336,4 +336,7 @@ config IOSB
 config XLNX_VERSAL_TRNG
     bool
 
+config SGI_IP2
+    bool
+
 source macio/Kconfig
