@@ -40,6 +40,7 @@
 #define IP2_SEG_TD          0
 #define IP2_SEG_STK         1
 #define IP2_SEG_OS          2
+#define IP2_SEG_MBMEM       4
 #define IP2_SEG_MBIO        5
 
 /* status register bits (cpureg.h / mame_ip2.cpp) */
@@ -93,6 +94,8 @@
 #define IP2_MB_MEM_BASE     0x40000000
 #define IP2_MB_REG_BASE     0x40100000
 #define IP2_MB_IO_BASE      0x50000000
+/* The CPU-visible Multibus memory window is MBUF (1 MB) + MBREG (1 MB). */
+#define IP2_MB_WINDOW       0x200000
 #define IP2_MB_MAP_ENTRIES  1024
 
 /* Interphase 2190 SMD controller in Multibus I/O space (iphreg.h) */
@@ -211,6 +214,24 @@ int sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
             return 0;           /* let the MMIO ops handle the 2190 */
         }
         return -1;              /* bus error: no board here */
+    }
+    if (seg == IP2_SEG_MBMEM) {
+        /*
+         * Multibus memory.  The low 2 MB of the segment is the host-RAM
+         * window (MBUF) plus the map registers (MBREG); both are backed by
+         * the system memory map and are legitimately always accessible.
+         * Above that the segment addresses the Multibus memory space
+         * directly, and no card is modelled there, so the cycle times out
+         * -- a bus error.  The kernel relies on exactly this to conclude a
+         * board is absent: sys/multibus/cdsio.c cdProbe() and pxd.c read a
+         * card's memory at SEG_MBMEM+CDMEMBASE / SEG_MBMEM+PXDMEM_ADDR, and
+         * its trap handler keys off DCFA's segment (SEG_MBMEM) to take the
+         * SIGSEGV path rather than pagein (sys/ipII/trap.c:112).
+         */
+        if ((address & 0x0fffffff) >= IP2_MB_WINDOW) {
+            return -1;
+        }
+        return 0;
     }
     if (seg > IP2_SEG_OS) {
         return 0;
