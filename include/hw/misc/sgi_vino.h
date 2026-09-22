@@ -36,12 +36,33 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIVinoState, SGI_VINO)
 #define SGI_VINO_CHIP_ID      0x0B
 #define SGI_VINO_REVISION     0x01
 
+/* VINO I2C master: control/status at id 3 (offset 0x1c), data at id 4
+ * (offset 0x24).  Recovered from the IRIX 5.3 driver (vino_i2c.o): the
+ * control byte 0x5 issues a byte transfer, 0x0 forces the bus idle; status
+ * bits read back from 0x1c are 0x01 bus-busy, 0x10 transfer-in-progress,
+ * 0x20 ack, 0x80 error.  The analog decoder sits at 7-bit address 0x45
+ * (write 0x8a / read 0x8b); a second device answers at 0x2b. */
+#define SGI_VINO_I2C_CTRL_OFFSET  0x1c
+#define SGI_VINO_I2C_DATA_OFFSET  0x24
+#define SGI_VINO_I2C_ADDR_WRITE   0x8a   /* SAA7191 */
+#define SGI_VINO_I2C_ADDR_ALT     0x56   /* second I2C device */
+
 struct SGIVinoState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     bool present;
     uint8_t regs[SGI_VINO_REG_SIZE];
+
+    /* Modelled SAA7191 / second-device I2C register files and the master
+     * transfer state (write byte stream: address, sub-address, then data). */
+    uint8_t i2c_dec[256];
+    uint8_t i2c_alt[256];
+    uint8_t i2c_ptr;
+    uint8_t i2c_first;   /* next data byte is the device address */
+    uint8_t i2c_expect_sub; /* next data byte is the sub-address */
+    uint8_t i2c_alt_dev; /* current transaction targets the second device */
 };
+
 
 #endif /* HW_MISC_SGI_VINO_H */

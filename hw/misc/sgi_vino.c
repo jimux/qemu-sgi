@@ -51,9 +51,19 @@ static uint64_t sgi_vino_read(void *opaque, hwaddr offset, unsigned size)
         trace_sgi_vino_read(offset, size, ~0ULL, 1);
         return ~0ULL;
     }
-    /* Big-endian byte assembly, so byte/half/word accesses all agree. */
-    for (i = 0; i < size; i++) {
-        val = (val << 8) | s->regs[offset + i];
+    if (offset == SGI_VINO_I2C_CTRL_OFFSET) {
+        /* Status: idle, so all of busy/xfer/ack/error read clear.  The driver
+         * polls these bits and only cares that a transfer completes. */
+        val = 0;
+    } else if (offset == SGI_VINO_I2C_DATA_OFFSET) {
+        /* Data byte from the addressed slave, advancing the sub-address. */
+        uint8_t *f = s->i2c_alt_dev ? s->i2c_alt : s->i2c_dec;
+        val = f[s->i2c_ptr++];
+    } else {
+        /* Big-endian byte assembly, so byte/half/word accesses all agree. */
+        for (i = 0; i < size; i++) {
+            val = (val << 8) | s->regs[offset + i];
+        }
     }
     trace_sgi_vino_read(offset, size, val, 1);
     return val;
@@ -70,6 +80,29 @@ static void sgi_vino_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     trace_sgi_vino_write(offset, value, size, 1);
+    if (offset == SGI_VINO_I2C_CTRL_OFFSET) {
+        /* Non-zero arms a byte stream; zero forces the bus idle.  Either way
+         * the next data byte starts with the device address. */
+        s->i2c_first = 1;
+        return;
+    }
+    if (offset == SGI_VINO_I2C_DATA_OFFSET) {
+        uint8_t byte = value & 0xff;
+        uint8_t *f = s->i2c_alt_dev ? s->i2c_alt : s->i2c_dec;
+
+        if (s->i2c_first) {
+            /* Device address byte; bit 0 selects read vs write. */
+            s->i2c_alt_dev = ((byte & 0xfe) != SGI_VINO_I2C_ADDR_WRITE);
+            s->i2c_first = 0;
+            s->i2c_expect_sub = !(byte & 1);
+        } else if (s->i2c_expect_sub) {
+            s->i2c_ptr = byte;
+            s->i2c_expect_sub = 0;
+        } else {
+            f[s->i2c_ptr++] = byte;
+        }
+        return;
+    }
     for (i = 0; i < size; i++) {
         s->regs[offset + i] = (value >> (8 * (size - 1 - i))) & 0xff;
     }
@@ -90,6 +123,12 @@ static void sgi_vino_reset(DeviceState *dev)
     SGIVinoState *s = SGI_VINO(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->i2c_dec, 0, sizeof(s->i2c_dec));
+    memset(s->i2c_alt, 0, sizeof(s->i2c_alt));
+    s->i2c_ptr = 0;
+    s->i2c_first = 1;
+    s->i2c_expect_sub = 0;
+    s->i2c_alt_dev = 0;
     /* Version register (base+4): VINO_CHIP_ID in bits [7:4], revision low. */
     s->regs[SGI_VINO_REV_OFFSET + 3] =
         (SGI_VINO_CHIP_ID << 4) | SGI_VINO_REVISION;
