@@ -19,11 +19,15 @@
 #define HW_MISC_SGI_VINO_H
 
 #include "hw/core/sysbus.h"
+#include "chardev/char-fe.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_SGI_VINO "sgi-vino"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIVinoState, SGI_VINO)
+
+/* Largest MVPF frame we accept from the host video-source helper. */
+#define SGI_VINO_FRAME_MAX (4u * 1024 * 1024)
 
 /* VINO register aperture.  Register layout is the VINO Design Specification
  * 099-8937-001 (table 1), cross-checked against the Linux VINO driver
@@ -155,6 +159,27 @@ struct SGIVinoState {
     int cache_pos[2];
     uint32_t next_desc[2];              /* auto-advancing fetch pointer */
     uint32_t field_count[2];
+
+    /* Host video source (sgi-video-source interface).  An external helper
+     * (the shared o2helpers decoder wrapper, reused unchanged) connects to
+     * the video-in chardev and streams MVPF frames; a received frame replaces
+     * the internal luma ramp on the next field.  With nothing attached the
+     * device falls back to the ramp, so existing capture tests are unchanged. */
+    CharFrontend video_in;
+    char *video_in_path;
+    char *video_helper;
+    GPid helper_pid;
+    guint helper_watch;
+    char *helper_source;
+    bool helper_is_url;
+    uint8_t *rx_buf;
+    size_t rx_len;
+    size_t rx_payload_len;
+    uint8_t *frame_buf;
+    size_t frame_len;
+    uint32_t frame_width;
+    uint32_t frame_height;
+    uint32_t frame_fourcc;
 };
 
 
