@@ -966,10 +966,16 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                     isp->pci_cmd = val;
                     break;
                 case 0x10:
-                    isp->pci_bar[0] = val;
+                    /* PCI BAR size mask, 1 MB per BAR.  Measured from the guest
+                     * (BRIDGECFG trace): it does the all-ones size probe (write
+                     * 0xffffffff, read back the mask) and allocates sequentially
+                     * by the probed size.  Two 1 MB BARs fill a device's 2 MB
+                     * DevIO window, landing dev0 at 0x200000 and dev1 at 0x400000
+                     * -- their BRIDGE_DEVIO windows (sys/PCI/bridge.h). */
+                    isp->pci_bar[0] = val & 0xfff00000;
                     break;
                 case 0x14:
-                    isp->pci_bar[1] = val;
+                    isp->pci_bar[1] = val & 0xfff00000;
                     break;
                 default:
                     break;
@@ -977,15 +983,30 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                 break;
             }
             if (dev == BRIDGE_IOC3_ID) {
+                /*
+                 * PCI BAR size mask.  A real BAR carries a write mask for its
+                 * decode size: SW writes all-ones and reads back a value with the
+                 * implemented low bits cleared, so size = ~value + 1.  The IOC3
+                 * sits in a 1 MB BRIDGE DevIO window (BRIDGE_DEVIO2, see
+                 * sys/PCI/bridge.h), so its mask is ~0xfffff = 0xfff00000.
+                 *
+                 * Masking the stored value makes the all-ones probe return the
+                 * size mask and a normal aligned base write pass through unchanged.
+                 * Without it the guest cannot learn the window size, so it places
+                 * the BAR arbitrarily (observed 0x00500000, which then falls inside
+                 * SCSI1's DevIO window and gets mapped through it -- pcibr.c
+                 * pcibr_piotrans_addr's first-pass "covering window" rule -- so
+                 * pciio_pio_addr() never equals the console's BRIDGE_DEVIO2 base).
+                 */
                 switch (cfg) {
                 case 0x04:
                     s->pci_cmd = val;
                     break;
                 case 0x10:
-                    s->pci_bar[0] = val;
+                    s->pci_bar[0] = val & 0xfff00000;
                     break;
                 case 0x14:
-                    s->pci_bar[1] = val;
+                    s->pci_bar[1] = val & 0xfff00000;
                     break;
                 default:
                     break;
