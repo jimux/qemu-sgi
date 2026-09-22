@@ -61,6 +61,10 @@
 #define SGI_IP6_CLRERR_BASE 0x1faa0000ULL
 #define SGI_IP6_CLRERR_SIZE 0x8
 
+/* DP8572A RTC */
+#define SGI_IP6_RTC_BASE    0x1fbc0000ULL
+#define SGI_IP6_RTC_SIZE    0x80
+
 /* cpuauxctl bits */
 #define CPUAUX_EEPROM_CS    0x20
 #define CPUAUX_EEPROM_CLK   0x40
@@ -83,8 +87,11 @@ typedef struct SGIip6State {
     MemoryRegion lio;
     MemoryRegion err;
     MemoryRegion clrerr;
+    MemoryRegion rtc;
 
     eeprom_t *eeprom;
+
+    uint8_t rtc_regs[SGI_IP6_RTC_SIZE];
 
     uint8_t memcfg;
     uint16_t cpucfg;
@@ -113,12 +120,8 @@ static uint64_t sgi_ip6_ctl1_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (off) {
     case SGI_IP6_CTL1_MEMCFG: {
-        /* memcfg in the top byte lane, sysid in the next.  sysid bit1
-         * (SYSID_FPPRES) reads as 1 here, which is the state the 4D/25
-         * PROM expects on a normal power-up (it takes the FPU-init/reset
-         * path otherwise). */
-        uint8_t sysid = (s->eeprom ? eeprom93xx_read(s->eeprom) : 0)
-                        | SYSID_FPPRES;
+        /* memcfg in the top byte lane, sysid in the next. */
+        uint8_t sysid = s->eeprom ? eeprom93xx_read(s->eeprom) : 0;
 
         val = ((uint32_t)s->memcfg << 24) | ((uint32_t)sysid << 16);
         break;
@@ -346,6 +349,39 @@ static const MemoryRegionOps sgi_ip6_clrerr_ops = {
     },
 };
 
+/* ---- DP8572A RTC ------------------------------------------------------ */
+
+/*
+ * Placeholder register file for the DP8572A real-time clock.  The PROM uses
+ * a control bit (0x4c bit 7) as a one-shot latch during its FPU/reset
+ * sequencing, so the registers must persist writes even before the calendar
+ * is modelled.
+ */
+static uint64_t sgi_ip6_rtc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    return s->rtc_regs[addr & (SGI_IP6_RTC_SIZE - 1)];
+}
+
+static void sgi_ip6_rtc_write(void *opaque, hwaddr addr, uint64_t data,
+                              unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    s->rtc_regs[addr & (SGI_IP6_RTC_SIZE - 1)] = data & 0xff;
+}
+
+static const MemoryRegionOps sgi_ip6_rtc_ops = {
+    .read = sgi_ip6_rtc_read,
+    .write = sgi_ip6_rtc_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 /* ---- machine ---------------------------------------------------------- */
 
 static void main_cpu_reset(void *opaque)
@@ -447,16 +483,19 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_add_subregion(system_memory, SGI_IP6_CLRERR_BASE,
                                 &s->clrerr);
 
-    /* Devices not yet implemented: PIT, SCSI (WD33C93), DUARTs (SCN2681),
-     * RTC (DP8572A), LANCE and GR1 graphics.  Map them as unimplemented so
-     * accesses are logged rather than aborting. */
+    memory_region_init_io(&s->rtc, OBJECT(machine), &sgi_ip6_rtc_ops, s,
+                          "sgi-ip6-rtc", SGI_IP6_RTC_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_RTC_BASE, &s->rtc);
+
+    /* Devices not yet implemented: PIT, WD33C93, SCN2681 DUARTs, LANCE and
+     * GR1 graphics.  Map them as unimplemented so accesses are logged
+     * rather than aborting. */
     create_unimplemented_device("sgi-ip6-pit", 0x1fb40000, 0x10);
     create_unimplemented_device("sgi-ip6-scsi", 0x1fb00000, 0x800);
     create_unimplemented_device("sgi-ip6-scsictl", 0x1fa80000, 0x10);
     create_unimplemented_device("sgi-ip6-timer", 0x1fa00000, 0x30000);
     create_unimplemented_device("sgi-ip6-vrrst", 0x1fac0000, 0x4);
     create_unimplemented_device("sgi-ip6-duart", 0x1fb80000, 0x100);
-    create_unimplemented_device("sgi-ip6-rtc", 0x1fbc0000, 0x80);
     create_unimplemented_device("sgi-ip6-lance", 0x1f950000, 0x20000);
     create_unimplemented_device("sgi-ip6-gr1", 0x1f000000, 0x8000);
 
@@ -475,6 +514,7 @@ static void sgi_ip6_init(MachineState *machine)
     memset(s->dmahi, 0, sizeof(s->dmahi));
     s->erradr = 0;
     s->refadr = 0;
+    memset(s->rtc_regs, 0, sizeof(s->rtc_regs));
     s->lio_isr = 0x3ff;
     s->lio_imr = 0;
 }
