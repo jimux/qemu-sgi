@@ -30,6 +30,7 @@
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "ui/console.h"
+#include "qemu/timer.h"
 
 #define TYPE_SGI_GR2 "sgi-gr2"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
@@ -141,6 +142,18 @@ struct SGIGr2State {
     uint8_t bdvers1;
     uint8_t bdvers2;
     uint8_t bdvers3;
+
+    /* GIO interrupt output.  The kernel driver registers its retrace handler
+     * with setgiovector on GIO vector 2 — the same line the HPC3 exposes as
+     * its "gio-retrace" input, which is how Newport's VRINT is delivered.  A
+     * real CRT always has a vertical retrace, so the board raises it at ~60 Hz
+     * once it has been started; the pulse is asserted then lowered after the
+     * blanking interval, mirroring Newport's VBLANK model.  Without it the
+     * driver's interrupt-driven paths never run and Xsgi wedges. */
+    qemu_irq irq;
+    QEMUTimer *retrace_timer;
+    QEMUTimer *retrace_lower_timer;
+    bool retrace_active;
 };
 
 #endif /* HW_MISC_SGI_GR2_H */
