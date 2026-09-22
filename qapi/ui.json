@@ -232,15 +232,22 @@
 # @input: the video endpoint to attach to.  The O2 accepts ``vin1``
 #     and ``vin2`` (video inputs) and ``vout`` (video output sink).
 #
-# @source: the host source to attach: a local file path, a ``file://``
-#     or stream URL for an input, or an output directory for ``vout``.
-#     Any source containing ``://`` is treated as a URL.
+# @source: the host source to attach: a local file path, a
+#     ``file://`` or stream URL for an input, or an output directory
+#     for ``vout``.  Any source containing ``://`` is treated as a
+#     URL.  A local source (a bare path or a ``file://`` URL) is
+#     checked for existence synchronously and rejected here if it is
+#     missing; a remote URL cannot be validated without a network
+#     round trip, so it stays asynchronous.  An asynchronous failure
+#     after a successful attach is reported with a
+#     #VIDEO_SOURCE_ERROR event.
 #
 # Returns: a #VideoAttachResult on success.
 #
 # Errors:
 #     - if the machine has no ``sgi-video-source`` device
 #     - if @input is not a known endpoint
+#     - if a local @source does not exist
 #     - if the device has no helper configured, or it cannot start
 #
 # Since: 10.2
@@ -300,6 +307,33 @@
 { 'command': 'video-detach',
   'data': { 'input': 'str' },
   'returns': 'VideoDetachResult' }
+
+##
+# @VIDEO_SOURCE_ERROR:
+#
+# Emitted when a host video source that was successfully attached
+# fails asynchronously, i.e. after ``video-attach`` already returned
+# success.  This happens when the external decoder or sink helper
+# exits non-zero or is killed by a signal: for a remote URL, which
+# cannot be validated at attach time, when the stream is unreachable;
+# and for a local file that existed at attach time but could not be
+# decoded or later disappeared.  It is the only asynchronous failure
+# signal a QMP client gets for a video source; without it the caller
+# sees only the earlier success.  A local source that is already
+# missing at attach time is rejected synchronously by
+# ``video-attach`` and does not reach here.
+#
+# @input: the video endpoint whose helper failed (e.g. ``vin1``, or
+#     ``vout``)
+#
+# @source: the source string that was attached
+#
+# @message: human-readable reason for the failure
+#
+# Since: 10.2
+##
+{ 'event': 'VIDEO_SOURCE_ERROR',
+  'data': { 'input': 'str', 'source': 'str', 'message': 'str' } }
 
 ##
 # Spice

@@ -22,6 +22,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "qapi/qapi-events-ui.h"
 #include "system/address-spaces.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties-system.h"
@@ -1142,21 +1143,38 @@ static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
          * @@SEMANTICS@@ A helper that exits non-zero means the source could
          * not be opened (unreachable URL, missing ffmpeg, bad path): the
          * helper validates the source before it ever connects, so this is a
-         * real error, not a transient EOF.  Report it (QEMU stderr + -D log)
-         * rather than silently showing the internal pattern.
+         * real error, not a transient EOF.  Report it both to QEMU's stderr
+         * and, because video-attach has already returned success by now, as
+         * a #VIDEO_SOURCE_ERROR QMP event -- that event is the only
+         * asynchronous failure signal a QMP client gets.  (A local source
+         * missing at attach time never reaches here; mvp_video_attach
+         * rejects it synchronously.)
          */
         if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            g_autofree char *msg =
+                g_strdup_printf("helper exited with code %d; source "
+                                "unavailable, reverting to internal pattern",
+                                WEXITSTATUS(status));
+
             qemu_log_mask(LOG_GUEST_ERROR,
                           "video: helper for %s exited (code %d); source "
                           "'%s' unavailable, reverting to internal pattern\n",
                           mvp_video_input_name(in->index),
                           WEXITSTATUS(status), src ? src : "(none)");
+            qapi_event_send_video_source_error(
+                mvp_video_input_name(in->index), src ? src : "", msg);
         } else if (WIFSIGNALED(status)) {
+            g_autofree char *msg =
+                g_strdup_printf("helper killed by signal %d",
+                                WTERMSIG(status));
+
             qemu_log_mask(LOG_GUEST_ERROR,
                           "video: helper for %s killed by signal %d; source "
                           "'%s' stopped\n",
                           mvp_video_input_name(in->index),
                           WTERMSIG(status), src ? src : "(none)");
+            qapi_event_send_video_source_error(
+                mvp_video_input_name(in->index), src ? src : "", msg);
         }
     }
     g_free(src);
@@ -1165,6 +1183,7 @@ static void mvp_video_helper_exit(GPid pid, gint status, gpointer opaque)
 static void mvp_video_out_helper_exit(GPid pid, gint status, gpointer opaque)
 {
     MVPVideoSink *out = opaque;
+    char *src = g_strdup(out->helper_source);
 
     g_spawn_close_pid(pid);
     if (out->helper_pid == pid) {
@@ -1173,7 +1192,32 @@ static void mvp_video_out_helper_exit(GPid pid, gint status, gpointer opaque)
         g_free(out->helper_source);
         out->helper_source = NULL;
         out->helper_is_url = false;
+        /*
+         * @@SEMANTICS@@ Mirror the VIN path: a sink helper that fails
+         * after a successful attach is only otherwise visible in the QEMU
+         * log, so surface it as the same #VIDEO_SOURCE_ERROR event.
+         */
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            g_autofree char *msg =
+                g_strdup_printf("sink helper exited with code %d",
+                                WEXITSTATUS(status));
+
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "video: sink helper exited (code %d) for source "
+                          "'%s'\n", WEXITSTATUS(status), src ? src : "(none)");
+            qapi_event_send_video_source_error("vout", src ? src : "", msg);
+        } else if (WIFSIGNALED(status)) {
+            g_autofree char *msg =
+                g_strdup_printf("sink helper killed by signal %d",
+                                WTERMSIG(status));
+
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "video: sink helper killed by signal %d for source "
+                          "'%s'\n", WTERMSIG(status), src ? src : "(none)");
+            qapi_event_send_video_source_error("vout", src ? src : "", msg);
+        }
     }
+    g_free(src);
 }
 
 static void mvp_video_out_detach(SGIMACEVideoState *s)
@@ -1301,6 +1345,38 @@ static void mvp_video_detach(SGIVideoSource *src, const char *input)
     g_spawn_close_pid(pid);
 }
 
+/*
+ * @@SEMANTICS@@ The local half of the source contract.  A bare path or a
+ * file:// URL names a host file that can be checked without a network round
+ * trip, so video-attach can refuse a missing one synchronously instead of
+ * returning success and failing later inside the helper -- which is exactly
+ * what let `file:///no/such/clip.mkv` return ok (any string containing
+ * "://" used to be classified as a URL and never checked).  A remote URL
+ * cannot be validated this way and stays asynchronous (the helper's
+ * preflight reports it through the #VIDEO_SOURCE_ERROR event).  Returns the
+ * local filesystem path to test in @buf, or NULL when @source is remote.
+ */
+static const char *mvp_local_source_path(const char *source,
+                                         char *buf, size_t buflen)
+{
+    const char *scheme = strstr(source, "://");
+
+    if (!scheme) {
+        return source;
+    }
+    if (g_ascii_strncasecmp(source, "file://", 7) == 0) {
+        /* file:///path -> /path; file://host/path -> /path */
+        const char *slash = strchr(source + 7, '/');
+
+        if (!slash) {
+            return NULL;
+        }
+        g_strlcpy(buf, slash, buflen);
+        return buf;
+    }
+    return NULL;
+}
+
 static bool mvp_video_attach(SGIVideoSource *src, const char *input,
                              const char *source, bool is_url, Error **errp)
 {
@@ -1334,6 +1410,19 @@ static bool mvp_video_attach(SGIVideoSource *src, const char *input,
     if (!source || !*source) {
         error_setg(errp, "empty video source");
         return false;
+    }
+    {
+        /*
+         * Refuse a missing local source synchronously (see
+         * mvp_local_source_path); a remote URL is left to the async helper.
+         */
+        char path[4096];
+        const char *local = mvp_local_source_path(source, path, sizeof(path));
+
+        if (local && !g_file_test(local, G_FILE_TEST_EXISTS)) {
+            error_setg(errp, "video source '%s' does not exist", source);
+            return false;
+        }
     }
 
     mvp_video_detach(src, input);
