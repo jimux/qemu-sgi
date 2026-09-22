@@ -196,10 +196,59 @@ static const MemoryRegionOps sgi_gr2_ops = {
     .valid.max_access_size = 8,
 };
 
+/*
+ * Scanout (P0.4 step a).  A QEMU display surface proves the OUTPUT stage
+ * before the RE3 producer: the framebuffer is filled with a known pattern
+ * and must appear on the GR2 console, falsifiably, independent of the guest.
+ */
+static void sgi_gr2_fill_bars(SGIGr2State *s)
+{
+    static const uint32_t bars[8] = {
+        0xffffff, 0xffff00, 0x00ffff, 0x00ff00,
+        0xff00ff, 0xff0000, 0x0000ff, 0x000000,
+    };
+    int x, y;
+
+    if (!s->scanout) {
+        return;
+    }
+    for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
+        for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
+            s->scanout[y * SGI_GR2_SCREEN_W + x] = bars[x * 8 / SGI_GR2_SCREEN_W];
+        }
+    }
+}
+
+static void sgi_gr2_update_display(void *opaque)
+{
+    SGIGr2State *s = opaque;
+    DisplaySurface *surface;
+    uint32_t *dest;
+    int stride, y;
+
+    if (!s->con || !s->scanout) {
+        return;
+    }
+    surface = qemu_console_surface(s->con);
+    if (!surface) {
+        return;
+    }
+    dest = (uint32_t *)surface_data(surface);
+    stride = surface_stride(surface);
+    for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
+        memcpy(dest + (y * stride) / 4,
+               s->scanout + y * SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_W * 4);
+    }
+    dpy_gfx_update(s->con, 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+}
+
+static const GraphicHwOps sgi_gr2_gfx_ops = {
+    .gfx_update = sgi_gr2_update_display,
+};
+
 static void sgi_gr2_reset(DeviceState *dev)
 {
     SGIGr2State *s = SGI_GR2(dev);
-
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ucode, 0, sizeof(s->ucode));
     s->gepc = 0;
@@ -222,6 +271,12 @@ static void sgi_gr2_reset(DeviceState *dev)
     /* HQ2 revision register (read >> 16 into gr2_info.HQ2Rev). */
     s->regs[SGI_GR2_HQ_OFF + 0x6c + 0] = 0x00;
     s->regs[SGI_GR2_HQ_OFF + 0x6c + 1] = 0x01;
+
+    /* P0.4 step (a): the synthetic scanout pattern, if the test asked for it.
+     * The scanout region exists only when present (allocated in realize). */
+    if (s->scanout && s->scanout_bars) {
+        sgi_gr2_fill_bars(s);
+    }
 }
 
 static void sgi_gr2_realize(DeviceState *dev, Error **errp)
@@ -231,10 +286,20 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(s), &sgi_gr2_ops, s,
                           TYPE_SGI_GR2, SGI_GR2_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+
+    /* Scanout (P0.4 step a) only when the board is present, so plain
+     * `-M indy` gains no extra console. */
+    if (s->present) {
+        s->scanout = g_new0(uint32_t,
+                            (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        s->con = graphic_console_init(dev, 0, &sgi_gr2_gfx_ops, s);
+        qemu_console_resize(s->con, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+    }
 }
 
 static const Property sgi_gr2_properties[] = {
     DEFINE_PROP_BOOL("present", SGIGr2State, present, false),
+    DEFINE_PROP_BOOL("scanout-bars", SGIGr2State, scanout_bars, false),
     DEFINE_PROP_UINT8("ges", SGIGr2State, ges, 2),
     DEFINE_PROP_UINT8("bitplanes", SGIGr2State, bitplanes, 24),
     DEFINE_PROP_BOOL("zbuffer", SGIGr2State, zbuffer, true),

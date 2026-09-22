@@ -50,6 +50,7 @@
 #include "hw/misc/sgi_mc.h"
 #include "hw/misc/sgi_vino.h"
 #include "hw/misc/sgi_gr2.h"
+#include "monitor/qdev.h"
 #include "hw/misc/unimp.h"
 #include "hw/scsi/scsi.h"
 #include "qapi/error.h"
@@ -465,7 +466,10 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
    * probe finds the HQ2 presence magic.
    */
   gr2_dev = qdev_new(TYPE_SGI_GR2);
-  object_property_add_child(OBJECT(machine), "gr2", OBJECT(gr2_dev));
+  /* Give it a stable qdev id so QMP `screendump <id>` can capture the GR2
+   * display surface by id (the primary console is Newport).  qdev_set_id
+   * parents the device; do not also object_property_add_child it. */
+  qdev_set_id(gr2_dev, g_strdup("sgi-gr2"), &error_fatal);
   gr2_present =
       object_property_get_bool(OBJECT(gr2_dev), "present", &error_abort);
 

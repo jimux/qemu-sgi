@@ -29,9 +29,15 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "ui/console.h"
 
 #define TYPE_SGI_GR2 "sgi-gr2"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
+
+/* Scanout geometry for the P0.4 step-(a) synthetic test (matches Newport so a
+ * later region-by-region comparison against it is size-compatible). */
+#define SGI_GR2_SCREEN_W 1280
+#define SGI_GR2_SCREEN_H 1024
 
 /* Byte offsets within the GIO64 board window (gr2hw.h).  The board map is
  * 0x6d000 bytes (GR2_GFX_SIZE); round the aperture up to 0x70000. */
@@ -114,6 +120,13 @@ struct SGIGr2State {
     uint32_t gepc;
     bool hq_ready;
     bool xmap_ready;
+
+    /* Scanout (P0.4 step a): a QEMU display surface proving the output stage
+     * before the RE3 producer.  `scanout` is the framebuffer VC1 would scan
+     * (host xRGB32); VC1/RE3 will read it once the producer is emulated. */
+    QemuConsole *con;
+    uint32_t *scanout;
+    bool scanout_bars; /* fill a colour-bar test pattern (P0.4 step a) */
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */
