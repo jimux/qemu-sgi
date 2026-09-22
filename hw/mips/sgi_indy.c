@@ -615,6 +615,12 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
   if (vino_dev) {
     sysbus_realize_and_unref(SYS_BUS_DEVICE(vino_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(vino_dev), 0, SGI_EISA_IO_BASE);
+    /* VINO interrupt -> HPC3 INT3 local1 bit 6 (EISA bus / Video) -> CPU IP3.
+     * IRIX installs vinoInterrupt at VECTOR_VIDEO (14); see sgi_hpc3_video_irq. */
+    if (hpc3_dev) {
+      sysbus_connect_irq(SYS_BUS_DEVICE(vino_dev), 0,
+                         qdev_get_gpio_in_named(hpc3_dev, "eisa-video", 0));
+    }
   }
 
   /*

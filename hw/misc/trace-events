@@ -435,6 +435,8 @@ sgi_hpc3_scsi_dma_chain(int ch, uint32_t desc, uint32_t nbp, int eox) "SCSI%d ch
 sgi_hpc3_scsi_irq(int ch, uint32_t status) "SCSI%d IRQ status=0x%08x"
 sgi_hpc3_int3(int level, uint32_t stat, uint32_t mask) "INT3 local%d stat=0x%02x mask=0x%02x"
 sgi_hpc3_int3_map(int irq, int ip) "INT3 mapped irq%d -> IP%d"
+sgi_hpc3_map_mask(int which, uint32_t val) "INT3 map_mask%d = 0x%02x"
+sgi_hpc3_int3_rd(int which, uint32_t addr, uint32_t val) "INT3 rd%d addr=0x%x val=0x%02x"
 sgi_hpc3_pit(int timer, uint32_t count) "PIT timer%d count=%u"
 sgi_hpc3_scc_tx(int ch, uint8_t data) "SCC ch%d TX 0x%02x"
 sgi_hpc3_scc_rx(int ch, uint8_t data) "SCC ch%d RX 0x%02x"

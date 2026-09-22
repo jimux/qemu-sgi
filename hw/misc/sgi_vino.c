@@ -32,6 +32,7 @@
 #include "qemu/osdep.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/misc/sgi_vino.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
@@ -61,6 +62,55 @@ static void sgi_vino_chreg_set(SGIVinoState *s, int ch, unsigned rel,
     s->regs[o + 1] = val >> 16;
     s->regs[o + 2] = val >> 8;
     s->regs[o + 3] = val;
+}
+
+static uint32_t sgi_vino_control(SGIVinoState *s)
+{
+    return ((uint32_t)s->regs[SGI_VINO_CONTROL_OFFSET] << 24) |
+           ((uint32_t)s->regs[SGI_VINO_CONTROL_OFFSET + 1] << 16) |
+           ((uint32_t)s->regs[SGI_VINO_CONTROL_OFFSET + 2] << 8) |
+           (uint32_t)s->regs[SGI_VINO_CONTROL_OFFSET + 3];
+}
+
+static uint32_t sgi_vino_intstat(SGIVinoState *s)
+{
+    return ((uint32_t)s->regs[SGI_VINO_INTSTAT_OFFSET] << 24) |
+           ((uint32_t)s->regs[SGI_VINO_INTSTAT_OFFSET + 1] << 16) |
+           ((uint32_t)s->regs[SGI_VINO_INTSTAT_OFFSET + 2] << 8) |
+           (uint32_t)s->regs[SGI_VINO_INTSTAT_OFFSET + 3];
+}
+
+/* Assert the interrupt line while any latched status bit has its matching
+ * per-channel enable set in the control register.  The driver latches EOF/EOD
+ * in the status word (0x14) and clears it by writing 0x14; that write and any
+ * control write re-evaluate this.  The line is a direct INT3 local1 bit on
+ * Indy (VECTOR_VIDEO), delivered through the HPC3. */
+static void sgi_vino_update_irq(SGIVinoState *s)
+{
+    uint32_t stat = sgi_vino_intstat(s);
+    uint32_t ctl = sgi_vino_control(s);
+    bool pending = false;
+
+    if ((stat & SGI_VINO_INT_A_EOF) && (ctl & SGI_VINO_CTRL_A_EOF_INT)) {
+        pending = true;
+    }
+    if ((stat & SGI_VINO_INT_A_FIFO) && (ctl & SGI_VINO_CTRL_A_FIFO_INT)) {
+        pending = true;
+    }
+    if ((stat & SGI_VINO_INT_A_EOD) && (ctl & SGI_VINO_CTRL_A_EOD_INT)) {
+        pending = true;
+    }
+    if ((stat & SGI_VINO_INT_B_EOF) && (ctl & SGI_VINO_CTRL_B_EOF_INT)) {
+        pending = true;
+    }
+    if ((stat & SGI_VINO_INT_B_FIFO) && (ctl & SGI_VINO_CTRL_B_FIFO_INT)) {
+        pending = true;
+    }
+    if ((stat & SGI_VINO_INT_B_EOD) && (ctl & SGI_VINO_CTRL_B_EOD_INT)) {
+        pending = true;
+    }
+
+    qemu_set_irq(s->irq, pending ? 1 : 0);
 }
 
 /* Refill the four-entry descriptor cache from the auto-advancing fetch
@@ -146,6 +196,7 @@ static void sgi_vino_emit_field(SGIVinoState *s, int ch)
     s->regs[SGI_VINO_INTSTAT_OFFSET + 3] |= ch ? SGI_VINO_INT_B_EOF
                                                : SGI_VINO_INT_A_EOF;
     trace_sgi_vino_field(ch, s->field_count[ch], bytes);
+    sgi_vino_update_irq(s);
 }
 
 static void sgi_vino_field_tick(void *opaque)
@@ -249,7 +300,19 @@ static void sgi_vino_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     for (i = 0; i < size; i++) {
-        s->regs[offset + i] = (value >> (8 * (size - 1 - i))) & 0xff;
+        uint8_t byte = (value >> (8 * (size - 1 - i))) & 0xff;
+
+        if (offset + i >= SGI_VINO_INTSTAT_OFFSET &&
+            offset + i < SGI_VINO_INTSTAT_OFFSET + 4) {
+            /* Interrupt status is write-0-to-clear: the bits are set by
+             * hardware and cleared by software writing a zero (spec, Interrupt
+             * register); writing a one has no effect.  Storing the value here
+             * instead latched the upper bits as 1 and the driver never saw a
+             * clearable status. */
+            s->regs[offset + i] &= byte;
+        } else {
+            s->regs[offset + i] = byte;
+        }
     }
     if (offset == SGI_VINO_CH_A_BASE + SGI_VINO_CH_NEXT4DESC ||
         offset == SGI_VINO_CH_B_BASE + SGI_VINO_CH_NEXT4DESC) {
@@ -287,6 +350,9 @@ static void sgi_vino_write(void *opaque, hwaddr offset, uint64_t value,
         }
         sgi_vino_update_timer(s);
     }
+    /* A write to the status word (0x14) clears latched bits; a control write
+     * changes the enables.  Re-evaluate the interrupt line either way. */
+    sgi_vino_update_irq(s);
 }
 
 static const MemoryRegionOps sgi_vino_ops = {
@@ -314,6 +380,7 @@ static void sgi_vino_reset(DeviceState *dev)
     if (s->field_timer) {
         timer_del(s->field_timer);
     }
+    qemu_set_irq(s->irq, 0);
     memset(s->i2c_dec, 0, sizeof(s->i2c_dec));
     memset(s->i2c_alt, 0, sizeof(s->i2c_alt));
     s->i2c_ptr = 0;
@@ -332,6 +399,7 @@ static void sgi_vino_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &sgi_vino_ops, s,
                           "sgi-vino", SGI_VINO_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     s->field_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_vino_field_tick, s);
 }
 

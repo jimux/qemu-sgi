@@ -149,6 +149,7 @@ struct SGIVinoState {
      * with a field-count increment and an EOF interrupt, a stop descriptor
      * with an EOD interrupt. */
     QEMUTimer *field_timer;
+    qemu_irq irq;                       /* INT3 local1 bit 6 via HPC3 */
     bool dma_en[2];
     bool cache_valid[2];
     int cache_pos[2];

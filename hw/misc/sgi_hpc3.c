@@ -1146,13 +1146,13 @@ static void sgi_hpc3_update_irq(SGIHPC3State *s)
      * Local0 sources: SCSI0 (0x02), SCSI1 (0x04), ETHERNET (0x08),
      *                  MAPPABLE0 (0x80)
      * Local1 sources: HPC_DMA (0x10), GIO2/Retrace (0x80),
-     *                  MAPPABLE1/LCL0 (0x08)
+     *                  MAPPABLE1/LCL0 (0x08), EISA/Video (0x40)
      */
     s->int3_local0_stat &= (INT3_LOCAL0_SCSI0 | INT3_LOCAL0_SCSI1 |
                              INT3_LOCAL0_ETHERNET | INT3_LOCAL0_MC_DMA |
                              INT3_LOCAL0_MAPPABLE0);
     s->int3_local1_stat &= (INT3_LOCAL1_LCL0 | INT3_LOCAL1_HPC_DMA |
-                             INT3_LOCAL1_GIO2);
+                             INT3_LOCAL1_GIO2 | INT3_LOCAL1_EISA);
     int local0_pending = (s->int3_local0_stat & s->int3_local0_mask) ? 1 : 0;
     int local1_pending = (s->int3_local1_stat & s->int3_local1_mask) ? 1 : 0;
 
@@ -1214,6 +1214,27 @@ static void sgi_hpc3_gio_retrace_irq(void *opaque, int n, int level)
         s->int3_local1_stat |= INT3_LOCAL1_GIO2;
     } else {
         s->int3_local1_stat &= ~INT3_LOCAL1_GIO2;
+    }
+
+    sgi_hpc3_update_irq(s);
+}
+
+/*
+ * Handle the VINO video-input interrupt.  On Indy (IP24) the VINO line is a
+ * direct INT3 local1 status bit, not a mapped one: IRIX kern/sys/IP22.h gives
+ * VECTOR_VIDEO = 14, and local vectors >= 8 live in local1, so vector 14 is
+ * local1 bit 6 -- the header's INT3_LOCAL1_EISA ("EISA bus / Video").  The
+ * stock driver installs vinoInterrupt via setlclvector(14, ...), which also
+ * enables local1 mask bit 6.
+ */
+static void sgi_hpc3_video_irq(void *opaque, int n, int level)
+{
+    SGIHPC3State *s = SGI_HPC3(opaque);
+
+    if (level) {
+        s->int3_local1_stat |= INT3_LOCAL1_EISA;
+    } else {
+        s->int3_local1_stat &= ~INT3_LOCAL1_EISA;
     }
 
     sgi_hpc3_update_irq(s);
@@ -2048,12 +2069,14 @@ static uint64_t sgi_hpc3_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case HPC3_INT3_LOCAL1_STAT:
         val = s->int3_local1_stat;
+        trace_sgi_hpc3_int3_rd(1, (uint32_t)addr, val);
         break;
     case HPC3_INT3_LOCAL1_MASK:
         val = s->int3_local1_mask;
         break;
     case HPC3_INT3_MAP_STATUS:
         val = s->int3_map_status;
+        trace_sgi_hpc3_int3_rd(2, (uint32_t)addr, val);
         break;
     case HPC3_INT3_MAP_MASK0:
         val = s->int3_map_mask0;
@@ -2685,11 +2708,13 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case HPC3_INT3_MAP_MASK0:
         s->int3_map_mask0 = val;
+        trace_sgi_hpc3_map_mask(0, val);
         /* Re-evaluate mapped interrupt cascade (per MAME set_map_int_mask) */
         sgi_hpc3_update_irq(s);
         break;
     case HPC3_INT3_MAP_MASK1:
         s->int3_map_mask1 = val;
+        trace_sgi_hpc3_map_mask(1, val);
         /* Re-evaluate mapped interrupt cascade (per MAME set_map_int_mask) */
         sgi_hpc3_update_irq(s);
         break;
@@ -2738,10 +2763,12 @@ static void sgi_hpc3_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case HPC3_FH_INT3_MAP_MASK0:
         s->int3_map_mask0 = val;
+        trace_sgi_hpc3_map_mask(0, val);
         sgi_hpc3_update_irq(s);
         break;
     case HPC3_FH_INT3_MAP_MASK1:
         s->int3_map_mask1 = val;
+        trace_sgi_hpc3_map_mask(1, val);
         sgi_hpc3_update_irq(s);
         break;
     case HPC3_FH_INT3_TIMER_CLEAR:
@@ -3217,6 +3244,10 @@ static void sgi_hpc3_init(Object *obj)
     /* Create GPIO input for GIO retrace/VBLANK interrupt (from Newport) */
     qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_gio_retrace_irq,
                             "gio-retrace", 1);
+
+    /* Create GPIO input for the VINO video-input interrupt (Indy, IP24).
+     * Routes to INT3 local1 bit 6 (EISA bus / Video); see sgi_hpc3_video_irq. */
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_video_irq, "eisa-video", 1);
     qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_mc_dma_irq,
                             "mc-dma-irq", 1);
 
