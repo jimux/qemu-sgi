@@ -599,6 +599,15 @@ static void sgi_ip54_class_init(ObjectClass *oc, const void *data)
     mc->no_cdrom = 1;
 }
 
+static void sgi_ip55_class_init(ObjectClass *oc, const void *data)
+{
+    sgi_ip54_class_init(oc, data);
+    /* The IP55 reuses the IP54 carrier but must not report the IP54 name:
+     * the description is guest-visible (a config UI reading -M help would
+     * otherwise configure an IP54). */
+    MACHINE_CLASS(oc)->desc = "SGI IP55 Paravirtual Workstation";
+}
+
 static const TypeInfo sgi_octane_type = {
     .name = MACHINE_TYPE_NAME("octane"),
     .parent = TYPE_MACHINE,
@@ -608,7 +617,7 @@ static const TypeInfo sgi_octane_type = {
 static const TypeInfo sgi_ip55_type = {
     .name = MACHINE_TYPE_NAME("sgi-ip55"),
     .parent = TYPE_MACHINE,
-    .class_init = sgi_ip54_class_init,
+    .class_init = sgi_ip55_class_init,
 };
 
 static void sgi_octane_machine_init(void)
