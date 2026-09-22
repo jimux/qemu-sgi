@@ -171,8 +171,27 @@ static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return false;
     }
+    if (qlisp_dbg() && addr >= 0x40000000ULL && addr < 0x40010000ULL) {
+        static unsigned n;
+        if (n < 20) {
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: entry addr=0x%llx phys=0x%llx "
+                          "raw=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                          (unsigned long long)addr,
+                          (unsigned long long)ql_dma_to_phys(s, addr),
+                          raw[0], raw[1], raw[2], raw[3],
+                          raw[4], raw[5], raw[6], raw[7]);
+            n++;
+        }
+    }
     memcpy(e, raw, QL_ENTRY_SIZE);
-    if (s->control_munge) {
+    /*
+     * The K1/direct request ring the driver builds by hand carries byte-reversed
+     * (word-munged) control entries; the BRIDGE ATE-window ring (USE_MAPPED_
+     * CONTROL_STREAM path) is written in natural order.  Un-munge only the
+     * former.
+     */
+    if (s->control_munge && !(addr >= 0x40000000ULL && addr < 0x40010000ULL)) {
         ql_munge(e, QL_ENTRY_SIZE);
     }
     return true;
