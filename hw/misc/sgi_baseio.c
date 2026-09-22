@@ -799,9 +799,25 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
    *             before its NULL check -- the observed POD TLB refill.
    *   other     no device (0xffffffff).
    */
-  if (off >= 0x20000 && off < 0x28000) {
-    unsigned slot = (off - 0x20000) >> 12;
-    unsigned cfg = off & 0xfff;
+  if (off >= 0x20000 && off < 0x30000) {
+    unsigned slot, func, cfg;
+
+    /*
+     * 0x28000..0x30000 is Type-1 configuration space (BRIDGE_TYPE1_CFG): no bus
+     * exists behind the bridge, so every read must return all-ones (vendor
+     * 0xffff = "no device").  Returning 0 instead makes the kernel believe a
+     * device sits on a phantom bus and walk it forever.
+     */
+    if (off >= 0x28000) {
+      return 0xffffffff;
+    }
+    slot = (off - 0x20000) >> 12;
+    func = ((off - 0x20000) >> 8) & 0xf;
+    cfg = off & 0xff;
+    /* The BaseIO devices are single-function; absent functions read no device. */
+    if (func != 0) {
+      return 0xffffffff;
+    }
 
     if (slot == 0) {
       /* IOC3: vendor 0x10a9 / device 0x0003.  Other config dwords reflect
@@ -833,15 +849,22 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
         return (QLISP_CLASS << 8) | isp->pci_rev;
       case 0x0c:
         return 0; /* header type 0, single function */
-      case 0x10:
-        return isp->pci_bar[0];
-      case 0x14:
-        return isp->pci_bar[1];
+      case QLISP_PCI_BAR0_OFF:
+      case QLISP_PCI_BAR1_OFF:
+        {
+          uint32_t bar = sgi_qlisp_pci_config_read(isp, cfg);
+
+          if (getenv("SGI_BASEIO_PCILOG"))
+            fprintf(stderr, "sgi-baseio: PCI READ slot=%u cfg=0x%x bar=0x%x\n",
+                    (unsigned)slot, cfg, bar);
+          return bar;
+        }
       default:
         return 0;
       }
     }
-    return (cfg == 0x00) ? 0xffffffff : 0;
+    /* Absent slot: all-ones so the kernel sees no device. */
+    return 0xffffffff;
   }
   /*
    * BRIDGE_INT_STATUS (0x104): one bit per PCI device (bit N = device N).
@@ -903,13 +926,32 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
    * PCI config-space writes through the bridge window (0x20000 + slot*0x1000).
    * Slot 0 is the IOC3: latch command/latency/BARs so reads reflect them.
    */
-  if (off >= 0x20000 && off < 0x28000) {
-    if (((off - 0x20000) >> 12) == 0) {
-      unsigned cfg = off & 0xfff;
+  if (off >= 0x20000 && off < 0x30000) {
+    unsigned slot, func, cfg;
 
+    /* Type-1 (0x28000..): no bus behind the bridge; writes go nowhere. */
+    if (off >= 0x28000) {
+      return;
+    }
+    slot = (off - 0x20000) >> 12;
+    func = ((off - 0x20000) >> 8) & 0xf;
+    cfg = off & 0xff;
+    if (func != 0) {
+      return;                     /* the BaseIO devices are single-function */
+    }
+    if (getenv("SGI_BASEIO_PCILOG") && (slot == 1 || slot == 2) &&
+        (cfg == QLISP_PCI_BAR0_OFF || cfg == QLISP_PCI_BAR1_OFF)) {
+      fprintf(stderr, "sgi-baseio: PCI WRITE slot=%u cfg=0x%x val=0x%x\n",
+              slot, cfg, (unsigned)val);
+    }
+    if (slot == 0) {
+      /* IOC3: latch command/latency/BARs so config reads reflect them. */
       if (cfg <= 0xfc) {
         s->pci_cfg0[cfg >> 2] = val;
       }
+    } else if (slot == 1 || slot == 2) {
+      /* QLogic ISP1020: latch the BARs (per-BAR sizing contract). */
+      sgi_qlisp_pci_config_write(&s->isp[slot - 1], cfg, val);
     }
     return;
   }
