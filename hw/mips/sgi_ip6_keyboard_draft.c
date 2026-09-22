@@ -5,12 +5,20 @@
  * never been compiled or run.  It is a sketch with the protocol from the
  * PROM's own driver (0xbfc148c0), not a finished device.
  *
- * UNTESTED PRESUPPOSITION: this assumes the design note's option (b) --
- * serial console moved off DUART0-A so the keyboard owns it.  If the console
- * still occupies channel A, none of this is reachable (measured: the PROM
- * spends a whole boot polling channel A for its console and never issues a
- * keyboard byte).  Do not judge this code until that seam question is settled
- * by measurement.
+ * SEAM -- now settled by the Orchestrator (#2960), correcting an earlier
+ * framing of mine.  This is NOT "moving" the console: MAME's ip6.cpp has the
+ * keyboard on duart[0] A, the mouse on duart[0] B, and the serial ports on
+ * duart[1].  The console chardev on duart[0]-A is a STAND-IN this machine
+ * invented (sgi_ip6.c:1548 does serial_hd(i*2+ch), so -serial stdio lands on
+ * duart[0]-A; serial_hd(1) is discarded outright).  The task is to model the
+ * ports as the hardware has them: keyboard peer on 0-A, mouse peer on 0-B
+ * (unchanged), serial_hd(0) on duart[1]-A, serial_hd(1) on duart[1]-B.
+ *
+ * STILL TO BE MEASURED, not assumed: with the keyboard on 0-A and nothing in
+ * the console env, which port does the PROM fall back to?  That measurement
+ * decides whether the harnesses change at all (the remap keeps serial_hd(0)
+ * as the console, so the clean outcome is that no script command line
+ * changes -- but confirm before claiming it).
  *
  * Protocol, from the PROM's driver:
  *   the guest WRITES a command byte, then READS a reply:
@@ -103,12 +111,17 @@ void sgi_ip6_keyboard_key(SgiIp6InputState *s, int qcode, bool down)
 }
 
 /*
- * TODO(seam): the console move.  In the machine (sgi_ip6.c) the serial
- * chardev is attached to DUART channel A.  Option (b) reattaches it to
- * channel B of DUART1 and attaches this keyboard peer to DUART0-A.  That is
- * a machine-level change and must be gated on: (1) the keyboard error
- * disappearing from the PROM diagnostics, (2) the Command Monitor accepting
- * input from here, (3) the mouse gate still passing (it uses DUART0-B).
+ * TODO(seam): the port remap in sgi_ip6.c:1542-1562 -- attach a keyboard peer
+ * on duart[0]-A and move serial_hd(0)/serial_hd(1) to duart[1]-A/B.  A
+ * machine-level change, gated on all four (the fourth is the negative the
+ * Orchestrator added and is what makes the gate meaningful):
+ *   (1) the keyboard error disappears from the PROM diagnostics;
+ *   (2) the Command Monitor accepts input from here;
+ *   (3) the mouse gate still passes (it uses duart[0]-B);
+ *   (4) an UNPLUGGED keyboard (this peer detached) must STILL produce
+ *       "keyboard not responding" -- if the error is absent with the HLE
+ *       detached, then (1)-(3) were passed by something that is not the
+ *       keyboard and the fix is unproven.
  *
  * TODO(parity): the link is 600-8-O-1 odd.  Not modelled, and not
  * representable at this seam; no firmware poll site tests PERR, so reporting
