@@ -1122,10 +1122,25 @@ static void sgi_ip6_init(MachineState *machine)
         }
     }
 
-    /* 93C56 serial EEPROM (128 x 16-bit words), blank by default.  The
-     * eeprom93xx helper wants a DeviceState owner for vmstate; the CPU is
-     * the only one this machine has so far. */
+    /*
+     * 93C56 serial EEPROM (128 x 16-bit words).  The PROM reads its system
+     * configuration - including the Ethernet address - from it: config bytes
+     * 122..127 (words 61..63) are the eaddr, fetched word-at-a-time by the
+     * PROM reader at 0xbfc13490.  A blank EEPROM makes the PROM report
+     * "bad ethernet address 0:0:0:0:0:0" and refuse to netboot, so seed a
+     * factory-style address.
+     * [ASSUMPTION] word offsets and byte order inferred from the PROM read
+     * path, not from a documented IP6 EEPROM layout; revisit if a real dump
+     * or the SAIO PROM source appears.
+     */
     s->eeprom = eeprom93xx_new(DEVICE(cpu), 128);
+    {
+        uint16_t *ee = eeprom93xx_data(s->eeprom);
+
+        ee[61] = 0x0800;
+        ee[62] = 0x6912;
+        ee[63] = 0x3456;
+    }
 
     memory_region_init_io(&s->ctl1, OBJECT(machine), &sgi_ip6_ctl1_ops, s,
                           "sgi-ip6-ctl1", SGI_IP6_CTL1_SIZE);
