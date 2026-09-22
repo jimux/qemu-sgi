@@ -130,6 +130,19 @@ struct SGIGL2State {
     uint16_t fbc_out;             /* FBC output register (reset/version) */
     uint16_t ge_flags;
 
+    /*
+     * GE command pipe (GEPORT, write-only).  Every write is a big-endian
+     * stream of 16-bit words: a passthru header (low byte GEpassthru 0x08,
+     * count-1 in bits 8-14), then the FBC command word, then count-1 operand
+     * words.  Parsed here and executed against the framebuffer.
+     */
+    MemoryRegion ge;
+    uint16_t ge_cmd;
+    uint16_t ge_args[64];
+    unsigned ge_nargs;            /* operands collected for the current cmd */
+    unsigned ge_need;             /* operands the current cmd still wants */
+    bool ge_in_cmd;
+
     bool testpattern;
     bool trace;
     bool dirty;
@@ -479,6 +492,139 @@ static const MemoryRegionOps gl2_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/* Plot one pixel with the current FBC colour and write-enable state. */
+static void gl2_draw_pixel(SGIGL2State *s, unsigned x, unsigned y)
+{
+    uint8_t *p;
+
+    if (x >= GL2_XDIM || y >= GL2_YDIM) {
+        return;
+    }
+    p = &s->fb[y * GL2_XDIM + x];
+    *p = gl2_blend(*p, s->color_ab, s->we_ab, 0);
+    *p = gl2_blend(*p, s->color_cd, s->we_cd, 2);
+    s->dirty = true;
+}
+
+/* Execute one FBC command delivered through the GE passthru pipe. */
+static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
+                        const uint16_t *args, unsigned nargs)
+{
+    unsigned i;
+
+    if (s->trace) {
+        fprintf(stderr, "gl2: GE cmd=0x%02x nargs=%u", cmd, nargs);
+        for (i = 0; i < nargs; i++) {
+            fprintf(stderr, " %04x", args[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    switch (cmd) {
+    case 0x04:                          /* FBCrgbcolor */
+    case 0x05:                          /* FBCrgbwrten */
+        if (nargs >= 2) {
+            /* w0: plane enables for A/B (bits 0-1) and C/D (bits 2-3);
+             * w1: matching colour bits. */
+            if (cmd == 0x04) {
+                s->color_ab = args[0];
+                s->color_cd = args[0];
+            } else {
+                s->we_ab = args[0];
+                s->we_cd = args[0];
+            }
+        }
+        break;
+
+    case 0x12:                          /* FBCpoint: x, y */
+        if (nargs >= 2) {
+            gl2_draw_pixel(s, args[0], args[1]);
+        }
+        break;
+
+    case 0x2f:                          /* FBCpixelsetup */
+        /*
+         * A pixel-readback setup carries a sub-command word naming the read
+         * operation.  The kernel issues this in gr_init as a self-test and
+         * checks FBCdata for the matching interrupt code; model the
+         * 32-plane readback code (_INTPIXEL32) it expects.
+         */
+        for (i = 0; i + 1 < nargs; i++) {
+            if (args[i] == 0x000e) {
+                s->fbc_out = 10;        /* _INTPIXEL32 */
+                break;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* Assemble the 16-bit GE port stream and dispatch whole commands. */
+static void gl2_ge_word(SGIGL2State *s, uint16_t w)
+{
+    if (!s->ge_in_cmd) {
+        if ((w & 0xff) != 0x08) {   /* not a GEpassthru header */
+            return;
+        }
+        s->ge_need = ((w >> 8) & 0x7f) + 1;     /* words incl. command */
+        s->ge_cmd = 0;
+        s->ge_nargs = 0;
+        s->ge_in_cmd = true;
+        return;
+    }
+
+    if (s->ge_nargs == 0) {
+        s->ge_cmd = w;
+    } else if (s->ge_nargs - 1 < ARRAY_SIZE(s->ge_args)) {
+        s->ge_args[s->ge_nargs - 1] = w;
+    }
+    s->ge_nargs++;
+    s->ge_need--;
+
+    if (s->ge_need == 0) {
+        gl2_ge_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
+        s->ge_in_cmd = false;
+    }
+}
+
+static uint64_t gl2_ge_read(void *opaque, hwaddr addr, unsigned size)
+{
+    (void)opaque;
+    (void)addr;
+    (void)size;
+    return 0;
+}
+
+static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    SGIGL2State *s = opaque;
+
+    if (s->trace) {
+        fprintf(stderr, "gl2: GE WR off=0x%x val=0x%llx size=%u\n",
+                (unsigned)addr, (unsigned long long)val, size);
+    }
+    if (addr < 0x1000) {
+        return;                     /* GETOKEN: token/port control */
+    }
+    if (size == 4) {
+        gl2_ge_word(s, (val >> 16) & 0xffff);
+        gl2_ge_word(s, val & 0xffff);
+    } else {
+        gl2_ge_word(s, val & 0xffff);
+    }
+}
+
+static const MemoryRegionOps gl2_ge_ops = {
+    .read = gl2_ge_read,
+    .write = gl2_ge_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void gl2_cmap_default(SGIGL2State *s)
 {
     int i;
@@ -538,6 +684,10 @@ static void gl2_reset(DeviceState *dev)
     s->fbc_flags = 0;
     s->fbc_out = 0;
     s->ge_flags = 0;
+    s->ge_in_cmd = false;
+    s->ge_need = s->ge_nargs = 0;
+    s->ge_cmd = 0;
+    memset(s->ge_args, 0, sizeof(s->ge_args));
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
     if (s->fb) {
@@ -568,12 +718,20 @@ static void gl2_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &gl2_ops, s, "sgi-gl2",
                           GL2_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
+    memory_region_init_io(&s->ge, obj, &gl2_ge_ops, s, "sgi-gl2-ge",
+                          0x2000);
+    sysbus_init_mmio(sbd, &s->ge);
     sysbus_init_irq(sbd, &s->irq);
 }
 
 MemoryRegion *sgi_gl2_mmio_region(DeviceState *dev)
 {
     return &SGI_GL2(dev)->mmio;
+}
+
+MemoryRegion *sgi_gl2_ge_region(DeviceState *dev)
+{
+    return &SGI_GL2(dev)->ge;
 }
 
 static const Property gl2_properties[] = {

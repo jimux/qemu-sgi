@@ -18,4 +18,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGL2State, SGI_GL2)
  */
 MemoryRegion *sgi_gl2_mmio_region(DeviceState *dev);
 
+/*
+ * The GF2 Geometry Engine command pipe, at GEPORT (write-only, in the GE
+ * segment at 0x60001000) and GETOKEN (0x60000000).  Placed by the machine
+ * in the system address map.
+ */
+MemoryRegion *sgi_gl2_ge_region(DeviceState *dev);
+
 #endif

@@ -13,6 +13,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "system/system.h"
+#include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
@@ -165,6 +166,9 @@ static void iris3130_init(MachineState *machine)
         memory_region_add_subregion_overlap(sgi_ip2_mbio_region(board),
                                             0x2000,
                                             sgi_gl2_mmio_region(gl2), 1);
+        /* The GF2 Geometry Engine command pipe (GEPORT/GETOKEN). */
+        memory_region_add_subregion_overlap(get_system_memory(), 0x60000000,
+                                            sgi_gl2_ge_region(gl2), 1);
     }
 }
 
