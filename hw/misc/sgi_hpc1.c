@@ -1536,12 +1536,12 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
     space = w0 & 0x1fffu;                        /* r_rbcnt: room left */
     bufaddr = HPC1_DMA_ADDR(w1 & 0x0fffffffu);   /* r_rbufptr */
     /*
-     * The driver arms with r_rbcnt = MAX_RPKT - HPC_RSPACE and derives
-     * rlen = MAX_RPKT - r_rbcnt - HPC_RSPACE (if_ec2.c:870/716), so the
-     * hardware decrements by the frame length only -- RSPACE is already
-     * accounted for by the driver's arm value and its rlen formula.
+     * The ring is armed with r_rbcnt = MAX_RPKT (if_ec2.c:316) and the driver
+     * derives rlen = MAX_RPKT - r_rbcnt - HPC_RSPACE (:716/:749), so the
+     * hardware decrements the count by the bytes it consumes in the buffer:
+     * the 2-byte offset + the frame + the trailing status = size + RSPACE.
      */
-    used = size;
+    used = size + HPC1_ENET_RSPACE;
 
     /*
      * Ownership: the driver arms a buffer with r_own (bit 31) set and the
@@ -1551,6 +1551,18 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
      * unowned buffer and do not advance past it (that is how the model was
      * clobbering descriptors with buf=0).
      */
+    /*
+     * Ring-end sentinel: the driver terminates the ring with an extra
+     * descriptor whose r_rbufptr is the magic 0xEBAD and whose r_own is left
+     * SET (if_ec2.c:344-345), so it looks armed but must never be filled.
+     */
+    if ((w1 & 0x0fffffffu) == 0xEBADu) {
+        s->enet_ctl |= HPC1_ENET_CTL_RBO;
+        s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
+        sgi_hpc1_enet_raise_irq(s);
+        return size;
+    }
+
     if (!(w0 & 0x80000000u)) {
         s->enet_ctl |= HPC1_ENET_CTL_RBO;
         s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
@@ -1588,7 +1600,8 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
      * as the HPC3 model does (enet_rx_nbdp = nbdp).  The Seeq status goes in
      * the HIGH byte (shift 8).
      */
-    s->enet_nrbdp = w2;
+    s->enet_nrbdp = w2;              /* next to fill */
+    s->enet_crbdp = desc;            /* current (the one just filled) */
     s->seeq_rx_status = st;
     s->enet_rcvstat = (s->enet_rcvstat & HPC1_ENET_STRCVDMA) |
                       ((uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT);
