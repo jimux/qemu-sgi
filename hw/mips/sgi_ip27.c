@@ -381,9 +381,18 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
    * mach_type@48, check_sum_adj@52 (all from base 0x60).
    */
 #define IP27_CONFIG_MAGIC    0x69703237636f6e66ULL /* CONFIG_MAGIC */
-#define IP27_CONFIG_FREQ_CPU 200000000ULL
-#define IP27_CONFIG_FREQ_HUB 100000000ULL
-#define IP27_CONFIG_FREQ_RTC 1250ULL
+/*
+ * All three fields are in Hz, matching ip27config_t (sys/SN/SN0/ip27config.h)
+ * and the PROM's own ip27config_table (whose entries pair IP27C_MHZ(200) with
+ * IP27C_MHZ(100)): freq_cpu is the CPU core clock and freq_hub the hub clock.
+ * freq_rtc is compared by ml/SN/mp.c:allowboot() against
+ * IP27C_KHZ(IP27_RTC_FREQ) == 1000 * 1250 == 1250000, and any mismatch is a
+ * fatal "RTC frequency incorrect. Please upgrade your proms" panic -- so it
+ * must read 1250000, not 1250.
+ */
+#define IP27_CONFIG_FREQ_CPU 200000000ULL /* R10000 core clock (Hz) */
+#define IP27_CONFIG_FREQ_HUB 100000000ULL /* hub clock (Hz) */
+#define IP27_CONFIG_FREQ_RTC 1250000ULL   /* Hz = 1000 * 1250 kHz */
   {
     uint8_t *c = flash_dst + 0x60;
     uint8_t *adj = flash_dst + 0x60 + 0x34; /* check_sum_adj */
@@ -748,19 +757,24 @@ static void sgi_ip27_init(MachineState *machine) {
   }
 
   /*
-   * IP27 kernel-load relocation (default ON; IP27_NO_SEG2REDIR disables for
-   * A/B).  The miniroot/sa flat loader places an ELF image at
-   * KERNEL_START_OFFSET + file_offset, ignoring each segment's p_paddr, so the
-   * kernel's RW segment lands at 0x38ea58 instead of its link address
-   * 0x138ea58 (16 MB high).  Overlay this range and forward the loader's
-   * writes up by 0x1000000.  Verified: seg2 content ("bad ista") lands at phys
-   * 0x138ea60 and the stack var at 0x13f3930 reads 0xc0000000013c3fe0.
+   * IP27 kernel-load relocation -- OPT-IN ONLY (IP27_SEG2REDIR=1), OFF by
+   * default.  History: this forwarded the miniroot/sa loader's seg2 writes up
+   * by 0x1000000 on the theory that the RW segment must land at the ELF link
+   * address 0x138ea58.  The kernel's own mapped_kernel.h disproves that:
+   * MAPPED_KERN_RW_TO_PHYS(x) = (KDM_TO_PHYS(x) & 0xffffff) | node_base, i.e.
+   * the RW seg2 phys is bit-24-masked to the low/flat page -- for node 0 that
+   * is (0x13c3f78 & 0xffffff) = 0x3c3f78, matching the loader's flat placement
+   * at the ELF p_paddr (p_paddr 0xc00000000138ea58 -> 0x38ea58).  Relocating
+   * the loader's seg2 to 0x138ea58 therefore put it where the kernel never
+   * looks: the store and the later load of the same VA then translated to
+   * different physical pages, ra read back as 0, and jr ra went to PC 0.  That
+   * null-PC is the redirect's bug, not evidence for it.
    *
-   * The forward is gated on the storing PC being in the loader (see
-   * ip27_seg2redir_write) so that ordinary RAM users -- the PROM memory test,
-   * and the kernel itself -- see normal memory; reads are never relocated.
+   * Kept reachable for A/B only.  The ON path gated the forward on the
+   * storing PC being in the loader (see ip27_seg2redir_write) so ordinary RAM
+   * users saw normal memory; reads were never relocated.
    */
-  if (!getenv("IP27_NO_SEG2REDIR")) {
+  if (getenv("IP27_SEG2REDIR")) {
     IP27Seg2Redir *t = g_new0(IP27Seg2Redir, 1);
     t->ram = ram;
     t->phys = 0x38ea58;
