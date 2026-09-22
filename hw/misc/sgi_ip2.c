@@ -163,9 +163,9 @@ static void ip2_set_boot(SGIIP2State *s, bool enabled)
  * controlled; segment 0 is left to the boot mirror while it is enabled, and
  * segments >= 3 are left to the memory map.
  */
-bool sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
-                          MMUAccessType access_type, int mmu_idx, bool probe,
-                          hwaddr *physical, int *prot)
+int sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx, bool probe,
+                         hwaddr *physical, int *prot)
 {
     SGIIP2State *s = opaque;
     int seg = (address >> 28) & 0xf;
@@ -178,23 +178,23 @@ bool sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
     (void)probe;
 
     if (seg > IP2_SEG_OS) {
-        return false;
+        return 0;
     }
     if (seg == IP2_SEG_TD && s->boot_enabled) {
-        return false;
+        return 0;
     }
 
     offset = address & 0x0fffffff;
     if (seg == IP2_SEG_STK) {
         page = extract32(offset, 12, 14) ^ 0x3fff;
         if (s->limit[seg] && page > s->limit[seg]) {
-            return false;
+            return s->boot_enabled ? 0 : -1;
         }
         page_number = s->base[seg] - page;
     } else {
         page = extract32(offset, 12, 14);
         if (s->limit[seg] && page > s->limit[seg]) {
-            return false;
+            return s->boot_enabled ? 0 : -1;
         }
         page_number = s->base[seg] + page;
     }
@@ -216,14 +216,20 @@ bool sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
         p = PAGE_READ | PAGE_WRITE;
         break;
     default:                    /* no access */
-        return false;
+        /*
+         * Once the kernel owns segment 0 the monitor's boot mirror is gone,
+         * so an unmapped page is a real fault the kernel's bus-error handler
+         * must see (fill-on-demand); before that, fall through so the mirror
+         * keeps serving the PROM.
+         */
+        return s->boot_enabled ? 0 : -1;
     }
     if (p & PAGE_READ) {
         p |= PAGE_EXEC;
     }
     *physical = (hwaddr)(((pte & PAGE_PFNUM) << 12) | (offset & 0xfff));
     *prot = p;
-    return true;
+    return 1;
 }
 
 static uint32_t ip2_ram_read(SGIIP2State *s, uint32_t phys, unsigned size)

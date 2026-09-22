@@ -964,29 +964,6 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     int ret;
     target_ulong page_size;
 
-    if (env->ext_tlb_fill) {
-        hwaddr ext_physical;
-        int ext_prot;
-
-        if (env->ext_tlb_fill(env->ext_tlb_opaque, address, size,
-                              qemu_access_type, mmu_idx, probe,
-                              &ext_physical, &ext_prot)) {
-            tlb_set_page(cs, address & TARGET_PAGE_MASK,
-                         ext_physical & TARGET_PAGE_MASK, ext_prot,
-                         mmu_idx, TARGET_PAGE_SIZE);
-            return true;
-        }
-    }
-
-    if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
-        /* MMU disabled */
-        tlb_set_page(cs, address & TARGET_PAGE_MASK,
-                     address & TARGET_PAGE_MASK,
-                     PAGE_READ | PAGE_WRITE | PAGE_EXEC,
-                     mmu_idx, TARGET_PAGE_SIZE);
-        return true;
-    }
-
     if (qemu_access_type == MMU_INST_FETCH) {
         access_type = ACCESS_CODE;
     } else {
@@ -997,6 +974,38 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     }
     if (mmu_idx != MMU_USER_IDX) {
         access_type |= ACCESS_SUPER;
+    }
+
+    if (env->ext_tlb_fill) {
+        hwaddr ext_physical;
+        int ext_prot;
+        int ext_ret;
+
+        ext_ret = env->ext_tlb_fill(env->ext_tlb_opaque, address, size,
+                                    qemu_access_type, mmu_idx, probe,
+                                    &ext_physical, &ext_prot);
+        if (ext_ret > 0) {
+            tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                         ext_physical & TARGET_PAGE_MASK, ext_prot,
+                         mmu_idx, TARGET_PAGE_SIZE);
+            return true;
+        }
+        if (ext_ret < 0) {
+            /* Board-detected access fault: deliver a bus error. */
+            if (probe) {
+                return false;
+            }
+            goto do_page_fault;
+        }
+    }
+
+    if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
+        /* MMU disabled */
+        tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                     address & TARGET_PAGE_MASK,
+                     PAGE_READ | PAGE_WRITE | PAGE_EXEC,
+                     mmu_idx, TARGET_PAGE_SIZE);
+        return true;
     }
 
     ret = get_physical_address(env, &physical, &prot,
@@ -1011,7 +1020,8 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         return false;
     }
 
-    /* page fault */
+do_page_fault:
+    /* page fault / board bus error */
     env->mmu.ssw = M68K_ATC_040;
     switch (size) {
     case 1:

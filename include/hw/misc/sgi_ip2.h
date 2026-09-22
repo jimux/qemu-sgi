@@ -27,9 +27,9 @@ MemoryRegion *sgi_ip2_sys_region(DeviceState *dev);
  * The board's custom-MMU translation, installed on the CPU by the machine
  * (which can see the target's CPUM68KState) via sgi_ip2_set_cpu().
  */
-bool sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
-                          MMUAccessType access_type, int mmu_idx, bool probe,
-                          hwaddr *physical, int *prot);
+int sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
+                         MMUAccessType access_type, int mmu_idx, bool probe,
+                         hwaddr *physical, int *prot);
 void sgi_ip2_set_cpu(DeviceState *dev, CPUState *cpu);
 
 #endif

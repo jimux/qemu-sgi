@@ -159,12 +159,14 @@ typedef struct CPUArchState {
     /*
      * Optional board-provided address translation, used by machines with a
      * custom MMU that is not the Motorola one (e.g. SGI IRIS IP2). Consulted
-     * first by m68k_cpu_tlb_fill; returns true and fills physical/prot on a
-     * valid translation, false to fall through to the default path.
+     * first by m68k_cpu_tlb_fill. Returns >0 and fills physical/prot on a
+     * valid translation, 0 to fall through to the default path, or <0 for a
+     * board-detected access fault (invalid/unprotected page), which is
+     * delivered as a bus error (EXCP_ACCESS) with the faulting address.
      */
-    bool (*ext_tlb_fill)(void *opaque, vaddr address, int size,
-                         MMUAccessType access_type, int mmu_idx, bool probe,
-                         hwaddr *physical, int *prot);
+    int (*ext_tlb_fill)(void *opaque, vaddr address, int size,
+                        MMUAccessType access_type, int mmu_idx, bool probe,
+                        hwaddr *physical, int *prot);
     void *ext_tlb_opaque;
 } CPUM68KState;
 
