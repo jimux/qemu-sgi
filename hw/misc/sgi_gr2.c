@@ -270,8 +270,10 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->regs[SGI_GR2_HQ_MYSTERY + 3] = SGI_GR2_HQ_MAGIC & 0xff;
 
     /* Board version / config bytes decoded by Gr2Probe: one byte per 32-bit
-     * slot at 0x6c000/4/8/c.  Per-instance so a variant (e.g. XS-24) can
-     * report its own identity. */
+     * slot at 0x6c000/4/8/c, in the addressed byte lane (the kernel probe
+     * byte-reads them).  Per-instance so a variant can report its identity.
+     * NOTE: storing them in the low lane instead was tried (to suit a 32-bit
+     * ARCS read) and did NOT change the reported name, so it was reverted. */
     s->regs[SGI_GR2_BDVERS_OFF + 0] = s->bdvers0;
     s->regs[SGI_GR2_BDVERS_OFF + 4] = s->bdvers1;
     s->regs[SGI_GR2_BDVERS_OFF + 8] = s->bdvers2;
