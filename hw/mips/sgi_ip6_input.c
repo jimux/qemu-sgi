@@ -393,6 +393,17 @@ static void sgi_ip6_kbd_event(DeviceState *dev, QemuConsole *src,
         if (code < 0) {
             return;
         }
+        /*
+         * OFF BY ONE, MEASURED.  The PROM's translator at 0xbfc22940 computes
+         * its table address as 0xa03c1df0 + scancode*24 with NO adjustment,
+         * while the table (copied 1:1 from file 0x3c8bc by 0xbfc22c60) has a
+         * 1-BASED keycode field: the entry at index m holds label m+1, so
+         * entry 22 holds '5' (label 23) and entry 50 holds '\r' (label 51).
+         * Sending the label makes the PROM read the NEXT key's entry -- '5'
+         * came out as 'r', which is exactly why the menu never moved.  The
+         * wire scancode is therefore the label MINUS ONE.
+         */
+        code -= 1;
         b = (key->down ? 0x00 : 0x80) | (code & 0x7f);
         qemu_log_mask(LOG_UNIMP,
                       "sgi-ip6-kbd: key event qcode=%d code=%d %s -> %02x\n",
