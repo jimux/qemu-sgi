@@ -1008,12 +1008,16 @@ static int gr1_dr_hit(uint32_t eff, unsigned size)
  * idle.  We do not execute microcode, but a completion edge is the visible
  * contract the firmware expects.
  */
+/*
+ * A command asserts (clears) the LIO ge bit and it LATCHES: both the
+ * download check (0xbfc1d0cc) and the graphics verdict's first check
+ * (0xbfc04958) read this bit as completion, and an earlier model that
+ * released it after 2 ms left any later check seeing it idle and timing
+ * out.  Clearing on command, never releasing.
+ */
 static void sgi_ip6_gr1_ge_done(void *opaque)
 {
-    SGIip6State *s = opaque;
-
-    s->lio_isr |= (1u << LIO_GE);
-    sgi_ip6_lio_update(s);
+    (void)opaque;
 }
 
 static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
@@ -1101,8 +1105,6 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
          */
         s->lio_isr &= ~(1u << LIO_GE);
         sgi_ip6_lio_update(s);
-        timer_mod(s->gr1_ge_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2 * NANOSECONDS_PER_SECOND / 1000);
         qemu_log_mask(LOG_UNIMP, "sgi-ip6-gr1: GE5 command 0x%" PRIx64
                       " accepted; no microcode interpreter modelled\n", val);
     } else if (eff >= 0x8000 && eff < 0xa000) {
