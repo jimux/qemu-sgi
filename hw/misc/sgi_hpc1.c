@@ -1509,12 +1509,13 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
                         MEMTXATTRS_UNSPECIFIED, &st, 1);
 
     /*
-     * r_rown (bit 31) is hardware ownership: the driver arms the buffer
-     * with r_rown = 0 and spins `while (!rd_chain->r_rown)` waiting for the
-     * hardware to fill it (if_ec2.c:706/870), then sets it back to 1 after
-     * consuming.  So SET r_rown to publish the frame; decrement r_rbcnt.
+     * r_rown (bit 31) is software ownership of the buffer: the driver spins
+     * `while (!rd_chain->r_rown)` and processes a descriptor while r_rown is
+     * 0, setting it back to 1 after consuming (if_ec2.c:706/790).  So CLEAR
+     * r_rown to publish the frame ("data ready"), exactly as the HPC3 model
+     * does, and store the decremented byte count.
      */
-    newbc = (w0 & ~0x1fffu) | 0x80000000u | ((space - used) & 0x1fffu);
+    newbc = (w0 & ~0x1fffu & ~0x80000000u) | ((space - used) & 0x1fffu);
     address_space_stl_be(&address_space_memory, desc, newbc,
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
@@ -1524,6 +1525,13 @@ static ssize_t sgi_hpc1_enet_receive(NetClientState *nc,
     s->seeq_rx_status = st;
     s->enet_rcvstat = (s->enet_rcvstat & HPC1_ENET_STRCVDMA) |
                       ((uint32_t)st << HPC1_ENET_RCVSTAT_SHIFT);
+    /*
+     * r_eor ends the receive chain: deactivate the channel so the driver
+     * re-arms it, exactly as the HPC3 model clears RXC_CA at EOX.
+     */
+    if (w1 & 0x80000000u) {
+        s->enet_rcvstat &= ~HPC1_ENET_STRCVDMA;
+    }
     sgi_hpc1_enet_raise_irq(s);
     return size;
 }
