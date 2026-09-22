@@ -212,9 +212,11 @@ static const MemoryRegionOps xbow_ops = {
 
 /*
  * HEART widget ID word (heart.h HEART_WID_ID): part 0xc001 at [27:12],
- * mfg 0x036 at [10:1], rev A (1) at [31:28].
+ * mfg 0x036 at [10:1], rev at [31:28].  The kernel's heart_rev() reads this
+ * nibble and PANICs for rev <= HEART_REV_C ("Prototype Heart chip"), so report
+ * a production rev: shipping Octanes are rev D or later.
  */
-#define HEART_WID_ID_VAL 0x000000001c00106cULL
+#define HEART_WID_ID_VAL 0x000000004c00106cULL
 
 static uint64_t heart_widget_id_read(void *opaque, hwaddr off, unsigned size)
 {
