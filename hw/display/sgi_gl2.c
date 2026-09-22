@@ -142,6 +142,11 @@ struct SGIGL2State {
     unsigned ge_nargs;            /* operands collected for the current cmd */
     unsigned ge_need;             /* operands the current cmd still wants */
     bool ge_in_cmd;
+    bool ge_pending;              /* a passthru header awaiting its opcode */
+    unsigned ge_pending_need;
+
+    /* Kernel textport state (FBCcharposnabs / FBCdrawchars). */
+    int16_t char_x, char_y;
 
     bool testpattern;
     bool trace;
@@ -507,6 +512,56 @@ static void gl2_draw_pixel(SGIGL2State *s, unsigned x, unsigned y)
     s->dirty = true;
 }
 
+/* Draw one glyph from font RAM at the current character position.  The
+ * kernel's FBCloadmasks stores the built-in font as raw words whose high byte
+ * is the 8-pixel row (bit 15 leftmost), the same convention the PROM's
+ * WRITEFONT uses. */
+static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
+                           int xoff, int yoff)
+{
+    int gx, gy;
+    static int dbg;
+    int hit = 0;
+
+    for (gy = 0; gy < h; gy++) {
+        uint16_t wd = s->font[(offset + gy) % GL2_FONT_WORDS];
+
+        for (gx = 0; gx < 8; gx++) {
+            int px, py;
+            uint8_t *p;
+
+            if (!(wd & (0x8000 >> gx))) {
+                continue;
+            }
+            hit++;
+            px = s->char_x + xoff + gx;
+            py = s->char_y + yoff + gy;
+            if ((unsigned)px >= GL2_XDIM || (unsigned)py >= GL2_YDIM) {
+                continue;
+            }
+            p = &s->fb[py * GL2_XDIM + px];
+            {
+                /* The kernel leaves the plane write-enable at 0 for the
+                 * textport and relies on the FBC's char masks; treat 0 as
+                 * "all planes" so the glyph lands. */
+                uint16_t we_ab = s->we_ab ? s->we_ab : 0xf;
+                uint16_t we_cd = s->we_cd ? s->we_cd : 0xf;
+
+                *p = gl2_blend(*p, s->color_ab, we_ab, 0);
+                *p = gl2_blend(*p, s->color_cd, we_cd, 2);
+            }
+        }
+    }
+    if (s->trace && dbg < 4) {
+        fprintf(stderr, "gl2: glyph off=%#x w=%d h=%d x=%d y=%d "
+                "color=%#x we=%#x font0=%#x hit=%d\n", offset, w, h,
+                s->char_x, s->char_y, s->color_ab, s->we_ab,
+                s->font[offset % GL2_FONT_WORDS], hit);
+        dbg++;
+    }
+    s->dirty = true;
+}
+
 /* Execute one FBC command delivered through the GE passthru pipe. */
 static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
                         const uint16_t *args, unsigned nargs)
@@ -537,9 +592,54 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         }
         break;
 
+    case 0x14:                          /* FBCcolor (colour index) */
+        if (nargs >= 1) {
+            s->color_ab = args[0];
+            s->color_cd = args[0];
+        }
+        break;
+
+    case 0x15:                          /* FBCwrten (write enable) */
+        if (nargs >= 1) {
+            s->we_ab = args[0];
+            s->we_cd = args[0];
+        }
+        break;
+
+    case 0x17:                          /* FBCloadmasks: font RAM */
+        if (nargs >= 1) {
+            unsigned addr = args[0];
+
+            for (i = 1; i < nargs; i++) {
+                s->font[addr++ % GL2_FONT_WORDS] = args[i];
+            }
+        }
+        break;
+
     case 0x12:                          /* FBCpoint: x, y */
         if (nargs >= 2) {
             gl2_draw_pixel(s, args[0], args[1]);
+        }
+        break;
+
+    case 0x1a:                          /* FBCcharposnabs: GEpoint, x, y */
+        if (nargs >= 3) {
+            s->char_x = (int16_t)args[1];
+            s->char_y = (int16_t)args[2];
+        }
+        break;
+
+    case 0x1c:                          /* FBCdrawchars: fontchar descriptors */
+        for (i = 0; i + 3 < nargs; i += 4) {
+            unsigned offset = args[i];
+            int w = args[i + 1] >> 8;
+            int h = args[i + 1] & 0xff;
+            int xoff = (int8_t)(args[i + 2] >> 8);
+            int yoff = (int8_t)(args[i + 2] & 0xff);
+            short width = (int16_t)args[i + 3];
+
+            gl2_draw_glyph(s, offset, w, h, xoff, yoff);
+            s->char_x += width;
         }
         break;
 
@@ -563,31 +663,66 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
     }
 }
 
-/* Assemble the 16-bit GE port stream and dispatch whole commands. */
+/* Assemble the 16-bit GE port stream and dispatch whole commands.
+ *
+ * The port carries two kinds of word: raw GE commands (with their operand
+ * words) and GEpassthru packets for the FBC.  A passthru header is only
+ * accepted when the word after it is a known FBC opcode -- otherwise it was
+ * an operand word of a raw GE command that merely shares the 0x08 low byte,
+ * and is discarded.  This lets the FBC stream be recovered without having to
+ * decode every GE instruction. */
+static bool gl2_fbc_known(uint16_t c)
+{
+    switch (c) {
+    case 0x00: case 0x02: case 0x04: case 0x05: case 0x08: case 0x09:
+    case 0x0a: case 0x0d: case 0x0e: case 0x10: case 0x11: case 0x12:
+    case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: case 0x18:
+    case 0x19: case 0x1a: case 0x1b: case 0x1c: case 0x1d: case 0x1e:
+    case 0x1f: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
+    case 0x25: case 0x26: case 0x27: case 0x28: case 0x29: case 0x2a:
+    case 0x2b: case 0x2c: case 0x2d: case 0x2e: case 0x2f: case 0x30:
+    case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: case 0x36:
+    case 0x38: case 0x3b: case 0x3d: case 0x3e: case 0x44:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void gl2_ge_word(SGIGL2State *s, uint16_t w)
 {
-    if (!s->ge_in_cmd) {
-        if ((w & 0xff) != 0x08) {   /* not a GEpassthru header */
-            return;
+    if (s->ge_in_cmd) {
+        if (s->ge_nargs - 1 < ARRAY_SIZE(s->ge_args)) {
+            s->ge_args[s->ge_nargs - 1] = w;
         }
-        s->ge_need = ((w >> 8) & 0x7f) + 1;     /* words incl. command */
-        s->ge_cmd = 0;
-        s->ge_nargs = 0;
-        s->ge_in_cmd = true;
+        s->ge_nargs++;
+        if (--s->ge_need == 0) {
+            gl2_ge_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
+            s->ge_in_cmd = false;
+        }
         return;
     }
 
-    if (s->ge_nargs == 0) {
-        s->ge_cmd = w;
-    } else if (s->ge_nargs - 1 < ARRAY_SIZE(s->ge_args)) {
-        s->ge_args[s->ge_nargs - 1] = w;
+    if (s->ge_pending) {
+        s->ge_pending = false;
+        if (gl2_fbc_known(w)) {
+            s->ge_cmd = w;
+            s->ge_nargs = 1;
+            s->ge_need = s->ge_pending_need - 1;
+            if (s->ge_need == 0) {
+                gl2_ge_exec(s, s->ge_cmd, s->ge_args, 0);
+            } else {
+                s->ge_in_cmd = true;
+            }
+            return;
+        }
+        /* Bogus header: it was GE operand data; fall through and let w
+         * itself be considered as a header. */
     }
-    s->ge_nargs++;
-    s->ge_need--;
 
-    if (s->ge_need == 0) {
-        gl2_ge_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
-        s->ge_in_cmd = false;
+    if ((w & 0xff) == 0x08 && !(w & 0x8000)) {
+        s->ge_pending = true;
+        s->ge_pending_need = ((w >> 8) & 0x7f) + 1;
     }
 }
 
@@ -686,9 +821,12 @@ static void gl2_reset(DeviceState *dev)
     s->fbc_out = 0;
     s->ge_flags = 0;
     s->ge_in_cmd = false;
+    s->ge_pending = false;
+    s->ge_pending_need = 0;
     s->ge_need = s->ge_nargs = 0;
     s->ge_cmd = 0;
     memset(s->ge_args, 0, sizeof(s->ge_args));
+    s->char_x = s->char_y = 0;
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
     if (s->fb) {
