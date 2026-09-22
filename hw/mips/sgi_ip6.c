@@ -180,6 +180,25 @@ typedef struct SGIip6State {
     uint16_t gr1_pc;          /* microcode PC, read back by the firmware */
     uint32_t gr1_finish[2];
     uint32_t gr1_code_data;   /* data/buffer FIFO (simplified) */
+    /*
+     * The GE5 command aperture at 0x800-0xbff is a FIFO OF INDEXED REGISTER
+     * WRITES, not a linear queue and not a plain register file.  Reference:
+     * MAME sgi_gr1.cpp sgi_gr1_device::fifo_w() -
+     *     m_fifo.enqueue((u64(offset) << 32) | data);
+     * i.e. BOTH the aperture offset (register selector) and the data are
+     * carried, and the GE5 microcode consumes the stream and dispatches on
+     * the offset.  fifo_w also drives DR3_FIFOEMPTY / DR3_FIFOFULL (the
+     * queue length > 256) and raises the FIFO interrupt through
+     * m_int_fifo_cb; buffer_r() returns m_bus (it does NOT pop).
+     * Stated wrongly twice before this: first as a plain linear FIFO
+     * (ignored the selectors), then as a plain register aperture (ignored
+     * the queue).  Both wrong framings would likely have passed the
+     * firmware's RE-pattern check, which is why the reference source, not
+     * the test, settled it.
+     */
+    uint64_t gr1_fifo[256];   /* (offset << 32) | data, per fifo_w */
+    unsigned gr1_fifo_len;
+    uint32_t gr1_fifo_bus;    /* buffer_r() read-back (MAME: m_bus) */
     bool gr1_kicked;
     QEMUTimer *gr1_ge_timer;   /* releases the GE LIO bit when it completes */
     uint8_t gr1_dr[5];        /* dr0..dr4 display registers */
@@ -1045,7 +1064,8 @@ static uint64_t sgi_ip6_gr1_read(void *opaque, hwaddr addr, unsigned size)
     } else if (eff >= GR1_FINISH && eff < GR1_FINISH + 8) {
         val = s->gr1_finish[(eff - GR1_FINISH) >> 2];
     } else if (eff >= GR1_BUF && eff < GR1_BUF + 0x400) {
-        val = s->gr1_code_data;
+        /* MAME sgi_ge5.cpp: u32 buffer_r(offs_t) { return m_bus; } */
+        val = s->gr1_fifo_bus;
     } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
         /*
          * The GE data window (MAME: space(1), map(0x1400,0x17ff), 8 KB RAM).
@@ -1100,6 +1120,16 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
         s->gr1_code[pc * 2 + 1] = data;
     } else if (eff >= GR1_MAR && eff < GR1_MAR + 0x200) {
         s->gr1_mar = eff & 0x7f;
+    } else if (eff >= GR1_BUF && eff < GR1_BUF + 0x400) {
+        /*
+         * MAME sgi_gr1.cpp fifo_w(): enqueue BOTH the aperture offset (the
+         * register selector the microcode dispatches on) and the data.
+         */
+        if (s->gr1_fifo_len < ARRAY_SIZE(s->gr1_fifo)) {
+            s->gr1_fifo[s->gr1_fifo_len++] =
+                ((uint64_t)(eff - GR1_BUF) << 32) | (uint32_t)val;
+        }
+        s->gr1_fifo_bus = val;
     } else if (eff >= GR1_DATA && eff < GR1_DATA + 0x400) {
         uint32_t mp = (eff - GR1_DATA) |
                       ((uint32_t)(s->gr1_mar & 0x3f) << 8);
@@ -1117,10 +1147,20 @@ static void sgi_ip6_gr1_write(void *opaque, hwaddr addr, uint64_t val,
          */
         s->gr1_kicked = true;
         /*
-         * The engine signals completion with the LIO ge interrupt.  We do
-         * not execute the microcode, but the firmware's contract is that a
-         * kicked engine asserts this bit, so satisfy the visible contract
-         * rather than the engine's internals.
+         * TODO(ge5): this assert is WRONG IN PRINCIPLE and only harmless
+         * because the latch below holds the bit clear (the value both
+         * firmware checks want, and a clear-interrupt on an already-clear
+         * bit is a no-op).  Reference: MAME sgi_ge5.cpp command_w()  -
+         * 0x8640 is the microcode's CONTROL register, not a kick:
+         *     offset 0x00 clear stall (m_state = DECODE)
+         *     offset 0x10/0x20/0x30 set/clear/exec single step
+         *     offset 0x50 clear interrupt (set_int(false))
+         * The real lifecycle is: the ENGINE asserts its interrupt on
+         * completion (set_int(true)) and command_w 0x50 clears it, while
+         * the FIFO interrupt is a SEPARATE line (m_int_fifo_cb, driven by
+         * DR3_FIFOEMPTY/DR3_FIFOFULL).  Fix when the register-file model
+         * is built, not as a standalone patch: this is a wrong-but-passing
+         * mechanism, which is exactly what misleads the next reader.
          */
         s->lio_isr &= ~(1u << LIO_GE);
         sgi_ip6_lio_update(s);
