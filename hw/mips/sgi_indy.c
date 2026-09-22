@@ -649,6 +649,16 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     memory_region_add_subregion_overlap(
         system_memory, SGI_GIO_GFX_BASE,
         sysbus_mmio_get_region(SYS_BUS_DEVICE(gr2_dev), 0), 1);
+    /* GR2 retrace (Gr2RetraceInterrupt / gr2_retr_intr) is registered on GIO
+     * vector 2 — the HPC3's "gio-retrace" line, the same one Newport's VRINT
+     * uses.  Without it the driver's interrupt-driven paths never run and Xsgi
+     * wedges with :0 bound but unserviced. */
+    {
+      DeviceState *gr2_irq_target = is_ip20 ? hpc1_dev : hpc3_dev;
+      sysbus_connect_irq(SYS_BUS_DEVICE(gr2_dev), 0,
+                         qdev_get_gpio_in_named(gr2_irq_target,
+                                                "gio-retrace", 0));
+    }
   }
 
   create_gio_empty_slot(system_memory, "gio-exp0", SGI_GIO_EXP0_BASE, 2 * MiB);

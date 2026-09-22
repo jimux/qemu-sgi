@@ -17,9 +17,17 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/sgi_gr2.h"
 #include "trace.h"
+
+/* Vertical retrace, as a real CRT would produce it.  The board raises its GIO
+ * interrupt at ~60 Hz once started; the pulse is asserted for the blanking
+ * interval and then lowered so the HPC3's level-triggered GIO2 source clears,
+ * exactly like Newport's VBLANK model (see sgi_newport.c:newport_vblank_timer). */
+#define SGI_GR2_RETRACE_HZ       60
+#define SGI_GR2_RETRACE_PULSE_NS (500 * 1000) /* ~40 scanlines of blanking */
 
 /* Extract `size` big-endian bytes starting at byte `byte` of a 32-bit word. */
 static uint64_t sgi_gr2_word_read(uint32_t word, unsigned byte, unsigned size)
@@ -254,6 +262,32 @@ static const GraphicHwOps sgi_gr2_gfx_ops = {
     .gfx_update = sgi_gr2_update_display,
 };
 
+/* Lower the retrace IRQ at the end of the blanking interval. */
+static void sgi_gr2_retrace_lower(void *opaque)
+{
+    SGIGr2State *s = SGI_GR2(opaque);
+
+    s->retrace_active = false;
+    qemu_irq_lower(s->irq);
+}
+
+/* 60 Hz retrace tick: raise the GIO interrupt for the blanking interval.
+ * Only once the driver has started the board (Gr2Start writes the start
+ * token), so we never deliver an interrupt before its vector is registered. */
+static void sgi_gr2_retrace_tick(void *opaque)
+{
+    SGIGr2State *s = SGI_GR2(opaque);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->present && s->hq_ready && !s->retrace_active) {
+        s->retrace_active = true;
+        qemu_irq_raise(s->irq);
+        timer_mod(s->retrace_lower_timer, now + SGI_GR2_RETRACE_PULSE_NS);
+    }
+    timer_mod(s->retrace_timer,
+              now + NANOSECONDS_PER_SECOND / SGI_GR2_RETRACE_HZ);
+}
+
 static void sgi_gr2_reset(DeviceState *dev)
 {
     SGIGr2State *s = SGI_GR2(dev);
@@ -262,6 +296,10 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->gepc = 0;
     s->hq_ready = false;
     s->xmap_ready = false;
+    s->retrace_active = false;
+    if (s->irq) {
+        qemu_irq_lower(s->irq);
+    }
 
     /* HQ2 presence magic (32-bit BE) read by Gr2Probe. */
     s->regs[SGI_GR2_HQ_MYSTERY + 0] = (SGI_GR2_HQ_MAGIC >> 24) & 0xff;
@@ -297,6 +335,17 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mmio, OBJECT(s), &sgi_gr2_ops, s,
                           TYPE_SGI_GR2, SGI_GR2_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+
+    /* GIO interrupt output (retrace → HPC3 "gio-retrace").  Always initialised;
+     * the machine only connects it when the board is present. */
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    s->retrace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    sgi_gr2_retrace_tick, s);
+    s->retrace_lower_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          sgi_gr2_retrace_lower, s);
+    timer_mod(s->retrace_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / SGI_GR2_RETRACE_HZ);
 
     /* Scanout (P0.4 step a) only when the board is present, so plain
      * `-M indy` gains no extra console. */
