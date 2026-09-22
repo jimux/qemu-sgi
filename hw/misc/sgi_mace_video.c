@@ -462,7 +462,19 @@ static void mvp_vin_geometry(const MVPChannelState *ch, unsigned *fmt,
         unsigned start = ch->vclip_odd & 0x3ff;
         unsigned end = (ch->vclip_odd >> 20) & 0x3ff;
 
-        *lines = (end > start) ? (end - start) : 243;
+        /*
+         * @@SEMANTICS@@ VCLIP_ODD/_EVEN (spec 2.3.5.4 TABLE 18) encode
+         * VStart in bits 9:0 and VEnd in bits 29:20 as an INCLUSIVE line
+         * range: VEnd = VStart + (#lines to clip) - 1.  The captured
+         * field height is therefore end - start + 1.  The guest driver
+         * programs the square-pixel 525 field this way -- VCLIP_ODD
+         * 0x10004411 -> start 17, end 256 (240 lines) and VCLIP_EVEN
+         * 0xff04010 -> start 16, end 255 (240 lines) -- and
+         * VL_CAPTURE_INTERLEAVED doubles that to the documented 480-line
+         * frame.  The previous end - start count lost the last line of
+         * each field, so an interleaved frame wrote only rows 0..477.
+         */
+        *lines = (end > start) ? (end - start + 1) : 243;
     }
 }
 
