@@ -1020,6 +1020,10 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             for (n = 0; n < size; n++) {
                 s->ate_ram[(offset - 0x10000) + n] = (val >> (8 * n)) & 0xff;
             }
+            if (getenv("BRIDGE_DEBUG")) {
+                fprintf(stderr, "BRIDGE: ATE wr off=0x%x val=0x%llx size=%u\n",
+                        (unsigned)offset, (unsigned long long)val, size);
+            }
         }
         break;
 
@@ -1137,12 +1141,61 @@ static void sgi_bridge_dev_irq(void *opaque, int n, int level)
     sgi_bridge_update_irq(s);
 }
 
+/*
+ * Translate a BRIDGE ATE-mapped PCI DMA address to a system physical address.
+ *
+ * The IRIX ql driver programs the ISP ring bases with addresses from
+ * pciio_dmatrans_addr(), which on IP30 fall in the BRIDGE ATE-mapped PCI window
+ * (BRIDGE_DMA_MAPPED_BASE 0x40000000, 4K pages).  The guest fills the bridge
+ * ATE RAM (b_int_ate_ram, mapped at 0x10000) itself, so read the ATE it wrote:
+ *   ate  = ate_ram[(pci - BASE) >> 12]          (proto | port<<8 | xio pfn)
+ *   xio  = (ate & ~0xfff) + (pci & 0xfff)
+ *   phys = xio                                  (heart: XIO>=0x20000000 == addr)
+ * Returns the input unchanged if the address is outside the window or the ATE
+ * is not valid.
+ */
+static uint64_t sgi_bridge_dma_xlate(void *arg, uint64_t pci_addr)
+{
+    SGIBRIDGEState *s = arg;
+    uint32_t idx, i, w0, w1;
+    uint64_t ate;
+
+    if (pci_addr < 0x40000000ULL || pci_addr >= 0x80000000ULL) {
+        return pci_addr;
+    }
+    /* BRIDGE_DMA_MAPPED_BASE 0x40000000, IOPGSIZE 0x4000 (IOPFNSHIFT 14). */
+    idx = (pci_addr - 0x40000000ULL) >> 14;
+    if (idx >= 0x80) {                 /* external ATEs not modelled */
+        return pci_addr;
+    }
+    /*
+     * The guest writes the 64-bit ATE as a big-endian store; QEMU splits it
+     * into two 32-bit word accesses, which the register handler stores
+     * little-endian per word.  Recombine the two words (first = high).
+     */
+    w0 = 0;
+    w1 = 0;
+    for (i = 0; i < 4; i++) {
+        w0 |= (uint32_t)s->ate_ram[idx * 8 + i] << (8 * i);
+        w1 |= (uint32_t)s->ate_ram[idx * 8 + 4 + i] << (8 * i);
+    }
+    ate = ((uint64_t)w0 << 32) | w1;
+    if (!(ate & 0x01)) {               /* ATE_V */
+        return pci_addr;
+    }
+    if (getenv("BRIDGE_DEBUG")) {
+        fprintf(stderr, "BRIDGE: xlate pci=0x%llx idx=%u ate=0x%llx -> phys=0x%llx\n",
+                (unsigned long long)pci_addr, idx, (unsigned long long)ate,
+                (unsigned long long)((ate & ~0x3fffULL) + (pci_addr & 0x3fff)));
+    }
+    return (ate & ~0x3fffULL) + (pci_addr & 0x3fff);
+}
+
 static void sgi_bridge_realize(DeviceState *dev, Error **errp)
 {
     SGIBRIDGEState *s = SGI_BRIDGE(dev);
     Chardev *chr;
     int i;
-
     /* Output line to HEART IP30_HVEC_WIDERR_BASEIO; inputs are PCI devices. */
     qdev_init_gpio_out(dev, &s->cpu_irq, 1);
     qdev_init_gpio_in(dev, sgi_bridge_dev_irq, 8);
@@ -1196,6 +1249,9 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
         /* IP30's ARCS ql.c munges control entries; IP27's does not. */
         object_property_set_bool(OBJECT(&s->isp[i]), "control-munge", true,
                                  &error_abort);
+        /* Let the ISP resolve its ATE-mapped PCI DMA ring addresses. */
+        s->isp[i].dma_xlate = sgi_bridge_dma_xlate;
+        s->isp[i].dma_xlate_arg = s;
         if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
             return;
         }

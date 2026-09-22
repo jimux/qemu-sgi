@@ -200,6 +200,16 @@ struct SGIQLispState {
      */
     qemu_irq irq;
 
+    /*
+     * Optional DMA-address translation installed by the BRIDGE parent.  On
+     * IP30 the IRIX ql driver programs the request/response ring bases with
+     * PCI addresses from the BRIDGE ATE-mapped window (0x40000000); the
+     * bridge turns those back into system physical addresses.  NULL => no
+     * translation (identity/K1 handling only).
+     */
+    uint64_t (*dma_xlate)(void *arg, uint64_t pci_addr);
+    void *dma_xlate_arg;
+
     /* register file: [0x00..0xff] as 16-bit words */
     uint16_t reg[QLISP_REGS_SIZE / 2];
 
