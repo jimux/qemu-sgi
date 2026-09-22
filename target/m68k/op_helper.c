@@ -345,6 +345,39 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             cpu_abort(cs, "DOUBLE MMU FAULT\n");
         }
         env->mmu.fault = true;
+        if (env->ext_tlb_fill) {
+            /*
+             * Board-detected bus error (the SGI IP2's custom MMU).  The
+             * IP2 kernel's handler (sys/ipII/frame.h) reads the frame after
+             * the format word as: pad(2), SSW(2), pipe-C(2), pipe-B(2),
+             * DCFA(4), ...; it takes the data-fault path (SSW & 0xc000 == 0)
+             * and page-fills the page at DCFA (trap.c).  Emit exactly that,
+             * with the faulting address in DCFA, and pad to the same total
+             * size as the standard long-bus-fault frame so m68k_rte still
+             * pops the right amount.
+             */
+            int i;
+
+            for (i = 0; i < 10; i++) {          /* remainder of the frame */
+                sp -= 4;
+                cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            }
+            /* data cycle fault address */
+            sp -= 4;
+            cpu_stl_be_mmuidx_ra(env, sp, env->mmu.ar, MMU_KERNEL_IDX, 0);
+            /* instruction pipe stage B */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* instruction pipe stage C */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* special status word (bits 14:15 clear -> data fault) */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, env->mmu.ssw, MMU_KERNEL_IDX, 0);
+            /* pad */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+        } else {
         /* push data 3 */
         sp -= 4;
         cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
@@ -390,6 +423,7 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
         /* effective address */
         sp -= 4;
         cpu_stl_be_mmuidx_ra(env, sp, env->mmu.ar, MMU_KERNEL_IDX, 0);
+        }
 
         do_stack_frame(env, &sp, 7, oldsr, 0, env->pc);
         env->mmu.fault = false;
