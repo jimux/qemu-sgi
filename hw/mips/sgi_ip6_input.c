@@ -122,14 +122,18 @@ static int sgi_ip6_peer_write(Chardev *chr, const uint8_t *buf, int len)
              * why none of it appears in a capture with no keyboard.
              */
             if (buf[i] == 0x10) {
-                uint8_t reply = 1;      /* US layout id (measured next) */
+                /*
+                 * MEASURED reply value: the driver reads the byte, then
+                 *   bfc149f8: beq v1,110(0x6e), 0xbfc14918
+                 *   bfc14a00: beq v1,170(0xaa), 0xbfc1498c  <- handshake
+                 *   bfc14a08: b 0xbfc149e8                   <- else retry
+                 * so it expects 0xAA (ACK).  A layout id (e.g. 0x01) is read
+                 * and REJECTED, which is exactly what we observed.
+                 */
+                uint8_t reply = 0xaa;
                 qemu_log_mask(LOG_UNIMP,
-                              "sgi-ip6-kbd: queueing layout reply %02x "
-                              "(can_write=%d)\n", reply,
-                              (int)qemu_chr_be_can_write(s->chr));
+                              "sgi-ip6-kbd: queueing ACK %02x\n", reply);
                 sgi_ip6_input_queue(s, &reply, 1);
-                qemu_log_mask(LOG_UNIMP,
-                              "sgi-ip6-kbd: after queue rx_len=%d\n", s->rx_len);
             }
         }
         return len;
