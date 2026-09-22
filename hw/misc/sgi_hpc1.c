@@ -1456,7 +1456,18 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
 
 #define HPC1_DMA_ADDR(x)        ((x) & 0x1fffffffu)
 #define HPC1_ENET_MAXPKT        1536
-#define HPC1_ENET_RSPACE        3u    /* 2-byte offset + 1 status byte */
+/*
+ * HPC_RSPACE, from the IP20 KERNEL header (tmp/kernbuild/kern/bsd/misc/seeq.h),
+ * NOT the ARCS one (which says 3):
+ *     #define HPC_RSPACE 8
+ *     #define MAX_RPKT   (MAX_TPKT + HPC_RSPACE + 64)   == 1586
+ * The driver arms r_rbcnt = MAX_RPKT (1586) and derives
+ *     rlen = MAX_RPKT - r_rbcnt - HPC_RSPACE
+ * then reads the Seeq status byte from MEMORY at eh + rlen.  With RSPACE = 3
+ * the model under-decremented by 5, so the driver read the status 5 bytes
+ * early (frame data instead of SEQ_RS_GOOD) and dropped every frame.
+ */
+#define HPC1_ENET_RSPACE        8u
 #define HPC1_ENET_SEQ_RXS_GOOD  0x20  /* SEQ_RS_GOOD */
 #define HPC1_ENET_SEQ_RXS_END   0x10  /* SEQ_RS_END */
 
