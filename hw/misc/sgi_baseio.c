@@ -562,6 +562,20 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off == SGI_BASEIO_IOC3_SIO_CR) {
     return 0x00400000; /* SIO_CR_ARB_DIAG_IDLE */
   }
+  /*
+   * IOC3 GenericPIO block: GPCR (control; set at +0x34, clear at +0x38) and
+   * GPDR (data, +0x3c).  The PROM drives a PHY reset through GPCR; serve the
+   * latched control/data.
+   */
+  if (off == 0x200034 || off == 0x200038) {
+    return s->ioc3_gpcr;
+  }
+  if (off == 0x20003c) {
+    return s->ioc3_gpdr;
+  }
+  if (off == 0x20002c) {
+    return 0; /* second SuperIO register; unused */
+  }
   /* IOC3 Ethernet MAC register file + MII management. */
   if (off >= SGI_BASEIO_ETH_OFF &&
       off < SGI_BASEIO_ETH_OFF + SGI_BASEIO_ETH_SIZE) {
@@ -577,6 +591,18 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
       v = s->phy_read_data & 0xffff;
     }
     return v;
+  }
+  /*
+   * IOC3 SuperIO UART B (16550, byte-spaced) at SIO+0x170.  UART A
+   * (0x220178) is a separate region; UART B is otherwise unmodelled and the
+   * PROM polls its LSR (offset 5), so return THRE|TEMT to let the poll exit.
+   */
+  if (off >= 0x220170 && off < 0x220178) {
+    switch (off - 0x220170) {
+    case 2: return 0x01;  /* IIR: no interrupt pending */
+    case 5: return 0x60;  /* LSR: THRE | TEMT */
+    default: return 0;
+    }
   }
   /*
    * PCI config slots: the Bridge exposes each PCI device's config dword 0 at
@@ -598,8 +624,9 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     unsigned cfg = off & 0xfff;
 
     if (slot == 0) {
-      /* IOC3: vendor 0x10a9 / device 0x0003. */
-      return (cfg == 0x00) ? 0x000310a9 : 0;
+      /* IOC3: vendor 0x10a9 / device 0x0003.  Other config dwords reflect
+       * what the PROM wrote (command/latency/BARs) or read 0. */
+      return (cfg == 0x00) ? 0x000310a9 : s->pci_cfg0[(cfg >> 2) & 0x3f];
     }
     if (slot == 1 || slot == 2) {
       /*
@@ -669,6 +696,41 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   }
   if (off == SGI_BASEIO_IOC3_MCR) {
     sgi_baseio_mcr_write(&s->ds_mac, val);
+    return;
+  }
+  /* IOC3 SuperIO control/data registers (SIO_CR 0x200028, +0x2c): accepted. */
+  if (off == SGI_BASEIO_IOC3_SIO_CR || off == 0x20002c) {
+    return;
+  }
+  /* IOC3 GenericPIO block: GPCR set (+0x34) / clear (+0x38), GPDR (+0x3c). */
+  if (off == 0x200034) {
+    s->ioc3_gpcr |= val;
+    return;
+  }
+  if (off == 0x200038) {
+    s->ioc3_gpcr &= ~val;
+    return;
+  }
+  if (off == 0x20003c) {
+    s->ioc3_gpdr = val;
+    return;
+  }
+  /*
+   * PCI config-space writes through the bridge window (0x20000 + slot*0x1000).
+   * Slot 0 is the IOC3: latch command/latency/BARs so reads reflect them.
+   */
+  if (off >= 0x20000 && off < 0x28000) {
+    if (((off - 0x20000) >> 12) == 0) {
+      unsigned cfg = off & 0xfff;
+
+      if (cfg <= 0xfc) {
+        s->pci_cfg0[cfg >> 2] = val;
+      }
+    }
+    return;
+  }
+  /* IOC3 SuperIO UART B (see the read side): accept writes, no model. */
+  if (off >= 0x220170 && off < 0x220178) {
     return;
   }
   /* IOC3 Ethernet MAC register file + MII management. */

@@ -160,6 +160,13 @@ struct SGIBaseIOState {
   uint32_t phy_write_data;
   uint32_t phy_read_data;
 
+  /* IOC3 GenericPIO block (GPCR set 0x34 / clear 0x38, GPDR data 0x3c). */
+  uint32_t ioc3_gpcr;
+  uint32_t ioc3_gpdr;
+
+  /* PCI config-space writes to slot 0 (IOC3), via the bridge config window. */
+  uint32_t pci_cfg0[0x40];
+
   /* IOC3 SSRAM diagnostic region (16-bit data + parity bit). */
   MemoryRegion ssram_mr;
   uint32_t ssram[SGI_BASEIO_IOC3_SSRAM_WORDS];
