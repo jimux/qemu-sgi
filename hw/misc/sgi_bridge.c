@@ -73,6 +73,26 @@
 #define IOC3_UART_B_OFFSET  0x620178
 
 /*
+ * IOC3 serial DMA control (SSCR) for the two ports, and its pause
+ * handshake bits.  Offsets are offsetof(ioc3_mem_t, port_a/b.sscr) from
+ * IRIX sys/PCI/ioc3.h (port_a at 0xb8, port_b at 0xd4 -- the Ethernet
+ * block eregs that follows at 0xf0 is SGI_BRIDGE_ETH_OFF).
+ */
+#define IOC3_PORT_A_SSCR_OFF  0x6000b8
+#define IOC3_PORT_B_SSCR_OFF  0x6000d4
+#define IOC3_SSCR_DMA_PAUSE   0x20000000u /* pause the DMA channel          */
+#define IOC3_SSCR_PAUSE_STATE 0x40000000u /* sets when pause takes effect   */
+/*
+ * Self-clearing command bits: the guest writes one to start a reset / RX
+ * drain, then spins until the hardware clears it (sio_ioc3.c hardware_init
+ * waits on SSCR_RESET via sio_cr; ioc3_read spins on SSCR_RX_DRAIN at
+ * :1768).  Report them clear so those loops always terminate.
+ */
+#define IOC3_SSCR_RX_DRAIN    0x08000000u /* drain RX buffer to memory      */
+#define IOC3_SSCR_RESET       0x80000000u /* reset DMA channels             */
+#define IOC3_SSCR_SELFCLR     (IOC3_SSCR_RX_DRAIN | IOC3_SSCR_RESET)
+
+/*
  * IOC3 UART custom MemoryRegion ops.
  *
  * Physical byte offset → standard 16550 register: std_reg = offset ^ 3
@@ -857,6 +877,18 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
         } else if (offset == 0x600030) {
             /* IOC3 MCR: 1-wire line to the MAC-address EEPROM. */
             val = sgi_bridge_ds_line_read(&s->ioc3_ds);
+        } else if (offset == IOC3_PORT_A_SSCR_OFF || offset == IOC3_PORT_B_SSCR_OFF) {
+            /*
+             * IOC3 serial DMA control (SSCR).  SSCR_PAUSE_STATE reflects
+             * SSCR_DMA_PAUSE: ioc3_open() asserts DMA_PAUSE and spins until
+             * PAUSE_STATE reads back set (io/sio_ioc3.c SPIN).  Without this
+             * the kernel's console open times out (~1e6 iterations) and the
+             * serial console goes silent right after the boot banner.
+             */
+            uint32_t sscr = s->ioc3_regs[(offset - 0x600000) >> 2];
+
+            sscr &= ~IOC3_SSCR_SELFCLR;
+            val = sscr | ((sscr & IOC3_SSCR_DMA_PAUSE) ? IOC3_SSCR_PAUSE_STATE : 0);
         } else if (offset >= SGI_BRIDGE_ETH_OFF &&
                    offset < SGI_BRIDGE_ETH_OFF + SGI_BRIDGE_ETH_SIZE) {
             unsigned idx = (offset - SGI_BRIDGE_ETH_OFF) >> 2;
