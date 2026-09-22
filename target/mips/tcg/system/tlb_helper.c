@@ -63,7 +63,14 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
     tlb->EHINV = 0;
     tlb->VPN = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
 #if defined(TARGET_MIPS64)
-    tlb->VPN &= env->SEGMask;
+    /*
+     * A2: IP27 (PAMask_override) keeps the full VPN2 so a 64-bit kseg VA is not
+     * folded by the 44-bit SEGMask (the EntryHi write canonicalises it).  Other
+     * machines keep the original clamp, byte for byte.
+     */
+    if (!env->PAMask_override) {
+        tlb->VPN &= env->SEGMask;
+    }
 #endif
     tlb->ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     tlb->MMID = env->CP0_MemoryMapID;
@@ -455,7 +462,9 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
         target_ulong tag = address & ~mask;
         target_ulong VPN = tlb->VPN & ~mask;
 #if defined(TARGET_MIPS64)
-        tag &= env->SEGMask;
+        if (!env->PAMask_override) {
+            tag &= env->SEGMask;
+        }
 #endif
 
         /* Check ASID/MMID, virtual page number & size */

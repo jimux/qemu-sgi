@@ -1088,7 +1088,24 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
     mask &= env->SEGMask;
 #endif
     old = env->CP0_EntryHi;
-    val = (arg1 & mask) | (old & ~mask);
+    if (env->PAMask_override) {
+        /*
+         * IP27 (PAMask_override): a sub-64-bit VA implementation (the
+         * R10000's 44-bit SEGBITS) does not define EntryHi bits above SEGBITS.
+         * Inheriting them from the previous value lets a 64-bit kernel VA such
+         * as the IRIX kseg3 PDA page (0xffffffffffffc000) pick up stale high
+         * bits and collapse into the segmented space (0xc0000fffffff8000),
+         * matching the wrong TLB entry.  Derive them by sign-extending the
+         * address's top in-mask bit (bit SEGBITS-1) instead.  Gated: other
+         * machines keep the original preserve-from-old behaviour byte for byte.
+         */
+        val = arg1 & mask;
+        if (env->SEGBITS < 64 && (arg1 & (1ULL << (env->SEGBITS - 1)))) {
+            val |= ~env->SEGMask;
+        }
+    } else {
+        val = (arg1 & mask) | (old & ~mask);
+    }
     env->CP0_EntryHi = val;
     if (ase_mt_available(env)) {
         sync_c0_entryhi(env, env->current_tc);
