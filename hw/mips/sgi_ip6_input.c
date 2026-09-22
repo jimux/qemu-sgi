@@ -305,6 +305,8 @@ static void sgi_ip6_kbd_event(DeviceState *dev, QemuConsole *src,
         return;
     }
     b = (key->down ? 0x00 : 0x80) | (code & 0x7f);
+    qemu_log_mask(LOG_UNIMP, "sgi-ip6-kbd: host key qcode=%d code=%d %s -> %02x\n",
+                  key->key->u.qcode.data, code, key->down ? "down" : "up", b);
     sgi_ip6_input_queue(s, &b, 1);
 }
 
