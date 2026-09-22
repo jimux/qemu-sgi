@@ -60,6 +60,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
  * 5; the driver polls it before/while draining the token FIFO, so it must read
  * as read-only and empty (0), not as whatever the bus last wrote. */
 #define SGI_GR2_HQ_FIFOSTAT    0x6a040
+#define SGI_GR2_HQ_IDLE_BIT    0x1     /* bit 0: HQ2 idle/ready (Xsgi polls) */
 #define SGI_GR2_HQ_READY_BIT   0x2     /* bit 1: ucode ready (polled)       */
 #define SGI_GR2_HQ_TOKEN_START 0x4077c /* FIFO token Gr2Start writes to run */
 #define SGI_GR2_HQ_NUMGE       0x6a044

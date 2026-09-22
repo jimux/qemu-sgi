@@ -76,10 +76,12 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
         val = sgi_gr2_word_read(s->gepc, offset & 3, size);
     } else if (offset >= SGI_GR2_HQ_FIFOSTAT &&
                offset < SGI_GR2_HQ_FIFOSTAT + 4) {
-        /* HQ2 status: bit 1 reports "ucode ready" once Gr2Start has kicked
-         * the sequencer with the start token; occupancy stays empty. */
-        val = sgi_gr2_word_read(s->hq_ready ? SGI_GR2_HQ_READY_BIT : 0,
-                                offset & 3, size);
+        /* HQ2 status: bit 0 = HQ2 idle/ready (the X DDX's expInit spins on
+         * it — lw 0x6a040; andi 0x1; beqz), bit 1 = ucode ready (the kernel's
+         * _Gr2UcodeReady).  Occupancy stays empty. */
+        val = sgi_gr2_word_read(
+            SGI_GR2_HQ_IDLE_BIT |
+            (s->hq_ready ? SGI_GR2_HQ_READY_BIT : 0), offset & 3, size);
     } else if (offset >= SGI_GR2_XMAP_STATUS &&
                offset < SGI_GR2_XMAP_STATUS + 4) {
         /* XMAP status: bit 1 reports "ready"; _Gr2XMAPInit3 spins on it.
