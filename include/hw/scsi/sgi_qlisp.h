@@ -256,6 +256,14 @@ struct SGIQLispState {
 
     /* SCSI backend (legacy -drive property) */
     BlockBackend *blk;
+
+    /*
+     * Machine DMA convention for data dsegs: true when the bridge direct-map
+     * (host phys + QL_DMA_DIRECT_BASE) is the correct decoding, false when the
+     * machine's convention is otherwise (default: keep the historical K1-aware
+     * decoding).  Set by the machine/bridge, never inferred here.
+     */
+    bool data_dma_direct;
 };
 
 #endif /* HW_SCSI_SGI_QLISP_H */

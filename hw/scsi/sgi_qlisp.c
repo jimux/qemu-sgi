@@ -162,6 +162,39 @@ static uint64_t ql_dma_to_phys(SGIQLispState *s, uint64_t a)
     return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
 }
 
+/*
+ * Data dsegs are bridge direct-map addresses (host physical + QL_DMA_DIRECT_BASE),
+ * NOT K1 virtuals — only the request/response *ring* bases are K1.  This matters
+ * on IP30: RAM sits at 0x20000000, so the direct-map range for RAM
+ * (0x80000000 + 0x20000000 = 0xa0000000..0xb0000000) OVERLAPS the K1 range
+ * 0xa0000000..0xc0000000.  Running a data dseg through the K1 branch of
+ * ql_dma_to_phys therefore sends every RAM dseg to a non-RAM hole (observed:
+ * raw 0xaffaea00 -> 0xffaea00, a hole, while the payload was really at the
+ * direct-map address 0x2ffaea00).  Data decodes as direct-map only.
+ */
+static uint64_t ql_dma_to_phys_data(SGIQLispState *s, uint64_t a)
+{
+    /*
+     * Only machines that declare the direct-map convention use the
+     * direct-map-only decoding; others keep the historical K1-aware behaviour,
+     * so this shared file carries no per-machine rule.
+     */
+    if (!s->data_dma_direct) {
+        return ql_dma_to_phys(s, a);
+    }
+    if (s->dma_xlate) {
+        uint64_t p = s->dma_xlate(s->dma_xlate_arg, a);
+
+        if (p != a) {
+            return p;
+        }
+    }
+    if (a >> 32) {
+        return a & 0xffffffffULL;
+    }
+    return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
+}
+
 /* True when `a` lies in the BRIDGE's ATE-mapped PCI DMA window. */
 static bool ql_addr_is_ate(SGIQLispState *s, uint64_t a)
 {
@@ -239,11 +272,11 @@ static bool ql_sg_move(SGIQLispState *s, uint8_t *buf, uint32_t len,
         n = MIN(len, g->len - s->sg_off);
         if (to_host) {
             address_space_write(&address_space_memory,
-                                ql_dma_to_phys(s, g->addr) + s->sg_off,
+                                ql_dma_to_phys_data(s, g->addr) + s->sg_off,
                                 MEMTXATTRS_UNSPECIFIED, buf, n);
         } else {
             address_space_read(&address_space_memory,
-                               ql_dma_to_phys(s, g->addr) + s->sg_off,
+                               ql_dma_to_phys_data(s, g->addr) + s->sg_off,
                                MEMTXATTRS_UNSPECIFIED, buf, n);
         }
         s->sg_off += n;
@@ -990,6 +1023,12 @@ static const Property qlisp_props[] = {
      * false (default) for SN0/IP27, which leave them in natural order.
      */
     DEFINE_PROP_BOOL("control-munge", SGIQLispState, control_munge, false),
+    /*
+     * True when this machine's data dsegs are bridge direct-map addresses
+     * (host phys + QL_DMA_DIRECT_BASE); false (default) keeps the historical
+     * K1-aware decoding.  Declared by the machine/bridge, not inferred.
+     */
+    DEFINE_PROP_BOOL("data-dma-direct", SGIQLispState, data_dma_direct, false),
 };
 
 static void qlisp_class_init(ObjectClass *klass, const void *data)

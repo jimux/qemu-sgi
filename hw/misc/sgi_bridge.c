@@ -1312,6 +1312,14 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
         /* IP30's ARCS ql.c munges control entries; IP27's does not. */
         object_property_set_bool(OBJECT(&s->isp[i]), "control-munge", true,
                                  &error_abort);
+        /*
+         * IP30 RAM sits at 0x20000000, so the bridge direct-map range for RAM
+         * (host phys + 0x80000000 = 0xa0000000..0xb0000000) overlaps the K1
+         * range: data dsegs must decode as direct-map, not K1.  Declared here
+         * (the IP30 board), so the shared ISP model carries no per-machine rule.
+         */
+        object_property_set_bool(OBJECT(&s->isp[i]), "data-dma-direct", true,
+                                 &error_abort);
         /* Let the ISP resolve its ATE-mapped PCI DMA ring addresses. */
         s->isp[i].dma_xlate = sgi_bridge_dma_xlate;
         s->isp[i].dma_xlate_arg = s;
