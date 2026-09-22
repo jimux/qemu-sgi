@@ -110,6 +110,9 @@ static void mips_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->CP0_Config2, env->CP0_Config3);
     qemu_fprintf(f, "    Config4 0x%08x Config5 0x%08x\n",
                  env->CP0_Config4, env->CP0_Config5);
+    qemu_fprintf(f, "    PRId    0x%08x (implementation 0x%02x, revision 0x%02x)\n",
+                 env->CP0_PRid,
+                 (env->CP0_PRid >> 8) & 0xff, env->CP0_PRid & 0xff);
     if ((flags & CPU_DUMP_FPU) && (env->hflags & MIPS_HFLAG_FPU)) {
         fpu_dump_state(env, f, flags);
     }
