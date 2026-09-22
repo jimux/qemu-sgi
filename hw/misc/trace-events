@@ -535,3 +535,4 @@ sgi_gr2_fiforead(uint64_t off, uint64_t val, uint32_t pc) "GR2 fiforead off=0x%0
 sgi_gr2_regread(uint64_t off, uint64_t val, uint32_t pc) "GR2 regread off=0x%05"PRIx64" val=0x%08"PRIx64" pc=%08x"
 sgi_gr2_hqread(uint64_t off, uint64_t val, uint32_t pc) "GR2 hqread off=0x%05"PRIx64" val=0x%08"PRIx64" pc=%08x"
 sgi_gr2_hqwrite(uint64_t off, uint64_t val, uint32_t pc) "GR2 hqwrite off=0x%05"PRIx64" val=0x%08"PRIx64" pc=%08x"
+sgi_gr2_re3_fill(uint8_t colour, uint32_t rgb, uint32_t w, uint32_t h) "GR2 re3 fill colour=%u rgb=0x%06x %ux%u"

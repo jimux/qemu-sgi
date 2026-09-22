@@ -64,6 +64,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_HQ_IDLE_BIT    0x1     /* bit 0: HQ2 idle/ready (Xsgi polls) */
 #define SGI_GR2_HQ_READY_BIT   0x2     /* bit 1: ucode ready (polled)       */
 #define SGI_GR2_HQ_TOKEN_START 0x4077c /* FIFO token Gr2Start writes to run */
+#define SGI_GR2_RE3_COLOUR_TOKEN 0x40530 /* FIFO token: RE3 pixel colour    */
 #define SGI_GR2_HQ_NUMGE       0x6a044
 #define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
 #define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
@@ -129,6 +130,21 @@ struct SGIGr2State {
     QemuConsole *con;
     uint32_t *scanout;
     bool scanout_bars; /* fill a colour-bar test pattern (P0.4 step a) */
+
+    /* RE3 producer colour latch + RAMDAC palette (8-bit mode).  In the 8-bit
+     * mode the guest runs (xwininfo: depth 8 PseudoColor), the RE3 fill colour
+     * the DDX writes is a palette INDEX; the RAMDAC maps index -> RGB for
+     * scanout.  `scanout` is the framebuffer the RE3 fill writes and VC1 scans
+     * out, so the producer and the output stage meet in one buffer.  The
+     * palette defaults to the stock X colormap READ from the guest with
+     * `xwd -root` (index 1 = red, 2 = green, 3 = yellow, 4 = blue, 5 = magenta,
+     * 6 = cyan, 7 = white, 8..15 = greys, rest black); capturing the DDX's own
+     * RAMDAC programming is future work. */
+    uint32_t ramdac[256];
+    uint8_t re3_colour;   /* last colour latched from the RE3 colour token */
+    bool re3_colour_valid;
+    uint32_t last_puc;    /* previous PUC_DATA word (rect geometry pair)     */
+    bool last_puc_valid;
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */
