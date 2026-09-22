@@ -133,8 +133,17 @@ static uint16_t scn2681_ct_count(SCN2681State *s)
     uint32_t rate = scn2681_ct_rate(s);
     uint64_t ticks;
 
-    if (!rate || !timer_pending(s->ct_timer)) {
+    if (!rate) {
         return s->ct_reload;
+    }
+    if (!timer_pending(s->ct_timer)) {
+        /*
+         * Stopped: return the count captured at STOP.  Returning the preload
+         * here would make a read-after-stop a constant, and a guest that
+         * calibrates by reading after stopping would loop forever (divide by
+         * zero).  The IP2 model reconciles on this behaviour.
+         */
+        return s->ct_frozen;
     }
     ticks = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->ct_start_ns)
             * (uint64_t)rate / NANOSECONDS_PER_SECOND;
@@ -256,6 +265,7 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
         ret = 0;
         break;
     case SCN2681_REG_OP_RST:  /* read = stop counter command */
+        s->ct_frozen = scn2681_ct_count(s);
         timer_del(s->ct_timer);
         s->isr &= ~SCN2681_ISR_CNTR;
         scn2681_update_irq(s);
@@ -400,6 +410,7 @@ static void scn2681_reset(DeviceState *dev)
         timer_del(s->ct_timer);
     }
     s->ct_reload = 0;
+    s->ct_frozen = 0;
     s->ct_half = false;
 }
 

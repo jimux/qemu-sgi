@@ -89,6 +89,7 @@ struct SCN2681State {
     QEMUTimer *ct_timer;
     bool ct_half;             /* timer mode: half-period toggle */
     uint16_t ct_reload;       /* reload value, as read back on CTU/CTL */
+    uint16_t ct_frozen;       /* live count captured at STOP, read while stopped */
     uint32_t ct_period;       /* counts per period (a reload of 0 means 65536) */
     int64_t ct_start_ns;      /* when the current period started */
 };
