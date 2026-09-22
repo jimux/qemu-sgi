@@ -471,10 +471,11 @@ static void gl2_gfx_update(void *opaque)
     }
     dest = (uint32_t *)surface_data(surface);
     for (y = 0; y < GL2_YDIM; y++) {
+        uint32_t *row = dest + (GL2_YDIM - 1 - y) * GL2_XDIM;
         for (x = 0; x < GL2_XDIM; x++) {
             uint8_t c = s->fb[y * GL2_XDIM + x];
             uint8_t *rgb = s->cmap[s->cur_map][c];
-            dest[y * GL2_XDIM + x] = rgb_to_pixel32(rgb[0], rgb[1], rgb[2]);
+            row[x] = rgb_to_pixel32(rgb[0], rgb[1], rgb[2]);
         }
     }
     dpy_gfx_update(s->con, 0, 0, GL2_XDIM, GL2_YDIM);
