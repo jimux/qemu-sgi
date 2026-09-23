@@ -637,7 +637,22 @@ static const Property mips_cpu_properties[] = {
 
 static int mips_cpu_mmu_index(CPUState *cs, bool ifunc)
 {
-    return mips_env_mmu_index(cpu_env(cs));
+    CPUMIPSState *env = cpu_env(cs);
+
+    /*
+     * R2000/R3000: an instruction fetch is never served by the isolated cache,
+     * even while Status.IsC is set -- the code itself runs from memory.  Give
+     * the fetch the normal index so the softmmu TLB keeps the code mapping and
+     * the isolated data mapping for the same page apart.  Without this a fetch
+     * of a kseg0 instruction page would install a memory mapping that a later
+     * isolated store in the same page reuses, writing the kernel's own text.
+     * See MMU_R3K_*_IDX in cpu.h.
+     */
+    if (ifunc && (env->hflags & MIPS_HFLAG_ISC)) {
+        return hflags_mmu_index(env->hflags &
+                                ~(MIPS_HFLAG_ISC | MIPS_HFLAG_SWC));
+    }
+    return mips_env_mmu_index(env);
 }
 
 static TCGTBCPUState mips_get_tb_cpu_state(CPUState *cs)

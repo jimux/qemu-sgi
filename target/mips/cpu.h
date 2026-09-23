@@ -1117,7 +1117,7 @@ typedef struct CPUArchState {
 #define EXCP_INST_NOTAVAIL 0x2 /* No valid instruction word for BadInstr */
     uint32_t hflags;    /* CPU State */
     /* TMASK defines different execution modes */
-#define MIPS_HFLAG_TMASK  0x3F5807FF
+#define MIPS_HFLAG_TMASK  0xFF5807FF
 #define MIPS_HFLAG_MODE   0x00007 /* execution modes                    */
     /*
      * The KSU flags must be the lowest bits in hflags. The flag order
@@ -1177,9 +1177,9 @@ typedef struct CPUArchState {
 #define MIPS_HFLAG_ERL   0x10000000 /* error level flag                    */
 /*
  * MIPS-I R2000/R3000 isolated-cache mode (Status.IsC) and cache swap
- * (Status.SwC).  These affect where a data access is routed, not how it is
- * translated into TCG, so they are deliberately NOT part of MIPS_HFLAG_TMASK
- * (which selects translated blocks): only the TLB fill path consults them.
+ * (Status.SwC).  These change where a data access lands, so they select the
+ * MMU index (see hflags_mmu_index below) and are part of MIPS_HFLAG_TMASK, so
+ * a translated block cannot carry a stale cache/normal routing.
  */
 #define MIPS_HFLAG_SWC   0x80000000 /* data accesses use the I-cache array */
 #define MIPS_HFLAG_ISC   0x40000000 /* data cache isolated from memory    */
@@ -1294,8 +1294,27 @@ uint32_t cpu_rddsp(uint32_t mask_num, CPUMIPSState *env);
 #define MIPS_ASIDX_ICACHE 2
 #define MIPS_ASIDX_MAX    2
 
+/*
+ * R2000/R3000 isolated-cache MMU indexes.  While Status.IsC is set a data
+ * access is served by a cache array instead of memory, but an instruction
+ * fetch (and any normal access) still goes to memory even for the same page.
+ * Those two routings must never share a softmmu TLB entry: a fetch of a kseg0
+ * instruction page would otherwise install a memory mapping that a later
+ * isolated store in the same page reuses -- writing the kernel's own text.
+ * Giving isolated mode its own MMU index tags its TLB entries apart from both
+ * the normal and the fetch mappings, so no flush is needed when IsC toggles.
+ * Status.SwC routes isolated data accesses at the instruction-cache array, and
+ * gets its own index for the same reason.
+ */
+#define MMU_R3K_DCACHE_IDX 4
+#define MMU_R3K_ICACHE_IDX 5
+
 static inline int hflags_mmu_index(uint32_t hflags)
 {
+    if (hflags & MIPS_HFLAG_ISC) {
+        return (hflags & MIPS_HFLAG_SWC) ? MMU_R3K_ICACHE_IDX
+                                         : MMU_R3K_DCACHE_IDX;
+    }
     if (hflags & MIPS_HFLAG_ERL) {
         return MMU_ERL_IDX;
     } else {
