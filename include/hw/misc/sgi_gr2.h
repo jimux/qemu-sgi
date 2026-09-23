@@ -74,6 +74,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_SPANS_TOKEN   0x404c4 /* token 305: expSolidSpans        */
 #define SGI_GR2_RE3_MODE_TOKEN    0x404d4 /* token 309: GC/ROP mode per sub-op */
 #define SGI_GR2_RE3_LINE_TOKEN    0x40564 /* token 345: expSegmentSS/expLineSS */
+#define SGI_GR2_RE3_SPANSTIP_TOKEN 0x4056c /* token 347: expStippledSpans    */
 #define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
 #define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
@@ -214,6 +215,7 @@ struct SGIGr2State {
     bool re3_solid_seen;    /* token 304 seen in the current op              */
     bool re3_spans_seen;    /* token 305 seen in the current op              */
     bool re3_line_seen;     /* token 345 seen: the op is a segment list      */
+    bool re3_spanstip_seen; /* token 347 seen: the op is a stippled span list */
     bool re3_pair_seen;     /* a 1280-then-1024 pair appeared in the payload */
     bool re3_stipple_valid; /* token 318 written: next rect is stippled      */
     uint32_t re3_stipple;   /* 32-bit stipple pattern (token 318)            */

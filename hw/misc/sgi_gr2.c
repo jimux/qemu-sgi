@@ -265,6 +265,49 @@ static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
     }
 }
 
+/* Draw a stippled-span sub-op (expStippledSpans, token 347).  After the same
+ * "0xff 0x3 0x0" prefix the geometry is groups of four (x, y, count, pattern):
+ * a horizontal span of `count` pixels at row y, each pixel set when its bit in
+ * the 32-bit pattern is 1 — the guest emits the root's discs as alternating
+ * 0xaaaaaaaa/0x55555555 rows, a checkerboard.  Set bits take the 312 colour;
+ * clear bits are left alone (the stipple is transparent). */
+static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n, i, k, start = n;
+
+    for (i = 0; i + 3 < n; i++) {
+        if (s->re3_data[i] == 0xff && s->re3_data[i + 1] == 3 &&
+            s->re3_data[i + 2] == 0) {
+            start = i + 3;
+            break;
+        }
+    }
+    if (start >= n) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    for (i = start; i + 3 < n; i += 4) {
+        uint32_t x = s->re3_data[i], y = s->re3_data[i + 1];
+        uint32_t count = s->re3_data[i + 2], pattern = s->re3_data[i + 3];
+
+        if (x >= SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
+            count == 0 || count > 64) {
+            break;
+        }
+        for (k = 0; k < count; k++) {
+            uint32_t xx = x + k;
+
+            if (xx >= SGI_GR2_SCREEN_W) {
+                break;
+            }
+            if ((pattern >> (31 - (k & 31))) & 1) {
+                s->scanout[y * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+            }
+        }
+    }
+    sgi_gr2_update_display(s);
+}
+
 /* Evaluate the pending draw sub-op.  Called at token 331 (which starts a new
  * sub-op) and token 490 (the terminator), because one 490-terminated region can
  * hold several 331 sub-ops: the grainy root's stipple and the panel's own
@@ -286,6 +329,10 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         /* expSolidSpans: a span list, not a fill.  The PUC path draws the
          * weave spans inline; the DDX span op itself paints nothing here. */
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    if (s->re3_spanstip_seen) {
+        sgi_gr2_re3_draw_stippled_spans(s);
         return;
     }
     if (s->re3_line_seen) {
@@ -316,6 +363,7 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
     s->re3_line_seen = false;
+    s->re3_spanstip_seen = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_fg_valid = false;
@@ -510,6 +558,9 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == SGI_GR2_RE3_LINE_TOKEN) {
         s->re3_line_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_SPANSTIP_TOKEN) {
+        s->re3_spanstip_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_SOLID_TOKEN) {
         s->re3_solid_seen = true;
@@ -757,6 +808,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
     s->re3_line_seen = false;
+    s->re3_spanstip_seen = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_stipple = 0;
