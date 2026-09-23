@@ -1452,17 +1452,18 @@ static void sgi_ip6_init(MachineState *machine)
     memory_region_init(&s->ram_win, OBJECT(machine), "sgi-ip6-ramwin",
                        SGI_IP6_RAM_WINDOW);
     /*
-     * The zero-filled placeholder must not extend above the installed RAM.
-     * An SGI kernel sizes memory by probing upward and stops at the first
-     * bus error; a window that answers *every* address up to 256 MB makes it
-     * believe it has far more memory than it does, after which the pfdat and
-     * phead structures for the phantom pages overlap the real ones and
-     * corrupt the lists (observed: meminit+0x198 stores through a NULL
-     * forward pointer).  Keep the noprw fallback only within the installed
-     * size; above it nothing is mapped, so the probe gets a bus error.
+     * The placeholder spans the WHOLE window on purpose.  The PROM sizes
+     * memory by programming memcfg to its maximum window (memcfg |= 0x1f),
+     * filling [one-bank top, 8 banks) with a walking pattern, and taking the
+     * first address that does not read back as the top of memory; it depends
+     * on the unwritten area answering (read 0, writes ignored) rather than
+     * faulting.  Clamping this region to the installed size makes that walk
+     * take a bus error, the power-on self-test aborts before it writes the
+     * real memcfg back, and the kernel is handed memcfg=0xbf (256 MB) and
+     * then faults in meminit.  See progress_notes/personal_iris.
      */
     memory_region_init_io(&s->ram_zero, OBJECT(machine), &sgi_ip6_ram_zero_ops,
-                          s, "sgi-ip6-ramzero", s->ram_size);
+                          s, "sgi-ip6-ramzero", SGI_IP6_RAM_WINDOW);
     memory_region_add_subregion_overlap(&s->ram_win, 0, &s->ram_zero, -1);
     for (ai = 0; ai < SGI_IP6_RAM_ALIAS_MAX; ai++) {
         char name[32];
