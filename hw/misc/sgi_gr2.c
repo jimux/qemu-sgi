@@ -1250,6 +1250,35 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     } else if (offset == SGI_GR2_XMAP_PAL_CTL) {
         s->ramdac_ctl = value & 0xff;
     }
+    /* BT457 DAC palette/gamma RAM (SGI_GR2_DAC0_OFF): the colour byte at +4 is
+     * written to the current address at +0 and the address auto-increments, so
+     * a run after an address write is a ramp load.  Built from the guest, never
+     * assumed: the golden streams an identity ramp at the boot DAC probe and
+     * the display gamma when Xsgi starts. */
+    if (offset >= SGI_GR2_DAC0_OFF &&
+        offset < SGI_GR2_DAC0_OFF + SGI_GR2_DAC_NDAC * SGI_GR2_DAC_STRIDE) {
+        unsigned k;
+
+        for (k = 0; k < size; k++) {
+            uint64_t o = offset + k;
+            unsigned rel = o - SGI_GR2_DAC0_OFF;
+            unsigned dac = rel / SGI_GR2_DAC_STRIDE;
+            unsigned reg = rel % SGI_GR2_DAC_STRIDE;
+            uint8_t byte = (value >> (8 * (size - 1 - k))) & 0xff;
+
+            if (reg == SGI_GR2_DAC_ADDR) {
+                s->dac_addr[dac] = byte;
+            } else if (reg == SGI_GR2_DAC_PALT) {
+                uint8_t idx = s->dac_addr[dac];
+
+                s->dac_ramp[dac][idx] = byte;
+                s->dac_addr[dac] = (idx + 1) & 0xff;
+                s->dac_ramp_set = true;
+                trace_sgi_gr2_dac(dac, idx, byte);
+            }
+        }
+        return;
+    }
     /* Unpopulated GE units discard writes. */
     if (offset >= SGI_GR2_GE_OFF &&
         offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
@@ -1384,7 +1413,16 @@ static void sgi_gr2_update_display(void *opaque)
             if (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x]) {
                 row[x] = sgi_gr2_re3_332(idx);
             } else {
-                row[x] = s->ramdac[idx];
+                /* The CLUT byte is pre-gamma: run each channel through the
+                 * guest's BT457 output ramp.  The 332 path is left alone — its
+                 * ramp is already the final display value (measured from the
+                 * control), so applying gamma again would over-brighten it. */
+                uint32_t rgb = s->ramdac[idx];
+                uint8_t r = s->dac_ramp[0][(rgb >> 16) & 0xff];
+                uint8_t g = s->dac_ramp[1][(rgb >> 8) & 0xff];
+                uint8_t b = s->dac_ramp[2][rgb & 0xff];
+
+                row[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
             }
         }
     }
@@ -1456,6 +1494,8 @@ static void sgi_gr2_retrace_tick(void *opaque)
 static void sgi_gr2_reset(DeviceState *dev)
 {
     SGIGr2State *s = SGI_GR2(dev);
+    int i;
+
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ucode, 0, sizeof(s->ucode));
     s->gepc = 0;
@@ -1468,6 +1508,14 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->ramdac_index = 0;
     s->ramdac_ctl = 0;
     s->ramdac_stage_n = 0;
+    /* Output ramps start as the identity until the guest programs them. */
+    for (i = 0; i < 256; i++) {
+        s->dac_ramp[0][i] = i;
+        s->dac_ramp[1][i] = i;
+        s->dac_ramp[2][i] = i;
+    }
+    memset(s->dac_addr, 0, sizeof(s->dac_addr));
+    s->dac_ramp_set = false;
     s->re3_colour = 0;
     s->re3_colour_valid = false;
     s->re3_solid_seen = false;

@@ -179,6 +179,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
  * index 1's last 0x1c write would otherwise overwrite its red.  */
 #define SGI_GR2_XMAP_PAL_BANK_INSTALLED 0x11 /* normal map, written last */
 #define SGI_GR2_XMAP_PAL_BANK_ALT       0x10 /* same map; the weave lives here */
+/* The three BT457 RAMDACs, one per colour channel.  Each has an address
+ * register at +0 and a 256-entry palette/gamma RAM at +4 which auto-increments
+ * its address after every write (the +8/+0xc registers are command/overlay and
+ * unused here).  The XMAP CLUT (above) maps an 8-bit screen index to an 8-bit
+ * RGB triple; these RAMs then map each of those R/G/B bytes through a 256-entry
+ * ramp on the way to the DAC.  The kernel's Gr2SetGammaRamp writes that ramp:
+ * it sets the address to 0 and streams 256 bytes per channel.  The stock golden
+ * loads an identity ramp during the boot DAC probe and then the display gamma
+ * (exactly 255*(v/255)^(1/1.7), measured) when Xsgi starts, so the model builds
+ * the ramp from the guest's own writes and applies it at scanout. */
+#define SGI_GR2_DAC0_OFF    0x6c0a0 /* red   DAC: addr / paltram            */
+#define SGI_GR2_DAC_STRIDE  0x20    /* one DAC every 0x20 bytes             */
+#define SGI_GR2_DAC_NDAC    3       /* red, green, blue                     */
+#define SGI_GR2_DAC_ADDR    0x0
+#define SGI_GR2_DAC_PALT    0x4
+
 #define SGI_GR2_RE3_27_OFF  0x6c200 /* RE3 buffered register set */
 #define SGI_GR2_RE3_24_OFF  0x6c280 /* RE3 unbuffered register set */
 #define SGI_GR2_RE3_32_OFF  0x6c600 /* RE3 32-bit register */
@@ -238,6 +254,12 @@ struct SGIGr2State {
     uint8_t ramdac_ctl;        /* bank select from XMAP_PAL_CTL             */
     uint8_t ramdac_stage[3];   /* R,G,B bytes accumulating from PAL_DATA     */
     unsigned ramdac_stage_n;   /* bytes held (0..2)                          */
+    /* Per-channel output ramp (the BT457 DACs' palette/gamma RAM): index ->
+     * byte, applied to each of the CLUT's R/G/B bytes at scanout.  Built from
+     * the guest's DAC writes (see SGI_GR2_DAC0_OFF); reset to the identity. */
+    uint8_t dac_ramp[SGI_GR2_DAC_NDAC][256];
+    uint8_t dac_addr[SGI_GR2_DAC_NDAC]; /* current paltram write address     */
+    bool dac_ramp_set;                  /* guest has programmed any entry    */
     uint8_t re3_colour;   /* last colour latched from the RE3 colour token */
     bool re3_colour_valid;
     uint32_t last_puc;    /* previous PUC_DATA word (rect geometry pair)     */
