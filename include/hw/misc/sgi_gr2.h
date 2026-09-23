@@ -76,6 +76,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_LINE_TOKEN    0x40564 /* token 345: expSegmentSS/expLineSS */
 #define SGI_GR2_RE3_SPANSTIP_TOKEN 0x4056c /* token 347: expStippledSpans    */
 #define SGI_GR2_RE3_POLY_TOKEN    0x404b8 /* token 302: libgd filled polygon */
+#define SGI_GR2_RE3_MONO_TOKEN    0x404e0 /* token 312: expDrawMonoImage     */
+#define SGI_GR2_RE3_PEN_TOKEN     0x40574 /* token 349: glyph pen x          */
+#define SGI_GR2_RE3_PEN_MAX       64      /* pens recorded per sub-op        */
 #define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
 #define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
@@ -218,6 +221,21 @@ struct SGIGr2State {
     bool re3_line_seen;     /* token 345 seen: the op is a segment list      */
     bool re3_spanstip_seen; /* token 347 seen: the op is a stippled span list */
     bool re3_poly_seen;     /* token 302 seen: the op is a filled polygon     */
+    bool re3_mono_seen;     /* token 312/349 seen: a 1-bpp glyph blit         */
+    /* Glyph blits (expDrawMonoImage).  Token 349 is written TWICE per glyph,
+     * both times with the pen x; the piece that follows each is (f0,f1,h) plus
+     * h/2 words of an 8-px-wide bitmap (high byte = row 2k).  The pen value and
+     * the PUC_DATA index it was written at are recorded so the decoder can find
+     * each piece, since the pen tokens are not PUC_DATA themselves. */
+    uint32_t re3_pen_val[SGI_GR2_RE3_PEN_MAX];
+    unsigned re3_pen_off[SGI_GR2_RE3_PEN_MAX];
+    unsigned re3_npens;
+    /* The name-label's row: the top y of the last solid rect drawn in the label
+     * bar colour (222).  The DDX does not put the text y on the wire, and the
+     * label bar is drawn just before its glyphs, so this is the structural link
+     * for the glyph baseline. */
+    int re3_label_y;
+    bool re3_label_valid;
     bool re3_pair_seen;     /* a 1280-then-1024 pair appeared in the payload */
     bool re3_stipple_valid; /* token 318 written: next rect is stippled      */
     uint32_t re3_stipple;   /* 32-bit stipple pattern (token 318)            */
