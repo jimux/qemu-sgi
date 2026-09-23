@@ -1331,14 +1331,29 @@ static void aic7880_seq_run(SGIAIC7880State *s)
     }
 
     /*
-     * Re-arm unless paused: wait loops (DFSTATUS HDONE spins) exit
-     * via the self-jump valve and must retry after the async SCSI
-     * completion lands; the idle loop polls at the same cadence the
-     * real chip's sequencer clock would.  The kick paths (QINFIFO
-     * write, CLRINT/CLRSINT, HCNTRL unpause, SEQADDR steer) call
-     * seq_run directly for immediate response.
+     * Re-arm unless paused — but only while there is real work.
+     * Wait loops (DFSTATUS HDONE spins) exit via the self-jump valve
+     * and must retry after the async SCSI completion lands, and the
+     * idle loop must keep advancing while a command is in flight;
+     * both imply pending work (qin_count / cur_req / done_pending /
+     * bus_selected) or a PC outside the idle poll body (words 0-26).
+     *
+     * With an empty bus the sequencer is spinning its own poll loop
+     * on QINCNT==0 (word 14's gate jumps back to word 0).  On real
+     * silicon that spin costs the chip's own clock, but in emulation
+     * every iteration is host CPU, and there is nothing for it to
+     * observe that a kick path does not already deliver synchronously:
+     * the host QINFIFO write, CLRINT/CLRSINT, HCNTRL unpause and
+     * SEQADDR steer all call seq_run directly, and the SCSI transfer
+     * and completion paths kick (or arm the completion timer).  So an
+     * idle chip arms no timer at all; the next host access kicks it.
+     * Measured: with an empty bus this was the top residual hotspot
+     * (~26% of QEMU userspace cycles) with the seq timer firing tens
+     * of thousands of times a second to re-run an unchanged poll loop.
      */
-    if (s->seq_running && !s->seq_host_pause && !s->seq_int_pause) {
+    if (s->seq_running && !s->seq_host_pause && !s->seq_int_pause &&
+        (s->qin_count || s->cur_req || s->done_pending || s->bus_selected ||
+         s->seq_pc > 26)) {
         timer_mod(s->seq_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 50000);
     }
