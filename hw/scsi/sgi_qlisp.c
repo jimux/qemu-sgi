@@ -74,6 +74,23 @@ static const uint8_t ql_mbox_off[8] = {
     QL_MBOX7
 };
 
+/*
+ * QLISP_TAILDBG: arm a short trace window when a MAILBOX_REGISTER_TEST
+ * completes (the last mailbox command before the observed stall), so the
+ * register accesses of the following interrupt handler are visible.
+ */
+static unsigned qlisp_taildbg_budget;
+
+static bool qlisp_taildbg(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("QLISP_TAILDBG") != NULL;
+    }
+    return on;
+}
+
 static uint16_t ql_reg_get(SGIQLispState *s, hwaddr off)
 {
     return s->reg[(off & (QLISP_REGS_SIZE - 1)) >> 1];
@@ -93,6 +110,10 @@ static void qlisp_update_irq(SGIQLispState *s)
 {
     bool level = (ql_reg_get(s, QL_BUS_ISR) & BUS_ISR_RISC_INT) != 0;
 
+    if (getenv("QLISP_ALLDBG")) {
+        qemu_log_mask(LOG_UNIMP, "QLISP irq -> %d (bus_isr=0x%x pending=%d)\n",
+                      level, ql_reg_get(s, QL_BUS_ISR), s->cmd_pending);
+    }
     qemu_set_irq(s->irq, level);
 }
 
@@ -679,6 +700,9 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
                       "sgi-qlisp: #%lu mbox cmd=0x%x in=%d sts=0x%x\n",
                       dbg_cnt++, cmd, ql_mbox_get(s, 1), sts);
     }
+    if (qlisp_taildbg() && cmd == MBOX_CMD_MAILBOX_REGISTER_TEST) {
+        qlisp_taildbg_budget = 400;
+    }
 }
 
 static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
@@ -687,6 +711,12 @@ static uint64_t qlisp_read(void *opaque, hwaddr off, unsigned size)
     uint64_t v = 0;
     int i;
 
+    if (qlisp_taildbg() && qlisp_taildbg_budget && size == 2) {
+        qlisp_taildbg_budget--;
+        qemu_log_mask(LOG_UNIMP, "QLISPTAIL rd off=0x%x pending=%d bus_isr=0x%x\n",
+                      (unsigned)off, s->cmd_pending,
+                      ql_reg_get(s, QL_BUS_ISR));
+    }
     if (size == 2) {
         switch (off & ~1) {
         case QL_BUS_ID_LOW:
@@ -736,6 +766,13 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     SGIQLispState *s = opaque;
     int i;
 
+    if (qlisp_taildbg() && qlisp_taildbg_budget && size == 2) {
+        qlisp_taildbg_budget--;
+        qemu_log_mask(LOG_UNIMP,
+                      "QLISPTAIL wr off=0x%x val=0x%x pending=%d bus_isr=0x%x\n",
+                      (unsigned)off, (unsigned)val, s->cmd_pending,
+                      ql_reg_get(s, QL_BUS_ISR));
+    }
     if (size != 2) {
         for (i = 0; i < size; i++) {
             hwaddr o = off + i;

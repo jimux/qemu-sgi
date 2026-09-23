@@ -807,6 +807,16 @@ static void sgi_baseio_sio_tx_drain(SGIBaseIOState *s, int port) {
  * vector is cleared.  The kernel's pcibr then reads b_int_status to find the
  * line and its driver clears the device at the source.
  */
+/* Enabled with SGI_BASEIO_INTDBG=1 (mirrors the irq6/7/8 evidence runs). */
+static bool sgi_baseio_intdbg(void) {
+  static int on = -1;
+
+  if (on < 0) {
+    on = getenv("SGI_BASEIO_INTDBG") != NULL;
+  }
+  return on;
+}
+
 static void sgi_baseio_int_sync(SGIBaseIOState *s) {
   int n;
 
@@ -821,10 +831,22 @@ static void sgi_baseio_int_sync(SGIBaseIOState *s) {
           sgi_hub_raise_vector(s->hub, vec, 1);
         }
         s->int_delivered[n] = vec;
+        if (sgi_baseio_intdbg()) {
+          qemu_log_mask(LOG_UNIMP,
+                        "BASEIO int line=%d RAISE vec=%u (enable=0x%x "
+                        "line=0x%x)\n",
+                        n, vec, s->int_enable, s->int_line);
+        }
       }
     } else if (s->int_delivered[n] >= 0) {
       if (s->hub) {
         sgi_hub_raise_vector(s->hub, s->int_delivered[n], 0);
+      }
+      if (sgi_baseio_intdbg()) {
+        qemu_log_mask(LOG_UNIMP,
+                      "BASEIO int line=%d CLEAR vec=%u (enable=0x%x "
+                      "line=0x%x)\n",
+                      n, s->int_delivered[n], s->int_enable, s->int_line);
       }
       s->int_delivered[n] = -1;
     }
@@ -840,6 +862,11 @@ static void sgi_baseio_dev_irq(void *opaque, int n, int level) {
     s->int_line |= 1u << n;
   } else {
     s->int_line &= ~(1u << n);
+  }
+  if (sgi_baseio_intdbg()) {
+    qemu_log_mask(LOG_UNIMP,
+                  "BASEIO dev_irq line=%d level=%d line=0x%x enable=0x%x\n",
+                  n, level, s->int_line, s->int_enable);
   }
   sgi_baseio_int_sync(s);
 }
@@ -1105,6 +1132,16 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     uint32_t st = s->int_line;
     if (s->eth_regs[SGI_IOC3_EISR] & s->eth_regs[SGI_IOC3_EIER]) {
       st |= 1u << 0;
+    }
+    if (sgi_baseio_intdbg()) {
+      qemu_log_mask(LOG_UNIMP,
+                    "BASEIO rd INT_STATUS -> 0x%x (line=0x%x enable=0x%x "
+                    "delivered=%d,%d,%d,%d,%d,%d,%d,%d)\n",
+                    st, s->int_line, s->int_enable,
+                    s->int_delivered[0], s->int_delivered[1],
+                    s->int_delivered[2], s->int_delivered[3],
+                    s->int_delivered[4], s->int_delivered[5],
+                    s->int_delivered[6], s->int_delivered[7]);
     }
     return st;
   }

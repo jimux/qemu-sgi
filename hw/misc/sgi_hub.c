@@ -253,6 +253,12 @@ void sgi_hub_raise_vector(SGIHubState *s, unsigned vec, int level) {
   } else {
     return;
   }
+  if (getenv("SGI_HUB_INTDBG")) {
+    qemu_log_mask(LOG_UNIMP,
+                  "HUB raise vec=%u level=%d pend0=0x%llx mask0A=0x%llx\n", vec,
+                  level, (unsigned long long)s->int_pend0,
+                  (unsigned long long)s->int_mask[0]);
+  }
   sgi_hub_update_irqs(s);
 }
 
@@ -358,6 +364,13 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
     /* Set/clear a pending interrupt level. */
     uint64_t bit = val & 0x3f;
     bool set = (val & PI_INT_PEND_SET_BIT) != 0;
+    if (getenv("SGI_HUB_INTDBG")) {
+      qemu_log_mask(LOG_UNIMP,
+                    "HUB INT_PEND_MOD val=0x%llx bit=%llu set=%d "
+                    "pend0=0x%llx\n",
+                    (unsigned long long)val, (unsigned long long)bit, set,
+                    (unsigned long long)s->int_pend0);
+    }
     if (bit < 64) {
       if (set) {
         s->int_pend0 |= (1ULL << bit);
