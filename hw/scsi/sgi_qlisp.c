@@ -340,17 +340,45 @@ static void ql_scsi_transfer_data(SCSIRequest *req, uint32_t len)
     bool to_host = req->cmd.mode == SCSI_XFER_FROM_DEV;
 
     /*
-     * The data stream is word-reversed by the host driver on machines that do
-     * not define SWAP_DATA_STREAM (i.e. not IP30).  That is the same split as
-     * the control-entry munge: when control_munge is clear (IP27), the driver
-     * munges the data too, so the device must pre-munge what it hands over and
-     * un-munge what it picks up.  ql_munge is its own inverse, so applying it
-     * symmetrically in both directions is correct.
+     * SN0/IP27 word-swap emulation.  The ql data path is word-reversed, and
+     * the reader decides where it is undone:
+     *
+     *  - The IRIX kernel maps its DMA with PCIIO_WORD_VALUES and lets the
+     *    BRIDGE swap host memory, so it must receive NATURAL bytes both ways
+     *    (mapped_control_stream set).  This is what lets the kernel recognise
+     *    a direct-access disk (INQUIRY byte0==0) and read the miniroot XFS.
+     *
+     *  - The ARCS standalone byte-streams and expects the DEVICE end to be
+     *    swapped.  On a READ the swap must land in host memory (the driver's
+     *    own munge()/un-swap then restores natural order), so munge BEFORE
+     *    ql_sg_move; on a WRITE the driver hands over natural bytes and the
+     *    bridge (BRIDGE_DEV_SWAP_DIR) swaps them on the way out, so the data
+     *    must be un-swapped AFTER ql_sg_move -- otherwise the miniroot sash
+     *    writes to the swap partition lands word-reversed and the kernel later
+     *    fails to mount it (EWRONGFS, errno 1011).
      */
-    if (!s->control_munge) {
-        ql_munge(buf, len);
+    bool munge = !s->control_munge && !s->mapped_control_stream;
+
+    if (to_host) {
+        if (munge) {
+            ql_munge(buf, len);
+        }
+        ql_sg_move(s, buf, len, true);
+    } else {
+        ql_sg_move(s, buf, len, false);
+        if (munge) {
+            ql_munge(buf, len);
+        }
     }
-    ql_sg_move(s, buf, len, to_host);
+    if (getenv("QLISP_DATA_DBG") && len >= 8) {
+        qemu_log_mask(LOG_UNIMP,
+                      "QLISP_DATA len=%u dir=%s first8=%02x %02x %02x %02x "
+                      "%02x %02x %02x %02x munge=%d mapped=%d\n",
+                      len, to_host ? "dev2host" : "host2dev",
+                      buf[0], buf[1], buf[2], buf[3],
+                      buf[4], buf[5], buf[6], buf[7], munge,
+                      s->mapped_control_stream);
+    }
     scsi_req_continue(req);
 }
 
@@ -628,6 +656,7 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
         s->req.count = depth;
         s->req.in = idx;
         s->req.out = idx;
+        s->mapped_control_stream = true;
         ql_mbox_put(s, 5, idx);
         sts = MBOX_STS_COMMAND_COMPLETE;
         if (qlisp_dbg()) {
@@ -646,6 +675,7 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
         s->rsp.count = depth;
         s->rsp.out = idx;
         s->rsp.in = 0;
+        s->mapped_control_stream = true;
         ql_mbox_put(s, 5, idx);
         sts = MBOX_STS_COMMAND_COMPLETE;
         if (qlisp_dbg()) {
@@ -676,6 +706,7 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
             s->rsp.out = idx;
             s->rsp.in = 0;
         }
+        s->mapped_control_stream = false;
         ql_mbox_put(s, 5, idx);
         sts = MBOX_STS_COMMAND_COMPLETE;
         break;

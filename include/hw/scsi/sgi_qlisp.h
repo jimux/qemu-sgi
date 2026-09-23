@@ -220,6 +220,20 @@ struct SGIQLispState {
     bool control_munge;
 
     /*
+     * Set when the reader initialises the MAPPED (32-bit) request/response
+     * queues (mbox 0x10/0x11) rather than the legacy 64-bit queues (0x52/0x53).
+     * This distinguishes the IRIX kernel ql driver (USE_MAPPED_CONTROL_STREAM,
+     * used on SN0/IP27 and IP30) from the ARCS standalone.  It matters for the
+     * DATA stream on SN0: the kernel maps its DMA with PCIIO_WORD_VALUES and
+     * relies on the BRIDGE to word-swap host memory, so the device must hand
+     * over NATURAL data; the standalone instead byte-streams and munges the
+     * buffer itself in software, so the device must pre-munge.  Both use
+     * natural control entries on IP27 (control_munge=false), so this flag is
+     * the only per-reader discriminator for the data order.
+     */
+    bool mapped_control_stream;
+
+    /*
      * Optional DMA-address translation installed by the bridge parent.  The
      * IRIX ql driver programs the request/response ring bases with PCI
      * addresses out of pciio_dmatrans_addr(); on IP27 (and IP30) those fall in
