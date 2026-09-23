@@ -87,6 +87,13 @@ struct SCN2681State {
      * output-port set/reset commands instead.
      */
     QEMUTimer *ct_timer;
+    /*
+     * One character time per channel: writing THR clears TxRDY/TxEMT and the
+     * matching ISR bit (transmitter busy); the timer re-sets them when the
+     * character has drained.  Without this the driver's TX-complete loop
+     * re-triggers instantly and storms the interrupt line.
+     */
+    QEMUTimer *tx_timer[2];
     bool ct_half;             /* timer mode: half-period toggle */
     uint16_t ct_reload;       /* reload value, as read back on CTU/CTL */
     uint16_t ct_frozen;       /* live count captured at STOP, read while stopped */

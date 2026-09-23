@@ -45,6 +45,22 @@ static void scn2681_update_irq(SCN2681State *s)
     qemu_set_irq(s->irq, (s->isr & s->imr) != 0);
 }
 
+/* One character time for the transmit-busy model.  Fixed default: the exact
+ * baud comes from CSR/ACR, but any non-zero time is enough to stop the
+ * driver's TX-complete loop from re-triggering in the same instant. */
+#define SCN2681_TX_CHAR_NS 100000ULL
+
+static void scn2681_tx_cb(void *opaque)
+{
+    SCN2681Channel *c = opaque;
+    SCN2681State *s = container_of(c, SCN2681State, ch[0]);
+    int chn = c - &s->ch[0];
+
+    c->sr |= SCN2681_SR_TXRDY | SCN2681_SR_TXEMT;
+    s->isr |= chn ? SCN2681_ISR_TXRDYB : SCN2681_ISR_TXRDYA;
+    scn2681_update_irq(s);
+}
+
 static void scn2681_tx(SCN2681State *s, int chn, uint8_t val)
 {
     CharFrontend *chr = chn ? &s->chr_b : &s->chr_a;
@@ -59,10 +75,18 @@ static void scn2681_tx(SCN2681State *s, int chn, uint8_t val)
     } else if (qemu_chr_fe_backend_connected(chr)) {
         qemu_chr_fe_write_all(chr, &val, 1);
     }
-    /* Transmitter immediately ready again. */
-    s->ch[chn].sr |= SCN2681_SR_TXRDY | SCN2681_SR_TXEMT;
-    s->isr |= chn ? SCN2681_ISR_TXRDYB : SCN2681_ISR_TXRDYA;
+    /*
+     * The transmitter is now busy for one character time: TxRDY/TxEMT and the
+     * matching ISR bit clear, and the timer re-sets them when the character
+     * drains.  On real silicon writing THR clears TxRDY - asserting it here
+     * instead (as we used to) makes the driver's TX-complete loop re-fire in
+     * the same instant and storm the interrupt line.
+     */
+    s->ch[chn].sr &= ~(SCN2681_SR_TXRDY | SCN2681_SR_TXEMT);
+    s->isr &= ~(chn ? SCN2681_ISR_TXRDYB : SCN2681_ISR_TXRDYA);
     scn2681_update_irq(s);
+    timer_mod(s->tx_timer[chn],
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCN2681_TX_CHAR_NS);
 }
 
 static void scn2681_cmd(SCN2681State *s, int chn, uint8_t data)
@@ -420,6 +444,8 @@ static void scn2681_realize(DeviceState *dev, Error **errp)
 
     qdev_init_gpio_out_named(dev, &s->irq, "irq", 1);
     s->ct_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, scn2681_ct_cb, s);
+    s->tx_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, scn2681_tx_cb, &s->ch[0]);
+    s->tx_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL, scn2681_tx_cb, &s->ch[1]);
 
     if (qemu_chr_fe_backend_connected(&s->chr_a)) {
         qemu_chr_fe_set_handlers(&s->chr_a, scn2681_can_receive,
