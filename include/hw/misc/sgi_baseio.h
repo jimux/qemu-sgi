@@ -33,6 +33,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 
 /* Widget ID word (read at offset 4): part 0xc002 (Bridge). */
 #define SGI_BASEIO_WIDGET_PART 0xc002
+/*
+ * SGI manufacturer number in WIDGET_ID (bits [11:1]).  The xwidget driver
+ * match (XWIDGET_HARDWARE_ID_MATCH) requires the mfg number to match the
+ * driver's registration, so the bridge driver pcibr (registered with
+ * BRIDGE_WIDGET_MFGR_NUM = 0x036) only attaches when we report it; with mfg 0
+ * the board never bound and no "<widget>/pci" vertex was created.
+ */
+#define SGI_BASEIO_WIDGET_MFGR 0x036
 
 /* IOC3 on the BaseIO: register block at bridge+0x200000, UART A at +0x220178. */
 #define SGI_BASEIO_IOC3_BASE 0x200000ULL

@@ -753,7 +753,8 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
    * widget part number; 0xc002 identifies a Bridge.
    */
   if (off == 4) {
-    return (uint64_t)(SGI_BASEIO_WIDGET_PART << 12);
+    return (uint64_t)((SGI_BASEIO_WIDGET_PART << 12) |
+                      (SGI_BASEIO_WIDGET_MFGR << 1));
   }
   /*
    * Widget control (WIDGET_CONTROL = 0x24): low nibble is the board's XIO
