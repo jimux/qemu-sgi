@@ -72,10 +72,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
  * draws is named by the marker token it writes, not by the PUC_DATA tail. */
 #define SGI_GR2_RE3_SOLID_TOKEN   0x404c0 /* token 304: expDrawSolidRects    */
 #define SGI_GR2_RE3_SPANS_TOKEN   0x404c4 /* token 305: expSolidSpans        */
+#define SGI_GR2_RE3_MODE_TOKEN    0x404d4 /* token 309: GC/ROP mode per sub-op */
 #define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
 #define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
 #define SGI_GR2_RE3_DONE_TOKEN    0x407a8 /* token 490: op terminator        */
+/* The PUC_DATA words of one sub-op, kept so the rect list can be decoded from
+ * the DDX store order rather than from a guessed tail heuristic.  A solid-rect
+ * sub-op carries a short prefix then groups of four; the weave op's 1024 span
+ * spans arrive before its own 331, so a per-sub-op buffer of this size is ample
+ * and the span words are discarded when the 331 resets the buffer. */
+#define SGI_GR2_RE3_DATA_MAX      512
 #define SGI_GR2_HQ_NUMGE       0x6a044
 #define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
 #define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
@@ -210,6 +217,14 @@ struct SGIGr2State {
     uint32_t re3_stipple;   /* 32-bit stipple pattern (token 318)            */
     uint8_t re3_fg;         /* token 314: stipple foreground colour index    */
     bool re3_fg_valid;
+    uint32_t re3_rop;       /* token 309 value of the current sub-op         */
+    bool re3_rop_valid;
+    /* PUC_DATA of the current sub-op, so the rect list is decoded from the
+     * DDX store order (a short prefix then groups of four (x1,y1,x2,y2)) and
+     * not from a guessed (w,h) tail.  Reset at every 331 and 490. */
+    uint32_t re3_data[SGI_GR2_RE3_DATA_MAX];
+    unsigned re3_data_n;
+    bool re3_data_overflow;
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */

@@ -133,41 +133,100 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
     sgi_gr2_update_display(s);
 }
 
-/* Evaluate the pending draw op and, if it is a full-screen fill, paint it.
- * Called at each op boundary — token 331 (which starts a new sub-op) and token
- * 490 (the terminator) — because one 490-terminated region can hold several 331
- * sub-ops, and the grainy root's stipple (318) and its full-screen rect live in
- * the FIRST sub-op, before the panel's own 331.  The rect is recognised
- * structurally: a rect-list op (304/318) containing a 1280-then-1024 pair, or
- * any fill op whose final two data words are (1280,1024).  305 is excluded from
- * the pair rule because an expSolidSpans triple list ends (0x500,0x400,0x1) —
- * a span at x=1280,y=1024, not a rectangle. */
-static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
+/* Paint a solid-rect sub-op's rectangle list.  The DDX's expDrawSolidRects
+ * stores the geometry as PUC_DATA words in groups of four (x1,y1,x2,y2) after a
+ * short non-rectangle prefix ("0xff 0x3 0x0", sometimes preceded by the clip
+ * bounds 0x4ff 0x0 0x3ff).  Rather than assume the prefix length, walk back
+ * from the end while each four-word group is a sane rectangle, so the prefix is
+ * left alone: the longest valid suffix is the list.  This is the layout read
+ * off the DDX store sequences (note 31), not a guessed (w,h) tail. */
+static void sgi_gr2_re3_paint_rect_list(SGIGr2State *s, uint8_t colour)
 {
-    bool fs_rect = s->re3_pair_seen && !s->re3_spans_seen &&
-                   (s->re3_solid_seen || s->re3_stipple_valid);
-    bool fs_tail = (s->re3_solid_seen || s->re3_spans_seen ||
-                    s->re3_stipple_valid) &&
-                   s->prev_puc == SGI_GR2_SCREEN_W &&
-                   s->last_puc == SGI_GR2_SCREEN_H;
+    unsigned n = s->re3_data_n, groups = 0, g;
 
-    if (!fs_rect && !fs_tail) {
+    while ((groups + 1) * 4 <= n) {
+        unsigned o = n - (groups + 1) * 4;
+        uint32_t x1 = s->re3_data[o], y1 = s->re3_data[o + 1];
+        uint32_t x2 = s->re3_data[o + 2], y2 = s->re3_data[o + 3];
+
+        if (x1 >= x2 || y1 >= y2 || x1 >= SGI_GR2_SCREEN_W ||
+            y1 >= SGI_GR2_SCREEN_H || x2 > SGI_GR2_SCREEN_W ||
+            y2 > SGI_GR2_SCREEN_H) {
+            break;
+        }
+        groups++;
+    }
+    if (groups == 0) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
     }
+    for (g = groups; g > 0; g--) {
+        unsigned o = n - g * 4;
+        uint32_t x1 = s->re3_data[o], y1 = s->re3_data[o + 1];
+        uint32_t x2 = s->re3_data[o + 2], y2 = s->re3_data[o + 3];
+        uint32_t rgb = sgi_gr2_re3_fill(s, colour, x1, y1,
+                                        x2 - x1 + 1, y2 - y1 + 1);
+
+        trace_sgi_gr2_re3_rect(colour, rgb, x1, y1, x2, y2);
+    }
+}
+
+/* Evaluate the pending draw sub-op.  Called at token 331 (which starts a new
+ * sub-op) and token 490 (the terminator), because one 490-terminated region can
+ * hold several 331 sub-ops: the grainy root's stipple and the panel's own
+ * solid-rect list live in the SAME region, the panel as a nested 331.  The
+ * sub-op is classified by the markers the DDX store order leaves behind — 318
+ * stipple, 304 solid rect, 305 spans — per the dispatch table in note 31, and
+ * anything matching none of those is traced as unmatched rather than guessed
+ * at. */
+static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
+{
     if (s->re3_stipple_valid) {
         uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
 
+        /* The stippled sub-op is the full-screen backdrop; the panel's own
+         * rects arrive as the nested solid sub-op that follows it. */
         sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
                                  0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
         trace_sgi_gr2_re3_stipple(fg, s->re3_colour, s->re3_stipple,
                                   SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
-    } else if (s->re3_colour_valid) {
-        uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, 0, 0,
-                                        SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
-
-        trace_sgi_gr2_re3_fill(s->re3_colour, rgb,
-                               SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+        return;
     }
+    if (s->re3_spans_seen) {
+        /* expSolidSpans: a span list, not a fill.  The PUC path draws the
+         * weave spans inline; the DDX span op itself paints nothing here. */
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    if (s->re3_solid_seen) {
+        /* Token 309 is the sub-op's GC/ROP mode.  Real fills seen so far carry
+         * 0; the weave op's trailing full-screen black rect carries 0xf, and
+         * painting it would wipe the weave, so a non-zero mode is flagged, not
+         * painted, until its meaning is pinned. */
+        if (s->re3_rop == 0) {
+            sgi_gr2_re3_paint_rect_list(s, s->re3_colour);
+        } else {
+            trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        }
+        return;
+    }
+    if (s->re3_data_n || s->re3_data_overflow) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+    }
+}
+
+/* Clear the per-sub-op state.  The data buffer and the ROP latch belong to one
+ * sub-op, so they reset with the markers; the PUC span state does not. */
+static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
+{
+    s->re3_solid_seen = false;
+    s->re3_spans_seen = false;
+    s->re3_pair_seen = false;
+    s->re3_stipple_valid = false;
+    s->re3_fg_valid = false;
+    s->re3_rop_valid = false;
+    s->re3_data_n = 0;
+    s->re3_data_overflow = false;
 }
 
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
@@ -321,6 +380,14 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->prev_puc = s->last_puc;
         s->last_puc = value;
         s->last_puc_valid = true;
+        /* Keep the sub-op's PUC_DATA for the rect-list decoder.  The weave op's
+         * 1024 spans arrive before its own 331, so they fill and then reset the
+         * buffer at the 331; only the tail that belongs to the 331 matters. */
+        if (s->re3_data_n < SGI_GR2_RE3_DATA_MAX) {
+            s->re3_data[s->re3_data_n++] = value;
+        } else {
+            s->re3_data_overflow = true;
+        }
         if (s->prev_puc == SGI_GR2_SCREEN_W &&
             s->last_puc == SGI_GR2_SCREEN_H) {
             s->re3_pair_seen = true;
@@ -340,11 +407,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * a flat solid fill without guessing at the PUC_DATA tail. */
     if (size == 4 && offset == SGI_GR2_RE3_OP_TOKEN) {
         sgi_gr2_re3_flush_fill(s);
-        s->re3_solid_seen = false;
-        s->re3_spans_seen = false;
-        s->re3_pair_seen = false;
-        s->re3_stipple_valid = false;
-        s->re3_fg_valid = false;
+        sgi_gr2_re3_reset_subop(s);
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_MODE_TOKEN) {
+        s->re3_rop = (uint32_t)value;
+        s->re3_rop_valid = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_SOLID_TOKEN) {
         s->re3_solid_seen = true;
@@ -365,11 +432,7 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
          * an expSolidSpans triple list from being mistaken for a rect. */
         sgi_gr2_re3_flush_fill(s);
         s->re3_colour_valid = false;
-        s->re3_solid_seen = false;
-        s->re3_spans_seen = false;
-        s->re3_pair_seen = false;
-        s->re3_stipple_valid = false;
-        s->re3_fg_valid = false;
+        sgi_gr2_re3_reset_subop(s);
     }
     /* HQ2-block writes (start / DMA control / FIFO thresholds) with the PC. */
     if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
@@ -600,6 +663,10 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_stipple = 0;
     s->re3_fg = 0;
     s->re3_fg_valid = false;
+    s->re3_rop = 0;
+    s->re3_rop_valid = false;
+    s->re3_data_n = 0;
+    s->re3_data_overflow = false;
     s->last_puc = 0;
     s->prev_puc = 0;
     s->last_puc_valid = false;
