@@ -739,6 +739,12 @@ static void sgi_ip27_init(MachineState *machine) {
     env->PAMask = IP27_PAMASK;
     /* Model a cold reset (ErrorEPC clear) for the PROM's reset dispatch. */
     env->cold_erre_clear = true;
+    /*
+     * IP27 derives its scheduling clock from CP0 COUNT/COMPARE (IP7); lock
+     * COUNT to the host wall clock so the interval is honoured instead of the
+     * virtual clock racing ahead and livelocking IP7 (see cp0_timer.c).
+     */
+    env->count_realtime = true;
 
     cpu_mips_irq_init_cpu(c);
     cpu_mips_clock_init(c);
