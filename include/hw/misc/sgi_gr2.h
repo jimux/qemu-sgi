@@ -87,6 +87,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_VIEWPORT 0x400f0 /* token 60                          */
 #define SGI_GR2_GE7_NORMAL   0x400d4 /* token 53                          */
 #define SGI_GR2_GE7_MV       0x400dc /* token 55, 16 floats               */
+#define SGI_GR2_GE7_SINGLE   0x400d8 /* token 54, 16 floats: the MSINGLE  */
+                                     /* combined (projection*viewing)     */
+                                     /* matrix.  IRIS GL puts the whole    */
+                                     /* transform here when mmode=MSINGLE, */
+                                     /* which is what ideas' line/tmesh    */
+                                     /* pass uses (note 90).               */
 #define SGI_GR2_GE7_PROJ     0x400e0 /* token 56, 16 floats               */
 #define SGI_GR2_GE7_TEX      0x400e4 /* token 57, texture matrix          */
 #define SGI_GR2_GE7_VTX      0x4298c /* token 2659, three floats          */
@@ -451,6 +457,13 @@ struct SGIGr2State {
     unsigned ge_proj_n;            /* words of the current projection run    */
     bool ge_mv_valid;
     bool ge_proj_valid;
+    /* MSINGLE combined matrix (token 54).  When it is the most recently
+     * written matrix port it is the whole transform, so it takes precedence
+     * over the separate modelview/projection pair. */
+    float ge_single[16] __attribute__((aligned(16)));
+    unsigned ge_single_n;
+    bool ge_single_valid;
+    unsigned long ge_seq54, ge_seq55, ge_seq56, ge_seq;
     int vp_x;                      /* token 60 + 3 PUC_DATA: viewport x,y,w,h */
     int vp_y;
     int vp_w;

@@ -973,28 +973,48 @@ static void sgi_gr2_ge7_clear_rect(SGIGr2State *s, int vx, int vy, int vw,
     s->ge_3d_seen = true;
 }
 
+/* True when the MSINGLE combined matrix (token 54) is the current transform,
+ * i.e. it was written more recently than the separate modelview/projection.
+ * powerflip sets 54 only at init and drives 55/56, so it is unaffected; ideas
+ * draws its lines/meshes in MSINGLE and relies on 54. */
+static bool sgi_gr2_ge7_single_active(const SGIGr2State *s)
+{
+    return s->ge_single_valid && s->ge_seq54 > s->ge_seq55 &&
+           s->ge_seq54 > s->ge_seq56;
+}
+
 /* Transform an object-space point by projection*modelview.  Returns false if
  * the point is behind the eye (w <= 0) so it is skipped rather than projected
  * through the eye. */
 static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
                               float *sx, float *sy, float *sz)
 {
+    static const float ident[16] = { 1, 0, 0, 0, 0, 1, 0, 0,
+                                     0, 0, 1, 0, 0, 0, 0, 1 };
+    const float *mv, *proj;
     float cam[4], clip[4];
     int r, c;
 
-    if (!s->ge_mv_valid || !s->ge_proj_valid) {
-        return false;
+    if (sgi_gr2_ge7_single_active(s)) {
+        mv = s->ge_single;
+        proj = ident;
+    } else {
+        if (!s->ge_mv_valid || !s->ge_proj_valid) {
+            return false;
+        }
+        mv = s->ge_mv;
+        proj = s->ge_proj;
     }
     for (r = 0; r < 4; r++) {
-        cam[r] = s->ge_mv[3 * 4 + r]; /* v[3] = 1 */
+        cam[r] = mv[3 * 4 + r]; /* v[3] = 1 */
         for (c = 0; c < 3; c++) {
-            cam[r] += s->ge_mv[c * 4 + r] * p[c];
+            cam[r] += mv[c * 4 + r] * p[c];
         }
     }
     for (r = 0; r < 4; r++) {
         clip[r] = 0.0f;
         for (c = 0; c < 4; c++) {
-            clip[r] += s->ge_proj[c * 4 + r] * cam[c];
+            clip[r] += proj[c * 4 + r] * cam[c];
         }
     }
     if (clip[3] <= 0.0f) {
@@ -1111,7 +1131,10 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
      * no origin source the drawable sits at the screen origin. */
     vx += s->ge_win_x;
     vy += s->ge_win_y;
-    if (s->ge_need_clear) {
+    if (s->ge_need_clear && !sgi_gr2_ge7_single_active(s)) {
+        /* Only the 3D modelview/projection path clears per frame; a MSINGLE
+         * app (ideas) writes 55 per object, so clearing there would wipe its
+         * line art mid-frame. */
         sgi_gr2_ge7_clear_rect(s, vx, vy, vw, vh);
         s->ge_need_clear = false;
     }
@@ -1268,7 +1291,6 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     float lx, ly, lz, hx, hy, hz;
     float nx[3] = { 0.0f, 0.0f, 1.0f };
     float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
-    float pz[SGI_GR2_GE7_MAX_LVERTS];
     unsigned i;
     const float shininess = 8.0f;
     int idx;
@@ -1319,11 +1341,10 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
         }
         px[i] = vx + (cx + 1.0f) * 0.5f * vw;
         py[i] = vy + (1.0f - (cy + 1.0f) * 0.5f) * vh;
-        pz[i] = cz;
     }
     for (i = 1; i < s->ge_line_n; i++) {
-        float x0 = px[i - 1], y0 = py[i - 1], z0 = pz[i - 1];
-        float x1 = px[i], y1 = py[i], z1 = pz[i];
+        float x0 = px[i - 1], y0 = py[i - 1];
+        float x1 = px[i], y1 = py[i];
         int steps, st;
 
         if (x0 < -1e8f || x1 < -1e8f) {
@@ -1340,7 +1361,8 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
             float t = (float)st / (float)steps;
             int x = (int)(x0 + (x1 - x0) * t + 0.5f);
             int y = (int)(y0 + (y1 - y0) * t + 0.5f);
-            float z = z0 + (z1 - z0) * t;
+            float z = -1.0f; /* 2D lines on top: they are the app's ink, not
+                              * depth-sorted geometry (ideas). */
             size_t o;
 
             x = MAX(x, vx); y = MAX(y, vy);
@@ -1396,6 +1418,18 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         offset != SGI_GR2_HQ_TOKEN_START) {
         s->ge_clip_armed = false;
     }
+    /* A matrix operand is always 16 consecutive words on its own port.  Any
+     * other token ends a run, so a partial run cannot leak into the next
+     * matrix and misalign it. */
+    if (offset != SGI_GR2_GE7_MV) {
+        s->ge_mv_n = 0;
+    }
+    if (offset != SGI_GR2_GE7_PROJ) {
+        s->ge_proj_n = 0;
+    }
+    if (offset != SGI_GR2_GE7_SINGLE) {
+        s->ge_single_n = 0;
+    }
 
     switch (offset) {
     case SGI_GR2_GE7_WINRECT:
@@ -1445,6 +1479,7 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         if (s->ge_mv_n == 16) {
             s->ge_mv_n = 0;
             s->ge_mv_valid = true;
+            s->ge_seq55 = ++s->ge_seq;
             /* A fresh modelview begins a frame: clear the Z-buffer to "far"
              * (0x7f7f7f7f ~ +3.4e38) so the previous frame does not occlude
              * it, and mark the drawable for a colour clear.  The FIFO stream
@@ -1457,11 +1492,21 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
             s->ge_need_clear = true;
         }
         break;
+    case SGI_GR2_GE7_SINGLE:
+        /* MSINGLE combined matrix: the whole transform in one 16-float run. */
+        s->ge_single[s->ge_single_n++] = sgi_gr2_u2f(v);
+        if (s->ge_single_n == 16) {
+            s->ge_single_n = 0;
+            s->ge_single_valid = true;
+            s->ge_seq54 = ++s->ge_seq;
+        }
+        break;
     case SGI_GR2_GE7_PROJ:
         s->ge_proj[s->ge_proj_n++] = sgi_gr2_u2f(v);
         if (s->ge_proj_n == 16) {
             s->ge_proj_n = 0;
             s->ge_proj_valid = true;
+            s->ge_seq56 = ++s->ge_seq;
         }
         break;
     case SGI_GR2_GE7_TEX:
