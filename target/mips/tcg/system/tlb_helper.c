@@ -711,9 +711,25 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
         env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
                            ((address >> 9) & 0x007ffff0);
     }
-    env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
-                       (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
-                       (address & (TARGET_PAGE_MASK << 1));
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I EntryHi.VPN is VA[31:12] (20 bits): there is one 4 KiB page
+         * per entry, so VA[12] is part of the VPN and must be preserved.  The
+         * MIPS III/IV formula below masks with TARGET_PAGE_MASK << 1 because
+         * there VA[12] is the odd/even selector and is NOT part of VPN2, so
+         * for an R3000 it would drop VPN bit 0 and make the software refill
+         * build a TLB entry for the wrong (VA & ~0x1000) page, faulting
+         * forever on any page whose VA[12] is set (e.g. the IRIX kseg2 heap
+         * at 0xC0019000) and reporting a bus error.
+         */
+        env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
+                           (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
+                           (address & TARGET_PAGE_MASK);
+    } else {
+        env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
+                           (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
+                           (address & (TARGET_PAGE_MASK << 1));
+    }
 #if defined(TARGET_MIPS64)
     env->CP0_EntryHi &= env->SEGMask;
     env->CP0_XContext =
