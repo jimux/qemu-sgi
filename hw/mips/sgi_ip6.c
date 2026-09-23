@@ -130,7 +130,7 @@
 /* WD33C93 SCSI (indirect address/data ports) and its reset lines */#define SGI_IP6_SCSI_BASE   0x1fb00000ULL
 #define SGI_IP6_SCSI_SIZE   0x200
 #define SGI_IP6_SCSIRST_BASE 0x1fa80000ULL
-#define SGI_IP6_SCSIRST_SIZE 0x10
+#define SGI_IP6_SCSIRST_SIZE 0x08
 
 /* LIO interrupt bits (MAME ip6.cpp lio_int_number) */
 #define LIO_VR              2   /* vertical retrace interrupt */
@@ -184,6 +184,16 @@
 #define PARERR_B0           0x80
 #define PARERR_BYTE         0xf0
 
+/*
+ * The bus-error handler needs the physical base of the region it was called
+ * for: MemoryRegionOps handlers receive the offset within the region, and
+ * erradr must latch the absolute address the CPU touched.
+ */
+typedef struct SGIip6BuserrCtx {
+    struct SGIip6State *sgi;
+    hwaddr base;
+} SGIip6BuserrCtx;
+
 typedef struct SGIip6State {
     MemoryRegion ctl1;
     MemoryRegion ram_win;
@@ -202,6 +212,7 @@ typedef struct SGIip6State {
     MemoryRegion rtc;
     MemoryRegion scsi_regs;
     MemoryRegion scsi_reset;
+    MemoryRegion scsi_buserr;
     MemoryRegion duart_regs;
     MemoryRegion lance_regs;
     MemoryRegion lance_reset;
@@ -253,6 +264,8 @@ typedef struct SGIip6State {
     uint32_t erradr;
     uint32_t refadr;
     int64_t ref_load_time;
+
+    SGIip6BuserrCtx buserr_ctx[3];
 
     /*
      * CTL1 parity mechanism (MAME sgi/ctl1.cpp).  While CPUCFG_BAD is set,
@@ -626,40 +639,50 @@ static const MemoryRegionOps sgi_ip6_lio_ops = {
 /* ---- bus-error regions (MAME sgi/ip6.cpp buserror_r / buserror_w) ----- */
 
 /*
- * A non-existent VME/high-space access latches erradr and asserts the
- * bus-error line.  MAME wires that line to INPUT_LINE_IRQ5, and MAME's mips1
- * core maps irqline n to Cause bit (10 + n), i.e. IRQ5 -> bit 15 = IP7; QEMU
- * maps env->irq[n] to Cause bit (8 + n) (hw/mips/mips_int.c), so the same
- * Cause bit is QEMU irq[7].  That is the bit IRIX's badaddr() polls: it sets
- * the address, reads it, then tests Cause & 0x8000.
+ * A non-existent VME/high-space access latches erradr and raises the
+ * bus-error line, in both directions.  MAME wires the line to INPUT_LINE_IRQ5
+ * on a write, and maps irqline n to Cause bit (10 + n), i.e. IRQ5 -> bit 15;
+ * QEMU maps env->irq[n] to Cause bit (8 + n) (hw/mips/mips_int.c), so the line
+ * is QEMU irq[7].
  *
- * MAME additionally asserts berr_w on a read of this range (a synchronous
- * bus error).  We deliberately do not: badaddr() reads such an address and
- * expects to complete the load and find the error latched in Cause, not to
- * take an exception, and a real CTL1 latches the error and raises the line.
- * Parity errors keep their synchronous data bus error (see below).
+ * A read must COMPLETE (returning 0) and leave the line latched, not take an
+ * exception.  IRIX's badaddr() is built to that behaviour: it clears the latch
+ * (lw from 0xbfa40000), raises in_badaddr, does the load, then tests
+ * Cause & 0x8000 and, on a hit, jumps to baerror, which re-reads 0xbfa40000 to
+ * drop the line and returns 1.  Delivering MEMTX_ERROR instead makes the probe
+ * fault past that poll, so the latch is never re-armed the way badaddr expects.
+ *
+ * erradr latches the absolute physical address: the ops handler is handed the
+ * offset within the region, so the region base is carried in the opaque.
  */
-static uint64_t sgi_ip6_buserr_read(void *opaque, hwaddr addr, unsigned size)
+static MemTxResult sgi_ip6_buserr_read(void *opaque, hwaddr addr,
+                                       uint64_t *data, unsigned size,
+                                       MemTxAttrs attrs)
 {
-    SGIip6State *s = opaque;
+    SGIip6BuserrCtx *ctx = opaque;
+    SGIip6State *s = ctx->sgi;
 
-    s->erradr = addr;
+    s->erradr = ctx->base + addr;
     qemu_set_irq(s->cpu->env.irq[7], 1);
-    return 0;
+    *data = 0;
+    return MEMTX_OK;
 }
 
-static void sgi_ip6_buserr_write(void *opaque, hwaddr addr, uint64_t data,
-                                 unsigned size)
+static MemTxResult sgi_ip6_buserr_write(void *opaque, hwaddr addr,
+                                        uint64_t data, unsigned size,
+                                        MemTxAttrs attrs)
 {
-    SGIip6State *s = opaque;
+    SGIip6BuserrCtx *ctx = opaque;
+    SGIip6State *s = ctx->sgi;
 
-    s->erradr = addr;
+    s->erradr = ctx->base + addr;
     qemu_set_irq(s->cpu->env.irq[7], 1);
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps sgi_ip6_buserr_ops = {
-    .read = sgi_ip6_buserr_read,
-    .write = sgi_ip6_buserr_write,
+    .read_with_attrs = sgi_ip6_buserr_read,
+    .write_with_attrs = sgi_ip6_buserr_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -1768,13 +1791,19 @@ static void sgi_ip6_init(MachineState *machine)
     }
     memory_region_add_subregion(system_memory, 0, &s->ram_win);
 
-    memory_region_init_io(&s->buserr, OBJECT(machine), &sgi_ip6_buserr_ops, s,
-                          "sgi-ip6-buserr", SGI_IP6_BUSERR_SIZE);
+    s->buserr_ctx[0].sgi = s;
+    s->buserr_ctx[0].base = SGI_IP6_BUSERR_BASE;
+    s->buserr_ctx[1].sgi = s;
+    s->buserr_ctx[1].base = SGI_IP6_HIGH_BASE;
+
+    memory_region_init_io(&s->buserr, OBJECT(machine), &sgi_ip6_buserr_ops,
+                          &s->buserr_ctx[0], "sgi-ip6-buserr",
+                          SGI_IP6_BUSERR_SIZE);
     memory_region_add_subregion(system_memory, SGI_IP6_BUSERR_BASE,
                                 &s->buserr);
     memory_region_init_io(&s->buserr_high, OBJECT(machine),
-                          &sgi_ip6_buserr_ops, s, "sgi-ip6-buserr-high",
-                          SGI_IP6_HIGH_SIZE);
+                          &sgi_ip6_buserr_ops, &s->buserr_ctx[1],
+                          "sgi-ip6-buserr-high", SGI_IP6_HIGH_SIZE);
     memory_region_add_subregion(system_memory, SGI_IP6_HIGH_BASE,
                                 &s->buserr_high);
 
@@ -1899,6 +1928,21 @@ static void sgi_ip6_init(MachineState *machine)
                           SGI_IP6_SCSIRST_SIZE);
     memory_region_add_subregion(system_memory, SGI_IP6_SCSIRST_BASE,
                                 &s->scsi_reset);
+
+    /*
+     * MAME ip6.cpp maps 0x1fa80008-0x1fa8000b to buserror_r/w (the "scsibstat"
+     * register above it is commented out there).  scsi_init() relies on that:
+     * it probes 0xbfa80008 with wbadaddr() and skips the SCSI-present test when
+     * the write bus-errors.  With our reset region sized 0x10 the probe landed
+     * on a no-op, returned "writable", and scsi_init instead wrote 0x8c and
+     * read back 0, never setting the SCSI-present flag.
+     */
+    s->buserr_ctx[2].sgi = s;
+    s->buserr_ctx[2].base = 0x1fa80008;
+    memory_region_init_io(&s->scsi_buserr, OBJECT(machine),
+                          &sgi_ip6_buserr_ops, &s->buserr_ctx[2],
+                          "sgi-ip6-scsibuserr", 0x04);
+    memory_region_add_subregion(system_memory, 0x1fa80008, &s->scsi_buserr);
 
     /* IP6 mouse: Mouse Systems peer on DUART0-B (serial chardevs unused). */
     s->mouse = SGI_IP6_INPUT(qdev_new(TYPE_SGI_IP6_INPUT));
