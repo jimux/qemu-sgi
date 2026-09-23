@@ -127,6 +127,7 @@ struct SGIGL2State {
     uint32_t rgb_color, rgb_we;   /* 32-bit RGB plane colour / write-enable */
     bool rgb_valid;               /* rgb registers in force (else A/B/C/D) */
     unsigned nplanes;             /* installed BP3 planes (device property) */
+    int readback_seq;             /* FBCpixelsetup plane-mask readback */
     uint16_t ucr;
     uint16_t scrmaskx, scrmasky;
     uint16_t fmaddr;              /* current FM (font/pattern) address */
@@ -389,7 +390,20 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
             if (s->micro_access) {
                 return idx < 4096 ? s->microram[s->micro_slice][idx] : 0;
             }
-            return s->fbc_out;
+            switch (s->readback_seq) {
+            case 1:
+                s->readback_seq = 2;
+                return 10;              /* _INTPIXEL32 */
+            case 2:
+                s->readback_seq = 3;
+                return (s->nplanes > 16)
+                       ? ((1u << (s->nplanes - 16)) - 1) : 0;   /* CD */
+            case 3:
+                s->readback_seq = 0;
+                return (1u << (s->nplanes < 16 ? s->nplanes : 16)) - 1; /* AB */
+            default:
+                return s->fbc_out;
+            }
         }
         default:
             return 0;           /* GEflags reads as 0 when idle */
@@ -650,7 +664,6 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         }
         fprintf(stderr, "\n");
     }
-
     switch (cmd) {
     case 0x04:                          /* FBCrgbcolor */
     case 0x05:                          /* FBCrgbwrten */
@@ -750,6 +763,7 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         for (i = 0; i + 1 < nargs; i++) {
             if (args[i] == 0x000e) {
                 s->fbc_out = 10;        /* _INTPIXEL32 */
+                s->readback_seq = 1;    /* next FBCdata reads: intcode, CD, AB */
                 s->prog_int_pending = true;
                 gl2_update_irq(s);
                 break;
@@ -1087,6 +1101,7 @@ static void gl2_reset(DeviceState *dev)
     s->cur_map = 0;
     s->rgb_color = s->rgb_we = 0;
     s->rgb_valid = false;
+    s->readback_seq = 0;
     s->vert_pending = false;
     s->prog_int_pending = false;
     if (s->retrace_timer) {
