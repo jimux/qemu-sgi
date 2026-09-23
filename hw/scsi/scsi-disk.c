@@ -2662,6 +2662,16 @@ static void scsi_hd_realize(SCSIDevice *dev, Error **errp)
     }
     s->qdev.blocksize = s->qdev.conf.logical_block_size;
     s->qdev.type = TYPE_DISK;
+    /*
+     * Initialise max_lba from the backend geometry now that blocksize is
+     * known.  scsi_disk_reset() does this too, but the resettable hold
+     * phase is not reached for disks created by the legacy "if=scsi"
+     * command line path, so max_lba would stay 0 and every request past
+     * LBA 0 would be rejected with LBA_OUT_OF_RANGE.  Drivers that never
+     * issue READ CAPACITY (e.g. the IRIX 4.0.5 "dksc" standalone, which
+     * takes its geometry from the SGI volume header) rely on this.
+     */
+    scsi_disk_reset(DEVICE(dev));
     if (!s->product) {
         s->product = g_strdup("QEMU HARDDISK");
     }
