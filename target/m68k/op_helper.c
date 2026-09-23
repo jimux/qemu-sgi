@@ -316,6 +316,13 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     vector = cs->exception_index << 2;
 
     sr = env->sr | cpu_m68k_get_ccr(env);
+    if (getenv("SGI_SYSCALL_LOG") && cs->exception_index == EXCP_TRAP0) {
+        fprintf(stderr, "SYSCALL nr=%u d1=%08x d2=%08x a0=%08x a1=%08x "
+                "pc=%08x usr=%d\n",
+                env->dregs[0], env->dregs[1], env->dregs[2],
+                env->aregs[0], env->aregs[1], (unsigned)last_pc,
+                !(sr & SR_S));
+    }
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
         static int count;
         qemu_log("INT %6d: %s(%#x) pc=%08x sp=%08x sr=%04x\n",
