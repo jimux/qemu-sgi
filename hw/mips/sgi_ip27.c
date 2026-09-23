@@ -814,11 +814,20 @@ static void sgi_ip27_init(MachineState *machine) {
    * memory; here they all resolve to node 0.
    */
   for (i = 1; i <= IP27_NODE_TAG_MAX; i++) {
-    MemoryRegion *na = g_new(MemoryRegion, 1);
+    /*
+     * Reproduce the memory controller's BANK-SLOT layout (bank b at b << 29),
+     * not a flat 256 MB window.  The PROM DIMM probe sizes a 256 MB node as
+     * two 128 MB banks, so a page in the second DIMM carries the physical
+     * address tag | 0x20000000 (MD_BANK_SHFT = 29, i.e. 512 MB slots).  A flat
+     * alias of machine->ram_size stops at 256 MB, so the first bank-1 page the
+     * kernel allocates (measured: 0x1c020002298, bank1 @ 512 MB) landed in a
+     * hole and raised a user Data Bus Error.  ip27_add_ram_banks() maps each
+     * bank slot onto ram[] exactly as the CAC/HSPEC containers already do.
+     */
+    uint64_t banksz = MIN(machine->ram_size, (uint64_t)0x8000000);
 
-    memory_region_init_alias(na, NULL, "sgi-ip27.ram.nodetag", ram, 0,
-                             machine->ram_size);
-    memory_region_add_subregion(system_memory, (uint64_t)i << 32, na);
+    ip27_add_ram_banks(system_memory, (uint64_t)i << 32, ram,
+                       machine->ram_size, banksz, "sgi-ip27.ram.nodetag");
   }
 
   /*
