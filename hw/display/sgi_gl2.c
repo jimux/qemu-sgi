@@ -104,6 +104,7 @@ struct SGIGL2State {
      * the line on the read that services it.
      */
     QEMUTimer *retrace_timer;
+    bool no_retrace;   /* SGI_GL2_NO_RETRACE: A/B test hook */
     bool vert_pending;
     bool prog_int_pending;
 
@@ -1001,6 +1002,9 @@ static void gl2_retrace_timer(void *opaque)
 {
     SGIGL2State *s = opaque;
 
+    if (s->no_retrace) {
+        return;         /* A/B hook: leave the retrace line unasserted */
+    }
     s->vert_pending = true;
     gl2_update_irq(s);
     if (s->retrace_timer) {
@@ -1073,6 +1077,7 @@ static void gl2_init(Object *obj)
 
     s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
     s->retrace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gl2_retrace_timer, s);
+    s->no_retrace = getenv("SGI_GL2_NO_RETRACE") != NULL;
     memory_region_init_io(&s->mmio, obj, &gl2_ops, s, "sgi-gl2",
                           GL2_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
