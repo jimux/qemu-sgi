@@ -101,6 +101,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
                                      /* a window move (note 79)            */
 #define SGI_GR2_GE7_MAX_VERTS 64     /* vertices buffered per polygon     */
 
+/* Phong material/light state, one float per token write (the client repeats
+ * the token for each component).  See note 75: 117 ambient_sum, 118/119
+ * emission, 120/121 ambient, 122/123 diffuse (+alpha), 124/125 specular,
+ * 126 lcolor, 127 lightpos, 129 lmcolor.  The 12x pair are the front/back
+ * material sides; we shade the front. */
+#define SGI_GR2_GE7_AMBIENT_SUM 0x401d4 /* token 117, RGB                  */
+#define SGI_GR2_GE7_EMISSION    0x401d8 /* token 118, RGB                  */
+#define SGI_GR2_GE7_AMBIENT     0x401e0 /* token 120, RGB                  */
+#define SGI_GR2_GE7_DIFFUSE     0x401e8 /* token 122, RGBA                 */
+#define SGI_GR2_GE7_SPECULAR    0x401f0 /* token 124, RGB                  */
+#define SGI_GR2_GE7_LCOLOR      0x401f8 /* token 126, light colour RGB     */
+#define SGI_GR2_GE7_LPOS        0x401fc /* token 127, light position XYZ   */
+#define SGI_GR2_GE7_LMCOLOR     0x40204 /* token 129, lighting model       */
+
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
 #define SGI_GR2_HQ_MYSTERY  0x6a07c /* presence magic, read by Gr2Probe */
 #define SGI_GR2_HQ_MAGIC    0xdeadbeefu
@@ -442,11 +456,26 @@ struct SGIGr2State {
     bool ge_clip_armed;
     bool ge_need_clear;            /* a fresh frame: clear the drawable first */
     float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
+    float ge_vnormal[SGI_GR2_GE7_MAX_VERTS][3]; /* its per-vertex normals     */
     unsigned ge_poly_n;
     float ge_normal[3];            /* current vertex normal                  */
     float ge_nx, ge_ny, ge_nz;     /* normal words collected                 */
     float ge_vx, ge_vy, ge_vz;     /* vertex words collected                 */
     unsigned ge_n_n, ge_v_n;       /* words collected for normal / vertex     */
+    /* Phong material/light state (tokens 116..129).  Each is a small vector
+     * filled one component per repeated token write; ge_mat_tok detects the
+     * run boundary so a 4-component (RGBA) vector does not leak its alpha
+     * into the next.  Values are the guest's, not assumed. */
+    float ge_ambient[3];           /* token 120: material ambient RGB        */
+    float ge_diffuse[3];           /* token 122: material diffuse RGB        */
+    float ge_specular[3];          /* token 124: material specular RGB       */
+    float ge_emission[3];          /* token 118: material emission RGB       */
+    float ge_lcolor[3];            /* token 126: light colour RGB            */
+    float ge_lpos[3];              /* token 127: light position XYZ          */
+    float ge_ambient_sum[3];       /* token 117: summed ambient RGB          */
+    hwaddr ge_mat_tok;             /* last material token (run boundary)     */
+    unsigned ge_mat_n;             /* components collected in the run        */
+    bool ge_mat_valid;
     float *ge_zbuf;                /* SCREEN_W*SCREEN_H depth, lazily made   */
     bool ge_3d_seen;               /* a polygon has been rasterised          */
     unsigned long ge_polys;        /* polygons rasterised (trace/diagnostics) */

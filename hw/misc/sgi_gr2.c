@@ -907,15 +907,15 @@ static inline float sgi_gr2_u2f(uint32_t v)
     return x.f;
 }
 
-/* Map an intensity level (0..15) to a palette index by nearest luminance, so
+/* Map an intensity level (0..31) to a palette index by nearest luminance, so
  * the shaded bust uses whatever palette the guest programmed rather than a
- * guessed index.  Rebuilt per polygon batch: 16 x 256 comparisons. */
-static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[16])
+ * guessed index.  Rebuilt per polygon batch: 32 x 256 comparisons. */
+static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[32])
 {
     int g, i;
 
-    for (g = 0; g < 16; g++) {
-        int target = g * 17;
+    for (g = 0; g < 32; g++) {
+        int target = g * 255 / 31;
         int best = 0, bestd = 1 << 30;
 
         for (i = 0; i < 256; i++) {
@@ -1011,16 +1011,50 @@ static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
  * back to the whole screen. */
 static void sgi_gr2_ge7_draw(SGIGr2State *s)
 {
-    float nx[SGI_GR2_GE7_MAX_VERTS], ny[SGI_GR2_GE7_MAX_VERTS];
-    float nz[SGI_GR2_GE7_MAX_VERTS];
     float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
     float sz[SGI_GR2_GE7_MAX_VERTS];
+    float iv[SGI_GR2_GE7_MAX_VERTS]; /* per-vertex light intensity          */
     int vx, vy, vw, vh;
     unsigned i;
-    uint8_t lut[16];
+    uint8_t lut[32];
+    /* Eye-space light and half vectors.  The guest sets one light position
+     * (token 127, (0,0,1) for powerflip) and the eye is at the origin looking
+     * down -z, so both point along +z; a positional light at finite distance
+     * would need the vertex, which the stream does not carry per component. */
+    float lx, ly, lz;
+    float hx, hy, hz;
+    const float shininess = 8.0f;
 
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
         return;
+    }
+    /* The light direction is the guest's, normalized; fall back to a headlight
+     * if no material/light has been seen yet. */
+    {
+        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
+                   s->ge_lpos[1] * s->ge_lpos[1] +
+                   s->ge_lpos[2] * s->ge_lpos[2];
+
+        if (s->ge_mat_valid && ll > 1e-6f) {
+            ll = sqrtf(ll);
+            lx = s->ge_lpos[0] / ll;
+            ly = s->ge_lpos[1] / ll;
+            lz = s->ge_lpos[2] / ll;
+        } else {
+            lx = 0.0f;
+            ly = 0.0f;
+            lz = 1.0f;
+        }
+        /* half vector between the (infinitely far) light and the eye */
+        hx = lx;
+        hy = ly;
+        hz = lz + 1.0f;
+        ll = sqrtf(hx * hx + hy * hy + hz * hz);
+        if (ll > 1e-6f) {
+            hx /= ll;
+            hy /= ll;
+            hz /= ll;
+        }
     }
     if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
         vx = s->vp_x;
@@ -1046,6 +1080,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     for (i = 0; i < s->ge_poly_n; i++) {
         float cx, cy, cz;
         float px, py;
+        float een[3], nn[3], col[3], inten;
         int c;
 
         if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz)) {
@@ -1056,12 +1091,51 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         sx[i] = px;
         sy[i] = py;
         sz[i] = cz;
-        /* rotate the normal by the modelview for shading */
-        nx[i] = ny[i] = nz[i] = 0.0f;
+        /* Rotate this vertex's own normal into eye space (the object-space
+         * normal was captured with the vertex, not shared per polygon). */
         for (c = 0; c < 3; c++) {
-            nx[i] += s->ge_mv[c * 4 + 0] * s->ge_normal[c];
-            ny[i] += s->ge_mv[c * 4 + 1] * s->ge_normal[c];
-            nz[i] += s->ge_mv[c * 4 + 2] * s->ge_normal[c];
+            een[c] = s->ge_mv[c * 4 + 0] * s->ge_vnormal[i][0] +
+                     s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
+                     s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
+        }
+        {
+            float nl = sqrtf(een[0] * een[0] + een[1] * een[1] +
+                             een[2] * een[2]);
+            float ndl, ndh;
+
+            if (nl > 1e-9f) {
+                nn[0] = een[0] / nl;
+                nn[1] = een[1] / nl;
+                nn[2] = een[2] / nl;
+            } else {
+                nn[0] = 0.0f;
+                nn[1] = 0.0f;
+                nn[2] = 1.0f;
+            }
+            /* Two-sided: the guest sends front and back material (tokens
+             * 120/122/124 and 121/123/125), so a normal facing away from the
+             * eye is flipped rather than left unlit. */
+            if (nn[2] < 0.0f) {
+                nn[0] = -nn[0];
+                nn[1] = -nn[1];
+                nn[2] = -nn[2];
+            }
+            ndl = nn[0] * lx + nn[1] * ly + nn[2] * lz;
+            ndl = MAX(ndl, 0.0f);
+            ndh = nn[0] * hx + nn[1] * hy + nn[2] * hz;
+            ndh = MAX(ndh, 0.0f);
+            /* Phong: emission + ambient_sum*ambient + lcolor*(diffuse*N.L +
+             * specular*(N.H)^s).  All terms are the guest's values. */
+            for (c = 0; c < 3; c++) {
+                col[c] = s->ge_emission[c] +
+                         s->ge_ambient[c] * s->ge_ambient_sum[c] +
+                         s->ge_lcolor[c] *
+                             (s->ge_diffuse[c] * ndl +
+                              s->ge_specular[c] * powf(ndh, shininess));
+                col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
+            }
+            inten = 0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2];
+            iv[i] = MIN(MAX(inten, 0.0f), 1.0f);
         }
     }
     sgi_gr2_ge7_greylut(s, lut);
@@ -1069,26 +1143,10 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         float ax = sx[0], ay = sy[0], az = sz[0];
         float bx = sx[i], by = sy[i], bz = sz[i];
         float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1];
-        float lx = nx[i], ly = ny[i], lz = nz[i];
-        float len = lx * lx + ly * ly + lz * lz;
-        float inten;
+        float i0 = iv[0], i1 = iv[i], i2 = iv[i + 1];
         int minx, maxx, miny, maxy, x, y;
         int idx;
         float area;
-
-        if (len > 0.0f) {
-            len = sqrtf(len);
-            inten = (lx * 0.3f + ly * 0.4f + lz * 0.86f) / len;
-        } else {
-            inten = 0.5f;
-        }
-        if (inten < 0.0f) {
-            inten = -inten;
-        }
-        if (inten > 1.0f) {
-            inten = 1.0f;
-        }
-        idx = lut[2 + (int)(inten * 13.0f)];
 
         minx = (int)MIN(ax, MIN(bx, cx));
         maxx = (int)MAX(ax, MAX(bx, cx)) + 1;
@@ -1118,12 +1176,20 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                 float w0 = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area;
                 float w1 = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area;
                 float w2 = 1.0f - w0 - w1;
+                float ig;
                 float z;
                 size_t o;
+                int li;
 
                 if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
                     continue;
                 }
+                /* Gouraud: interpolate the per-vertex intensity, then map it
+                 * to the nearest palette luminance. */
+                ig = w1 * i1 + w2 * i2 + w0 * i0;
+                li = (int)(ig * 31.0f + 0.5f);
+                li = MIN(MAX(li, 0), 31);
+                idx = lut[li];
                 z = w1 * bz + w2 * cz + w0 * az;
                 o = (size_t)y * SGI_GR2_SCREEN_W + x;
                 if (z < s->ge_zbuf[o]) {
@@ -1139,6 +1205,26 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
 
 /* Feed one FIFO token word to the GE7 3D path.  Returns true if the token was
  * a 3D command port (so the caller can skip unrelated paths if it wants). */
+/* Accumulate one component of a material/light vector.  The client repeats
+ * the token for every component, so a change of token starts a new vector;
+ * components past the third (e.g. diffuse's alpha) are collected and dropped
+ * rather than spilling into the next vector. */
+static void sgi_gr2_ge7_mat_word(SGIGr2State *s, float *dst, hwaddr tok,
+                                 float f)
+{
+    if (s->ge_mat_tok != tok) {
+        s->ge_mat_tok = tok;
+        s->ge_mat_n = 0;
+    }
+    if (s->ge_mat_n < 3) {
+        dst[s->ge_mat_n] = f;
+    }
+    s->ge_mat_n++;
+    if (s->ge_mat_n >= 3) {
+        s->ge_mat_valid = true;
+    }
+}
+
 static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
 {
     uint32_t v = (uint32_t)value;
@@ -1225,6 +1311,29 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         break;
     case SGI_GR2_GE7_TEX:
         break; /* texture matrix: not modelled, the bust is untextured */
+    case SGI_GR2_GE7_AMBIENT:
+        sgi_gr2_ge7_mat_word(s, s->ge_ambient, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_DIFFUSE:
+        sgi_gr2_ge7_mat_word(s, s->ge_diffuse, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_SPECULAR:
+        sgi_gr2_ge7_mat_word(s, s->ge_specular, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_EMISSION:
+        sgi_gr2_ge7_mat_word(s, s->ge_emission, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_LCOLOR:
+        sgi_gr2_ge7_mat_word(s, s->ge_lcolor, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_LPOS:
+        sgi_gr2_ge7_mat_word(s, s->ge_lpos, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_AMBIENT_SUM:
+        sgi_gr2_ge7_mat_word(s, s->ge_ambient_sum, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_LMCOLOR:
+        break; /* lighting-model selector: the material above is what we use */
     case SGI_GR2_GE7_NORMAL:
         switch (s->ge_n_n++) {
         case 0: s->ge_normal[0] = sgi_gr2_u2f(v); break;
@@ -1243,6 +1352,10 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
                 s->ge_poly[s->ge_poly_n][0] = s->ge_vx;
                 s->ge_poly[s->ge_poly_n][1] = s->ge_vy;
                 s->ge_poly[s->ge_poly_n][2] = s->ge_vz;
+                /* the normal that preceded this vertex belongs to it */
+                s->ge_vnormal[s->ge_poly_n][0] = s->ge_normal[0];
+                s->ge_vnormal[s->ge_poly_n][1] = s->ge_normal[1];
+                s->ge_vnormal[s->ge_poly_n][2] = s->ge_normal[2];
                 s->ge_poly_n++;
             }
             break;
