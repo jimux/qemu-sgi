@@ -61,11 +61,9 @@ static uint32_t sgi_gr2_word_write(uint64_t value, unsigned byte, unsigned size)
 static void sgi_gr2_update_display(void *opaque);
 
 /* RE3 solid-rectangle fill.  In the 8-bit mode the guest runs, the latched
- * colour is a RAMDAC index, so the fill expands it through the palette and
- * writes the resulting RGB into `scanout` — the same buffer the display
- * update reads, so the RE3 producer and the scanout stage meet in one place
- * and a black screen can only mean the producer wrote nothing.  Returns the
- * RGB written, for tracing. */
+ * colour is a RAMDAC index, and that is what the framebuffer stores — the
+ * palette is applied at scanout, not here.  Returns the RGB the index maps to
+ * right now, for tracing only. */
 static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
                                  int x, int y, int w, int h)
 {
@@ -91,7 +89,7 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
     }
     for (yy = y; yy < y + h; yy++) {
         for (xx = x; xx < x + w; xx++) {
-            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = rgb;
+            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = colour;
         }
     }
     sgi_gr2_update_display(s);
@@ -106,8 +104,6 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
 static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
                                      uint32_t pattern, int x, int y, int w, int h)
 {
-    uint32_t fg_rgb = s->ramdac[fg];
-    uint32_t bg_rgb = s->ramdac[bg];
     int xx, yy;
 
     if (!s->scanout) {
@@ -131,7 +127,7 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
         for (xx = x; xx < x + w; xx++) {
             bool on = (pattern >> (31 - (xx & 31))) & 1;
 
-            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = on ? fg_rgb : bg_rgb;
+            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = on ? fg : bg;
         }
     }
     sgi_gr2_update_display(s);
@@ -507,9 +503,15 @@ static void sgi_gr2_fill_bars(SGIGr2State *s)
     if (!s->scanout) {
         return;
     }
+    /* Test seam: the bars stand in for a drawn image, so put the bar colours in
+     * the first eight palette entries and write those indices — the scanout
+     * stage then resolves them like any other pixel. */
+    for (x = 0; x < 8; x++) {
+        s->ramdac[x] = bars[x];
+    }
     for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
         for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
-            s->scanout[y * SGI_GR2_SCREEN_W + x] = bars[x * 8 / SGI_GR2_SCREEN_W];
+            s->scanout[y * SGI_GR2_SCREEN_W + x] = x * 8 / SGI_GR2_SCREEN_W;
         }
     }
 }
@@ -531,8 +533,15 @@ static void sgi_gr2_update_display(void *opaque)
     dest = (uint32_t *)surface_data(surface);
     stride = surface_stride(surface);
     for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
-        memcpy(dest + (y * stride) / 4,
-               s->scanout + y * SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_W * 4);
+        uint32_t *row = dest + (y * stride) / 4;
+        const uint8_t *src = s->scanout + y * SGI_GR2_SCREEN_W;
+        int x;
+
+        /* The palette is applied HERE, at scanout, so a pixel drawn before its
+         * entry was programmed still shows the entry's final colour. */
+        for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
+            row[x] = s->ramdac[src[x]];
+        }
     }
     dpy_gfx_update(s->con, 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
 }
@@ -647,7 +656,7 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
     /* Scanout (P0.4 step a) only when the board is present, so plain
      * `-M indy` gains no extra console. */
     if (s->present) {
-        s->scanout = g_new0(uint32_t,
+        s->scanout = g_new0(uint8_t,
                             (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
         s->con = graphic_console_init(dev, 0, &sgi_gr2_gfx_ops, s);
         qemu_console_resize(s->con, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);

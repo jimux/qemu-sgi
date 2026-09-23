@@ -162,10 +162,13 @@ struct SGIGr2State {
     bool xmap_ready;
 
     /* Scanout (P0.4 step a): a QEMU display surface proving the output stage
-     * before the RE3 producer.  `scanout` is the framebuffer VC1 would scan
-     * (host xRGB32); VC1/RE3 will read it once the producer is emulated. */
+     * before the RE3 producer.  `scanout` holds palette INDICES, exactly as the
+     * hardware framebuffer does: the RAMDAC is applied when the buffer is
+     * scanned out, not when it is drawn.  That ordering matters — the DDX draws
+     * the root before it programs the entries the root uses, so resolving RGB
+     * at draw time would bake in whatever the palette happened to hold then. */
     QemuConsole *con;
-    uint32_t *scanout;
+    uint8_t *scanout;
     bool scanout_bars; /* fill a colour-bar test pattern (P0.4 step a) */
 
     /* RE3 producer colour latch + RAMDAC palette (8-bit mode).  In the 8-bit
