@@ -334,6 +334,14 @@ void mips_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
     MIPSCPUClass *mcc = MIPS_CPU_GET_CLASS(cs);
     CPUMIPSState *env = cpu_env(cs);
 
+    if (getenv("MIPS_TXFAIL_DBG")) {
+        qemu_log_mask(LOG_UNIMP,
+                      "mips-tx-fail: pc=0x%" PRIx64 " addr=0x%" PRIx64
+                      " phys=0x%" PRIx64 " size=%u access=%d response=%d\n",
+                      (uint64_t)env->active_tc.PC, (uint64_t)addr,
+                      (uint64_t)physaddr, size, access_type, response);
+    }
+
     if (access_type == MMU_INST_FETCH) {
         do_raise_exception(env, EXCP_IBE, retaddr);
     } else if (!mcc->no_data_aborts) {
