@@ -57,7 +57,14 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
 
     /* XXX: detect conflicting TLBs and raise a MCHECK exception when needed */
     tlb = &env->tlb->mmu.r4k.tlb[idx];
-    if (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) {
+    /*
+     * The R2000/R3000 have no EHINV bit: EntryHi[11:6] is the PID, so bit 10
+     * is part of the process ID and must not be read as "invalidate entry".
+     * Doing so discarded every MIPS-I entry whose PID had bit 4 set, which
+     * made the kernel's kseg2 refill for its heap a silent no-op and looped
+     * the fault forever.
+     */
+    if (!r3k && (env->CP0_EntryHi & (1 << CP0EnHi_EHINV))) {
         tlb->EHINV = 1;
         return;
     }
@@ -175,7 +182,7 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
 #if defined(TARGET_MIPS64)
     VPN &= env->SEGMask;
 #endif
-    EHINV = (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) != 0;
+    EHINV = !r3k && ((env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) != 0);
     /*
      * The Valid/Dirty/Global bits move between MIPS-I and MIPS III/IV (see
      * r4k_fill_tlb).  This test only decides whether a cached entry must be
