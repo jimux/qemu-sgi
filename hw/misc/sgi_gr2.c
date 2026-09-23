@@ -98,6 +98,45 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
     return rgb;
 }
 
+/* RE3 stippled-rectangle fill: the DDX arms a 32-bit stipple pattern on token
+ * 318 and a foreground colour index on token 314, then streams the rectangle.
+ * Render one pixel per bit of the pattern, repeating every 32 columns — bit 31
+ * is the leftmost pixel of each 32-pixel tile.  This is the grainy root: the
+ * X DDX's expStippledFillRects writes pattern 0x10101010 (a 1-in-4 dot). */
+static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
+                                     uint32_t pattern, int x, int y, int w, int h)
+{
+    uint32_t fg_rgb = s->ramdac[fg];
+    uint32_t bg_rgb = s->ramdac[bg];
+    int xx, yy;
+
+    if (!s->scanout) {
+        return;
+    }
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > SGI_GR2_SCREEN_W) {
+        w = SGI_GR2_SCREEN_W - x;
+    }
+    if (y + h > SGI_GR2_SCREEN_H) {
+        h = SGI_GR2_SCREEN_H - y;
+    }
+    for (yy = y; yy < y + h; yy++) {
+        for (xx = x; xx < x + w; xx++) {
+            bool on = (pattern >> (31 - (xx & 31))) & 1;
+
+            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = on ? fg_rgb : bg_rgb;
+        }
+    }
+    sgi_gr2_update_display(s);
+}
+
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGr2State *s = SGI_GR2(opaque);
@@ -220,14 +259,37 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->re3_colour_valid = true;
     }
     if (size == 4 && offset == SGI_GR2_HQ_TOKEN_START) {
-        if (s->last_puc_valid && s->re3_colour_valid &&
+        /* Only a real fill op paints the full-screen rect.  A segment/line op
+         * (expSegmentSS, tokens 328/330/345) streams a coordinate list that can
+         * merely CONTAIN the values 1280 and 1024; treating that as a
+         * full-screen fill painted the whole screen flat grey and hid the
+         * stippled root (note 27).  So require a fill marker (304 solid, 305
+         * spans, or a 318 stipple). */
+        if ((s->re3_solid_seen || s->re3_spans_seen ||
+             s->re3_stipple_valid) &&
+            s->last_puc_valid &&
             s->last_puc == SGI_GR2_SCREEN_W && value == SGI_GR2_SCREEN_H) {
-            uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, 0, 0,
-                                            SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+            if (s->re3_stipple_valid) {
+                /* Grainy root: token 318 armed a stipple pattern; draw the
+                 * rect as a stipple of fg (token 314) over bg (token 332). */
+                uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
 
-            trace_sgi_gr2_re3_fill(s->re3_colour, rgb,
-                                   SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+                sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
+                                         0, 0, SGI_GR2_SCREEN_W,
+                                         SGI_GR2_SCREEN_H);
+                trace_sgi_gr2_re3_stipple(fg, s->re3_colour, s->re3_stipple,
+                                          SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+            } else if (s->re3_colour_valid) {
+                uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, 0, 0,
+                                                SGI_GR2_SCREEN_W,
+                                                SGI_GR2_SCREEN_H);
+
+                trace_sgi_gr2_re3_fill(s->re3_colour, rgb,
+                                       SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+            }
             s->re3_colour_valid = false;
+            s->re3_stipple_valid = false;
+            s->re3_fg_valid = false;
         }
         /* The generic PUC path: PUC_COLOR chose the colour, PUC_RECTI2D armed
          * a rectangle, and its three PUC_DATA words are (x0, x1, y0) — one
@@ -258,6 +320,36 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (size == 4 && offset == SGI_GR2_PUC_RECTI2D_TOKEN) {
         s->puc_rect_armed = true;
         s->puc_rect_n = 0;
+    }
+    /* Fill-op markers (DDX token map, note 25/26).  An op starts at token 331,
+     * so the per-op markers are cleared there and set by 304 (solid rect),
+     * 314 (stipple fg colour) and 318 (stipple pattern); token 490 is the op
+     * terminator.  This is what distinguishes a grainy stippled root fill from
+     * a flat solid fill without guessing at the PUC_DATA tail. */
+    if (size == 4 && offset == SGI_GR2_RE3_OP_TOKEN) {
+        s->re3_solid_seen = false;
+        s->re3_spans_seen = false;
+        s->re3_stipple_valid = false;
+        s->re3_fg_valid = false;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_SOLID_TOKEN) {
+        s->re3_solid_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_SPANS_TOKEN) {
+        s->re3_spans_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_FG_TOKEN) {
+        s->re3_fg = value & 0xff;
+        s->re3_fg_valid = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_STIPPLE_TOKEN) {
+        s->re3_stipple = (uint32_t)value;
+        s->re3_stipple_valid = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_DONE_TOKEN) {
+        s->re3_solid_seen = false;
+        s->re3_stipple_valid = false;
+        s->re3_fg_valid = false;
     }
     /* HQ2-block writes (start / DMA control / FIFO thresholds) with the PC. */
     if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
@@ -471,6 +563,12 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->ramdac_stage_n = 0;
     s->re3_colour = 0;
     s->re3_colour_valid = false;
+    s->re3_solid_seen = false;
+    s->re3_spans_seen = false;
+    s->re3_stipple_valid = false;
+    s->re3_stipple = 0;
+    s->re3_fg = 0;
+    s->re3_fg_valid = false;
     s->last_puc = 0;
     s->last_puc_valid = false;
     if (s->irq) {

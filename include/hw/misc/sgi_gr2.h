@@ -67,6 +67,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_COLOUR_TOKEN 0x40530 /* FIFO token: RE3 pixel colour    */
 #define SGI_GR2_PUC_COLOR_TOKEN   0x40648 /* FIFO token: PUC_COLOR (index 402) */
 #define SGI_GR2_PUC_RECTI2D_TOKEN 0x40654 /* FIFO token: PUC_RECTI2D (405)    */
+/* Fill-op markers, read off the X DDX's own FIFO stores (token = offset/4;
+ * see progress_notes/indy/xz-gr2/25-*.md and 26-*.md).  Which shape an op
+ * draws is named by the marker token it writes, not by the PUC_DATA tail. */
+#define SGI_GR2_RE3_SOLID_TOKEN   0x404c0 /* token 304: expDrawSolidRects    */
+#define SGI_GR2_RE3_SPANS_TOKEN   0x404c4 /* token 305: expSolidSpans        */
+#define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
+#define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
+#define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
+#define SGI_GR2_RE3_DONE_TOKEN    0x407a8 /* token 490: op terminator        */
 #define SGI_GR2_HQ_NUMGE       0x6a044
 #define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
 #define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
@@ -177,6 +186,15 @@ struct SGIGr2State {
     bool puc_rect_armed;  /* a PUC_RECTI2D is awaiting its three data words  */
     uint32_t puc_rect[3];
     unsigned puc_rect_n;  /* data words collected for the armed rectangle    */
+
+    /* Fill-op markers (note 25/26).  A full-screen rect is drawn stippled when
+     * token 318 armed a pattern, flat when token 304 marked a solid rect. */
+    bool re3_solid_seen;    /* token 304 seen in the current op              */
+    bool re3_spans_seen;    /* token 305 seen in the current op              */
+    bool re3_stipple_valid; /* token 318 written: next rect is stippled      */
+    uint32_t re3_stipple;   /* 32-bit stipple pattern (token 318)            */
+    uint8_t re3_fg;         /* token 314: stipple foreground colour index    */
+    bool re3_fg_valid;
 
     /* Variant params supplied by the machine glue. */
     uint8_t ges;       /* number of GE7 engines (1, 2, 4, 8) */
