@@ -80,10 +80,10 @@
 /* IP20 keyboard HLE (DUART0 channel A, i.e. gfx(0)/KEYBD_PORT). The PROM's
  * libsk/io/sgi_kbd.c config_keyboard() writes CONFIG_REQUEST and expects the
  * standard keyboard's 2-byte reply: 0x6e (CONFIG_BYTE_NEWKB) then a layout id
- * <= 0x0f. Constants and the QKeyCode->scancode table are shared with
- * personal-iris's IP6 keyboard HLE (same SGI keyboard protocol family). */
+ * <= 0x0f. The type byte indexes sgi_kbd.c's kbd_types[] directly, where
+ * index 0 is "USA" and index 1 is "DEU" (German); so US MUST be 0. */
 #define HPC1_KBD_CONFIG_REQUEST 0x10
-#define HPC1_KBD_LAYOUT_US      1
+#define HPC1_KBD_LAYOUT_US      0
 
 static int scc_console_channel(const SGIHPC1State *s, int d, int c)
 {
