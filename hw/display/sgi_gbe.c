@@ -38,6 +38,8 @@
 #include "migration/vmstate.h"
 #include "ui/pixel_ops.h"
 #include "system/address-spaces.h"
+#include "system/memory.h"
+#include "system/ram_addr.h"
 #include "trace.h"
 #include "framebuffer.h"
 
@@ -429,11 +431,11 @@ static inline uint32_t sgi_gbe_gamma(SGIGBEState *s,
  *    "cm(4:0) & i8(7:0)"); with the DID stream off all pixels take
  *    WID 0 / mode_regs[0] (cm=0 → identical to the old window-0 lookup).
  */
-static void sgi_gbe_scanout(SGIGBEState *s)
+static bool sgi_gbe_scanout(SGIGBEState *s, bool force)
 {
     DisplaySurface *surface = qemu_console_surface(s->con);
     if (!surface) {
-        return;
+        return false;
     }
 
     int depth = (s->frm_size_tile >> 13) & 3;   /* 0=8 1=16 2=32bpp */
@@ -455,7 +457,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
     int pix_per_tile = (bpp == 1) ? 512 : (bpp == 2) ? 256 : 128;
     int width = width_tiles * pix_per_tile + rhs_pixels;
     if (width <= 0 || height <= 0) {
-        return;
+        return false;
     }
     width = MIN(width, 2048);
     height = MIN(height, 2048);
@@ -466,7 +468,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
         s->scan_height = height;
         surface = qemu_console_surface(s->con);
         if (!surface) {
-            return;
+            return false;
         }
     }
 
@@ -481,7 +483,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
     hwaddr list_ptr = s->frm_ctrl & 0xffffffe0;
     bool frm_on = (s->frm_ctrl & 1) != 0 && list_ptr != 0;
     if (!frm_on && !(s->ovr_ctrl & 1)) {
-        return;     /* neither channel's DMA enabled */
+        return false;     /* neither channel's DMA enabled */
     }
     trace_sgi_gbe_scanout(width, height, width_tiles, list_ptr);
 
@@ -504,6 +506,44 @@ static void sgi_gbe_scanout(SGIGBEState *s)
     int w = width_tiles + (rhs_pixels > 0 ? 1 : 0);
     int stride = surface_stride(surface) / sizeof(uint32_t);
     uint32_t *dst = (uint32_t *)surface_data(surface);
+    int sw = surface_width(surface);
+    int sh = surface_height(surface);
+
+    /*
+     * Dirty-region scanout.  Snapshot and clear the VGA dirty bitmap once
+     * per call; then decode only the tile scanlines whose backing bytes the
+     * guest wrote since the last scanout.  A control change (cmap/WID/DID/
+     * DMA geometry/cursor glyph) sets scan_dirty and passes force=true.
+     * With no ram link (any machine that does not set it) snap stays NULL
+     * and every line decodes, i.e. the previous full-frame behaviour.
+     */
+    DirtyBitmapSnapshot *snap = NULL;
+    if (!force && s->ram) {
+        snap = memory_region_snapshot_and_clear_dirty(
+            s->ram, 0, s->ram_size, DIRTY_MEMORY_VGA);
+    }
+    bool decoded_any = force;
+
+    /* Scanlines the hardware cursor occupies now or occupied before, so a
+     * moved cursor re-decodes the lines it vacated. */
+    bool crs_on = (s->crs_ctrl & 1) != 0;
+    int cr_y0 = 1, cr_y1 = 0;
+    if (crs_on && (s->crs_ctrl & 2)) {
+        cr_y0 = 0; cr_y1 = height;      /* crosshair = full-width row+col */
+    } else if (crs_on) {
+        int py = (s->crs_pos >> 16) & 0xfff;
+        int oy = (s->crs_pos_seen >> 16) & 0xfff;
+        if (!(s->crs_ctrl_seen & 1) || s->crs_ctrl != s->crs_ctrl_seen) {
+            cr_y0 = 0; cr_y1 = height;
+        } else if (s->crs_pos != s->crs_pos_seen) {
+            cr_y0 = MIN(py, oy);
+            cr_y1 = MAX(py + 32, oy + 32);
+        }
+    } else if (s->crs_ctrl_seen & 1) {
+        cr_y0 = 0; cr_y1 = height;      /* cursor turned off: erase */
+    }
+    s->crs_pos_seen = s->crs_pos;
+    s->crs_ctrl_seen = s->crs_ctrl;
 
     /*
      * Walk tile ROWS, not pixel columns: one tile row covers 128 LINES
@@ -569,6 +609,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                 /* overlay tile line for this span (8bpp: 512 px/tile) */
                 uint8_t ovr_buf[512];
                 bool have_ovr = false;
+                hwaddr obase = 0;
                 if (ovr_on && ovr_list != 0) {
                     /*
                      * Overlay descriptor index: the overlay's own
@@ -584,7 +625,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                                            MEMTXATTRS_UNSPECIFIED, &odesc, 2);
                         odesc = be16_to_cpu(odesc);
                         if (odesc != 0) {
-                            hwaddr obase = (hwaddr)(odesc & 0x7fff) << 16;
+                            obase = (hwaddr)(odesc & 0x7fff) << 16;
                             /*
                              * @@SEMANTICS@@ — an overlay tile is 512 bytes
                              * wide (8bpp: 512 px), but the normal-plane walk
@@ -609,6 +650,41 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                         }
                     }
                 }
+
+                /*
+                 * Skip a tile scanline whose backing bytes (normal plane
+                 * and overlay) the guest did not touch since the last
+                 * scanout.  Range-test only addresses inside ram; a tile
+                 * descriptor pointing outside (e.g. a SEG1 alias form)
+                 * falls back to decoding.  Cursor rows are forced dirty
+                 * above.
+                 */
+                bool line_dirty = force || !snap;
+                if (snap && !line_dirty) {
+                    hwaddr lo = tile_base + 512 * line;
+                    hwaddr sz = MIN(nbytes, 512 * 4);
+                    if (lo + sz <= s->ram_size) {
+                        line_dirty = memory_region_snapshot_get_dirty(
+                            s->ram, snap, lo, sz);
+                    } else {
+                        line_dirty = true;
+                    }
+                    if (!line_dirty && have_ovr) {
+                        lo = obase + 512 * (y & 127);
+                        sz = MIN(pix_here, 512);
+                        line_dirty = (lo + sz > s->ram_size) ||
+                            memory_region_snapshot_get_dirty(
+                                s->ram, snap, lo, sz);
+                    }
+                }
+                if (!line_dirty && y >= cr_y0 && y < cr_y1) {
+                    line_dirty = true;
+                }
+                if (!line_dirty) {
+                    x += pix_here;
+                    continue;
+                }
+                decoded_any = true;
 
                 for (int i = 0; i < pix_here && x < width; i++, x++) {
                     uint32_t r, g, b;
@@ -868,8 +944,7 @@ static void sgi_gbe_scanout(SGIGBEState *s)
                             b = grgb & 0xff;
                         }
                     }
-                    if (x >= 0 && x < surface_width(surface) &&
-                        y < surface_height(surface)) {
+                    if (x >= 0 && x < sw && y < sh) {
                         dst[y * stride + x] = rgb_to_pixel32(r, g, b);
                     }
                 }
@@ -880,14 +955,17 @@ static void sgi_gbe_scanout(SGIGBEState *s)
     /* ---- cursor compositing (spec §2.10) ---- */
     sgi_gbe_composite_cursor(s, surface);
 
+    g_free(snap);
     s->scan_dirty = false;
+    return decoded_any;
 }
 
 static void sgi_gbe_invalidate(void *opaque)
 {
     SGIGBEState *s = opaque;
     if (s->con) {
-        sgi_gbe_scanout(s);
+        /* Host surface lost/needs a full repaint: force every tile. */
+        sgi_gbe_scanout(s, true);
         dpy_gfx_update(s->con, 0, 0, surface_width(qemu_console_surface(s->con)),
                        surface_height(qemu_console_surface(s->con)));
     }
@@ -899,13 +977,17 @@ static void sgi_gbe_update(void *opaque)
     /*
      * Repaint when EITHER channel's DMA is enabled: during the console
      * switch the kernel runs with the overlay channel alone (frm DMA
-     * off, ovr on); gating on frm only froze the display.
+     * off, ovr on); gating on frm only froze the display.  A control-reg
+     * change (scan_dirty) forces a full decode; otherwise only tiles the
+     * guest touched since the last frame are decoded, and the host surface
+     * is pushed only when something actually changed.
      */
     if (s->con && ((s->frm_ctrl & 1) || (s->ovr_ctrl & 1))) {
-        sgi_gbe_scanout(s);
-        dpy_gfx_update(s->con, 0, 0,
-                       surface_width(qemu_console_surface(s->con)),
-                       surface_height(qemu_console_surface(s->con)));
+        if (sgi_gbe_scanout(s, s->scan_dirty)) {
+            dpy_gfx_update(s->con, 0, 0,
+                           surface_width(qemu_console_surface(s->con)),
+                           surface_height(qemu_console_surface(s->con)));
+        }
     }
 }
 
@@ -1283,54 +1365,84 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
         return;
 
     case GBE_OVR_WIDTH_TILE:
-        s->ovr_width_tile = v;
+        if (s->ovr_width_tile != v) {
+            s->ovr_width_tile = v;
+            s->scan_dirty = true;   /* overlay geometry/list mapping changed */
+        }
         return;
     case GBE_OVR_CTRL:
-        s->ovr_ctrl = v;
+        if (s->ovr_ctrl != v) {
+            s->ovr_ctrl = v;
+            s->scan_dirty = true;
+        }
         return;
     case GBE_OVR_INHWCTRL:
         /* inhwctrl is a read-only hardware view; accept the write */
         return;
 
     case GBE_FRM_SIZE_TILE:
-        s->frm_size_tile = v;
-        s->scan_dirty = true;
+        if (s->frm_size_tile != v) {
+            s->frm_size_tile = v;
+            s->scan_dirty = true;
+        }
         return;
     case GBE_FRM_SIZE_PIXEL:
-        s->frm_size_pixel = v;
-        s->scan_dirty = true;
+        if (s->frm_size_pixel != v) {
+            s->frm_size_pixel = v;
+            s->scan_dirty = true;
+        }
         return;
     case GBE_FRM_CTRL:
-        s->frm_ctrl = v;
-        s->scan_dirty = true;
+        if (s->frm_ctrl != v) {
+            s->frm_ctrl = v;
+            s->scan_dirty = true;
+        }
         trace_sgi_gbe_frm_ctrl(v);
         return;
     case GBE_FRM_INHWCTRL:
         return;
 
     case GBE_DID_CTRL:
-        s->did_ctrl = v;
+        if (s->did_ctrl != v) {
+            s->did_ctrl = v;
+            s->scan_dirty = true;   /* window table remap */
+        }
         return;
     case GBE_DID_INHWCTRL:
         return;
 
     /* Cursor */
     case GBE_CRS_POS:
+        /*
+         * Cursor moves are frequent, so they do NOT force a full decode:
+         * the scanout marks just the lines the cursor vacated/occupies
+         * (cr_y0..cr_y1) dirty.  crs_pos_seen records the previous pos.
+         */
         s->crs_pos = v;
-        s->scan_dirty = true;
         return;
     case GBE_CRS_CTRL:
-        s->crs_ctrl = v;
-        s->scan_dirty = true;
+        if (s->crs_ctrl != v) {
+            s->crs_ctrl = v;
+            s->scan_dirty = true;   /* enable/disable/crosshair */
+        }
         return;
     case GBE_CRS_CMAP0:
-        s->crs_cmap[0] = v;
+        if (s->crs_cmap[0] != v) {
+            s->crs_cmap[0] = v;
+            s->scan_dirty = true;
+        }
         return;
     case GBE_CRS_CMAP1:
-        s->crs_cmap[1] = v;
+        if (s->crs_cmap[1] != v) {
+            s->crs_cmap[1] = v;
+            s->scan_dirty = true;
+        }
         return;
     case GBE_CRS_CMAP2:
-        s->crs_cmap[2] = v;
+        if (s->crs_cmap[2] != v) {
+            s->crs_cmap[2] = v;
+            s->scan_dirty = true;
+        }
         return;
 
     default:
@@ -1340,9 +1452,10 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     /* Video timing registers */
     if (offset >= GBE_VT_VSYNC && offset <= GBE_VT_VCSTARTXY) {
         int idx = GBE_VT_IDX(offset);
-        if (idx >= 0 && idx < GBE_VT_REG_COUNT) {
+        if (idx >= 0 && idx < GBE_VT_REG_COUNT && s->vt_regs[idx] != v) {
             s->vt_regs[idx] = v;
             sgi_gbe_update_geometry(s);
+            s->scan_dirty = true;   /* possible resize/geometry change */
         }
         return;
     }
@@ -1350,7 +1463,11 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     /* WID mode registers */
     if (offset >= GBE_MODE_REGS_BASE &&
         offset < GBE_MODE_REGS_BASE + GBE_MODE_REGS_SIZE * 4) {
-        s->mode_regs[(offset - GBE_MODE_REGS_BASE) / 4] = v;
+        uint32_t mi = (offset - GBE_MODE_REGS_BASE) / 4;
+        if (s->mode_regs[mi] != v) {
+            s->mode_regs[mi] = v;
+            s->scan_dirty = true;   /* WID typ/cm change re-decodes pixels */
+        }
         return;
     }
 
@@ -1359,9 +1476,11 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     if (offset >= GBE_CMAP_BASE &&
         offset < GBE_CMAP_BASE + GBE_CMAP_SIZE * 4) {
         uint32_t idx = (offset - GBE_CMAP_BASE) / 4;
-        s->cmap[idx] = v;
+        if (s->cmap[idx] != v) {
+            s->cmap[idx] = v;
+            s->scan_dirty = true;
+        }
         trace_sgi_gbe_cmap_write(idx, v);
-        s->scan_dirty = true;
         return;
     }
 
@@ -1369,29 +1488,34 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
     if (offset >= GBE_GMAP_BASE &&
         offset < GBE_GMAP_BASE + GBE_GMAP_SIZE * 4) {
         uint32_t idx = (offset - GBE_GMAP_BASE) / 4;
-        s->gmap[idx] = v;
-        /*
-         * Track whether the guest's gamma table is the *direct* identity
-         * ramp (R=G=B=index).  The PROM's SetGammaIdentity loads exactly
-         * that to mean "no gamma" (measured live: gmap[1]=0x01010100 …),
-         * whereas the X DDX's -gamma loader stores bitrev8(H(i)); the two
-         * encodings cannot both be honoured by the same lookup, so a
-         * direct identity ramp is treated as a gamma bypass (see
-         * sgi_gbe_gamma).  Any non-identity entry clears the flag.
-         */
-        uint32_t ident = ((idx << 24) | (idx << 16) | (idx << 8));
-        if (v != ident) {
-            s->gmap_direct_id = false;
+        if (s->gmap[idx] != v) {
+            s->gmap[idx] = v;
+            /*
+             * Track whether the guest's gamma table is the *direct* identity
+             * ramp (R=G=B=index).  The PROM's SetGammaIdentity loads exactly
+             * that to mean "no gamma" (measured live: gmap[1]=0x01010100 …),
+             * whereas the X DDX's -gamma loader stores bitrev8(H(i)); the two
+             * encodings cannot both be honoured by the same lookup, so a
+             * direct identity ramp is treated as a gamma bypass (see
+             * sgi_gbe_gamma).  Any non-identity entry clears the flag.
+             */
+            uint32_t ident = ((idx << 24) | (idx << 16) | (idx << 8));
+            if (v != ident) {
+                s->gmap_direct_id = false;
+            }
+            s->scan_dirty = true;
         }
-        s->scan_dirty = true;
         return;
     }
 
     /* Cursor glyphs */
     if (offset >= GBE_CRS_GLYPH_BASE &&
         offset < GBE_CRS_GLYPH_BASE + GBE_CRS_GLYPH_COUNT * 4) {
-        s->crs_glyph[(offset - GBE_CRS_GLYPH_BASE) / 4] = v;
-        s->scan_dirty = true;
+        uint32_t gi = (offset - GBE_CRS_GLYPH_BASE) / 4;
+        if (s->crs_glyph[gi] != v) {
+            s->crs_glyph[gi] = v;
+            s->scan_dirty = true;
+        }
         return;
     }
 
@@ -1471,6 +1595,8 @@ static void sgi_gbe_reset(DeviceState *dev)
     s->scan_width = 0;
     s->scan_height = 0;
     s->scan_dirty = true;
+    s->crs_pos_seen = 0;
+    s->crs_ctrl_seen = 0;
 
     /* Default raster geometry until the PROM programs real timing */
     s->htotal = GBE_DEF_HTOTAL;
@@ -1514,6 +1640,17 @@ static void sgi_gbe_realize(DeviceState *dev, Error **errp)
     s->con = graphic_console_init(dev, 0, &sgi_gbe_gfx_ops, s);
     qemu_console_resize(s->con, GBE_DEF_HTOTAL >= 1280 ? 1280 : GBE_DEF_HTOTAL,
                          1024);
+
+    /*
+     * Dirty-region scanout: the tile data lives in the machine's RAM, so
+     * enable VGA dirty logging on that block and let the scanout decode
+     * only tile scanlines the guest touched.  Without a ram link the
+     * scanout keeps its previous decode-everything behaviour.
+     */
+    if (s->ram) {
+        s->ram_size = memory_region_size(s->ram);
+        memory_region_set_log(s->ram, true, DIRTY_MEMORY_VGA);
+    }
 }
 
 static const VMStateDescription vmstate_sgi_gbe = {
@@ -1562,6 +1699,12 @@ static const VMStateDescription vmstate_sgi_gbe = {
     }
 };
 
+static const Property sgi_gbe_properties[] = {
+    /* Machine RAM block holding the tile data (dirty-region scanout). */
+    DEFINE_PROP_LINK("ram", SGIGBEState, ram, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+};
+
 static void sgi_gbe_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1569,6 +1712,7 @@ static void sgi_gbe_class_init(ObjectClass *klass, const void *data)
     dc->realize = sgi_gbe_realize;
     device_class_set_legacy_reset(dc, sgi_gbe_reset);
     dc->vmsd = &vmstate_sgi_gbe;
+    device_class_set_props(dc, sgi_gbe_properties);
 }
 
 static const TypeInfo sgi_gbe_info = {

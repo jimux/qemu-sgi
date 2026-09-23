@@ -23,6 +23,7 @@
 #include "qemu/timer.h"
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "system/memory.h"
 
 #define TYPE_SGI_GBE "sgi-gbe"
 OBJECT_DECLARE_SIMPLE_TYPE(SGIGBEState, SGI_GBE)
@@ -215,6 +216,21 @@ struct SGIGBEState {
     /* Last latched DMA geometry, for scanout */
     int scan_width, scan_height;   /* active pixels */
     int scan_dirty;
+
+    /*
+     * Dirty-region scanout.  ram is the machine's RAM block, linked by the
+     * machine (O2); the tile data the scanout reads lives there.  Guest
+     * pixel writes (CRIME address_space_rw, CPU stores) set the VGA dirty
+     * bitmap, so the frame tick can decode only the tile scanlines that
+     * actually changed instead of re-decoding every tile at 60 Hz.  A
+     * control-register change sets scan_dirty and forces a full decode.
+     * crs_*_seen record the cursor state at the last scanout so a moved
+     * cursor can re-decode just the lines it vacated.
+     */
+    MemoryRegion *ram;
+    uint64_t ram_size;
+    uint32_t crs_pos_seen;
+    uint32_t crs_ctrl_seen;
 };
 
 #endif /* HW_DISPLAY_SGI_GBE_H */

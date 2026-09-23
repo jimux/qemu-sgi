@@ -65,6 +65,7 @@
 #include "hw/pci/pci.h"
 #include "hw/scsi/sgi_aic7880.h"
 #include "qapi/error.h"
+#include "qom/object.h"
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
@@ -1145,6 +1146,13 @@ static void sgi_o2_init(MachineState *machine) {
 
   /* GBE at 0x16000000 */
   gbe_dev = qdev_new(TYPE_SGI_GBE);
+  /*
+   * Dirty-region scanout: the GBE tile data lives in machine RAM, so hand
+   * the RAM block to GBE before realize; it enables VGA dirty logging and
+   * decodes only the tile scanlines the guest actually wrote.
+   */
+  object_property_set_link(OBJECT(gbe_dev), "ram", OBJECT(machine->ram),
+                           &error_abort);
   sysbus_realize_and_unref(SYS_BUS_DEVICE(gbe_dev), &error_fatal);
   sysbus_mmio_map(SYS_BUS_DEVICE(gbe_dev), 0, O2_GBE_BASE);
 
