@@ -835,6 +835,27 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case QL_BUS_ICR:
         ql_reg_put(s, QL_BUS_ICR, val & 0xffff);
+        /*
+         * ICR_SOFT_RESET resets the ISP's PCI/DMA logic.  The driver writes it
+         * at the top of ql_reset_interface(), then re-programs the response and
+         * request queues; between the two INIT queues it may ring the request
+         * doorbell (MBOX4), and the real chip has no request queue at that
+         * point.  Without dropping the previous (ARCS/kernel) queue state a
+         * stale ring is replayed -- observed as channel-1 status entries with
+         * handles from the earlier channel-0 ARCS ring, which the driver
+         * panics on ("Bogus response handle", io/ql.c:2155).  The firmware
+         * itself keeps running across the PCI soft reset (the driver downloads
+         * it before ql_reset_interface), so firmware_running is left set.
+         */
+        if (val & BUS_ICR_SOFT_RESET) {
+            memset(&s->req, 0, sizeof(s->req));
+            memset(&s->rsp, 0, sizeof(s->rsp));
+            if (qlisp_dbg()) {
+                qemu_log_mask(LOG_UNIMP,
+                              "sgi-qlisp: SOFT-RESET inst=%u queues dropped\n",
+                              s->busnr);
+            }
+        }
         break;
     case QL_MBOX5:
         /* host acks consumed responses by writing response_out */
@@ -872,6 +893,8 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             break;
         case HCCR_CMD_RESET:
             s->firmware_running = false;
+            memset(&s->req, 0, sizeof(s->req));
+            memset(&s->rsp, 0, sizeof(s->rsp));
             ql_reg_put(s, QL_HCCR, HCCR_RESET);
             break;
         case HCCR_CMD_RELEASE:
