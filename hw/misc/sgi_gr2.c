@@ -1149,15 +1149,30 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         offset != SGI_GR2_HQ_TOKEN_START) {
         s->vp_armed = false;
     }
+    /* The window rect is the same shape: token 485 carries x, the next three
+     * PUC_DATA words are y_bottom, w and h. */
+    if (s->ge_clip_armed && offset != SGI_GR2_GE7_WINRECT &&
+        offset != SGI_GR2_HQ_TOKEN_START) {
+        s->ge_clip_armed = false;
+    }
 
     switch (offset) {
+    case SGI_GR2_GE7_WINRECT:
+        /* The GL window's screen rect.  The DDX emits it per frame, so the
+         * origin we latch here follows a window move without any extra
+         * instrumentation.  y is bottom-origin (the raster path below is
+         * top-origin), so convert once the height is known. */
+        s->ge_clip_x = (int)v;
+        s->ge_clip_n = 1;
+        s->ge_clip_armed = true;
+        break;
     case SGI_GR2_GE7_VIEWPORT:
         s->vp_x = (int)v;
         s->vp_n = 1;
         s->vp_armed = true;
         s->vp_valid = false;
         break;
-    case SGI_GR2_HQ_TOKEN_START: /* token 479: viewport's (y,w,h) or GE data */
+    case SGI_GR2_HQ_TOKEN_START: /* token 479: viewport/window (y,w,h) or GE data */
         if (s->vp_armed) {
             if (s->vp_n == 1) {
                 s->vp_y = (int)v;
@@ -1169,6 +1184,19 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
                 s->vp_armed = false;
             }
             s->vp_n++;
+        } else if (s->ge_clip_armed) {
+            if (s->ge_clip_n == 1) {
+                s->ge_clip_y = (int)v;
+            } else if (s->ge_clip_n == 2) {
+                s->ge_clip_w = (int)v;
+            } else if (s->ge_clip_n == 3) {
+                s->ge_clip_h = (int)v;
+                s->ge_win_x = s->ge_clip_x;
+                s->ge_win_y = SGI_GR2_SCREEN_H -
+                              (s->ge_clip_y + s->ge_clip_h);
+                s->ge_clip_armed = false;
+            }
+            s->ge_clip_n++;
         }
         break;
     case SGI_GR2_GE7_MV:

@@ -95,6 +95,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_END      0x40104 /* token 65                          */
 #define SGI_GR2_GE7_END_B    0x41194 /* token 1125                        */
 #define SGI_GR2_GE7_CLEAR    0x40278 /* token 158, gl_clear               */
+#define SGI_GR2_GE7_WINRECT  0x40794 /* token 485, the GL window's screen  */
+                                     /* rect (x, y_bottom, w, h), re-sent  */
+                                     /* by the DDX each frame so it tracks */
+                                     /* a window move (note 79)            */
 #define SGI_GR2_GE7_MAX_VERTS 64     /* vertices buffered per polygon     */
 
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
@@ -425,13 +429,17 @@ struct SGIGr2State {
     unsigned vp_n;                 /* viewport words collected               */
     bool vp_armed;                 /* token 60 seen, awaiting three words    */
     bool vp_valid;
-    int ge_win_x;                  /* GL window content origin on screen.    */
-    int ge_win_y;                  /* Not in the FIFO (see note 78): the     */
-                                   /* client writes window-relative coords   */
-                                   /* and the X server's DDX holds the       */
-                                   /* origin.  Wired here so a source can    */
-                                   /* be plugged in without touching the     */
-                                   /* raster.                                */
+    int ge_win_x;                  /* GL window content origin on screen,    */
+    int ge_win_y;                  /* latched from token 485 (SGI_GR2_GE7_   */
+                                   /* WINRECT): the DDX streams the window's */
+                                   /* screen rect each frame, so the origin  */
+                                   /* follows a window move.  Token cell =   */
+                                   /* x, then PUC_DATA y_bottom, w, h; y is  */
+                                   /* bottom-origin, converted on latch.     */
+    int ge_clip_x, ge_clip_y;      /* token 485 words collected              */
+    int ge_clip_w, ge_clip_h;
+    unsigned ge_clip_n;
+    bool ge_clip_armed;
     bool ge_need_clear;            /* a fresh frame: clear the drawable first */
     float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
     unsigned ge_poly_n;
