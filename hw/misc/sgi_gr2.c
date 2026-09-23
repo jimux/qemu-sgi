@@ -1171,30 +1171,43 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         if (area == 0.0f) {
             continue;
         }
-        for (y = miny; y <= maxy; y++) {
-            for (x = minx; x <= maxx; x++) {
-                float w0 = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area;
-                float w1 = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area;
-                float w2 = 1.0f - w0 - w1;
-                float ig;
-                float z;
-                size_t o;
-                int li;
+        /* Half-pixel edge tolerance: a pixel whose centre is up to half a pixel
+         * outside an edge is still filled.  Adjacent triangles from the guest's
+         * mesh meet with a slight vertex mismatch, so without this a hairline
+         * crack opens along shared edges.  The barycentric weight changes by
+         * |edge|/(2*area) per pixel, so the tolerance is that times 0.5. */
+        {
+            float aa = fabsf(area);
+            float e0 = 0.5f * hypotf(bx - ax, by - ay) / aa;
+            float e1 = 0.5f * hypotf(cx - ax, cy - ay) / aa;
+            float e2 = 0.5f * hypotf(cx - bx, cy - by) / aa;
+            float e = MAX(e0, MAX(e1, e2));
 
-                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
-                    continue;
-                }
-                /* Gouraud: interpolate the per-vertex intensity, then map it
-                 * to the nearest palette luminance. */
-                ig = w1 * i1 + w2 * i2 + w0 * i0;
-                li = (int)(ig * 31.0f + 0.5f);
-                li = MIN(MAX(li, 0), 31);
-                idx = lut[li];
-                z = w1 * bz + w2 * cz + w0 * az;
-                o = (size_t)y * SGI_GR2_SCREEN_W + x;
-                if (z < s->ge_zbuf[o]) {
-                    s->ge_zbuf[o] = z;
-                    sgi_gr2_put(s, x, y, idx);
+            for (y = miny; y <= maxy; y++) {
+                for (x = minx; x <= maxx; x++) {
+                    float w0 = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area;
+                    float w1 = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area;
+                    float w2 = 1.0f - w0 - w1;
+                    float ig;
+                    float z;
+                    size_t o;
+                    int li;
+
+                    if (w0 < -e || w1 < -e || w2 < -e) {
+                        continue;
+                    }
+                    /* Gouraud: interpolate the per-vertex intensity, then map
+                     * it to the nearest palette luminance. */
+                    ig = MIN(MAX(w1 * i1 + w2 * i2 + w0 * i0, 0.0f), 1.0f);
+                    li = (int)(ig * 31.0f + 0.5f);
+                    li = MIN(MAX(li, 0), 31);
+                    idx = lut[li];
+                    z = w1 * bz + w2 * cz + w0 * az;
+                    o = (size_t)y * SGI_GR2_SCREEN_W + x;
+                    if (z < s->ge_zbuf[o]) {
+                        s->ge_zbuf[o] = z;
+                        sgi_gr2_put(s, x, y, idx);
+                    }
                 }
             }
         }
