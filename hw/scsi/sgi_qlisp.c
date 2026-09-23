@@ -282,7 +282,24 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
     stw_be_p(st + 0x08, completion);
     stw_be_p(st + 0x0a, scsi_status);
     stw_be_p(st + 0x0c, 0);          /* status_flags */
-    stw_be_p(st + 0x0e, QL_SS_GOT_STATUS | QL_SS_TRANSFER_COMPLETE);
+    /*
+     * The ISP auto-senses: on CHECK CONDITION the firmware returns the sense
+     * bytes in this status entry.  io/ql.c only reads req_sense_data when
+     * SS_GOT_SENSE is set in state_flags -- without it the driver issues its
+     * own REQUEST SENSE, finds nothing (the auto-sense already consumed it)
+     * and logs "request sense failed", retrying every command.  Set the flag
+     * only for CHECK CONDITION with sense present; setting it on a GOOD
+     * completion makes dk_chkcond() see stale/empty sense and retry.
+     * Ported verbatim from octane 0c9dbd48d1.
+     */
+    {
+        uint16_t state = QL_SS_GOT_STATUS | QL_SS_TRANSFER_COMPLETE;
+
+        if (sense && sense_len && scsi_status == 0x02) {
+            state |= QL_SS_GOT_SENSE;
+        }
+        stw_be_p(st + 0x0e, state);
+    }
     stw_be_p(st + 0x10, sense_len);
     stw_be_p(st + 0x12, 0);          /* time */
     stl_be_p(st + 0x14, residual);

@@ -177,6 +177,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 #define QL_SCS_COMPLETE          0x0000
 #define QL_SCS_TRANSPORT_ERROR   0x0003
 #define QL_SS_GOT_STATUS         0x1000
+#define QL_SS_GOT_SENSE          0x2000   /* state flag: req_sense_data valid */
 #define QL_SS_TRANSFER_COMPLETE  0x4000
 
 typedef struct QLQueue {
