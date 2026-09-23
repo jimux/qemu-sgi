@@ -91,6 +91,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHPC1State, SGI_HPC1)
 typedef struct SGIHPC1Uart {
     uint8_t reg_ptr;            /* selected WR/RR register (0-15) */
     uint8_t wr[16];             /* write registers */
+    uint8_t wr7p;               /* WR7' (85C30 extended read), read via RR14 */
     uint8_t rr3;                /* interrupt-pending bits (channel A) */
     uint8_t rx_fifo[HPC1_RX_FIFO_SIZE];
     uint8_t rx_head;
@@ -209,6 +210,9 @@ struct SGIHPC1State {
 
     /* Z85C30 DUARTs [duart][channel] */
     SGIHPC1Uart uart[HPC1_NUM_DUARTS][HPC1_DUART_CH];
+
+    /* IP20 keyboard HLE input handler (activated in realize) */
+    struct QemuInputHandlerState *kbd_ih;
 
     /* Named IRQ outputs (wired by the machine) */
     qemu_irq cpu_irq[2];    /* INT2 LIO0 -> IP2, LIO1 -> IP3 */

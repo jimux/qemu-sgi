@@ -174,6 +174,20 @@ static void scc_ctrl_write(SGIHPC1State *s, int d, int c, uint8_t val)
     case 5: /* WR5: TX parameters */
         u->wr[5] = val;
         break;
+    case 7:
+        /*
+         * WR7. On the 85C30, when WR15 bit 0 (Extended Read enable) is set,
+         * WR7 is WR7' and RR14/RR9/RR11 can read it back instead of their
+         * normal images. The IP20 power-on keyboard/mouse diagnostic uses
+         * exactly this: it sets WR15=1, writes WR7'=0x40, then reads RR14 and
+         * expects 0x40 -- so without WR7' the DUART looks absent and the
+         * diagnostic fails.
+         */
+        u->wr[7] = val;
+        if (u->wr[15] & 0x01) {
+            u->wr7p = val;
+        }
+        break;
     case 8: /* WR8: transmit buffer */
         scc_tx(s, d, c, val);
         break;
@@ -221,6 +235,19 @@ static uint8_t scc_ctrl_read(SGIHPC1State *s, int d, int c)
          */
         val = (c == 0) ? (u->rr3 | s->uart[d][1].rr3) : 0;
         break;
+    case 12: /* RR12 = WR12 (BRG time constant, low) */
+        val = u->wr[12];
+        break;
+    case 13: /* RR13 = WR13 (BRG time constant, high) */
+        val = u->wr[13];
+        break;
+    case 14:
+        /* 85C30: RR14 reflects WR7' when WR7' bit6 is set, else RR10 (0). */
+        val = (u->wr7p & 0x40) ? u->wr7p : 0x00;
+        break;
+    case 15: /* RR15 = WR15 (external/status IE bits), unused bits 0 */
+        val = u->wr[15] & 0xfa;
+        break;
     default: /* RR0 status */
         val = 0x2c; /* TX empty, DCD, CTS */
         if (u->rx_count > 0) {
@@ -250,9 +277,38 @@ static uint8_t scc_data_read(SGIHPC1State *s, int d, int c)
     return val;
 }
 
+static void scc_push_rx(SGIHPC1State *s, int d, int c, uint8_t b)
+{
+    SGIHPC1Uart *u = &s->uart[d][c];
+
+    if (u->rx_count >= HPC1_RX_FIFO_SIZE) {
+        return;
+    }
+    u->rx_fifo[u->rx_head] = b;
+    u->rx_head = (u->rx_head + 1) % HPC1_RX_FIFO_SIZE;
+    u->rx_count++;
+    u->rr3 |= (c == 0 ? SCC_RX_IP_A : SCC_RX_IP);
+    scc_update_irq(s);
+}
+
 static void scc_data_write(SGIHPC1State *s, int d, int c, uint8_t val)
 {
+    SGIHPC1Uart *u = &s->uart[d][c];
+
     scc_tx(s, d, c, val);
+
+    /*
+     * Z8530 WR14 bit 1 = Local Loopback: the transmitter output is wired
+     * internally to the receiver input, so a byte written to the transmit
+     * buffer returns on RX with no cable or device present. The IP20 power-on
+     * "Keyboard/Mouse diagnostic" is exactly this test on the DUART that
+     * carries the keyboard/mouse -- z8530_func_bfc04ea0 carries the string
+     * "Cannot run loopback test on console channel" -- and it cannot pass
+     * without local loopback.
+     */
+    if (u->wr[14] & 0x02) {
+        scc_push_rx(s, d, c, val);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -262,16 +318,7 @@ static void scc_data_write(SGIHPC1State *s, int d, int c, uint8_t val)
 /* Push one byte into the keyboard channel's RX FIFO (DUART0 channel A). */
 static void sgi_hpc1_kbd_push(SGIHPC1State *s, uint8_t b)
 {
-    SGIHPC1Uart *u = &s->uart[0][0];
-
-    if (u->rx_count >= HPC1_RX_FIFO_SIZE) {
-        return;
-    }
-    u->rx_fifo[u->rx_head] = b;
-    u->rx_head = (u->rx_head + 1) % HPC1_RX_FIFO_SIZE;
-    u->rx_count++;
-    u->rr3 |= SCC_RX_IP_A;
-    scc_update_irq(s);
+    scc_push_rx(s, 0, 0, b);
 }
 
 /*
@@ -1932,8 +1979,10 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_in_named(dev, hpc1_scsi_irq, "scsi-irq", 1);
     qdev_init_gpio_in_named(dev, hpc1_scsi_drq, "scsi-drq", 1);
 
-    /* IP20 keyboard HLE on DUART0 channel A. */
-    qemu_input_handler_register(dev, &sgi_hpc1_kbd_handler);
+    /* IP20 keyboard HLE on DUART0 channel A. Register AND activate, or the
+     * events are never routed here (another handler grabs them). */
+    s->kbd_ih = qemu_input_handler_register(dev, &sgi_hpc1_kbd_handler);
+    qemu_input_handler_activate(s->kbd_ih);
 
     /* WD33C93 SCSI controller */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
@@ -1993,6 +2042,7 @@ static const VMStateDescription vmstate_sgihpc1_uart = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(reg_ptr, SGIHPC1Uart),
         VMSTATE_UINT8_ARRAY(wr, SGIHPC1Uart, 16),
+        VMSTATE_UINT8(wr7p, SGIHPC1Uart),
         VMSTATE_UINT8(rr3, SGIHPC1Uart),
         VMSTATE_UINT8_ARRAY(rx_fifo, SGIHPC1Uart, HPC1_RX_FIFO_SIZE),
         VMSTATE_UINT8(rx_head, SGIHPC1Uart),
