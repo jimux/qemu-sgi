@@ -813,8 +813,16 @@ static void sgi_bridge_phy_init(SGIBRIDGEState *s)
     memset(s->phy_regs, 0, sizeof(s->phy_regs));
     s->phy_regs[0] = 0x1000;  /* BMCR: auto-negotiation enabled */
     s->phy_regs[1] = 0x7824;  /* BMSR: caps + autoneg done + link up */
-    s->phy_regs[2] = 0x0015;  /* PHY ID 1: ICS1890 OUI */
-    s->phy_regs[3] = 0xf400;  /* PHY ID 2 */
+    /*
+     * PHY identity: the IRIX ef driver's ef_phyprobe() computes
+     *   val = (reg2 << 12) | (reg3 >> 4)
+     * and accepts it only if it equals a known PHY (if_ef.h): ICS1890 is
+     * 0x0015F42.  So reg2=0x0015 and reg3>>4=0xF42, i.e. reg3=0xF42r with r
+     * the revision in the low nibble (ef_phyrev = reg3 & 0xf).  A reg3 of
+     * 0xF400 gives 0x15F40, which matches nothing -> "ef0: PHY not found".
+     */
+    s->phy_regs[2] = 0x0015;  /* PHY ID 1 */
+    s->phy_regs[3] = 0xf422;  /* PHY ID 2: ICS1890 (0x0015F42), rev 2 */
     s->phy_regs[4] = 0x01e0;  /* ANAR: 10/10FD/100/100FD */
     s->phy_regs[5] = 0x01e0;  /* ANLPAR: same */
     s->phy_regs[6] = 0x0001;  /* ANER: link partner auto-neg able */
