@@ -75,6 +75,19 @@
  * (MAME's noprw placeholder) - the PROM's sizing probe relies on that.
  */
 #define SGI_IP6_RAM_WINDOW     (256 * MiB)
+
+/*
+ * IP6 VME / expansion space.  Nothing is installed here on this machine, so
+ * the CTL1 latches the address and asserts the bus-error line (MAME's ip6.cpp
+ * maps 0x10000000-0x1effffff and 0x40000000-0xffffffff to its buserror_r /
+ * buserror_w pair).  The access itself completes -- the error is latched, not
+ * trapped -- because IRIX's badaddr() probes such an address and then polls
+ * Cause bit 15 for the error, expecting no exception.
+ */
+#define SGI_IP6_BUSERR_BASE    0x10000000ULL
+#define SGI_IP6_BUSERR_SIZE    0x0f000000ULL   /* 0x10000000 .. 0x1effffff */
+#define SGI_IP6_HIGH_BASE      0x40000000ULL
+#define SGI_IP6_HIGH_SIZE      0xc0000000ULL   /* 0x40000000 .. 0xffffffff */
 #define SGI_IP6_HOST_SIMM_SIZE (16 * MiB)
 #define SGI_IP6_RAM_ALIAS_MAX  128
 
@@ -174,6 +187,8 @@
 typedef struct SGIip6State {
     MemoryRegion ctl1;
     MemoryRegion ram_win;
+    MemoryRegion buserr;
+    MemoryRegion buserr_high;
     MemoryRegion ram_zero;
     MemoryRegion bank_alias[SGI_IP6_RAM_ALIAS_MAX];
     unsigned bank_alias_count;
@@ -608,6 +623,54 @@ static const MemoryRegionOps sgi_ip6_lio_ops = {
     },
 };
 
+/* ---- bus-error regions (MAME sgi/ip6.cpp buserror_r / buserror_w) ----- */
+
+/*
+ * A non-existent VME/high-space access latches erradr and asserts the
+ * bus-error line.  MAME wires that line to INPUT_LINE_IRQ5, and MAME's mips1
+ * core maps irqline n to Cause bit (10 + n), i.e. IRQ5 -> bit 15 = IP7; QEMU
+ * maps env->irq[n] to Cause bit (8 + n) (hw/mips/mips_int.c), so the same
+ * Cause bit is QEMU irq[7].  That is the bit IRIX's badaddr() polls: it sets
+ * the address, reads it, then tests Cause & 0x8000.
+ *
+ * MAME additionally asserts berr_w on a read of this range (a synchronous
+ * bus error).  We deliberately do not: badaddr() reads such an address and
+ * expects to complete the load and find the error latched in Cause, not to
+ * take an exception, and a real CTL1 latches the error and raises the line.
+ * Parity errors keep their synchronous data bus error (see below).
+ */
+static uint64_t sgi_ip6_buserr_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    s->erradr = addr;
+    qemu_set_irq(s->cpu->env.irq[7], 1);
+    return 0;
+}
+
+static void sgi_ip6_buserr_write(void *opaque, hwaddr addr, uint64_t data,
+                                 unsigned size)
+{
+    SGIip6State *s = opaque;
+
+    s->erradr = addr;
+    qemu_set_irq(s->cpu->env.irq[7], 1);
+}
+
+static const MemoryRegionOps sgi_ip6_buserr_ops = {
+    .read = sgi_ip6_buserr_read,
+    .write = sgi_ip6_buserr_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
 /* ---- CTL1 parity mechanism (MAME sgi/ctl1.cpp) ----------------------- */
 
 /*
@@ -761,7 +824,7 @@ static uint64_t sgi_ip6_err_read(void *opaque, hwaddr addr, unsigned size)
          * here).  A parity fault is now delivered as a synchronous data bus
          * error, so only the legacy IRQ5 deassert remains.
          */
-        qemu_set_irq(s->cpu->env.irq[5], 0);
+        qemu_set_irq(s->cpu->env.irq[7], 0);
         return s->erradr;
     case 0x04:
         /*
@@ -1704,6 +1767,16 @@ static void sgi_ip6_init(MachineState *machine)
                                      s->ram_size));
     }
     memory_region_add_subregion(system_memory, 0, &s->ram_win);
+
+    memory_region_init_io(&s->buserr, OBJECT(machine), &sgi_ip6_buserr_ops, s,
+                          "sgi-ip6-buserr", SGI_IP6_BUSERR_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_BUSERR_BASE,
+                                &s->buserr);
+    memory_region_init_io(&s->buserr_high, OBJECT(machine),
+                          &sgi_ip6_buserr_ops, s, "sgi-ip6-buserr-high",
+                          SGI_IP6_HIGH_SIZE);
+    memory_region_add_subregion(system_memory, SGI_IP6_HIGH_BASE,
+                                &s->buserr_high);
 
     /*
      * CTL1 parity support: a private 1:1 view of RAM for the parity hook to
