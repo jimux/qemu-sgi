@@ -25,6 +25,7 @@
 #include "fpu/softfloat.h"
 #include "exec/translation-block.h"
 #include "accel/tcg/cpu-ops.h"
+#include "hw/core/qdev-properties.h"
 
 static void m68k_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -629,6 +630,19 @@ static const TCGCPUOps m68k_tcg_ops = {
 #endif /* !CONFIG_USER_ONLY */
 };
 
+static const Property m68k_cpu_properties[] = {
+    /*
+     * Opt-in bus error for a device decode error inside a machine-declared
+     * window, used by machines whose bus must report an absent board as
+     * faulting rather than reading zero.  A machine sets both; a zero size
+     * leaves the facility off, so no machine-specific map lives here.
+     */
+    DEFINE_PROP_UINT64("bus-error-decode-base", M68kCPU,
+                       env.bus_error_decode_base, 0),
+    DEFINE_PROP_UINT64("bus-error-decode-size", M68kCPU,
+                       env.bus_error_decode_size, 0),
+};
+
 static void m68k_cpu_class_init(ObjectClass *c, const void *data)
 {
     M68kCPUClass *mcc = M68K_CPU_CLASS(c);
@@ -654,6 +668,8 @@ static void m68k_cpu_class_init(ObjectClass *c, const void *data)
     cc->disas_set_info = m68k_cpu_disas_set_info;
 
     cc->tcg_ops = &m68k_tcg_ops;
+
+    device_class_set_props(dc, m68k_cpu_properties);
 }
 
 static void m68k_cpu_class_init_cf_core(ObjectClass *c, const void *data)

@@ -104,6 +104,15 @@ static void iris3130_init(MachineState *machine)
 
     object_initialize_child(OBJECT(machine), "cpu", &s->cpu,
                             machine->cpu_type);
+    /*
+     * The IP2 bus must report an unmodelled Multibus I/O access as a bus
+     * error, not a zero read, so the PROM's board probe and the kernel's
+     * autoconfig conclude an absent board is absent.  The window lives here,
+     * in the machine, not in shared target/m68k code; the Multibus I/O
+     * segment is 0x50000000..0x5fffffff.
+     */
+    s->cpu.env.bus_error_decode_base = 0x50000000;
+    s->cpu.env.bus_error_decode_size = 0x10000000;
     qdev_realize(DEVICE(&s->cpu), NULL, &error_fatal);
     qemu_register_reset(iris3130_cpu_reset, &s->cpu);
 

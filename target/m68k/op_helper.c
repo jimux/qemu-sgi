@@ -549,17 +549,21 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
 
         cs->exception_index = EXCP_ACCESS;
         cpu_loop_exit(cs);
-    } else if (response == MEMTX_DECODE_ERROR &&
-               (physaddr & 0xf0000000) == 0x50000000) {
+    } else if (env->bus_error_decode_size != 0 &&
+               response == MEMTX_DECODE_ERROR &&
+               physaddr >= env->bus_error_decode_base &&
+               physaddr - env->bus_error_decode_base <
+                   env->bus_error_decode_size) {
         /*
          * The 68020/68030 deliver a bus error for a failed bus cycle as
-         * well.  The IP2 board relies on this for its absent-board test:
-         * a Multibus I/O access with no board fitted must fault so the
-         * PROM's probe and the kernel's autoconfig conclude the device is
-         * absent, exactly as the translation-time fault (ext_tlb_fill < 0)
-         * already does.  The Multibus I/O segment is 0x5xxxxxxx; the check
-         * keeps every other decode error on QEMU's permissive default so
-         * unrelated firmware probes still read back zero.
+         * well.  A machine whose bus models an absent board declares a
+         * decode-error window (see sgi_iris3130): the IP2 needs a Multibus
+         * I/O decode error to fault so the PROM's board probe and the
+         * kernel's autoconfig conclude the device is absent, exactly as the
+         * translation-time fault (ext_tlb_fill < 0) already does.  Decode
+         * errors outside the window, and all machines that declare none,
+         * keep QEMU's permissive default so ordinary firmware probes still
+         * read back zero.
          *
          * The kernel takes the same EXCP_ACCESS path and reads the faulting
          * address from mmu.ar.

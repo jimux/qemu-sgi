@@ -157,6 +157,18 @@ typedef struct CPUArchState {
     uint64_t features;
 
     /*
+     * Deliver a 68020/68030 bus error (EXCP_ACCESS) when a device reports a
+     * decode error in [bus_error_decode_base, +bus_error_decode_size),
+     * instead of QEMU's permissive default of returning zero.  A machine
+     * whose bus must show an absent board as absent (e.g. the SGI IRIS IP2,
+     * whose autoconfig probes for a fitted controller) sets this window, so
+     * this shared target code carries no machine-specific address map.  A
+     * zero size disables the facility.
+     */
+    uint64_t bus_error_decode_base;
+    uint64_t bus_error_decode_size;
+
+    /*
      * Optional board-provided address translation, used by machines with a
      * custom MMU that is not the Motorola one (e.g. SGI IRIS IP2). Consulted
      * first by m68k_cpu_tlb_fill. Returns >0 and fills physical/prot on a
