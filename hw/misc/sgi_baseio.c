@@ -1029,8 +1029,16 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
               slot, cfg, (unsigned)val);
     }
     if (slot == 0) {
-      /* IOC3: latch command/latency/BARs so config reads reflect them. */
-      if (cfg <= 0xfc) {
+      /*
+       * IOC3: latch command/latency/BARs so config reads reflect them.  The
+       * two memory BARs decode 1 MB each, matching the bridge DevIO layout
+       * (and octane's sgi_bridge): the all-ones sizing probe must read back a
+       * size mask, not 0xffffffff, or the guest computes a bogus BAR size and
+       * the ioc3 driver reports "unable to get PIO mapping for my MEM space".
+       */
+      if (cfg == 0x10 || cfg == 0x14) {
+        s->pci_cfg0[cfg >> 2] = val & 0xfff00000u;
+      } else if (cfg <= 0xfc) {
         s->pci_cfg0[cfg >> 2] = val;
       }
     } else if (slot == 1 || slot == 2) {
