@@ -907,9 +907,12 @@ static inline float sgi_gr2_u2f(uint32_t v)
     return x.f;
 }
 
-/* Map an intensity level (0..31) to a palette index by nearest luminance, so
- * the shaded bust uses whatever palette the guest programmed rather than a
- * guessed index.  Rebuilt per polygon batch: 32 x 256 comparisons. */
+/* Map an intensity level (0..31) to a palette index.  The target is a neutral
+ * grey of that intensity and the entry is chosen by nearest RGB distance, not
+ * nearest luminance: a luminance match alone picks red or blue entries whose
+ * brightness happens to coincide, which streaks a near-grey material.  RGB
+ * distance keeps the mapping on the grey axis.  Rebuilt per polygon batch:
+ * 32 x 256 comparisons. */
 static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[32])
 {
     int g, i;
@@ -923,12 +926,9 @@ static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[32])
             int r = (rgb >> 16) & 0xff;
             int gg = (rgb >> 8) & 0xff;
             int b = rgb & 0xff;
-            int lum = (r * 77 + gg * 150 + b * 29) >> 8;
-            int d = lum - target;
+            int dr = r - target, dg = gg - target, db = b - target;
+            int d = dr * dr + dg * dg + db * db;
 
-            if (d < 0) {
-                d = -d;
-            }
             if (d < bestd) {
                 bestd = d;
                 best = i;
