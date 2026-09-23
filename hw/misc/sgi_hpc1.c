@@ -28,6 +28,7 @@
 #include "migration/vmstate.h"
 #include "net/net.h"
 #include "qapi/error.h"
+#include "ui/input.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -76,6 +77,14 @@
 #define SCC_TX_IP      0x02
 #define SCC_TX_IP_A    0x10
 
+/* IP20 keyboard HLE (DUART0 channel A, i.e. gfx(0)/KEYBD_PORT). The PROM's
+ * libsk/io/sgi_kbd.c config_keyboard() writes CONFIG_REQUEST and expects the
+ * standard keyboard's 2-byte reply: 0x6e (CONFIG_BYTE_NEWKB) then a layout id
+ * <= 0x0f. Constants and the QKeyCode->scancode table are shared with
+ * personal-iris's IP6 keyboard HLE (same SGI keyboard protocol family). */
+#define HPC1_KBD_CONFIG_REQUEST 0x10
+#define HPC1_KBD_LAYOUT_US      1
+
 static int scc_console_channel(const SGIHPC1State *s, int d, int c)
 {
     /* DUART2 channel A is the console; DUART0 channel A carries the
@@ -86,6 +95,7 @@ static int scc_console_channel(const SGIHPC1State *s, int d, int c)
 static void scc_update_irq(SGIHPC1State *s);
 static void sgi_hpc1_enet_tx(SGIHPC1State *s);
 static void sgi_hpc1_enet_reset(SGIHPC1State *s);
+static void sgi_hpc1_kbd_push(SGIHPC1State *s, uint8_t b);
 
 static void scc_tx(SGIHPC1State *s, int d, int c, uint8_t data)
 {
@@ -93,6 +103,15 @@ static void scc_tx(SGIHPC1State *s, int d, int c, uint8_t data)
         qemu_chr_fe_write_all(&s->serial, &data, 1);
     }
     (void)scc_console_channel(s, d, c);
+
+    /*
+     * IP20 keyboard HLE: the PROM's config_keyboard() writes CONFIG_REQUEST
+     * to the keyboard port (DUART0 channel A) and expects 0x6e + a layout id.
+     */
+    if (d == 0 && c == 0 && data == HPC1_KBD_CONFIG_REQUEST) {
+        sgi_hpc1_kbd_push(s, 0x6e);
+        sgi_hpc1_kbd_push(s, HPC1_KBD_LAYOUT_US);
+    }
 
     /*
      * Writing the transmit buffer clears TX IP; once the byte has shifted out
@@ -235,6 +254,90 @@ static void scc_data_write(SGIHPC1State *s, int d, int c, uint8_t val)
 {
     scc_tx(s, d, c, val);
 }
+
+/* ------------------------------------------------------------------ */
+/* IP20 keyboard HLE                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Push one byte into the keyboard channel's RX FIFO (DUART0 channel A). */
+static void sgi_hpc1_kbd_push(SGIHPC1State *s, uint8_t b)
+{
+    SGIHPC1Uart *u = &s->uart[0][0];
+
+    if (u->rx_count >= HPC1_RX_FIFO_SIZE) {
+        return;
+    }
+    u->rx_fifo[u->rx_head] = b;
+    u->rx_head = (u->rx_head + 1) % HPC1_RX_FIFO_SIZE;
+    u->rx_count++;
+    u->rr3 |= SCC_RX_IP_A;
+    scc_update_irq(s);
+}
+
+/*
+ * Host key -> the PROM's SGI keyboard scancode. Shared with personal-iris's
+ * IP6 HLE (branch keyboard-hle): same SGI keyboard protocol family, same US
+ * layout table. Label MINUS ONE is emitted (measured on IP6). Keys not in the
+ * table are DROPPED rather than guessed.
+ */
+static int sgi_hpc1_kbd_keycode(QKeyCode q)
+{
+    switch (q) {
+    case Q_KEY_CODE_Q: return 10;  case Q_KEY_CODE_W: return 16;
+    case Q_KEY_CODE_E: return 17;  case Q_KEY_CODE_R: return 24;
+    case Q_KEY_CODE_T: return 25;  case Q_KEY_CODE_Y: return 32;
+    case Q_KEY_CODE_U: return 33;  case Q_KEY_CODE_I: return 40;
+    case Q_KEY_CODE_O: return 41;  case Q_KEY_CODE_P: return 48;
+    case Q_KEY_CODE_A: return 11;  case Q_KEY_CODE_S: return 12;
+    case Q_KEY_CODE_D: return 18;  case Q_KEY_CODE_F: return 19;
+    case Q_KEY_CODE_G: return 26;  case Q_KEY_CODE_H: return 27;
+    case Q_KEY_CODE_J: return 34;  case Q_KEY_CODE_K: return 35;
+    case Q_KEY_CODE_L: return 42;  case Q_KEY_CODE_Z: return 20;
+    case Q_KEY_CODE_X: return 21;  case Q_KEY_CODE_C: return 28;
+    case Q_KEY_CODE_V: return 29;  case Q_KEY_CODE_B: return 36;
+    case Q_KEY_CODE_N: return 37;  case Q_KEY_CODE_M: return 44;
+    case Q_KEY_CODE_1: return 8;   case Q_KEY_CODE_2: return 14;
+    case Q_KEY_CODE_3: return 15;  case Q_KEY_CODE_4: return 22;
+    case Q_KEY_CODE_5: return 23;  case Q_KEY_CODE_6: return 30;
+    case Q_KEY_CODE_7: return 31;  case Q_KEY_CODE_8: return 38;
+    case Q_KEY_CODE_9: return 39;  case Q_KEY_CODE_0: return 46;
+    case Q_KEY_CODE_RET: return 60;        case Q_KEY_CODE_KP_ENTER: return 51;
+    case Q_KEY_CODE_SPC: return 83;
+    case Q_KEY_CODE_BACKSPACE: return 61;  case Q_KEY_CODE_ESC: return 7;
+    case Q_KEY_CODE_TAB: return 9;
+    case Q_KEY_CODE_MINUS: return 47;      case Q_KEY_CODE_EQUAL: return 54;
+    case Q_KEY_CODE_SLASH: return 53;      case Q_KEY_CODE_DOT: return 52;
+    case Q_KEY_CODE_COMMA: return 45;      case Q_KEY_CODE_SEMICOLON: return 43;
+    case Q_KEY_CODE_APOSTROPHE: return 50; case Q_KEY_CODE_BRACKET_LEFT: return 49;
+    case Q_KEY_CODE_BRACKET_RIGHT: return 56; case Q_KEY_CODE_BACKSLASH: return 57;
+    case Q_KEY_CODE_GRAVE_ACCENT: return 55;
+    default: return -1;
+    }
+}
+
+/* QEMU key event -> SGI scancode on the keyboard channel (bit7 = release). */
+static void sgi_hpc1_kbd_event(DeviceState *dev, QemuConsole *src,
+                               InputEvent *evt)
+{
+    SGIHPC1State *s = SGI_HPC1(dev);
+    InputKeyEvent *key;
+    int code;
+
+    assert(evt->type == INPUT_EVENT_KIND_KEY);
+    key = evt->u.key.data;
+    code = sgi_hpc1_kbd_keycode(qemu_input_key_value_to_qcode(key->key));
+    if (code < 1) {
+        return;                        /* unknown key: drop, never invent */
+    }
+    sgi_hpc1_kbd_push(s, (uint8_t)((code - 1) | (key->down ? 0x00 : 0x80)));
+}
+
+static const QemuInputHandler sgi_hpc1_kbd_handler = {
+    .name  = "sgi-hpc1-kbd",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = sgi_hpc1_kbd_event,
+};
+
 
 /* ------------------------------------------------------------------ */
 /* Interrupt aggregation                                               */
@@ -1828,6 +1931,9 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_out_named(dev, s->timer_irq, "timer-irq", 2);
     qdev_init_gpio_in_named(dev, hpc1_scsi_irq, "scsi-irq", 1);
     qdev_init_gpio_in_named(dev, hpc1_scsi_drq, "scsi-drq", 1);
+
+    /* IP20 keyboard HLE on DUART0 channel A. */
+    qemu_input_handler_register(dev, &sgi_hpc1_kbd_handler);
 
     /* WD33C93 SCSI controller */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
