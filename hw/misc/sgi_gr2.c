@@ -837,6 +837,12 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         return;
     }
     if (s->re3_data_n || s->re3_data_overflow) {
+        /* No known marker: an op we do not model (3D geometry, for instance).
+         * Log its opening words so the token/payload family can be named. */
+        if (s->re3_data_n >= 2) {
+            trace_sgi_gr2_re3_unknown(s->re3_data[0], s->re3_data[1],
+                                      s->re3_data_n);
+        }
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
     }
 }
@@ -1297,6 +1303,42 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * polls it); a stray write must not corrupt the level/error bits. */
     if (offset >= SGI_GR2_HQ_FIFOSTAT &&
         offset < SGI_GR2_HQ_FIFOSTAT + 4) {
+        return;
+    }
+    /* bdvers is strapping: the bitplane/Z/revision bits are wired by the board
+     * and must survive the PROM/ARCS and driver config writes to the same
+     * register.  The ARCS Gr2InitInfo and the kernel Gr2Probe read
+     * (~rd0)&0xf for the revision and rd1 bits 4/5 for 24-bit and Z; if a
+     * config write is allowed to clear those, the board is reported as
+     * "missing bitplanes missing Z" and powerflip refuses.  Preserve the
+     * strapped bits, take the rest from the write. */
+    if (offset >= SGI_GR2_BDVERS_OFF &&
+        offset < SGI_GR2_BDVERS_OFF + 16) {
+        static const uint8_t strap_mask[16] = {
+            0x0f, 0x0f, 0x0f, 0x0f,  /* 0x6c000: revision nibble strapped */
+            0x30, 0x30, 0x30, 0x30,  /* 0x6c004: bit4=24-bit, bit5=Z       */
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        };
+        static const uint8_t strap_val[16] = {
+            SGI_GR2_BDVERS0, SGI_GR2_BDVERS0, SGI_GR2_BDVERS0, SGI_GR2_BDVERS0,
+            SGI_GR2_BDVERS1, SGI_GR2_BDVERS1, SGI_GR2_BDVERS1, SGI_GR2_BDVERS1,
+            SGI_GR2_BDVERS2, SGI_GR2_BDVERS2, SGI_GR2_BDVERS2, SGI_GR2_BDVERS2,
+            SGI_GR2_BDVERS3, SGI_GR2_BDVERS3, SGI_GR2_BDVERS3, SGI_GR2_BDVERS3,
+        };
+        unsigned k;
+
+        for (k = 0; k < size; k++) {
+            uint64_t o = offset + k - SGI_GR2_BDVERS_OFF;
+            uint8_t byte = (value >> (8 * (size - 1 - k))) & 0xff;
+
+            if (o < 16) {
+                s->regs[offset + k] = (byte & ~strap_mask[o]) |
+                                      (strap_val[o] & strap_mask[o]);
+            } else {
+                s->regs[offset + k] = byte;
+            }
+        }
         return;
     }
     for (i = 0; i < size; i++) {

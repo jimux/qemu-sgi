@@ -615,18 +615,34 @@ static void sgi_ip2x_init(MachineState *machine, enum sgi_ip2x_model model) {
     create_gio_empty_slot(system_memory, "gio-gfx-low", SGI_GIO_GFX_BASE,
                           REX3_REG_OFFSET);
 
-    /* Newport REX3 at 0x1f0f0000 */
-    newport_dev = qdev_new(TYPE_SGI_NEWPORT);
-    object_property_add_child(OBJECT(machine), "newport", OBJECT(newport_dev));
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(newport_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(newport_dev), 0,
-                    SGI_GIO_GFX_BASE + REX3_REG_OFFSET);
+    /*
+     * A real Indy XZ has NO Newport: the Express/GR2 board is the machine's
+     * graphics.  When the GR2 is present we must not instantiate Newport, or
+     * the PROM's graphics probe and the guest's hinv/inst see a Newport and
+     * report GFXBOARD=NG1, and IRIX then skips the XZ (NEWPRESS) software.
+     * Fenced strictly behind present=on: with present off this block is
+     * unchanged and a plain `-M indy` still gets Newport.
+     */
+    if (!gr2_present) {
+      /* Newport REX3 at 0x1f0f0000 */
+      newport_dev = qdev_new(TYPE_SGI_NEWPORT);
+      object_property_add_child(OBJECT(machine), "newport",
+                                OBJECT(newport_dev));
+      sysbus_realize_and_unref(SYS_BUS_DEVICE(newport_dev), &error_fatal);
+      sysbus_mmio_map(SYS_BUS_DEVICE(newport_dev), 0,
+                      SGI_GIO_GFX_BASE + REX3_REG_OFFSET);
 
-    /* Wire Newport VRINT → INT2/INT3 retrace interrupt */
-    {
-      DeviceState *irq_target = is_ip20 ? hpc1_dev : hpc3_dev;
-      sysbus_connect_irq(SYS_BUS_DEVICE(newport_dev), 0,
-                         qdev_get_gpio_in_named(irq_target, "gio-retrace", 0));
+      /* Wire Newport VRINT → INT2/INT3 retrace interrupt */
+      {
+        DeviceState *irq_target = is_ip20 ? hpc1_dev : hpc3_dev;
+        sysbus_connect_irq(SYS_BUS_DEVICE(newport_dev), 0,
+                           qdev_get_gpio_in_named(irq_target, "gio-retrace", 0));
+      }
+    } else {
+      /* No Newport: leave the REX3 window as a dead slot so it reads as
+       * unimplemented rather than falling through to a bus error. */
+      create_gio_empty_slot(system_memory, "gio-gfx-rex3",
+                            SGI_GIO_GFX_BASE + REX3_REG_OFFSET, REX3_REG_SIZE);
     }
 
     /* Cover GIO slot area after Newport REX3 (0x1f0f2000-0x1f3fffff) */
