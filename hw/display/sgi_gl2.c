@@ -107,6 +107,14 @@ struct SGIGL2State {
     bool no_retrace;   /* SGI_GL2_NO_RETRACE: A/B test hook */
     bool vert_pending;
     bool prog_int_pending;
+    /*
+     * UCR_VERTICAL: the vertical-blanking interval.  The kernel's
+     * gl_domapcolors() (run from the retrace handler) only programs the DC4
+     * colormap while this reads set, and gl_WaitForEOF/gsync() also test it.
+     * It is asserted by the retrace and cleared a little later.
+     */
+    bool vertical;
+    QEMUTimer *vert_clear_timer;
 
     /*
      * Plane value per pixel, one bit per installed bitplane (nplanes wide).
@@ -412,8 +420,8 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
     if (off < R_DC) {
         unsigned o = off - R_UC;
         if (o == 0x180) {
-            /* UCR: report not-busy, no vertical interval. */
-            return s->ucr & ~0x8000;
+            /* UCR: report not-busy; assert VERTICAL during the blank window. */
+            return (s->ucr & ~0x8000) | (s->vertical ? 0x2000 : 0);
         }
         if (o >= 0x200) {
             unsigned cmd = (o - 0x200) >> 1;
@@ -754,6 +762,21 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         }
         break;
 
+    case 0x26:                          /* FBCeof: pipe reached end of frame */
+        /*
+         * The GL library's gl_WaitForEOF() pushes FBCeof, increments
+         * shmem->EOFpending, and spins until the kernel's
+         * programmed-interrupt handler decrements it.  On real hardware the
+         * FBC raises an interrupt with code _INTEOF when it reaches this
+         * command; fbc_feedint(_INTEOF) falls through to endfeed, which is
+         * the decrement.  Without this the client spins forever waiting for
+         * a completion that never comes.
+         */
+        s->fbc_out = 9;                 /* _INTEOF */
+        s->prog_int_pending = true;
+        gl2_update_irq(s);
+        break;
+
     case 0x2f:                          /* FBCpixelsetup */
         /*
          * A pixel-readback setup carries a sub-command word naming the read
@@ -959,6 +982,18 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
          * itself be considered as a header or raw GE command. */
     }
 
+    /*
+     * FBCeof can also arrive on its own: the GL library pushes a passthru
+     * header and FBCeof as two separate 16-bit writes, and the kernel's
+     * retrace handler can interleave its own passthru commands between them,
+     * consuming the header so FBCeof would otherwise be dropped.  Handle the
+     * bare token so the EOF interrupt is always raised.
+     */
+    if (w == 0x26) {
+        gl2_ge_exec(s, 0x26, NULL, 0);
+        return;
+    }
+
     if ((w & 0xff) == 0x08 && !(w & 0x8000)) {
         s->ge_pending = true;
         s->ge_pending_need = ((w >> 8) & 0x7f) + 1;
@@ -1053,6 +1088,14 @@ static void gl2_update_irq(SGIGL2State *s)
     qemu_set_irq(s->irq, s->vert_pending || s->prog_int_pending);
 }
 
+/* End of the modelled vertical-blanking interval. */
+static void gl2_vert_clear_timer(void *opaque)
+{
+    SGIGL2State *s = opaque;
+
+    s->vertical = false;
+}
+
 /* One vertical-retrace interval (~60 Hz), host-timed on the virtual clock. */
 static void gl2_retrace_timer(void *opaque)
 {
@@ -1062,6 +1105,12 @@ static void gl2_retrace_timer(void *opaque)
         return;         /* A/B hook: leave the retrace line unasserted */
     }
     s->vert_pending = true;
+    s->vertical = true;
+    if (s->vert_clear_timer) {
+        timer_mod(s->vert_clear_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                  + NANOSECONDS_PER_SECOND / 60 / 8);
+    }
     gl2_update_irq(s);
     if (s->retrace_timer) {
         timer_mod(s->retrace_timer,
@@ -1078,6 +1127,7 @@ static void gl2_reset(DeviceState *dev)
     s->color_ab = s->color_cd = 0;
     s->we_ab = s->we_cd = 0;
     s->ucr = 0;
+    s->vertical = false;
     s->scrmaskx = s->scrmasky = 0;
     s->fmaddr = 0;
     s->fbc_data = 0;
@@ -1136,7 +1186,10 @@ static void gl2_init(Object *obj)
 
     s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
     s->retrace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gl2_retrace_timer, s);
+    s->vert_clear_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       gl2_vert_clear_timer, s);
     s->no_retrace = getenv("SGI_GL2_NO_RETRACE") != NULL;
+    s->trace = getenv("SGI_GL2_TRACE") != NULL;
     memory_region_init_io(&s->mmio, obj, &gl2_ops, s, "sgi-gl2",
                           GL2_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
