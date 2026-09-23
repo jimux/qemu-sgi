@@ -305,7 +305,7 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
             }
         }
     }
-    trace_sgi_gr2_re3_tile(w, h);
+    trace_sgi_gr2_re3_tile(w, h, s->re3_nclip);
     s->re3_nclip = 0;
     sgi_gr2_update_display(s);
 }
@@ -760,6 +760,8 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
             s->re3_clip[s->re3_nclip][2] = s->re3_data[2];
             s->re3_clip[s->re3_nclip][3] = s->re3_data[3];
             s->re3_nclip++;
+            trace_sgi_gr2_re3_clip(s->re3_data[0], s->re3_data[1],
+                                   s->re3_data[2], s->re3_data[3]);
         }
         return;
     }
