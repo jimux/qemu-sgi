@@ -117,12 +117,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_XMAP_PAL_DATA  0x6c1a8 /* R,G,B byte stream (sliding)      */
 #define SGI_GR2_XMAP_PAL_INDEX 0x6c1b0 /* entry index being programmed     */
 #define SGI_GR2_XMAP_PAL_CTL   0x6c1b4 /* control byte written per entry   */
-/* The control byte selects a palette bank.  Replaying both servers' streams
- * against their own `xwd` oracle showed entries written under control 0x11 are
- * exactly the installed (scanned-out) map — 4sight 18/18, the default pseudomap
- * 10/10 — while 0x1c/0x10/0x00/0x01 banks are not, so only 0x11 is committed to
- * the visible palette.  [ASSUMPTION: 0x11 is the installed bank.] */
-#define SGI_GR2_XMAP_PAL_BANK_INSTALLED 0x11
+/* The control byte is the high byte of the DDX's per-entry word (the DDX does
+ * `index = entry & 0xff; control = entry >> 8` in expStoreNormalColors), so it
+ * tags an entry with its kind, not a whole-map bank.  Replaying the default
+ * boot shows why the "installed map" is not a single value:
+ *   - entries 96..255 (the root weave) are written under 0x10 and NOWHERE else,
+ *     so accepting only 0x11 renders the weave black;
+ *   - but the root weave (0x10) and the colour ramp (0x11) are on screen
+ *     together, so they must share one map, not two.
+ * Committing 0x10 and 0x11 with last-write-wins resolves both: for every index
+ * that has both, 0x11 is written last, so the `xwd` oracle is preserved
+ * (4sight 18/18, default pseudomap 10/10), while the weave indices come in.
+ * 0x00/0x01/0x1c are the overlay / pup / 24-bit maps (expStoreOverlayColors,
+ * expStorePupColors, expStore24Colors) and must not touch the visible palette —
+ * index 1's last 0x1c write would otherwise overwrite its red.  */
+#define SGI_GR2_XMAP_PAL_BANK_INSTALLED 0x11 /* normal map, written last */
+#define SGI_GR2_XMAP_PAL_BANK_ALT       0x10 /* same map; the weave lives here */
 #define SGI_GR2_RE3_27_OFF  0x6c200 /* RE3 buffered register set */
 #define SGI_GR2_RE3_24_OFF  0x6c280 /* RE3 unbuffered register set */
 #define SGI_GR2_RE3_32_OFF  0x6c600 /* RE3 32-bit register */

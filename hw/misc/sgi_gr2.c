@@ -416,14 +416,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
                                ((uint32_t)s->ramdac_stage[1] << 8) |
                                s->ramdac_stage[2];
 
-                /* Only the control==0x11 bank is the one scanout reads.
-                 * Replaying both servers' streams against their `xwd` oracles
-                 * showed the 0x11 bank matches them exactly (4sight 18/18, the
-                 * default pseudomap 10/10) while 0x1c/0x10/0x00/0x01 do not, so
-                 * entries written under another control must not touch the
-                 * visible palette.  [ASSUMPTION: the control byte is a bank
-                 * select; 0x11 is the installed map.] */
-                if (s->ramdac_ctl == SGI_GR2_XMAP_PAL_BANK_INSTALLED) {
+                /* The visible map takes the normal entries (0x11) and the
+                 * weave entries (0x10); 0x00/0x01/0x1c are the overlay/pup/
+                 * 24-bit maps.  See the note by SGI_GR2_XMAP_PAL_BANK_*. */
+                if (s->ramdac_ctl == SGI_GR2_XMAP_PAL_BANK_INSTALLED ||
+                    s->ramdac_ctl == SGI_GR2_XMAP_PAL_BANK_ALT) {
                     s->ramdac[s->ramdac_index] = rgb;
                     trace_sgi_gr2_ramdac(s->ramdac_index, rgb);
                 }
