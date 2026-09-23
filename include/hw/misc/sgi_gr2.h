@@ -186,6 +186,7 @@ struct SGIGr2State {
     uint8_t re3_colour;   /* last colour latched from the RE3 colour token */
     bool re3_colour_valid;
     uint32_t last_puc;    /* previous PUC_DATA word (rect geometry pair)     */
+    uint32_t prev_puc;    /* the word before last_puc                        */
     bool last_puc_valid;
     /* Generic PUC draw path: PUC_COLOR + PUC_RECTI2D + three PUC_DATA words.
      * [ASSUMPTION, from the captured root-weave stream: 1024 rects of
@@ -201,6 +202,7 @@ struct SGIGr2State {
      * token 318 armed a pattern, flat when token 304 marked a solid rect. */
     bool re3_solid_seen;    /* token 304 seen in the current op              */
     bool re3_spans_seen;    /* token 305 seen in the current op              */
+    bool re3_pair_seen;     /* a 1280-then-1024 pair appeared in the payload */
     bool re3_stipple_valid; /* token 318 written: next rect is stippled      */
     uint32_t re3_stipple;   /* 32-bit stipple pattern (token 318)            */
     uint8_t re3_fg;         /* token 314: stipple foreground colour index    */

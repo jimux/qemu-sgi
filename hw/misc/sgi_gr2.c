@@ -137,6 +137,43 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
     sgi_gr2_update_display(s);
 }
 
+/* Evaluate the pending draw op and, if it is a full-screen fill, paint it.
+ * Called at each op boundary — token 331 (which starts a new sub-op) and token
+ * 490 (the terminator) — because one 490-terminated region can hold several 331
+ * sub-ops, and the grainy root's stipple (318) and its full-screen rect live in
+ * the FIRST sub-op, before the panel's own 331.  The rect is recognised
+ * structurally: a rect-list op (304/318) containing a 1280-then-1024 pair, or
+ * any fill op whose final two data words are (1280,1024).  305 is excluded from
+ * the pair rule because an expSolidSpans triple list ends (0x500,0x400,0x1) —
+ * a span at x=1280,y=1024, not a rectangle. */
+static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
+{
+    bool fs_rect = s->re3_pair_seen && !s->re3_spans_seen &&
+                   (s->re3_solid_seen || s->re3_stipple_valid);
+    bool fs_tail = (s->re3_solid_seen || s->re3_spans_seen ||
+                    s->re3_stipple_valid) &&
+                   s->prev_puc == SGI_GR2_SCREEN_W &&
+                   s->last_puc == SGI_GR2_SCREEN_H;
+
+    if (!fs_rect && !fs_tail) {
+        return;
+    }
+    if (s->re3_stipple_valid) {
+        uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
+
+        sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
+                                 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+        trace_sgi_gr2_re3_stipple(fg, s->re3_colour, s->re3_stipple,
+                                  SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+    } else if (s->re3_colour_valid) {
+        uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, 0, 0,
+                                        SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+
+        trace_sgi_gr2_re3_fill(s->re3_colour, rgb,
+                               SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+    }
+}
+
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGr2State *s = SGI_GR2(opaque);
@@ -259,38 +296,12 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->re3_colour_valid = true;
     }
     if (size == 4 && offset == SGI_GR2_HQ_TOKEN_START) {
-        /* Only a real fill op paints the full-screen rect.  A segment/line op
-         * (expSegmentSS, tokens 328/330/345) streams a coordinate list that can
-         * merely CONTAIN the values 1280 and 1024; treating that as a
-         * full-screen fill painted the whole screen flat grey and hid the
-         * stippled root (note 27).  So require a fill marker (304 solid, 305
-         * spans, or a 318 stipple). */
-        if ((s->re3_solid_seen || s->re3_spans_seen ||
-             s->re3_stipple_valid) &&
-            s->last_puc_valid &&
-            s->last_puc == SGI_GR2_SCREEN_W && value == SGI_GR2_SCREEN_H) {
-            if (s->re3_stipple_valid) {
-                /* Grainy root: token 318 armed a stipple pattern; draw the
-                 * rect as a stipple of fg (token 314) over bg (token 332). */
-                uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
-
-                sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
-                                         0, 0, SGI_GR2_SCREEN_W,
-                                         SGI_GR2_SCREEN_H);
-                trace_sgi_gr2_re3_stipple(fg, s->re3_colour, s->re3_stipple,
-                                          SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
-            } else if (s->re3_colour_valid) {
-                uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, 0, 0,
-                                                SGI_GR2_SCREEN_W,
-                                                SGI_GR2_SCREEN_H);
-
-                trace_sgi_gr2_re3_fill(s->re3_colour, rgb,
-                                       SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
-            }
-            s->re3_colour_valid = false;
-            s->re3_stipple_valid = false;
-            s->re3_fg_valid = false;
-        }
+        /* The full-screen fill is decided at the op terminator (token 490), not
+         * here.  An expSolidSpans payload ends with the span triple
+         * (0x500, 0x400, 0x1) — x, y, count — so 0x400 DOES follow 0x500 in the
+         * middle of a span list, and testing inline fires on a span that is not
+         * a rectangle.  That misfire is what wiped the weave (note 28).  Only
+         * the op's FINAL two data words are the rect geometry. */
         /* The generic PUC path: PUC_COLOR chose the colour, PUC_RECTI2D armed
          * a rectangle, and its three PUC_DATA words are (x0, x1, y0) — one
          * horizontal span.  The root weave is 1024 of these. */
@@ -311,8 +322,13 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
                 s->puc_rect_n = 0;
             }
         }
+        s->prev_puc = s->last_puc;
         s->last_puc = value;
         s->last_puc_valid = true;
+        if (s->prev_puc == SGI_GR2_SCREEN_W &&
+            s->last_puc == SGI_GR2_SCREEN_H) {
+            s->re3_pair_seen = true;
+        }
     }
     if (size == 4 && offset == SGI_GR2_PUC_COLOR_TOKEN) {
         s->puc_colour = value & 0xff;
@@ -327,8 +343,10 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * terminator.  This is what distinguishes a grainy stippled root fill from
      * a flat solid fill without guessing at the PUC_DATA tail. */
     if (size == 4 && offset == SGI_GR2_RE3_OP_TOKEN) {
+        sgi_gr2_re3_flush_fill(s);
         s->re3_solid_seen = false;
         s->re3_spans_seen = false;
+        s->re3_pair_seen = false;
         s->re3_stipple_valid = false;
         s->re3_fg_valid = false;
     }
@@ -347,7 +365,13 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->re3_stipple_valid = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_DONE_TOKEN) {
+        /* Op end.  Deciding here — not inline on each PUC_DATA — is what keeps
+         * an expSolidSpans triple list from being mistaken for a rect. */
+        sgi_gr2_re3_flush_fill(s);
+        s->re3_colour_valid = false;
         s->re3_solid_seen = false;
+        s->re3_spans_seen = false;
+        s->re3_pair_seen = false;
         s->re3_stipple_valid = false;
         s->re3_fg_valid = false;
     }
@@ -562,11 +586,13 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_colour_valid = false;
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
+    s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_stipple = 0;
     s->re3_fg = 0;
     s->re3_fg_valid = false;
     s->last_puc = 0;
+    s->prev_puc = 0;
     s->last_puc_valid = false;
     if (s->irq) {
         qemu_irq_lower(s->irq);
