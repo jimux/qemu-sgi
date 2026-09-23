@@ -166,8 +166,46 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEREState, SGI_CRIME_RE)
 #define CRM_FOG_COLOR_REG          0x170
 #define CRM_LOGICOP_REG            0x1b0
 #define CRM_COLORMASK_REG          0x1b8
+/*
+ * Depth/stencil (crimedef.h CRM_DEPTH_*; spec Table 7-3 "Depth.func
+ * 0x1c0, Depth.Zs 0x1c8 (64), Depth.dzdx 0x1d0 (64), Depth.dzdy 0x1d8
+ * (64)").  Depth.mode packs (MSB-first, crimereg.h CrmDepthMode):
+ *   bits 27:25 func, bit 24 enTagClear, bits 23:0 clear (24-bit far value).
+ */
+#define CRM_DEPTH_FUNC_REG          0x1c0
+#define CRM_DEPTH_Z0_REG            0x1c8
+#define CRM_DEPTH_DZDX_REG          0x1d0
+#define CRM_DEPTH_DZDY_REG          0x1d8
 #define CRM_PIXPIPE_NULL_REG       0x1f0
 #define CRM_PIXPIPE_FLUSH_REG      0x1f8
+
+/* Depth.func field (spec §7.3.7.17 Table 7-25, GL_NEVER..GL_ALWAYS) */
+#define CRM_DEPTH_FUNC_SHIFT        25
+#define CRM_DEPTH_FUNC_MASK         (7u << CRM_DEPTH_FUNC_SHIFT)
+#define CRM_DEPTH_FUNC_NEVER        0
+#define CRM_DEPTH_FUNC_LESS         1
+#define CRM_DEPTH_FUNC_EQUAL        2
+#define CRM_DEPTH_FUNC_LEQUAL       3
+#define CRM_DEPTH_FUNC_GREATER      4
+#define CRM_DEPTH_FUNC_NOTEQUAL     5
+#define CRM_DEPTH_FUNC_GEQUAL       6
+#define CRM_DEPTH_FUNC_ALWAYS       7
+
+/* SZ pixel: bits 31:24 stencil, bits 23:0 depth (spec §7.3.4.4 Fig 7-6) */
+#define CRM_SZ_DEPTH_MASK           0x00ffffffu
+#define CRM_SZ_STENCIL_MASK         0xff000000u
+
+/*
+ * The depth/stencil buffer is mapped through framebuffer TLB C.  Live
+ * evidence (tmp/o2-qemu/depthfix/evidence/measure.trace): libGLcore's
+ * depth-buffer setup writes BufMode.src/dst = 0x10030226 and then loads
+ * TLB.fbC (bank 2) with the SZ tiles 0x65..0x7c, and glClear runs the
+ * depth clear as MTE CLEAR mode 0x208 (dstBufType=2 = framebuffer TLB C,
+ * pixDepth=2/32-bit, fgValue=0x00ffffff).  Spec §7.3.4.2: the framebuffer
+ * TLB holds "the base physical memory addresses of the tiles which compose
+ * a color buffer and the stencil-depth buffer".
+ */
+#define CRM_DEPTH_TLB_SEL           2
 
 /* DrawMode bits (crimedef.h) */
 #define DM_ENNOCONFLICT       (1U << 23)
@@ -179,6 +217,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEREState, SGI_CRIME_RE)
 #define DM_ENOPAQSTIPPLE      (1U << 17)
 #define DM_ENSMOOTHSHADE      (1U << 16)
 #define DM_ENTEXTURE          (1U << 15)    /* spec Table 7-2 enTexture */
+#define DM_ENDEPTHTEST        (1U << 2)     /* spec Table 7-7 bit 2 */
+#define DM_ENDEPTHMASK        (1U << 1)     /* spec Table 7-7 bit 1 */
 #define DM_ENLOGICOP          (1U << 9)
 #define DM_ENDITHER           (1U << 8)
 #define DM_ENCOLORMASK        (1U << 7)
@@ -316,6 +356,15 @@ struct SGICRIMEREState {
     int64_t tex_dsqdx, tex_dsqdy, tex_dtqdx, tex_dtqdy;
     int32_t tex_dqdx, tex_dqdy;
     uint32_t tex_border, tex_env;
+
+    /*
+     * Depth/stencil state (CrmDepthReg, spec §7.3.1.18).  mode is the raw
+     * Depth.mode word (func/enTagClear/clear); z0/dzdx/dzdy are the 64-bit
+     * 25.12 two's-complement plane parameters, loaded by libGLcore's
+     * __glCrmFillTriangle at the floored reference vertex.
+     */
+    uint32_t depth_mode;
+    int64_t depth_z0, depth_dzdx, depth_dzdy;
 
     uint32_t fog_color, fog_f0, fog_dfdx, fog_dfdy;
     uint32_t logicop;
