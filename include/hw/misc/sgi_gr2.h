@@ -104,6 +104,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
 #define SGI_GR2_RE3_IMAGE_TOKEN   0x40558 /* token 342: expDrawImage24       */
 #define SGI_GR2_RE3_IMG_MAX       256     /* 342 groups recorded per sub-op  */
+#define SGI_GR2_RE3_COPY_TOKEN    0x40550 /* token 340: expCopyRect marker   */
 #define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
 #define SGI_GR2_RE3_DONE_TOKEN    0x407a8 /* token 490: op terminator        */
 /* The PUC_DATA words of one sub-op, kept so the rect list can be decoded from
@@ -271,6 +272,15 @@ struct SGIGr2State {
     unsigned re3_img_off[SGI_GR2_RE3_IMG_MAX];
     unsigned re3_nimg;
     bool re3_image_seen;
+    /* expCopyRect (token 340).  When the type dispatch picks the stream-copy
+     * path the DDX writes 340 = words-per-row, then seven PUC_DATA words:
+     * stride, src_x, src_y, width, height, dst_x, dst_y.  There is no 490, so
+     * the op is closed by the seventh word.  A screen-to-screen copy is the
+     * window-move/scroll case; off-screen sources are not modelled yet. */
+    uint32_t re3_copy_wpr;
+    uint32_t re3_copy_v[7];
+    unsigned re3_copy_n;
+    bool re3_copy_active;
     /* The name-label's row: the top y of the last solid rect drawn in the label
      * bar colour (222).  The DDX does not put the text y on the wire, and the
      * label bar is drawn just before its glyphs, so this is the structural link

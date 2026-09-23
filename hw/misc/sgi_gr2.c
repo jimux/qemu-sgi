@@ -602,6 +602,56 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
     sgi_gr2_update_display(s);
 }
 
+/* expCopyRect screen-to-screen (token 340).  The DDX writes 340 = words-per-row
+ * and then seven PUC_DATA words: stride, src_x, src_y, width, height, dst_x,
+ * dst_y.  Both source and destination are on the scanout, which is the
+ * window-move / scroll case; an off-screen pixmap source is not modelled yet.
+ * Overlapping copies run in the direction that does not clobber unread source
+ * rows.  Indices and the direct-colour flag move together. */
+static void sgi_gr2_re3_copy_rect(SGIGr2State *s, int sx, int sy, int w, int h,
+                                  int dx, int dy)
+{
+    int r;
+
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+    if (sx + w > SGI_GR2_SCREEN_W) { w = SGI_GR2_SCREEN_W - sx; }
+    if (dx + w > SGI_GR2_SCREEN_W) { w = SGI_GR2_SCREEN_W - dx; }
+    if (sy + h > SGI_GR2_SCREEN_H) { h = SGI_GR2_SCREEN_H - sy; }
+    if (dy + h > SGI_GR2_SCREEN_H) { h = SGI_GR2_SCREEN_H - dy; }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (dy < sy || (dy == sy && dx < sx)) {
+        for (r = 0; r < h; r++) {
+            size_t so = (size_t)(sy + r) * SGI_GR2_SCREEN_W + sx;
+            size_t dofs = (size_t)(dy + r) * SGI_GR2_SCREEN_W + dx;
+
+            memmove(s->scanout + dofs, s->scanout + so, w);
+            if (s->scanout332) {
+                memmove(s->scanout332 + dofs, s->scanout332 + so, w);
+            }
+        }
+    } else {
+        for (r = h - 1; r >= 0; r--) {
+            size_t so = (size_t)(sy + r) * SGI_GR2_SCREEN_W + sx;
+            size_t dofs = (size_t)(dy + r) * SGI_GR2_SCREEN_W + dx;
+
+            memmove(s->scanout + dofs, s->scanout + so, w);
+            if (s->scanout332) {
+                memmove(s->scanout332 + dofs, s->scanout332 + so, w);
+            }
+        }
+    }
+    trace_sgi_gr2_re3_copy(sx, sy, w, h, dx, dy);
+    sgi_gr2_update_display(s);
+}
+
 /* Evaluate the pending draw sub-op.  Called at token 331 (which starts a new
  * sub-op) and token 490 (the terminator), because one 490-terminated region can
  * hold several 331 sub-ops: the grainy root's stipple and the panel's own
@@ -689,6 +739,8 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_rop_valid = false;
     s->re3_data_n = 0;
     s->re3_data_overflow = false;
+    s->re3_copy_active = false;
+    s->re3_copy_n = 0;
 }
 
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
@@ -879,6 +931,19 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->prev_puc = s->last_puc;
         s->last_puc = value;
         s->last_puc_valid = true;
+        /* expCopyRect: the seven words after 340 close the op (no 490). */
+        if (s->re3_copy_active) {
+            s->re3_copy_v[s->re3_copy_n++] = value;
+            if (s->re3_copy_n == 7) {
+                sgi_gr2_re3_copy_rect(s, (int)s->re3_copy_v[1],
+                                      (int)s->re3_copy_v[2],
+                                      (int)s->re3_copy_v[3],
+                                      (int)s->re3_copy_v[4],
+                                      (int)s->re3_copy_v[5],
+                                      (int)s->re3_copy_v[6]);
+                s->re3_copy_active = false;
+            }
+        }
         /* Keep the sub-op's PUC_DATA for the rect-list decoder.  The weave op's
          * 1024 spans arrive before its own 331, so they fill and then reset the
          * buffer at the 331; only the tail that belongs to the 331 matters. */
@@ -932,6 +997,13 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
             s->re3_nimg++;
         }
         s->re3_image_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_COPY_TOKEN) {
+        /* expCopyRect: 340 = words-per-row, then seven PUC_DATA words.  No 490,
+         * so the copy fires on the seventh. */
+        s->re3_copy_wpr = (uint32_t)value;
+        s->re3_copy_n = 0;
+        s->re3_copy_active = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_PEN_TOKEN) {
         /* The pen x for one glyph piece; remember where its data starts. */
