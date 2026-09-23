@@ -375,13 +375,17 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
 }
 
 /* Draw a colour image (expDrawImage24, token 342).  Each 342 starts one run and
- * streams, through PUC_DATA, a group of (y, width, 1, nwords, 2, 0) followed by
- * nwords 32-bit words, each holding four 8-bit palette indices, most significant
- * byte first.  The rows of a 98x98 icon arrive as two runs (x=459 w=64 and
- * x=523 w=34) and every group is padded with 0xdeadbeef out to 22 PUC_DATA words.
- * The run x is 342's value; its data index is recorded at write time, so the
- * decoder needs no guessed geometry.  The indices are written to scanout as-is;
- * the palette is applied there, like every other RE3 draw. */
+ * streams, through PUC_DATA, a group of (y, width, height, nwords_per_row, 2, 0)
+ * followed by height*nwords_per_row 32-bit words, each holding four 8-bit
+ * palette indices, most significant byte first - so one row is nwords_per_row
+ * words, four pixels each.  The run x is 342's value; its data index is recorded
+ * at write time, so the decoder needs no guessed geometry.
+ *
+ * The 98x98 icon arrives as scanlines, each one row high, two runs per row
+ * (x=459 w=64 and x=523 w=34); the text cursor in the login field arrives as
+ * 8-row blocks of 6-px rows at x=464.  Every group is padded with 0xdeadbeef to
+ * a fixed 22 PUC_DATA words.  The indices are written to scanout as-is; the
+ * palette is applied there, like every other RE3 draw (see sgi_gr2_re3_332). */
 static void sgi_gr2_re3_draw_image(SGIGr2State *s)
 {
     unsigned k;
@@ -392,35 +396,43 @@ static void sgi_gr2_re3_draw_image(SGIGr2State *s)
     for (k = 0; k < s->re3_nimg; k++) {
         unsigned off = s->re3_img_off[k];
         uint32_t x = s->re3_img_x[k];
-        uint32_t y, w, nwords, j, p;
+        uint32_t y, w, height, nrow, j, p;
 
         if (off + 6 > s->re3_data_n) {
             break;
         }
         y = s->re3_data[off];
         w = s->re3_data[off + 1];
-        nwords = s->re3_data[off + 3];
+        height = s->re3_data[off + 2];
+        nrow = s->re3_data[off + 3];
         if (w == 0 || w > SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
-            x >= SGI_GR2_SCREEN_W || nwords > SGI_GR2_RE3_DATA_MAX) {
+            x >= SGI_GR2_SCREEN_W || height == 0 ||
+            height > SGI_GR2_SCREEN_H || nrow == 0 ||
+            nrow * height > SGI_GR2_RE3_DATA_MAX) {
             trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
             continue;
         }
-        if (off + 6 + nwords > s->re3_data_n) {
-            nwords = s->re3_data_n - (off + 6);
+        if (off + 6 + nrow * height > s->re3_data_n) {
+            break;
         }
         if (k == 0) {
             trace_sgi_gr2_re3_image(x, y, w, s->re3_nimg);
         }
-        for (j = 0; j < nwords; j++) {
-            uint32_t word = s->re3_data[off + 6 + j];
+        for (j = 0; j < height; j++) {
+            uint32_t r;
 
-            for (p = 0; p < 4; p++) {
-                uint32_t px = x + j * 4 + p;
+            for (r = 0; r < nrow; r++) {
+                uint32_t word = s->re3_data[off + 6 + j * nrow + r];
 
-                if (px >= x + w || px >= SGI_GR2_SCREEN_W) {
-                    break;
+                for (p = 0; p < 4; p++) {
+                    uint32_t px = x + r * 4 + p, py = y + j;
+
+                    if (px >= x + w || px >= SGI_GR2_SCREEN_W ||
+                        py >= SGI_GR2_SCREEN_H) {
+                        continue;
+                    }
+                    sgi_gr2_put332(s, px, py, (word >> (24 - 8 * p)) & 0xff);
                 }
-                sgi_gr2_put332(s, px, y, (word >> (24 - 8 * p)) & 0xff);
             }
         }
     }
