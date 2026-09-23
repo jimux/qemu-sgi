@@ -1216,8 +1216,18 @@ static void sgi_hub_realize(DeviceState *dev, Error **errp) {
     }
   }
 
-  s->rt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_hub_rtc_timer, s);
-  timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+  /*
+   * The RTC counts QEMU_CLOCK_REALTIME (see sgi_hub_rtc_count), so its poll
+   * timer must live on the same clock: a timer's clock type is fixed at
+   * creation, and timer_mod() interprets the deadline in that type.  With a
+   * VIRTUAL timer rescheduled with a REALTIME deadline the next expiry sat
+   * ~host-uptime ns in the future (never, on the small virtual timeline), so
+   * PI_RT_PEND_x was never latched: the L4 clock tick stopped after the first
+   * arm, lbolt/time froze, and every timeout waiter (e.g. XFS log flush)
+   * slept forever.
+   */
+  s->rt_timer = timer_new_ns(QEMU_CLOCK_REALTIME, sgi_hub_rtc_timer, s);
+  timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000);
 }
 
 static const Property sgi_hub_properties[] = {
