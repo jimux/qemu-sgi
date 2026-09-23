@@ -1051,6 +1051,30 @@ static void sgi_ip27_init(MachineState *machine) {
                                 rboot);
   }
 
+  /*
+   * The guest also reaches the flash by its 40-bit PHYSICAL address.  IRIX's
+   * TO_PHYS() masks with 0xffffffffff (R10000, sys/mips_addrspace.h), dropping
+   * the XKPHYS space discriminator our IP27_PAMASK retains; a kernel mmap of
+   * the hwgraph flash node (e.g. /dev/mmem) then installs a user PTE whose
+   * PFN is the bare physical (0x10000000 LBOOT / 0x30000000 RBOOT).  With the
+   * flash mapped only at the discriminator-preserving physical, that TLB
+   * access was unbacked and raised a user Data Bus Error.  Measured on the
+   * installer's exit-command `flash -p`: pc=0x1000c148, size=8 store,
+   * phys=0x30000000 (the RBOOT window).  Alias the same flash at both low
+   * physical windows, above the flat-RAM alias so a device window wins if RAM
+   * would otherwise cover it.
+   */
+  {
+    MemoryRegion *lo = g_new(MemoryRegion, 1);
+    memory_region_init_alias(lo, NULL, "sgi-ip27.flash.lboot-lo", flash, 0,
+                             8 * IP27_FLASH_SIZE);
+    memory_region_add_subregion_overlap(system_memory, 0x10000000ULL, lo, 2);
+    lo = g_new(MemoryRegion, 1);
+    memory_region_init_alias(lo, NULL, "sgi-ip27.flash.rboot-lo", flash, 0,
+                             8 * IP27_FLASH_SIZE);
+    memory_region_add_subregion_overlap(system_memory, 0x30000000ULL, lo, 2);
+  }
+
   if (machine->firmware) {
     g_autofree char *filename =
         qemu_find_file(QEMU_FILE_TYPE_BIOS, machine->firmware);
