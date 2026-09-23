@@ -872,6 +872,17 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_tile_word0 = 0;
 }
 
+/* The guest PC of the instruction performing the current MMIO access.  cpu->mem_io_pc
+ * is the HOST return address (see include/hw/core/cpu.h), useless for attributing a
+ * poll to guest code; cc->get_pc() returns the guest's own PC instead. */
+static uint32_t sgi_gr2_guest_pc(void)
+{
+    if (current_cpu && current_cpu->cc->get_pc) {
+        return (uint32_t)current_cpu->cc->get_pc(current_cpu);
+    }
+    return 0;
+}
+
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGr2State *s = SGI_GR2(opaque);
@@ -940,21 +951,21 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
     /* The HQ2 block is the polled surface: log each access with the reading PC
      * so the poll loop (and the value it expects) can be read off directly. */
     if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
-        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+        uint32_t pc = sgi_gr2_guest_pc();
 
         trace_sgi_gr2_hqread(offset, val, pc);
     }
     /* The token FIFO is written as the command channel; any READ of it is the
      * board's read-back/consumption contract, so log those with the PC too. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
-        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+        uint32_t pc = sgi_gr2_guest_pc();
 
         trace_sgi_gr2_fiforead(offset, val, pc);
     }
     /* VC1 / XMAP / RE3 / GE / bdvers reads with the PC: the last surface that
      * could hold the "display is up" gate the DDX waits on. */
     if (offset >= SGI_GR2_HQUCODE_OFF) {
-        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+        uint32_t pc = sgi_gr2_guest_pc();
 
         trace_sgi_gr2_regread(offset, val, pc);
     }
