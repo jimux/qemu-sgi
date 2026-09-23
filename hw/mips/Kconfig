@@ -126,6 +126,7 @@ config SGI_O2
     select SGI_CRIME
     select SGI_CRIME_RE
     select SGI_MACE
+    select SGI_O2_FLASH
     select SGI_GBE
     select SGI_VICE
     select SGI_MACE_VIDEO

@@ -161,6 +161,9 @@ config SGI_MACE
     bool
     select PS2
 
+config SGI_O2_FLASH
+    bool
+
 config SGI_VICE
     bool
 

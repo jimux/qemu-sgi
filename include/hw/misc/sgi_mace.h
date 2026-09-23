@@ -80,6 +80,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIMACEState, SGI_MACE)
  */
 #define ISA_NIC_DEASSERT        0x00000004ULL /* bit2: drive the 1-wire low */
 #define ISA_NIC_DATA            0x00000008ULL /* bit3: DQ read-back level  */
+#define ISA_FLASH_WE            0x00000001ULL /* bit0: 1 => flash writes   */
+
+/*
+ * True while the ISA flash write-enable latch (bit 0 above) is asserted.  The
+ * O2 flash device gates all programming on this, exactly as the hardware and
+ * the IP32 PROM/IRIX flash code do (see hw/misc/sgi_o2flash.c).
+ */
+bool sgi_mace_flash_write_enabled(SGIMACEState *s);
 
 /*
  * DS2502 1-wire EEPROM (the O2's "NIC" serial-number/eaddr chip).

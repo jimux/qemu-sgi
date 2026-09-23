@@ -60,6 +60,7 @@
 #include "hw/misc/sgi_crime_re.h"
 #include "hw/misc/sgi_mace.h"
 #include "hw/misc/sgi_mace_video.h"
+#include "hw/misc/sgi_o2flash.h"
 #include "hw/misc/sgi_vice.h"
 #include "hw/misc/unimp.h"
 #include "hw/pci/pci.h"
@@ -194,13 +195,11 @@ static void sgi_o2_fix_segment_body_checksum(uint8_t *rom, int bios_size,
 #define PROM_CONTAINER_MAGIC 0x50524f4d /* 'PROM' */
 #define PROM_CONTAINER_OFFSET 0x100     /* Flash data starts here */
 
-static int sgi_o2_strip_prom_container(int bios_size) {
-  uint8_t *rom;
+static int sgi_o2_strip_prom_container(uint8_t *rom, int bios_size) {
   uint32_t magic;
   int flash_size;
 
-  rom = rom_ptr(O2_PROM_BASE, bios_size);
-  if (!rom || bios_size <= PROM_CONTAINER_OFFSET) {
+  if (bios_size <= PROM_CONTAINER_OFFSET) {
     return bios_size;
   }
 
@@ -338,20 +337,14 @@ static bool sgi_o2_validate_prom_checksums(uint8_t *rom, int bios_size) {
  *   0cXXXXXX  jal   simple_memtst
  *   00000000  nop
  */
-static void sgi_o2_patch_prom_memtest(int bios_size) {
+static void sgi_o2_patch_prom_memtest(uint8_t *rom, int bios_size) {
   static const uint32_t prologue[] = {
       0x27bdff80, /* addiu sp, sp, -0x80 */
       0xffbf0008, /* sd    ra, 0x08(sp)  */
       0xffa40010, /* sd    a0, 0x10(sp)  */
       0xffa50018, /* sd    a1, 0x18(sp)  */
   };
-  uint8_t *rom;
   int limit, i;
-
-  rom = rom_ptr(O2_PROM_BASE, bios_size);
-  if (!rom) {
-    return;
-  }
 
   limit = bios_size - ((int)ARRAY_SIZE(prologue) + 14) * 4;
   for (i = 0; i < limit; i += 4) {
@@ -857,9 +850,12 @@ static void sgi_o2_install_exc_vectors(void) {
            "(uTLB refill + general stub)\n");
 }
 
+/* -machine autoload=off forces the flash env AutoLoad value to "N". */
+static bool sgi_o2_autoload = true;
+
 static void sgi_o2_init(MachineState *machine) {
   MemoryRegion *system_memory = get_system_memory();
-  MemoryRegion *prom;
+  DeviceState *flash_dev;
   DeviceState *crime_dev;
   DeviceState *mace_dev;
   DeviceState *video_dev;
@@ -979,10 +975,36 @@ static void sgi_o2_init(MachineState *machine) {
     memory_region_add_subregion(system_memory, O2_NOECC_RAM_BASE, noecc);
   }
 
-  /* PROM at 0x1FC00000 */
-  prom = g_new(MemoryRegion, 1);
-  memory_region_init_rom(prom, NULL, "sgi-o2.prom", O2_PROM_SIZE, &error_fatal);
-  memory_region_add_subregion(system_memory, O2_PROM_BASE, prom);
+  /*
+   * System flash (PROM + writable env) at 0x1FC00000.
+   *
+   * The flash is a rom_device: reads and instruction fetches are direct,
+   * while writes go through the O2 flash model, which honours MACE's
+   * write-enable latch and persists the env segment.  The PROM image is
+   * loaded by hand (not via a ROM blob) so a reset never clobbers the env.
+   */
+  flash_dev = qdev_new(TYPE_SGI_O2_FLASH);
+  /*
+   * Create MACE here (realized later) so the flash can link to its ISA
+   * write-enable latch before the flash is realized; QOM forbids setting a
+   * link property after realize.
+   */
+  mace_dev = qdev_new(TYPE_SGI_MACE);
+  sgi_o2_flash_set_mace(flash_dev, mace_dev);
+  {
+    SGIO2FlashState *fl = SGI_O2_FLASH(flash_dev);
+    /* Per-machine sidecar in the working directory, like the Indy NVRAM
+     * files; overridable with -global sgi-o2-flash.nvram-file=... */
+    if (!fl->nvram_filename) {
+      qdev_prop_set_string(flash_dev, "nvram-file", "sgi_o2_nvram.bin");
+    }
+    /* Machine-level convenience override: -machine autoload=off. */
+    if (fl->autoload && !sgi_o2_autoload) {
+      qdev_prop_set_bit(flash_dev, "autoload", false);
+    }
+  }
+  sysbus_realize_and_unref(SYS_BUS_DEVICE(flash_dev), &error_fatal);
+  sysbus_mmio_map(SYS_BUS_DEVICE(flash_dev), 0, O2_PROM_BASE);
 
   /*
    * Load PROM/BIOS. Skipped entirely for -kernel direct boot: the trampoline
@@ -1001,21 +1023,30 @@ static void sgi_o2_init(MachineState *machine) {
     }
 
     if (filename) {
-      bios_size =
-          load_image_targphys(filename, O2_PROM_BASE, O2_PROM_SIZE, NULL);
-      g_free(filename);
-      if (bios_size < 0) {
-        error_report("Could not load PROM image");
+      g_autofree gchar *raw = NULL;
+      GError *gerr = NULL;
+      gsize fsize = 0;
+
+      if (!g_file_get_contents(filename, &raw, &fsize, &gerr)) {
+        error_report("Could not read PROM image '%s': %s", filename,
+                     gerr ? gerr->message : "unknown error");
         exit(EXIT_FAILURE);
       }
-      bios_size = sgi_o2_strip_prom_container(bios_size);
-      sgi_o2_patch_prom_memtest(bios_size);
-      if (!sgi_o2_validate_prom_checksums(
-              rom_ptr(O2_PROM_BASE, bios_size), bios_size)) {
+      g_free(filename);
+      if (fsize == 0 || fsize > O2_PROM_SIZE) {
+        error_report("PROM image '%s' has invalid size %zu", machine->firmware,
+                     (size_t)fsize);
+        exit(EXIT_FAILURE);
+      }
+      bios_size = (int)fsize;
+      bios_size = sgi_o2_strip_prom_container((uint8_t *)raw, bios_size);
+      sgi_o2_patch_prom_memtest((uint8_t *)raw, bios_size);
+      if (!sgi_o2_validate_prom_checksums((uint8_t *)raw, bios_size)) {
         error_report("PROM image failed flash-segment checksum validation — "
                      "refusing to boot a corrupted image");
         exit(EXIT_FAILURE);
       }
+      sgi_o2_flash_load_prom(flash_dev, (const uint8_t *)raw, bios_size);
     }
   }
 
@@ -1040,8 +1071,7 @@ static void sgi_o2_init(MachineState *machine) {
     sysbus_mmio_map(SYS_BUS_DEVICE(crime_re_dev), 0, O2_CRIME_RE_BASE);
   }
 
-  /* MACE at 0x1F000000 */
-  mace_dev = qdev_new(TYPE_SGI_MACE);
+  /* MACE at 0x1F000000 (created above so the flash could link to it) */
   /* The DS2502 1-wire bit-bang times its pulses on CRIME CRM_TIME. */
   object_property_set_link(OBJECT(mace_dev), "crime", OBJECT(crime_dev),
                            &error_fatal);
@@ -1311,9 +1341,26 @@ static void sgi_o2_init(MachineState *machine) {
   }
 }
 
+/*
+ * -machine autoload=off forces the flash env AutoLoad value to "N" at
+ * power-on.  (The same latch can also be reached through the flash device
+ * as -global sgi-o2-flash.autoload=false.)
+ */
+static bool sgi_o2_get_autoload(Object *obj, Error **errp)
+{
+  return sgi_o2_autoload;
+}
+
+static void sgi_o2_set_autoload(Object *obj, bool value, Error **errp)
+{
+  sgi_o2_autoload = value;
+}
+
 static void sgi_o2_class_init(ObjectClass *oc, const void *data) {
   MachineClass *mc = MACHINE_CLASS(oc);
 
+  object_class_property_add_bool(oc, "autoload", sgi_o2_get_autoload,
+                                 sgi_o2_set_autoload);
   mc->desc = "SGI O2 (IP32)";
   mc->init = sgi_o2_init;
   mc->block_default_type = IF_SCSI;

@@ -3352,6 +3352,11 @@ static void sgi_mace_write(void *opaque, hwaddr offset,
                   offset, value, size);
 }
 
+bool sgi_mace_flash_write_enabled(SGIMACEState *s)
+{
+    return (s->isa_flash_nic & ISA_FLASH_WE) != 0;
+}
+
 static const MemoryRegionOps sgi_mace_ops = {
     .read = sgi_mace_read,
     .write = sgi_mace_write,
