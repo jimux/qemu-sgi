@@ -1174,6 +1174,17 @@ typedef struct CPUArchState {
     struct {} end_reset_fields;
 
     /* Fields from here on are preserved across CPU reset. */
+
+    /*
+     * Lock CP0 COUNT/COMPARE (and the IP7 they raise) to the host wall clock
+     * (QEMU_CLOCK_REALTIME) instead of QEMU_CLOCK_VIRTUAL.  A machine whose
+     * guest derives its scheduling clock from COUNT must set this: virtual
+     * time races ahead of the guest's modeled rate, so the timer interval is
+     * already elapsed by the time interrupts are enabled and IP7 livelocks.
+     * Env QEMU_MIPS_COUNT_REALTIME still overrides (present = wins).  Set for
+     * IP27 (SN0); zero elsewhere.
+     */
+    bool count_realtime;
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;

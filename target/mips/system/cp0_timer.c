@@ -34,27 +34,33 @@
  * ahead of wall time and dilates everything the kernel reads — networking
  * timeouts, lbolt-derived gettimeofday(), animations.
  *
- * Setting QEMU_MIPS_COUNT_REALTIME=1 makes COUNT/COMPARE-IRQ7 read
- * QEMU_CLOCK_REALTIME (host monotonic) instead, so wall time is the source
- * of truth for the guest's perception of time.  Default keeps VIRTUAL to
- * preserve behaviour for other MIPS machines under test.
- * See progress_notes/time_decoupling_investigation_2026-06-19.md.
+ * Setting this machine property (env->count_realtime, set by the IP27/SN0
+ * machine) makes COUNT/COMPARE-IRQ7 read QEMU_CLOCK_REALTIME (host monotonic)
+ * instead, so wall time is the source of truth for the guest's perception of
+ * time -- the project's virtualization-native clock doctrine.  Without it the
+ * virtual clock races ahead of the guest's modeled rate, so an interval
+ * programmed by the guest's clock handler is already elapsed when interrupts
+ * are enabled and IP7 livelocks (observed on IP27: main frozen at +0x8c).
+ * Default stays VIRTUAL for machines that do not opt in.  The env variable
+ * QEMU_MIPS_COUNT_REALTIME overrides the property when present.
+ * See progress_notes/time_decoupling_investigation_2026-06-19.md and
+ * progress_notes/ip55/clock_decoupling.md.
  */
-static QEMUClockType mips_count_clock_type(void)
+static QEMUClockType mips_count_clock_type(CPUMIPSState *env)
 {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("QEMU_MIPS_COUNT_REALTIME");
-        cached = (e && *e && *e != '0') ? 1 : 0;
+    const char *e = getenv("QEMU_MIPS_COUNT_REALTIME");
+
+    if (e && *e) {
+        return (*e != '0') ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
     }
-    return cached ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
+    return env->count_realtime ? QEMU_CLOCK_REALTIME : QEMU_CLOCK_VIRTUAL;
 }
 
 /* MIPS R4K timer */
 static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
 {
     int64_t now_ns;
-    now_ns = qemu_clock_get_ns(mips_count_clock_type());
+    now_ns = qemu_clock_get_ns(mips_count_clock_type(env));
     return env->CP0_Count +
             (uint32_t)clock_ns_to_ticks(env->count_clock, now_ns);
 }
@@ -64,7 +70,7 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     uint64_t now_ns, next_ns;
     uint32_t wait;
 
-    now_ns = qemu_clock_get_ns(mips_count_clock_type());
+    now_ns = qemu_clock_get_ns(mips_count_clock_type(env));
     wait = env->CP0_Compare - cpu_mips_get_count_val(env);
     /* Clamp interval to overflow if virtual time had not progressed */
     if (!wait) {
@@ -91,7 +97,7 @@ uint32_t cpu_mips_get_count(CPUMIPSState *env)
     } else {
         uint64_t now_ns;
 
-        now_ns = qemu_clock_get_ns(mips_count_clock_type());
+        now_ns = qemu_clock_get_ns(mips_count_clock_type(env));
         if (timer_pending(env->timer)
             && timer_expired(env->timer, now_ns)) {
             /* The timer has already expired.  */
@@ -114,7 +120,7 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
     } else {
         /* Store new count register */
         env->CP0_Count = count - (uint32_t)clock_ns_to_ticks(env->count_clock,
-                        qemu_clock_get_ns(mips_count_clock_type()));
+                        qemu_clock_get_ns(mips_count_clock_type(env)));
         /* Update timer timer */
         cpu_mips_timer_update(env);
     }
@@ -141,7 +147,7 @@ void cpu_mips_stop_count(CPUMIPSState *env)
 {
     /* Store the current value */
     env->CP0_Count += (uint32_t)clock_ns_to_ticks(env->count_clock,
-                        qemu_clock_get_ns(mips_count_clock_type()));
+                        qemu_clock_get_ns(mips_count_clock_type(env)));
 }
 
 static void mips_timer_cb(void *opaque)
@@ -172,7 +178,7 @@ static void mips_timer_cb(void *opaque)
  */
 void cpu_mips_timer_catchup(CPUMIPSState *env)
 {
-    if (mips_count_clock_type() != QEMU_CLOCK_REALTIME) {
+    if (mips_count_clock_type(env) != QEMU_CLOCK_REALTIME) {
         return;
     }
     if (!env->timer || (env->CP0_Cause & (1 << CP0Ca_DC))) {
@@ -193,7 +199,7 @@ void cpu_mips_clock_init(MIPSCPU *cpu)
      * kernel.
      */
     if (!kvm_enabled()) {
-        env->timer = timer_new_ns(mips_count_clock_type(),
+        env->timer = timer_new_ns(mips_count_clock_type(env),
                                   &mips_timer_cb, env);
     }
 }
