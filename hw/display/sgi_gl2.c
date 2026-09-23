@@ -675,11 +675,11 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
          */
         if (nargs >= 1) {
             if (cmd == 0x04) {
-                s->color_ab = args[0];
-                s->color_cd = args[0];
+                s->color_ab = args[0] & 3;
+                s->color_cd = (args[0] >> 2) & 3;
             } else {
-                s->we_ab = args[0];
-                s->we_cd = args[0];
+                s->we_ab = args[0] & 3;
+                s->we_cd = (args[0] >> 2) & 3;
             }
         }
         if (nargs >= 3) {
@@ -696,16 +696,17 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
 
     case 0x14:                          /* FBCcolor (colour index) */
         if (nargs >= 1) {
-            s->color_ab = args[0];
-            s->color_cd = args[0];
+            /* The index splits into the A/B and C/D plane pairs. */
+            s->color_ab = args[0] & 3;
+            s->color_cd = (args[0] >> 2) & 3;
             s->rgb_valid = false;
         }
         break;
 
     case 0x15:                          /* FBCwrten (write enable) */
         if (nargs >= 1) {
-            s->we_ab = args[0];
-            s->we_cd = args[0];
+            s->we_ab = args[0] & 3;
+            s->we_cd = (args[0] >> 2) & 3;
             s->rgb_valid = false;
         }
         break;
