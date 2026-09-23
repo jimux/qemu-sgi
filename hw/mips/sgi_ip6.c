@@ -1058,7 +1058,7 @@ static void sgi_ip6_lio_update(SGIip6State *s)
 
     if (level != s->lio_int && s->cpu) {
         s->lio_int = level;
-        qemu_set_irq(s->cpu->env.irq[1], level);
+        qemu_set_irq(s->cpu->env.irq[3], level);
     }
 }
 
@@ -1331,7 +1331,7 @@ static void sgi_ip6_pit_out0(void *opaque, int n, int level)
      * leaves channel 0 toggling out of reset, so wait until the PROM has
      * actually programmed the chip before propagating edges. */
     if (level && !s->pit0_level && s->pit0_programmed && s->cpu) {
-        qemu_set_irq(s->cpu->env.irq[2], 1);
+        qemu_set_irq(s->cpu->env.irq[4], 1);
     }
     s->pit0_level = level;
 }
@@ -1384,7 +1384,7 @@ static uint64_t sgi_ip6_timer0_ack_read(void *opaque, hwaddr addr, unsigned size
     SGIip6State *s = opaque;
 
     if (s->cpu) {
-        qemu_set_irq(s->cpu->env.irq[2], 0);
+        qemu_set_irq(s->cpu->env.irq[4], 0);
     }
     return 0;
 }
@@ -1394,7 +1394,7 @@ static uint64_t sgi_ip6_timer1_ack_read(void *opaque, hwaddr addr, unsigned size
     SGIip6State *s = opaque;
 
     if (s->cpu) {
-        qemu_set_irq(s->cpu->env.irq[4], 0);
+        qemu_set_irq(s->cpu->env.irq[6], 0);
     }
     return 0;
 }
