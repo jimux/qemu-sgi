@@ -59,6 +59,7 @@ static uint32_t sgi_gr2_word_write(uint64_t value, unsigned byte, unsigned size)
 }
 
 static void sgi_gr2_update_display(void *opaque);
+static void sgi_gr2_vc1_advance(SGIGr2State *s);
 
 /* Direct-colour 3-3-2 expansion (expDrawImage24).  In the 8-bit 3-3-2 visual the
  * stored byte is an RGB triple: bits 7-5 red, bits 4-3 blue, bits 2-0 green, each
@@ -807,6 +808,36 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
                       SGI_GR2_FIFO_FLUSH_MS);
         }
     }
+    /* VC1: an addressed 16-bit register file and SRAM, both auto-incrementing.
+     * addrlo/addrhi carry a byte address; cmd0 is the register port (the cursor's
+     * x/y go here) and sram the bitmap port (Gr2LoadVC1SRAM streams the cursor). */
+    if (offset == SGI_GR2_VC1_ADDRLO) {
+        s->vc1_addrlo = value & 0xff;
+        return;
+    }
+    if (offset == SGI_GR2_VC1_ADDRHI) {
+        s->vc1_addrhi = value & 0xff;
+        return;
+    }
+    if (offset == SGI_GR2_VC1_CMD0) {
+        unsigned a = ((((unsigned)s->vc1_addrhi << 8) | s->vc1_addrlo) >> 1);
+
+        if (a < SGI_GR2_VC1_REG_WORDS) {
+            s->vc1_reg[a] = value & 0xffff;
+        }
+        sgi_gr2_vc1_advance(s);
+        sgi_gr2_update_display(s);
+        return;
+    }
+    if (offset == SGI_GR2_VC1_SRAM) {
+        unsigned a = ((((unsigned)s->vc1_addrhi << 8) | s->vc1_addrlo) >> 1);
+
+        if (a < SGI_GR2_VC1_SRAM_WORDS) {
+            s->vc1_sram[a] = value & 0xffff;
+        }
+        sgi_gr2_vc1_advance(s);
+        return;
+    }
     /* RE3 producer, 8-bit mode.  The DDX writes the fill colour (a RAMDAC
      * INDEX) to the RE3 colour token, then pushes the rectangle's geometry as
      * the last two PUC_DATA words.  [ASSUMPTION, from the one captured
@@ -1077,6 +1108,43 @@ static void sgi_gr2_fill_bars(SGIGr2State *s)
     }
 }
 
+/* VC1 byte address -> the next address after a 16-bit port write. */
+static void sgi_gr2_vc1_advance(SGIGr2State *s)
+{
+    unsigned a = ((((unsigned)s->vc1_addrhi << 8) | s->vc1_addrlo) + 2) & 0xffff;
+
+    s->vc1_addrlo = a & 0xff;
+    s->vc1_addrhi = (a >> 8) & 0xff;
+}
+
+/* The hardware cursor: VC1 reg 0x20 holds the bitmap address (0x0a00), 0x22/0x24
+ * the x/y, 0x26 the mode.  The registers are RASTER coordinates, so the visible
+ * position is reg minus the horizontal/vertical backporch (GR2_CURS_*OFF_1280);
+ * at reset they read 0, which puts the sprite off-screen, so a fresh boot shows
+ * no cursor.  The image is 16x16 at 2 bpp - 0 transparent, 1 black, 2 white,
+ * 3 invert - loaded through the sram port by Gr2LoadVC1SRAM. */
+static bool sgi_gr2_vc1_cursor(SGIGr2State *s, int *cx, int *cy)
+{
+    unsigned base = s->vc1_reg[0x20 >> 1]; /* byte addr 0x20 = cursor image base */
+
+    if (base != SGI_GR2_VC1_CURSOR_ADDR) {
+        return false;
+    }
+    *cx = (int)s->vc1_reg[0x22 >> 1] - SGI_GR2_VC1_CURS_XOFF;
+    *cy = (int)s->vc1_reg[0x24 >> 1] - SGI_GR2_VC1_CURS_YOFF;
+    return true;
+}
+
+static unsigned sgi_gr2_vc1_cursor_code(SGIGr2State *s, int x, int y)
+{
+    unsigned p = y * SGI_GR2_VC1_CURSOR_W + x;
+    unsigned base = SGI_GR2_VC1_CURSOR_ADDR >> 1;
+    uint16_t w = s->vc1_sram[base + (p >> 3)];
+    unsigned byte = (w >> (8 * (1 - ((p >> 2) & 1)))) & 0xff;
+
+    return (byte >> (6 - 2 * (p & 3))) & 3;
+}
+
 static void sgi_gr2_update_display(void *opaque)
 {
     SGIGr2State *s = opaque;
@@ -1109,6 +1177,38 @@ static void sgi_gr2_update_display(void *opaque)
                 row[x] = sgi_gr2_re3_332(idx);
             } else {
                 row[x] = s->ramdac[idx];
+            }
+        }
+    }
+    /* The cursor is a hardware sprite: drawn on top here, never in the buffer. */
+    {
+        int cx, cy;
+
+        if (sgi_gr2_vc1_cursor(s, &cx, &cy)) {
+            for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
+                uint32_t *row = dest + (y * stride) / 4;
+                int py = y - cy;
+                int x;
+
+                if (py < 0 || py >= SGI_GR2_VC1_CURSOR_W) {
+                    continue;
+                }
+                for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
+                    int px = x - cx;
+                    unsigned code;
+
+                    if (px < 0 || px >= SGI_GR2_VC1_CURSOR_W) {
+                        continue;
+                    }
+                    code = sgi_gr2_vc1_cursor_code(s, px, py);
+                    if (code == 1) {
+                        row[x] = 0x000000;
+                    } else if (code == 2) {
+                        row[x] = 0xffffff;
+                    } else if (code == 3) {
+                        row[x] ^= 0xffffff;
+                    }
+                }
             }
         }
     }

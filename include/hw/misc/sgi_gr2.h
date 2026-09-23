@@ -47,6 +47,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_SHRAM_OFF   0x00000 /* 128 KB shared command/constant RAM */
 #define SGI_GR2_FIFO_OFF    0x40000 /* 128 KB token-addressed command FIFO */
 #define SGI_GR2_FIFO_FLUSH_MS 100   /* pause before an unterminated op is run */
+
+/* VC1: an addressed register file plus SRAM, which drives the hardware cursor.
+ * addrlo/addrhi hold a byte address; cmd0 is the register data port and sram the
+ * bitmap port, both 16-bit and auto-incrementing by 2.  Gr2PositionCursor writes
+ * 0x22/0x24 (x/y) through cmd0; Gr2LoadVC1SRAM streams the cursor bitmap through
+ * sram.  The sprite is composited at scanout, never written into the framebuffer. */
+#define SGI_GR2_VC1_CMD0    0x6c040
+#define SGI_GR2_VC1_SRAM    0x6c048
+#define SGI_GR2_VC1_TESTREG 0x6c04c
+#define SGI_GR2_VC1_ADDRLO  0x6c050
+#define SGI_GR2_VC1_ADDRHI  0x6c054
+#define SGI_GR2_VC1_SYSCTL  0x6c058
+#define SGI_GR2_VC1_REG_WORDS  128 /* byte address >> 1                       */
+#define SGI_GR2_VC1_SRAM_WORDS 8192
+#define SGI_GR2_VC1_CURSOR_ADDR 0x0a00 /* byte address of the cursor bitmap   */
+#define SGI_GR2_VC1_CURSOR_W    16     /* 16x16, 2 bpp                        */
+/* Raster backporch for 1280x1024 H60 (gr2hw.h GR2_CURS_*OFF_1280): the cursor
+ * registers are raster coordinates, so the visible position is reg minus these. */
+#define SGI_GR2_VC1_CURS_XOFF   250
+#define SGI_GR2_VC1_CURS_YOFF   35
 #define SGI_GR2_HQUCODE_OFF 0x60000 /* 8 K x 32-bit HQ2 microcode RAM */
 #define SGI_GR2_GE_OFF      0x68000 /* GE7 units: 8 x 1 KB RAM0, 0x400 stride */
 #define SGI_GR2_GE_STRIDE   0x400
@@ -301,6 +321,12 @@ struct SGIGr2State {
      * the op; this timer models that drain, rescheduled on every token write and
      * firing only after the stream pauses. */
     QEMUTimer *fifo_flush_timer;
+    /* VC1 register file and SRAM.  Addresses are byte addresses; the arrays are
+     * indexed by address>>1 (16-bit entries). */
+    uint8_t vc1_addrlo;
+    uint8_t vc1_addrhi;
+    uint16_t vc1_reg[SGI_GR2_VC1_REG_WORDS];
+    uint16_t vc1_sram[SGI_GR2_VC1_SRAM_WORDS];
     bool retrace_active;
 };
 
