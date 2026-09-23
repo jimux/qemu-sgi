@@ -64,6 +64,18 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     uint64_t now_ns, next_ns;
     uint32_t wait;
 
+    /*
+     * The R2000/R3000 have no CP0 Count/Compare (registers 9/11 are not
+     * implemented), so the internal timer must never be armed on them: the
+     * generic path raises irq[7] on expiry, and on IP6 irq[7] is the CTL1
+     * bus-error line, so a stray C0 timer tick presents as a spurious bus
+     * error.  IRIX 4.0.5 on the IP6 is such an R3000 and treads into
+     * prom_reboot's spin loop, where the tick fired and panicked the kernel.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        return;
+    }
+
     now_ns = qemu_clock_get_ns(mips_count_clock_type());
     wait = env->CP0_Compare - cpu_mips_get_count_val(env);
     /* Clamp interval to overflow if virtual time had not progressed */
@@ -129,7 +141,9 @@ void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
     if (env->insn_flags & ISA_MIPS_R2) {
         env->CP0_Cause &= ~(1 << CP0Ca_TI);
     }
-    qemu_irq_lower(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
+    if (env->cpu_model->mmu_type != MMU_TYPE_R3000) {
+        qemu_irq_lower(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
+    }
 }
 
 void cpu_mips_start_count(CPUMIPSState *env)
