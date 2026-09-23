@@ -298,15 +298,14 @@ static void scc_data_write(SGIHPC1State *s, int d, int c, uint8_t val)
     scc_tx(s, d, c, val);
 
     /*
-     * Z8530 WR14 bit 1 = Local Loopback: the transmitter output is wired
+     * WR14 bit 4 (0x10) = Local Loopback: the transmitter output is wired
      * internally to the receiver input, so a byte written to the transmit
-     * buffer returns on RX with no cable or device present. The IP20 power-on
-     * "Keyboard/Mouse diagnostic" is exactly this test on the DUART that
-     * carries the keyboard/mouse -- z8530_func_bfc04ea0 carries the string
-     * "Cannot run loopback test on console channel" -- and it cannot pass
-     * without local loopback.
+     * buffer returns on RX with no cable or device present. (SGI's z8530.h:
+     * WR14_LCL_LPBK 0x10; 0x02 is WR14_BRG_PCLK.) The IP20 power-on
+     * "Keyboard/Mouse diagnostic" (duart_lpbk.c / z8530_func) runs exactly
+     * this test -- internal loopback -- and then waits for the RX interrupt.
      */
-    if (u->wr[14] & 0x02) {
+    if (u->wr[14] & 0x10) {
         scc_push_rx(s, d, c, val);
     }
 }
