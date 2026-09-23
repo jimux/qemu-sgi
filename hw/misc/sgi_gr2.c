@@ -363,6 +363,28 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
     }
+    if (s->poly_stroke) {
+        /* Test seam: stroke each contour (split where a vertex repeats the
+         * contour's first) instead of filling.  Kept behind a runtime property
+         * so one build can be A/B'd with no rebuild or trace differences. */
+        unsigned cstart = 0;
+
+        for (i = 1; i < nv; i++) {
+            if (i - cstart >= 2 && vx[i] == vx[cstart] && vy[i] == vy[cstart]) {
+                unsigned k;
+
+                for (k = cstart; k + 1 <= i; k++) {
+                    trace_sgi_gr2_re3_seg(s->re3_colour, s->ramdac[s->re3_colour],
+                                          vx[k], vy[k], vx[k + 1], vy[k + 1]);
+                    sgi_gr2_re3_line(s, s->re3_colour, vx[k], vy[k],
+                                     vx[k + 1], vy[k + 1]);
+                }
+                cstart = i + 1;
+            }
+        }
+        sgi_gr2_update_display(s);
+        return;
+    }
     ymin = ymax = vy[0];
     for (i = 1; i < nv; i++) {
         ymin = MIN(ymin, vy[i]);
@@ -1082,6 +1104,7 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
 static const Property sgi_gr2_properties[] = {
     DEFINE_PROP_BOOL("present", SGIGr2State, present, false),
     DEFINE_PROP_BOOL("scanout-bars", SGIGr2State, scanout_bars, false),
+    DEFINE_PROP_BOOL("poly-stroke", SGIGr2State, poly_stroke, false),
     DEFINE_PROP_UINT8("ges", SGIGr2State, ges, 2),
     DEFINE_PROP_UINT8("bitplanes", SGIGr2State, bitplanes, 24),
     DEFINE_PROP_BOOL("zbuffer", SGIGr2State, zbuffer, true),

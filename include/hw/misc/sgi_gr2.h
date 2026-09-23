@@ -183,6 +183,7 @@ struct SGIGr2State {
     QemuConsole *con;
     uint8_t *scanout;
     bool scanout_bars; /* fill a colour-bar test pattern (P0.4 step a) */
+    bool poly_stroke;  /* 302 op: stroke its path instead of filling (test seam) */
 
     /* RE3 producer colour latch + RAMDAC palette (8-bit mode).  In the 8-bit
      * mode the guest runs (xwininfo: depth 8 PseudoColor), the RE3 fill colour
