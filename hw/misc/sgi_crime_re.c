@@ -761,6 +761,14 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
     if (maxy > BOUND) { maxy = BOUND; }
 
     bool smooth = (s->drawmode & DM_ENSMOOTHSHADE) != 0;
+    if (s->drawmode & DM_ENTEXTURE) {
+        trace_sgi_crime_re_tex_tri(s->tex_mode, s->tex_format,
+                                   s->tex_sq0, s->tex_tq0, s->tex_q0,
+                                   s->tex_dqdx, s->tex_dqdy,
+                                   s->tex_stshift, s->winoffset_dst);
+        trace_sgi_crime_re_tex_slope(s->tex_dsqdx, s->tex_dsqdy,
+                                     s->tex_dtqdx, s->tex_dtqdy);
+    }
     CrimStipple st;
     sgi_crime_re_stipple_init(s, &st);
     bool poly_stipple = (s->drawmode & DM_ENPOLYSTIPPLE) != 0;
@@ -1577,6 +1585,93 @@ static void sgi_crime_re_pp_store(SGICRIMEREState *s, hwaddr p, uint32_t v)
         s->shade_plane[(p - CRM_SHADE_R0_REG) / 4] = v;
         return;
 
+    /* ---- texture ---- */
+    case CRM_TEXTURE_MODE_REG:
+        s->tex_mode = v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_FORMAT_REG:
+        s->tex_format = (s->tex_format & 0xffffffffu) | ((uint64_t)v << 32);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_FORMAT_REG + 4:
+        s->tex_format = (s->tex_format & ~0xffffffffULL) | v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    /* 64-bit coordinate planes: high word at the even offset, low at +4 */
+    case CRM_TEXTURE_SQ0_REG:
+        s->tex_sq0 = (int64_t)(((uint64_t)v << 32) | (uint32_t)s->tex_sq0);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_SQ0_REG + 4:
+        s->tex_sq0 = (int64_t)(((uint64_t)s->tex_sq0 & ~0xffffffffULL) | v);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_TQ0_REG:
+        s->tex_tq0 = (int64_t)(((uint64_t)v << 32) | (uint32_t)s->tex_tq0);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_TQ0_REG + 4:
+        s->tex_tq0 = (int64_t)(((uint64_t)s->tex_tq0 & ~0xffffffffULL) | v);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_Q0_REG:
+        s->tex_q0 = (int32_t)v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_STSHIFT_REG:
+        s->tex_stshift = (int32_t)v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DSQDX_REG:
+        s->tex_dsqdx = (int64_t)(((uint64_t)v << 32) | (uint32_t)s->tex_dsqdx);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DSQDX_REG + 4:
+        s->tex_dsqdx = (int64_t)(((uint64_t)s->tex_dsqdx & ~0xffffffffULL) | v);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DSQDY_REG:
+        s->tex_dsqdy = (int64_t)(((uint64_t)v << 32) | (uint32_t)s->tex_dsqdy);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DSQDY_REG + 4:
+        s->tex_dsqdy = (int64_t)(((uint64_t)s->tex_dsqdy & ~0xffffffffULL) | v);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DTQDX_REG:
+        s->tex_dtqdx = (int64_t)(((uint64_t)v << 32) | (uint32_t)s->tex_dtqdx);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DTQDX_REG + 4:
+        s->tex_dtqdx = (int64_t)(((uint64_t)s->tex_dtqdx & ~0xffffffffULL) | v);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DTQDY_REG:
+        s->tex_dtqdy = (int64_t)(((uint64_t)v << 32) | (uint32_t)s->tex_dtqdy);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DTQDY_REG + 4:
+        s->tex_dtqdy = (int64_t)(((uint64_t)s->tex_dtqdy & ~0xffffffffULL) | v);
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DQDX_REG:
+        s->tex_dqdx = (int32_t)v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_DQDY_REG:
+        s->tex_dqdy = (int32_t)v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_BORDER_REG:
+        s->tex_border = v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+    case CRM_TEXTURE_ENV_REG:
+        s->tex_env = v;
+        trace_sgi_crime_re_texreg((int)p, v);
+        return;
+
     /* ---- fog / logicop / colormask ---- */
     case CRM_FOG_COLOR_REG:      s->fog_color = v; return;
     case CRM_LOGICOP_REG:        s->logicop = v; return;
@@ -1723,6 +1818,8 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
                 trace_sgi_crime_re_tlb_write(2, (t - 0x400) / 8, value);
             } else if (t < CRM_TLB_CID_OFFSET) {
                 s->tlb_tex[(t - CRM_TLB_TEX_OFFSET) / 8] = value;
+                trace_sgi_crime_re_textlb((int)((t - CRM_TLB_TEX_OFFSET) / 8),
+                                          value);
             } else if (t < CRM_TLB_LINEAR_A_OFFSET) {
                 s->tlb_cid[(t - CRM_TLB_CID_OFFSET) / 8] = value;
             } else if (t < CRM_TLB_LINEAR_A_OFFSET + 0x80) {

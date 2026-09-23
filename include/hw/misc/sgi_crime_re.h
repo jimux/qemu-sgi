@@ -146,6 +146,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEREState, SGI_CRIME_RE)
 #define CRM_SHADE_DADX_REG         0x104
 #define CRM_SHADE_DBDY_REG         0x108
 #define CRM_SHADE_DADY_REG         0x10c
+
+/* Texture registers (crimereg.h CrmTextureReg / spec Table 7-3) */
+#define CRM_TEXTURE_MODE_REG        0x110
+#define CRM_TEXTURE_FORMAT_REG      0x118
+#define CRM_TEXTURE_SQ0_REG         0x120
+#define CRM_TEXTURE_TQ0_REG         0x128
+#define CRM_TEXTURE_Q0_REG          0x130
+#define CRM_TEXTURE_STSHIFT_REG     0x134
+#define CRM_TEXTURE_DSQDX_REG       0x138
+#define CRM_TEXTURE_DSQDY_REG       0x140
+#define CRM_TEXTURE_DTQDX_REG       0x148
+#define CRM_TEXTURE_DTQDY_REG       0x150
+#define CRM_TEXTURE_DQDX_REG        0x158
+#define CRM_TEXTURE_DQDY_REG        0x15c
+#define CRM_TEXTURE_BORDER_REG      0x160
+#define CRM_TEXTURE_ENV_REG         0x168
+
 #define CRM_FOG_COLOR_REG          0x170
 #define CRM_LOGICOP_REG            0x1b0
 #define CRM_COLORMASK_REG          0x1b8
@@ -161,6 +178,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEREState, SGI_CRIME_RE)
 #define DM_ENPOLYSTIPPLE      (1U << 18)
 #define DM_ENOPAQSTIPPLE      (1U << 17)
 #define DM_ENSMOOTHSHADE      (1U << 16)
+#define DM_ENTEXTURE          (1U << 15)    /* spec Table 7-2 enTexture */
 #define DM_ENLOGICOP          (1U << 9)
 #define DM_ENDITHER           (1U << 8)
 #define DM_ENCOLORMASK        (1U << 7)
@@ -283,6 +301,22 @@ struct SGICRIMEREState {
     uint32_t stipple_mode, stipple_pattern;
     uint32_t shade_fgcolor, shade_bgcolor;
     uint32_t shade_plane[12];       /* r0 g0 b0 a0 drdx dgdx drdy dgdy dbdx dadx dbdy dady */
+
+    /*
+     * Texture state (CrmTextureReg, spec §7.3.1.13).  SQs/TQs/Qs are the
+     * homogeneous-coordinate plane initial values (36.12 / 36.12 / 18.12)
+     * and dsq/dtq/dq the per-x and per-y slopes (36.12 / 18.12), exactly
+     * matching libGLcore __glCrmFillTriangle stores at 0x2120..0x215c.
+     */
+    uint32_t tex_mode;
+    uint64_t tex_format;
+    int64_t tex_sq0, tex_tq0;
+    int32_t tex_q0;
+    int32_t tex_stshift;
+    int64_t tex_dsqdx, tex_dsqdy, tex_dtqdx, tex_dtqdy;
+    int32_t tex_dqdx, tex_dqdy;
+    uint32_t tex_border, tex_env;
+
     uint32_t fog_color, fog_f0, fog_dfdx, fog_dfdy;
     uint32_t logicop;
     uint32_t colormask;
