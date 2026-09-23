@@ -45,8 +45,21 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/error-report.h"
 #include "system/address-spaces.h"
 #include "system/dma.h"
+
+/*
+ * Tripwire timeout, in guest (virtual) nanoseconds.  A healthy command
+ * completes in microseconds (the deferred posting fires 20 us after
+ * .complete), and the passing-path trace showed 2207/2207 selections
+ * completing; the driver's own polled timeout is 60 s (the PROM
+ * dialog's "ad_timeoutval 60").  10 s is ~5 orders of magnitude above
+ * any healthy completion yet still 50 s before the driver gives up, so
+ * the tripwire fires with the command still outstanding and plenty of
+ * time to capture the surrounding guest state.
+ */
+#define AIC7880_SEL_TRIPWIRE_NS  (10ULL * 1000000000ULL)
 
 /* =====================================================================
  * AIC-7880 chip registers (chip offsets, LE device view)
@@ -601,6 +614,17 @@ static void aic7880_start_selection(SGIAIC7880State *s, uint8_t scb_num)
         return;
     }
     s->bus_selected = true;
+    /*
+     * Tripwire: a real target was selected and its request is about to
+     * be enqueued — stash the command and arm the no-completion timer.
+     * Absent targets returned above, so the PROM's device scan (bus 0
+     * targets 2-4, bus 1 targets 1-15) never arms it.
+     */
+    s->sel_tarlun = tarlun;
+    s->sel_cdb_len = cdb_len;
+    memcpy(s->sel_cdb, cdb, sizeof(s->sel_cdb));
+    timer_mod(s->sel_watchdog,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + AIC7880_SEL_TRIPWIRE_NS);
     s->regs[AIC_SSTAT0] |= AIC_SELDO;  /* selection completed */
     s->cur_phase = AIC_MOPHASE;     /* selection with ATN -> MSG-OUT */
 
@@ -702,6 +726,7 @@ static void aic7880_post_complete(SGIAIC7880State *s)
     uint32_t qout;
 
     s->done_pending = false;
+    timer_del(s->sel_watchdog);     /* completion posted: disarm tripwire */
 
     /*
      * Completion posting (strict-registers tier): a real chip's
@@ -849,6 +874,7 @@ static void aic7880_request_cancelled(SCSIRequest *req)
 
     qemu_log_mask(LOG_UNIMP, "sgi_aic7880: request cancelled (scb %d)\n",
                   s->cur_scb);
+    timer_del(s->sel_watchdog);     /* legit abort: not a tripwire event */
     if (s->cur_req == req) {
         s->cur_req = NULL;
         scsi_req_unref(req);
@@ -1332,6 +1358,39 @@ static void aic7880_seq_timer_cb(void *opaque)
     aic7880_seq_run(s);
 }
 
+/*
+ * Tripwire: a selection was issued and no completion posted in time.
+ * Dumps the pending CDB, the done_pending flag, the seq_timer state and
+ * INTSTAT so the next natural occurrence of the "SCSI command timed out
+ * on (0,N)" flake captures its own evidence.  It never fires on the
+ * normal path: it is armed only after a real target is selected and a
+ * request enqueued, disarmed by every completion/cancel/chip-reset, and
+ * it logs only here — from the timeout itself, never per selection.
+ */
+static void aic7880_sel_watchdog_cb(void *opaque)
+{
+    SGIAIC7880State *s = SGI_AIC7880(opaque);
+    int64_t seq_remain = timer_pending(s->seq_timer)
+        ? (int64_t)(timer_expire_time_ns(s->seq_timer)
+                    - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) / 1000000
+        : -1;
+
+    warn_report("sgi_aic7880: TRIPWIRE scb=%d tarlun=0x%02x cdblen=%d "
+                "cdb=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x "
+                "done_pending=%d intstat=0x%02x bus_selected=%d "
+                "cur_req=%d seq_running=%d seq_host_pause=%d "
+                "seq_int_pause=%d seq_timer_pending=%d "
+                "seq_timer_remain_ms=%" PRId64
+                " (no completion after selection)",
+                s->cur_scb, s->sel_tarlun, s->sel_cdb_len,
+                s->sel_cdb[0], s->sel_cdb[1], s->sel_cdb[2], s->sel_cdb[3],
+                s->sel_cdb[4], s->sel_cdb[5], s->sel_cdb[6], s->sel_cdb[7],
+                s->sel_cdb[8], s->sel_cdb[9],
+                s->done_pending, s->intstat, s->bus_selected,
+                s->cur_req != NULL, s->seq_running, s->seq_host_pause,
+                s->seq_int_pause, timer_pending(s->seq_timer), seq_remain);
+}
+
 /* External kick: queue activity / interrupt clear / unpause */
 static void aic7880_kick(SGIAIC7880State *s)
 {
@@ -1433,6 +1492,7 @@ static void aic7880_chip_reset(SGIAIC7880State *s)
     s->seq_redirect = -1;
     s->qout_slot = 4;
     s->qout_base = 0;    /* register file cleared: re-arm via MovPtrToScratch */
+    timer_del(s->sel_watchdog);     /* reset: forget any in-flight tripwire */
     aic7880_update_irq(s);
 }
 
@@ -1628,6 +1688,9 @@ static void aic7880_realize(PCIDevice *pci_dev, Error **errp)
 {
     SGIAIC7880State *s = SGI_AIC7880(pci_dev);
 
+    s->sel_watchdog = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   aic7880_sel_watchdog_cb, s);
+
     /*
      * BAR0: 256-byte register window — the PROM's AIC driver maps the
      * whole register file (SCSI/sequencer block through the host
@@ -1696,6 +1759,7 @@ static void aic7880_exit(PCIDevice *pci_dev)
     SGIAIC7880State *s = SGI_AIC7880(pci_dev);
 
     timer_del(s->seq_timer);
+    timer_del(s->sel_watchdog);
     if (s->cur_req) {
         scsi_req_cancel(s->cur_req);
     }

@@ -138,6 +138,19 @@ struct SGIAIC7880State {
 
     QEMUTimer *seq_timer;           /* scheduler kick (idle re-arm only) */
 
+    /*
+     * Tripwire: armed when a real target is selected and a request is
+     * enqueued, disarmed when the completion is posted (or the request
+     * is cancelled / the chip is reset).  If it ever expires it means
+     * a selection was issued and no completion landed inside the
+     * timeout — the one state that produces the "SCSI command timed
+     * out on (0,N)" PROM dialog.  See aic7880_sel_watchdog_cb.
+     */
+    QEMUTimer *sel_watchdog;
+    uint8_t sel_cdb[16];            /* stashed CDB of the in-flight req */
+    uint8_t sel_cdb_len;
+    uint8_t sel_tarlun;
+
     uint32_t scsi_bus_num;          /* -drive if=scsi bus index        */
 };
 
