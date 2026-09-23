@@ -938,6 +938,41 @@ static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[16])
     }
 }
 
+/* gl_clear: fill a drawable rectangle with the palette's black and reset its
+ * depth, so the window shows the GL client's background instead of the desktop
+ * underneath.  powerflip's window is black, which is the palette entry nearest
+ * luminance zero. */
+static void sgi_gr2_ge7_clear_rect(SGIGr2State *s, int vx, int vy, int vw,
+                                   int vh)
+{
+    int x, y, i;
+    uint8_t idx = 0;
+    int bestd = 1 << 30;
+
+    if (!s->scanout) {
+        return;
+    }
+    for (i = 0; i < 256; i++) {
+        uint32_t rgb = s->ramdac[i];
+        int lum = (((rgb >> 16) & 0xff) * 77 + ((rgb >> 8) & 0xff) * 150 +
+                   (rgb & 0xff) * 29) >> 8;
+
+        if (lum < bestd) {
+            bestd = lum;
+            idx = (uint8_t)i;
+        }
+    }
+    for (y = MAX(vy, 0); y < MIN(vy + vh, SGI_GR2_SCREEN_H); y++) {
+        for (x = MAX(vx, 0); x < MIN(vx + vw, SGI_GR2_SCREEN_W); x++) {
+            sgi_gr2_put(s, x, y, idx);
+            if (s->ge_zbuf) {
+                s->ge_zbuf[(size_t)y * SGI_GR2_SCREEN_W + x] = 0x7f7f7f7f;
+            }
+        }
+    }
+    s->ge_3d_seen = true;
+}
+
 /* Transform an object-space point by projection*modelview.  Returns false if
  * the point is behind the eye (w <= 0) so it is skipped rather than projected
  * through the eye. */
@@ -998,6 +1033,16 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         vw = SGI_GR2_SCREEN_W;
         vh = SGI_GR2_SCREEN_H;
     }
+    /* The client writes window-relative coordinates; the window's origin on
+     * screen is the X server's state (the client never emits winposition into
+     * the FIFO and the GE has no window-origin register - see note 78).  With
+     * no origin source the drawable sits at the screen origin. */
+    vx += s->ge_win_x;
+    vy += s->ge_win_y;
+    if (s->ge_need_clear) {
+        sgi_gr2_ge7_clear_rect(s, vx, vy, vw, vh);
+        s->ge_need_clear = false;
+    }
     for (i = 0; i < s->ge_poly_n; i++) {
         float cx, cy, cz;
         float px, py;
@@ -1049,10 +1094,20 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         maxx = (int)MAX(ax, MAX(bx, cx)) + 1;
         miny = (int)MIN(ay, MIN(by, cy));
         maxy = (int)MAX(ay, MAX(by, cy)) + 1;
+        /* Clip to the drawable: the GL viewport (plus its window origin) is the
+         * only region a GL client may paint.  Without this the transformed
+         * vertices spill over the window frame and neighbouring windows. */
+        minx = MAX(minx, vx);
+        miny = MAX(miny, vy);
+        maxx = MIN(maxx, vx + vw - 1);
+        maxy = MIN(maxy, vy + vh - 1);
         minx = MAX(minx, 0);
         miny = MAX(miny, 0);
         maxx = MIN(maxx, SGI_GR2_SCREEN_W - 1);
         maxy = MIN(maxy, SGI_GR2_SCREEN_H - 1);
+        if (minx > maxx || miny > maxy) {
+            continue;
+        }
 
         area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
         if (area == 0.0f) {
@@ -1123,11 +1178,14 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
             s->ge_mv_valid = true;
             /* A fresh modelview begins a frame: clear the Z-buffer to "far"
              * (0x7f7f7f7f ~ +3.4e38) so the previous frame does not occlude
-             * it. */
+             * it, and mark the drawable for a colour clear.  The FIFO stream
+             * carries gl_clear (token 158) only once at start-up, so the
+             * per-frame double-buffer clear is stood in for here. */
             if (s->ge_zbuf) {
                 memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
                        SGI_GR2_SCREEN_H * sizeof(float));
             }
+            s->ge_need_clear = true;
         }
         break;
     case SGI_GR2_GE7_PROJ:

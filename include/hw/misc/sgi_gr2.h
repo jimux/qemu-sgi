@@ -94,6 +94,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_BGN_B    0x416b8 /* token 1454                        */
 #define SGI_GR2_GE7_END      0x40104 /* token 65                          */
 #define SGI_GR2_GE7_END_B    0x41194 /* token 1125                        */
+#define SGI_GR2_GE7_CLEAR    0x40278 /* token 158, gl_clear               */
 #define SGI_GR2_GE7_MAX_VERTS 64     /* vertices buffered per polygon     */
 
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
@@ -424,6 +425,14 @@ struct SGIGr2State {
     unsigned vp_n;                 /* viewport words collected               */
     bool vp_armed;                 /* token 60 seen, awaiting three words    */
     bool vp_valid;
+    int ge_win_x;                  /* GL window content origin on screen.    */
+    int ge_win_y;                  /* Not in the FIFO (see note 78): the     */
+                                   /* client writes window-relative coords   */
+                                   /* and the X server's DDX holds the       */
+                                   /* origin.  Wired here so a source can    */
+                                   /* be plugged in without touching the     */
+                                   /* raster.                                */
+    bool ge_need_clear;            /* a fresh frame: clear the drawable first */
     float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
     unsigned ge_poly_n;
     float ge_normal[3];            /* current vertex normal                  */
