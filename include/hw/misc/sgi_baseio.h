@@ -153,6 +153,16 @@ struct SGIBaseIOState {
   uint32_t nasid;
   uint32_t widget;
 
+  /*
+   * XIO widget id reported in WIDGET_CONTROL (bridge+0x24) -- the id the
+   * board is strapped with.  UINT32_MAX means "use @widget".  The IP27 machine
+   * maps the base IO board at the real IO widget and adds a discovery alias at
+   * SWIN widget 0; the alias must report the REAL board's id so the kernel's
+   * iograph (ml/SN/iograph.c:849, reads BRIDGE_WID_CONTROL at SWIN 0) derives
+   * basew_id = the widget the board actually lives at.
+   */
+  uint32_t wid_id;
+
   /* Bridge free-running counter/timer (offset 0x100): bit0 = enable. */
   uint32_t timer_en;
 

@@ -17,6 +17,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/boards.h"
 #include "hw/char/serial.h"
 #include "hw/misc/sgi_baseio.h"
 #include "chardev/char.h"
@@ -394,6 +395,8 @@ static void sgi_baseio_phy_init(SGIBaseIOState *s) {
   s->phy_read_data = 0;
 }
 
+static int sgi_baseio_rxtrace = -1;
+
 static void sgi_baseio_eth_deliver(SGIBaseIOState *s, const uint8_t *buf,
                                    size_t len) {
   uint32_t emcr = s->eth_regs[SGI_IOC3_EMCR];
@@ -401,19 +404,61 @@ static void sgi_baseio_eth_deliver(SGIBaseIOState *s, const uint8_t *buf,
   uint64_t erbr = sgi_baseio_dma_addr(
       ((uint64_t)s->eth_regs[SGI_IOC3_ERBR_H] << 32) |
       s->eth_regs[SGI_IOC3_ERBR_L]);
-  uint64_t slot = 0;
+  uint64_t slot = 0, raw_desc = 0;
   uint32_t w0, err;
   uint8_t frame[2048];
 
-  if (!(emcr & 0x00010000) || erbr == 0 || len > sizeof(frame)) {
-    return; /* RXEN off */
+  if (sgi_baseio_rxtrace < 0) {
+    sgi_baseio_rxtrace = getenv("SGIBASEIO_RXTRACE") != NULL;
   }
-  if (dma_memory_read(&address_space_memory, erbr + s->eth_rxprod, &slot,
-                      sizeof(slot), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
-      slot == 0) {
+  if (!(emcr & 0x00010000) || erbr == 0 || len > sizeof(frame)) {
+    /*
+     * Log the REFUSAL, not only what landed: a size cap that silently drops is
+     * invisible to any instrument placed after it (iris3130's rung on this).
+     */
+    if (sgi_baseio_rxtrace) {
+      printf("[RXTRACE] REFUSED len=%u frame_cap=%zu rxen=%d erbr=0x%" PRIx64
+             " emcr=0x%x\n", (unsigned)len, sizeof(frame),
+             !!(emcr & 0x00010000), erbr, emcr);
+    }
+    return; /* RXEN off / frame cap */
+  }
+  if (dma_memory_read(&address_space_memory, erbr + s->eth_rxprod, &raw_desc,
+                      sizeof(raw_desc), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+    if (sgi_baseio_rxtrace) {
+      printf("[RXTRACE] DESC-FAIL(memtx) erbr=0x%" PRIx64 " slotoff=0x%x\n",
+             erbr, s->eth_rxprod);
+    }
     return;
   }
-  slot = sgi_baseio_dma_addr(be64_to_cpu(slot));
+  if (raw_desc == 0) {
+    if (sgi_baseio_rxtrace) {
+      printf("[RXTRACE] DESC-ZERO erbr=0x%" PRIx64 " slotoff=0x%x\n",
+             erbr, s->eth_rxprod);
+    }
+    return;
+  }
+  slot = sgi_baseio_dma_addr(be64_to_cpu(raw_desc));
+  /*
+   * Shared netboot instrument (shape mirrored verbatim from sgi_bridge.c so
+   * the two ARCS lanes are comparable): per delivered frame, the RAW
+   * descriptor value before translation, the translated physical, whether it
+   * falls inside RAM BY SIZE, and our producer index beside the guest's own.
+   * Settles, in one run: branch mis-handle vs ring bookkeeping vs neither.
+   */
+  if (sgi_baseio_rxtrace < 0) {
+    sgi_baseio_rxtrace = getenv("SGIBASEIO_RXTRACE") != NULL;
+  }
+  if (sgi_baseio_rxtrace) {
+    uint64_t ramsz = MACHINE(qdev_get_machine())->ram_size;
+    printf("[RXTRACE] prod=%u ringbase=0x%" PRIx64 " slotoff=0x%x "
+           "raw_desc=0x%" PRIx64 " xlated_phys=0x%" PRIx64 " len=%u "
+           "inram=%d (ram_size=0x%" PRIx64 ") guest_erxpi=0x%x "
+           "emcr=0x%x rxoff=0x%x\n",
+           s->eth_rxprod, erbr, s->eth_rxprod, be64_to_cpu(raw_desc), slot,
+           (unsigned)len, (slot + len) <= ramsz, ramsz,
+           s->eth_regs[SGI_IOC3_ERPIR], emcr, rxoff);
+  }
 
   w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
   err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
@@ -709,6 +754,17 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
    */
   if (off == 4) {
     return (uint64_t)(SGI_BASEIO_WIDGET_PART << 12);
+  }
+  /*
+   * Widget control (WIDGET_CONTROL = 0x24): low nibble is the board's XIO
+   * widget id (WIDGET_WIDGET_ID).  The IRIX kernel's iograph reads this at
+   * SWIN widget 0 to derive basew_id (ml/SN/iograph.c:849) and then addresses
+   * the bridge's PCI devices at that widget -- so the discovery alias must
+   * report the real board's id (see the wid_id property).
+   */
+  if (off == 0x24) {
+    uint32_t id = (s->wid_id == UINT32_MAX) ? s->widget : s->wid_id;
+    return (uint64_t)(id & 0xf);
   }
   /*
    * Widget status (WIDGET_STATUS = 0x0c): bit 5 is the PCI/GIO mode select
@@ -1248,6 +1304,7 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
 
 static void sgi_baseio_instance_init(Object *obj) {
   SGIBaseIOState *s = SGI_BASEIO(obj);
+  s->wid_id = UINT32_MAX;
   object_initialize_child(obj, "ioc3-uart", &s->ioc3_uart, TYPE_SERIAL);
   object_initialize_child(obj, "qlisp0", &s->isp[0], TYPE_SGI_QLISP);
   object_initialize_child(obj, "qlisp1", &s->isp[1], TYPE_SGI_QLISP);
@@ -1256,6 +1313,7 @@ static void sgi_baseio_instance_init(Object *obj) {
 static const Property sgi_baseio_properties[] = {
     DEFINE_PROP_UINT32("nasid", SGIBaseIOState, nasid, 0),
     DEFINE_PROP_UINT32("widget", SGIBaseIOState, widget, 0),
+    DEFINE_PROP_UINT32("wid-id", SGIBaseIOState, wid_id, UINT32_MAX),
     DEFINE_NIC_PROPERTIES(SGIBaseIOState, nic_conf),
 };
 

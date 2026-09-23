@@ -885,6 +885,16 @@ static void sgi_ip27_init(MachineState *machine) {
   baseio = qdev_new(TYPE_SGI_BASEIO);
   qdev_prop_set_uint32(baseio, "nasid", 0);
   qdev_prop_set_uint32(baseio, "widget", 0);
+  /*
+   * Discovery alias at SWIN widget 0: the kernel reads the Bridge part
+   * (WIDGET_ID) and its widget id (BRIDGE_WID_CONTROL/WIDGET_CONTROL) HERE to
+   * derive basew_id (ml/SN/iograph.c:849) and then addresses the bridge's PCI
+   * devices at that widget.  It must therefore report the REAL board's id (8),
+   * or basew_id comes out 0 and scsi_ctlr_nums_add walks an empty bridge --
+   * which is why devnamefromarcs degenerated to /hw/target/... and the root
+   * device was never found.
+   */
+  qdev_prop_set_uint32(baseio, "wid-id", 8);
   sysbus_realize_and_unref(SYS_BUS_DEVICE(baseio), &error_fatal);
   sysbus_mmio_map(SYS_BUS_DEVICE(baseio), 0, ip27_swin_phys(0, 0));
 
