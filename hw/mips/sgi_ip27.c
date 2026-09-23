@@ -876,6 +876,7 @@ static void sgi_ip27_init(MachineState *machine) {
                        sgi_ip27_mem_config(machine->ram_size));
   sysbus_realize_and_unref(SYS_BUS_DEVICE(hub), &error_fatal);
   sysbus_mmio_map(SYS_BUS_DEVICE(hub), 0, ip27_swin_phys(0, IP27_HUB_WIDGET));
+  hub_state = SGI_HUB(hub);
 
   /*
    * BaseIO board as XIO widget 0 (Bridge part 0xc002 + IOC3).  The PROM
@@ -906,6 +907,12 @@ static void sgi_ip27_init(MachineState *machine) {
     qemu_configure_nic_device(baseio8, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(baseio8), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(baseio8), 0, ip27_swin_phys(0, 8));
+    /*
+     * The base IO bridge delivers its PCI device interrupts to this node's
+     * hub: it latches the vector the kernel programs in b_int_addr[line]
+     * into the hub's INT_PEND0/1 (sgi_hub_raise_vector).
+     */
+    SGI_BASEIO(baseio8)->hub = hub_state;
 
     /*
      * Big-window alias of widget 0.  The IRIX kernel's NODE_SWIN_BASE(nasid,0)
