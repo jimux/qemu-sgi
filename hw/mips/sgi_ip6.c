@@ -156,6 +156,21 @@
 #define MEMCFG_4MRAM        0x10
 #define MEMCFG_TIMERDIS     0x20
 
+/* cpucfg bits (MAME sgi/ctl1.cpp) */
+#define CPUCFG_RPAR         0x0400  /* enable parity checking */
+#define CPUCFG_BAD          0x2000  /* write bad parity */
+
+/* parerr bits (MAME sgi/ctl1.cpp) */
+#define PARERR_GDMA         0x01
+#define PARERR_DMA          0x02
+#define PARERR_CPU          0x04
+#define PARERR_VME          0x08
+#define PARERR_B3           0x10
+#define PARERR_B2           0x20
+#define PARERR_B1           0x40
+#define PARERR_B0           0x80
+#define PARERR_BYTE         0xf0
+
 typedef struct SGIip6State {
     MemoryRegion ctl1;
     MemoryRegion ram_win;
@@ -224,6 +239,21 @@ typedef struct SGIip6State {
     uint32_t refadr;
     int64_t ref_load_time;
 
+    /*
+     * CTL1 parity mechanism (MAME sgi/ctl1.cpp).  While CPUCFG_BAD is set,
+     * writes set a bad-parity bit in this shadow map; while CPUCFG_RPAR is
+     * set, reads of a byte whose bit is set raise PARERR_CPU and record the
+     * address in erradr.  The map is only installed over RAM while one of
+     * those modes is active, so ordinary operation is untouched.
+     */
+    uint8_t parerr;
+    uint8_t *parity;
+    int parity_bad;
+    bool parity_mapped;
+    MemoryRegion parity_mr;
+    MemoryRegion parity_ram_alias;
+    AddressSpace parity_as;
+
     uint8_t vme_isr;
     uint8_t vme_imr;
 
@@ -232,6 +262,8 @@ typedef struct SGIip6State {
 } SGIip6State;
 
 static SGIip6State ip6_state;
+
+static void sgi_ip6_parity_update(SGIip6State *s);
 
 static void sgi_ip6_lio_update(SGIip6State *s);
 
@@ -386,6 +418,8 @@ static void sgi_ip6_ctl1_write(void *opaque, hwaddr addr, uint64_t data,
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         }
         s->cpucfg = cfg;
+        /* Bad-parity writes and parity checking install the shadow map. */
+        sgi_ip6_parity_update(s);
         break;
     }
     case SGI_IP6_CTL1_CPUAUX:
@@ -574,6 +608,109 @@ static const MemoryRegionOps sgi_ip6_lio_ops = {
     },
 };
 
+/* ---- CTL1 parity mechanism (MAME sgi/ctl1.cpp) ----------------------- */
+
+/*
+ * Install or drop the bad-parity shadow map over RAM.  It is only needed
+ * while bad-parity writes (CPUCFG_BAD) or parity checking (CPUCFG_RPAR) is
+ * enabled, or while bits are still set in it, so normal operation never pays
+ * for it.  The map is a plain shadow: RAM contents are unaffected (the
+ * writes still reach RAM through the forwarding alias).
+ */
+static void sgi_ip6_parity_update(SGIip6State *s)
+{
+    bool want = (s->cpucfg & (CPUCFG_BAD | CPUCFG_RPAR)) || s->parity_bad > 0;
+
+    if (want && !s->parity_mapped) {
+        if (!s->parity) {
+            s->parity = g_new0(uint8_t, MAX(s->ram_size / 8, 1));
+            s->parity_bad = 0;
+        }
+        memory_region_add_subregion_overlap(&s->ram_win, 0, &s->parity_mr, 2);
+        s->parity_mapped = true;
+    } else if (!want && s->parity_mapped) {
+        memory_region_del_subregion(&s->ram_win, &s->parity_mr);
+        s->parity_mapped = false;
+        g_free(s->parity);
+        s->parity = NULL;
+        s->parity_bad = 0;
+    }
+}
+
+static uint64_t sgi_ip6_parity_read(void *opaque, hwaddr addr, unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint8_t tmp[8];
+    uint64_t val = 0;
+    unsigned i;
+
+    address_space_read(&s->parity_as, addr, MEMTXATTRS_UNSPECIFIED, tmp, size);
+
+    if (s->cpucfg & CPUCFG_RPAR) {
+        bool error = false;
+
+        for (i = 0; i < size; i++) {
+            unsigned hwaddr_i = addr + i;
+            unsigned bit = (addr & 4) * 4 + i;
+            unsigned idx = hwaddr_i >> 3;
+
+            if (s->parity && (s->parity[idx] & (1 << bit))) {
+                s->parerr |= (PARERR_B0 >> i) | PARERR_CPU;
+                error = true;
+            }
+        }
+        if (error) {
+            s->erradr = addr;
+            /* MAME asserts the CPU bus error; reading erradr clears it. */
+            qemu_set_irq(s->cpu->env.irq[5], 1);
+        }
+    }
+
+    for (i = 0; i < size; i++) {
+        val = (val << 8) | tmp[i];
+    }
+    return val;
+}
+
+static void sgi_ip6_parity_write(void *opaque, hwaddr addr, uint64_t data,
+                                 unsigned size)
+{
+    SGIip6State *s = opaque;
+    uint8_t tmp[8];
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        tmp[i] = (data >> (8 * (size - 1 - i))) & 0xff;
+
+        if (s->parity) {
+            unsigned bit = (addr & 4) * 4 + i;
+            unsigned idx = (addr + i) >> 3;
+
+            if (s->cpucfg & CPUCFG_BAD) {
+                if (!(s->parity[idx] & (1 << bit))) {
+                    s->parity[idx] |= 1 << bit;
+                    s->parity_bad++;
+                }
+            } else if (s->parity[idx] & (1 << bit)) {
+                s->parity[idx] &= ~(1 << bit);
+                s->parity_bad--;
+            }
+        }
+    }
+
+    address_space_write(&s->parity_as, addr, MEMTXATTRS_UNSPECIFIED, tmp, size);
+}
+
+static const MemoryRegionOps sgi_ip6_parity_ops = {
+    .read = sgi_ip6_parity_read,
+    .write = sgi_ip6_parity_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 /* ---- CTL1 error / refresh registers ---------------------------------- */
 
 static uint64_t sgi_ip6_err_read(void *opaque, hwaddr addr, unsigned size)
@@ -584,6 +721,7 @@ static uint64_t sgi_ip6_err_read(void *opaque, hwaddr addr, unsigned size)
     switch (off) {
     case 0x00:
         /* Reading erradr clears the CPU bus-error interrupt. */
+        qemu_set_irq(s->cpu->env.irq[5], 0);
         return s->erradr;
     case 0x04:
         /*
@@ -627,12 +765,22 @@ static const MemoryRegionOps sgi_ip6_err_ops = {
 
 static uint64_t sgi_ip6_clrerr_read(void *opaque, hwaddr addr, unsigned size)
 {
+    SGIip6State *s = opaque;
+
+    if ((addr & 7) == 4) {
+        return s->parerr;
+    }
+    /* Writing/reading a clear register clears that parity source's flag. */
+    s->parerr &= ~(PARERR_BYTE | (1 << (addr & 7)));
     return 0;
 }
 
 static void sgi_ip6_clrerr_write(void *opaque, hwaddr addr, uint64_t data,
                                  unsigned size)
 {
+    SGIip6State *s = opaque;
+
+    s->parerr &= ~(PARERR_BYTE | (1 << (addr & 7)));
 }
 
 static const MemoryRegionOps sgi_ip6_clrerr_ops = {
@@ -1492,6 +1640,20 @@ static void sgi_ip6_init(MachineState *machine)
                                      s->ram_size));
     }
     memory_region_add_subregion(system_memory, 0, &s->ram_win);
+
+    /*
+     * CTL1 parity support: a private 1:1 view of RAM for the parity hook to
+     * forward its accesses through (the installed configuration maps the low
+     * window straight onto host RAM), plus the hook itself, which is only
+     * added to ram_win while parity mode is active.
+     */
+    memory_region_init_alias(&s->parity_ram_alias, OBJECT(machine),
+                             "sgi-ip6-parity-ram", machine->ram, 0,
+                             s->ram_size);
+    address_space_init(&s->parity_as, &s->parity_ram_alias,
+                       "sgi-ip6-parity");
+    memory_region_init_io(&s->parity_mr, OBJECT(machine), &sgi_ip6_parity_ops,
+                          s, "sgi-ip6-parity", s->ram_size);
     sgi_ip6_ram_decode(s);
 
     /* Boot PROM at 0x1fc00000 */
