@@ -906,6 +906,31 @@ static void sgi_ip27_init(MachineState *machine) {
     qemu_configure_nic_device(baseio8, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(baseio8), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(baseio8), 0, ip27_swin_phys(0, 8));
+
+    /*
+     * Big-window alias of widget 0.  The IRIX kernel's NODE_SWIN_BASE(nasid,0)
+     * resolves widget 0 through the BIG window (sys/SN/SN0/addrs.h:106:
+     * widget 0 -> NODE_BWIN_BASE(nasid, SWIN0_BIGWIN)), NOT the small window,
+     * because a directly-connected bridge may sit at any widget.  With
+     * IIO_NUM_ITTES=7 (SWIN0_BIGWIN=6) and BWIN_SIZE_BITS=29 that address is
+     * IO_BASE + 7*BWIN_SIZE = IO_BASE + 0xE0000000.  The kernel reads WIDGET_ID
+     * (0x04) and WIDGET_CONTROL (0x24) there to identify the widget
+     * (ml/SN/iograph.c:847-849).  Without this alias those reads fell into the
+     * unimplemented xio-high device and returned 0; part_num 0 is
+     * XBOW_WIDGET_PART_NUM (io/xbow.h:271), which the kernel reported as the
+     * phantom "DOWNREV Crossbow ASIC ... rev unknown (code=0)", and
+     * base_io_scsi_ctlr_vhdl[] stayed empty.  Alias the real board window here
+     * (same offsets as the widget window).
+     */
+    {
+      MemoryRegion *bwin0 = g_new(MemoryRegion, 1);
+      memory_region_init_alias(bwin0, NULL, "sgi-ip27.baseio.bwin0",
+                               sysbus_mmio_get_region(SYS_BUS_DEVICE(baseio8),
+                                                      0),
+                               0, SGI_BASEIO_WINDOW_SIZE);
+      memory_region_add_subregion_overlap(system_memory,
+          ip27_phys(IP27_IO_BASE) + 7 * (1ULL << 29), bwin0, 1);
+    }
   }
 
   /*
