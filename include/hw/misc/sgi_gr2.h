@@ -186,6 +186,11 @@ struct SGIGr2State {
      * at draw time would bake in whatever the palette happened to hold then. */
     QemuConsole *con;
     uint8_t *scanout;
+    /* Per-pixel flag: this pixel came from a direct-colour image op
+     * (expDrawImage24), whose byte is a 3-3-2 RGB triple rather than a palette
+     * index.  At scanout a flagged pixel is expanded 3-3-2, an unflagged one
+     * goes through ramdac[], so both visual modes coexist on the same screen. */
+    uint8_t *scanout332;
     bool scanout_bars; /* fill a colour-bar test pattern (P0.4 step a) */
     bool poly_stroke;  /* 302 op: stroke its path instead of filling (test seam) */
 

@@ -60,6 +60,49 @@ static uint32_t sgi_gr2_word_write(uint64_t value, unsigned byte, unsigned size)
 
 static void sgi_gr2_update_display(void *opaque);
 
+/* Direct-colour 3-3-2 expansion (expDrawImage24).  In the 8-bit 3-3-2 visual the
+ * stored byte is an RGB triple: bits 7-5 red, bits 4-3 blue, bits 2-0 green, each
+ * a level into a gamma ramp.  The levels below are the SGI 8-bit visual's ramp as
+ * measured from the reference and from the guest's own BT457 DAC writes (the
+ * paltram sequence cycles 81,122,134,155,184,201,209,233).  The cube image,
+ * EZsetup's icon, decodes 33/33 against this formula (see note 49). */
+static const uint8_t sgi_gr2_ramp_rg[8] = { 0, 81, 122, 155, 184, 209, 233, 255 };
+static const uint8_t sgi_gr2_ramp_b[4]  = { 0, 134, 201, 255 };
+
+static uint32_t sgi_gr2_re3_332(uint8_t v)
+{
+    uint8_t r = sgi_gr2_ramp_rg[(v >> 5) & 7];
+    uint8_t g = sgi_gr2_ramp_rg[v & 7];
+    uint8_t b = sgi_gr2_ramp_b[(v >> 3) & 3];
+
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/* Every scanout write goes through one of these, so the direct-colour flag is
+ * kept in step with the byte.  A later fill (for example `xsetroot -solid`) over
+ * a pixel an image op once drew must clear the flag, or that pixel keeps being
+ * expanded 3-3-2 and the fill comes out speckled. */
+static inline void sgi_gr2_put(SGIGr2State *s, int x, int y, uint8_t idx)
+{
+    size_t o = (size_t)y * SGI_GR2_SCREEN_W + x;
+
+    s->scanout[o] = idx;
+    if (s->scanout332) {
+        s->scanout332[o] = 0;
+    }
+}
+
+static inline void sgi_gr2_put332(SGIGr2State *s, int x, int y, uint8_t idx)
+{
+    size_t o = (size_t)y * SGI_GR2_SCREEN_W + x;
+
+    s->scanout[o] = idx;
+    if (s->scanout332) {
+        s->scanout332[o] = 1;
+    }
+}
+
+
 /* RE3 solid-rectangle fill.  In the 8-bit mode the guest runs, the latched
  * colour is a RAMDAC index, and that is what the framebuffer stores — the
  * palette is applied at scanout, not here.  Returns the RGB the index maps to
@@ -89,7 +132,7 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
     }
     for (yy = y; yy < y + h; yy++) {
         for (xx = x; xx < x + w; xx++) {
-            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = colour;
+            sgi_gr2_put(s, xx, yy, colour);
         }
     }
     sgi_gr2_update_display(s);
@@ -115,7 +158,7 @@ static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
     for (;;) {
         if (x0 >= 0 && x0 < SGI_GR2_SCREEN_W &&
             y0 >= 0 && y0 < SGI_GR2_SCREEN_H) {
-            s->scanout[y0 * SGI_GR2_SCREEN_W + x0] = colour;
+            sgi_gr2_put(s, x0, y0, colour);
         }
         if (x0 == x1 && y0 == y1) {
             break;
@@ -173,7 +216,7 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
         for (xx = x; xx < x + w; xx++) {
             bool on = (pattern >> (31 - (xx & 31))) & 1;
 
-            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = on ? fg : bg;
+            sgi_gr2_put(s, xx, yy, on ? fg : bg);
         }
     }
     sgi_gr2_update_display(s);
@@ -324,7 +367,7 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
                 break;
             }
             if ((pattern >> (31 - (k & 31))) & 1) {
-                s->scanout[y * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+                sgi_gr2_put(s, xx, y, s->re3_colour);
             }
         }
     }
@@ -377,8 +420,7 @@ static void sgi_gr2_re3_draw_image(SGIGr2State *s)
                 if (px >= x + w || px >= SGI_GR2_SCREEN_W) {
                     break;
                 }
-                s->scanout[y * SGI_GR2_SCREEN_W + px] =
-                    (word >> (24 - 8 * p)) & 0xff;
+                sgi_gr2_put332(s, px, y, (word >> (24 - 8 * p)) & 0xff);
             }
         }
     }
@@ -477,7 +519,7 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
             int xx;
 
             for (xx = xa; xx <= xb; xx++) {
-                s->scanout[sy * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+                sgi_gr2_put(s, xx, sy, s->re3_colour);
             }
         }
     }
@@ -532,11 +574,10 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
                         break;
                     }
                     if (r0 < SGI_GR2_SCREEN_H && ((w >> (15 - b)) & 1)) {
-                        s->scanout[r0 * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+                        sgi_gr2_put(s, xx, r0, s->re3_colour);
                     }
                     if (r0 + 1 < SGI_GR2_SCREEN_H && ((w >> (7 - b)) & 1)) {
-                        s->scanout[(r0 + 1) * SGI_GR2_SCREEN_W + xx] =
-                            s->re3_colour;
+                        sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
                     }
                 }
             }
@@ -1015,7 +1056,7 @@ static void sgi_gr2_fill_bars(SGIGr2State *s)
     }
     for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
         for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
-            s->scanout[y * SGI_GR2_SCREEN_W + x] = x * 8 / SGI_GR2_SCREEN_W;
+            sgi_gr2_put(s, x, y, x * 8 / SGI_GR2_SCREEN_W);
         }
     }
 }
@@ -1042,9 +1083,17 @@ static void sgi_gr2_update_display(void *opaque)
         int x;
 
         /* The palette is applied HERE, at scanout, so a pixel drawn before its
-         * entry was programmed still shows the entry's final colour. */
+         * entry was programmed still shows the entry's final colour.  A pixel
+         * flagged as direct-colour (from an image op) is expanded 3-3-2 instead,
+         * so the cube and the CLUT-indexed panel share one screen. */
         for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
-            row[x] = s->ramdac[src[x]];
+            uint8_t idx = src[x];
+
+            if (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x]) {
+                row[x] = sgi_gr2_re3_332(idx);
+            } else {
+                row[x] = s->ramdac[idx];
+            }
         }
     }
     dpy_gfx_update(s->con, 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
@@ -1175,6 +1224,8 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
     if (s->present) {
         s->scanout = g_new0(uint8_t,
                             (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        s->scanout332 = g_new0(uint8_t,
+                               (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
         s->con = graphic_console_init(dev, 0, &sgi_gr2_gfx_ops, s);
         qemu_console_resize(s->con, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
     }
