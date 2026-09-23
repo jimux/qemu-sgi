@@ -52,12 +52,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 
 /*
  * BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 1 and 2).  Register
- * (DevIO) windows at mem_base 0x08400000 / 0x08600000 for the node's IO widget
- * (widget 8), i.e. offsets 0x400000 / 0x600000 within the 16 MB widget window
- * (see ip27_swin_phys + pci_mem_base in the ARCS bridge code).
+ * (DevIO) windows within the node IO widget (widget 8) window.  The IRIX kernel
+ * pcibr maps each ISP memory BAR through a Bridge DevIO window at 1 MB
+ * granularity (BRIDGE_DEV_OFF_ADDR_SHFT 20); with the 2 MB DevIO1 window it
+ * packs both channels at offsets 0x400000 and 0x500000 (measured: the kernel's
+ * ql_init drives channel 1 at widget+0x500000).  (An earlier model pinned
+ * channel 1 at 0x600000 per the BAR value 0x08600000, but the BAR is the PCI
+ * bus address, not the xio PIO window the CPU uses.)
  */
 #define SGI_BASEIO_QLISP0_OFF 0x400000ULL
-#define SGI_BASEIO_QLISP1_OFF 0x600000ULL
+#define SGI_BASEIO_QLISP1_OFF 0x500000ULL
 
 /*
  * Bridge PCI-interrupt device lines the BaseIO devices wire to.
@@ -116,6 +120,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
  */
 #define SGI_BASEIO_BR_SSRAM_OFF 0x280000ULL
 #define SGI_BASEIO_BR_SSRAM_SIZE 0x80000
+
+/*
+ * Bridge internal ATE RAM, at bridge+0x10000 (BRIDGE_INT_ATE_RAM; 0x400 bytes,
+ * 128 8-byte entries).  The kernel programs the ISP ATE-mapped DMA window
+ * (BRIDGE_DMA_MAPPED_BASE 0x40000000) here.  See SGIBaseIOState.ate_ram.
+ */
+#define SGI_BASEIO_BR_ATE_OFF 0x10000ULL
 
 /* Register word indices (from IOC3 offset 0x0F0). */
 #define SGI_IOC3_EMCR 0
@@ -273,6 +284,15 @@ struct SGIBaseIOState {
    * forever.  Same contract octane models for IP30 (hw/misc/sgi_bridge.c).
    */
   uint8_t br_ssram[SGI_BASEIO_BR_SSRAM_SIZE];
+
+  /*
+   * Bridge internal ATE RAM (bridge+0x10000..0x103ff).  The kernel programs
+   * the ISP ring/SG DMA window (BRIDGE_DMA_MAPPED_BASE 0x40000000) here, one
+   * 8-byte address-translation entry per IOPAGE; sgi_baseio_dma_xlate() reads
+   * it back to translate qlisp DMA addresses to system physical addresses.
+   * Mirrors octane's sgi_bridge ate_ram contract.
+   */
+  uint8_t ate_ram[0x400];
 
   /*
    * IOC3 byte-bus time-of-day chip (Dallas DS1386) at bridge+0x280000

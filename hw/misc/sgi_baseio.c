@@ -1208,6 +1208,18 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     }
     return v;
   }
+  /* Bridge internal ATE RAM (bridge+0x10000..0x103ff); see the write side. */
+  if (off >= SGI_BASEIO_BR_ATE_OFF &&
+      off < SGI_BASEIO_BR_ATE_OFF + sizeof(s->ate_ram)) {
+    hwaddr o = off - SGI_BASEIO_BR_ATE_OFF;
+    unsigned n;
+    uint64_t v = 0;
+
+    for (n = 0; n < size; n++) {
+      v |= (uint64_t)s->ate_ram[o + n] << (8 * n);
+    }
+    return v;
+  }
   /* IOC3 SIO RTC (Dallas DS1386) at IOC3_SIO_RTC_BASE. */
   if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
     return sgi_baseio_tod_read(s, off - SGI_BASEIO_RTC_OFF);
@@ -1457,6 +1469,22 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
     }
     return;
   }
+  /*
+   * Bridge internal ATE RAM (bridge+0x10000..0x103ff).  The kernel fills the
+   * address-translation entries for the ISP's ATE-mapped DMA window
+   * (BRIDGE_DMA_MAPPED_BASE 0x40000000); sgi_baseio_dma_xlate() reads them back
+   * to translate qlisp ring/SG DMA addresses.  Back with plain storage.
+   */
+  if (off >= SGI_BASEIO_BR_ATE_OFF &&
+      off < SGI_BASEIO_BR_ATE_OFF + sizeof(s->ate_ram)) {
+    hwaddr o = off - SGI_BASEIO_BR_ATE_OFF;
+    unsigned n;
+
+    for (n = 0; n < size; n++) {
+      s->ate_ram[o + n] = (val >> (8 * n)) & 0xff;
+    }
+    return;
+  }
   /* IOC3 SIO RTC (Dallas DS1386) at IOC3_SIO_RTC_BASE. */
   if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
     sgi_baseio_tod_write(s, off - SGI_BASEIO_RTC_OFF, val);
@@ -1556,6 +1584,7 @@ static void sgi_baseio_reset(DeviceState *dev) {
   s->int_device = 0;
   s->int_host_err = 0;
   memset(s->int_addr, 0, sizeof(s->int_addr));
+  memset(s->ate_ram, 0, sizeof(s->ate_ram));
   for (i = 0; i < 8; i++) {
     s->int_delivered[i] = -1;
   }
@@ -1580,6 +1609,57 @@ static void sgi_baseio_reset(DeviceState *dev) {
   s->tod_epoch_sec = (int64_t)time(NULL);
   s->tod_control = RTC_DAL_UPDATE_ENABLE;
   s->tod_user = 0;
+}
+
+/*
+ * Translate a BRIDGE ATE-mapped PCI DMA address to a system physical address.
+ *
+ * The IRIX ql driver programs the ISP request/response ring bases with
+ * addresses from pciio_dmatrans_addr(), which fall in the BRIDGE ATE-mapped
+ * PCI window (BRIDGE_DMA_MAPPED_BASE 0x40000000, IOPAGE 0x4000).  The guest
+ * itself fills the bridge ATE RAM (bridge+0x10000), so read the ATE it wrote:
+ *   ate  = ate_ram[((pci - 0x40000000) >> 14)]   (proto | port<<8 | xio pfn)
+ *   phys = (ate & ~0x3fff) + (pci & 0x3fff)
+ * Returns the input unchanged when the address is outside the window or the
+ * ATE is not valid, so the qlisp falls back to its direct/K1 handling.  Same
+ * contract as octane's sgi_bridge_dma_xlate().
+ */
+static uint64_t sgi_baseio_dma_xlate(void *arg, uint64_t pci_addr) {
+  SGIBaseIOState *s = arg;
+  uint32_t idx, i, w0, w1;
+  uint64_t ate;
+
+  if (pci_addr < 0x40000000ULL || pci_addr >= 0x80000000ULL) {
+    return pci_addr;
+  }
+  idx = (pci_addr - 0x40000000ULL) >> 14;
+  if (idx >= sizeof(s->ate_ram) / 8) { /* external ATEs not modelled */
+    return pci_addr;
+  }
+  /*
+   * The guest writes the 64-bit ATE as a big-endian store; QEMU splits it into
+   * two 32-bit word accesses, which the register handler stores little-endian
+   * per word.  Recombine the two words (first = high).
+   */
+  w0 = 0;
+  w1 = 0;
+  for (i = 0; i < 4; i++) {
+    w0 |= (uint32_t)s->ate_ram[idx * 8 + i] << (8 * i);
+    w1 |= (uint32_t)s->ate_ram[idx * 8 + 4 + i] << (8 * i);
+  }
+  ate = ((uint64_t)w0 << 32) | w1;
+  if (!(ate & 0x01)) { /* ATE_V */
+    return pci_addr;
+  }
+  if (getenv("SGI_BASEIO_ATEDBG")) {
+    qemu_log_mask(LOG_UNIMP,
+                  "sgi-baseio: xlate pci=0x%llx idx=%u ate=0x%llx -> phys=0x%llx\n",
+                  (unsigned long long)pci_addr, idx,
+                  (unsigned long long)ate,
+                  (unsigned long long)((ate & ~0x3fffULL) +
+                                       (pci_addr & 0x3fff)));
+  }
+  return (ate & ~0x3fffULL) + (pci_addr & 0x3fff);
 }
 
 static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
@@ -1645,6 +1725,13 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
     if (!qdev_realize(DEVICE(&s->isp[i]), NULL, errp)) {
       return;
     }
+    /*
+     * Let the ISP translate its ring/SG DMA addresses through this bridge's
+     * ATE RAM (BRIDGE_DMA_MAPPED_BASE).  The standalone driver's 64-bit
+     * dirmap addresses do not fall in that window, so they are unaffected.
+     */
+    s->isp[i].dma_xlate = sgi_baseio_dma_xlate;
+    s->isp[i].dma_xlate_arg = s;
   }
   if (s->widget == 8) {
     memory_region_add_subregion(&s->iomem, SGI_BASEIO_QLISP0_OFF,
