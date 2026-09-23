@@ -207,7 +207,23 @@ uint32_t cpu_mips_get_random(CPUMIPSState *env)
     static uint32_t seed = 1;
     static uint32_t prev_idx;
     uint32_t idx;
-    uint32_t nb_rand_tlb = env->tlb->nb_tlb - env->CP0_Wired;
+    uint32_t wired = env->CP0_Wired;
+    uint32_t nb_rand_tlb;
+
+    /*
+     * The R2000/R3000 have no Wired register: TLB entries 0-7 cannot be
+     * replaced, and Random always ranges over 8..63.  Modelling that as
+     * CP0_Wired == 0 (which is what reset leaves) lets tlbwr evict entries
+     * 0-7 -- including the permanent entry the IRIX kernel keeps there for
+     * its kseg2 PDA, whose loss sends the TLB refill vector into an
+     * infinite nested miss.  Honouring the fixed lower bound here rather
+     * than in CP0_Wired keeps it correct across cpu reset and regardless of
+     * an mtc0 to the (non-existent) Wired register.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        wired = 8;
+    }
+    nb_rand_tlb = env->tlb->nb_tlb - wired;
 
     if (nb_rand_tlb == 1) {
         return env->tlb->nb_tlb - 1;
@@ -220,7 +236,7 @@ uint32_t cpu_mips_get_random(CPUMIPSState *env)
          * from ISO/IEC 9899 standard.
          */
         seed = 1103515245 * seed + 12345;
-        idx = (seed >> 16) % nb_rand_tlb + env->CP0_Wired;
+        idx = (seed >> 16) % nb_rand_tlb + wired;
     } while (idx == prev_idx);
     prev_idx = idx;
     return idx;
@@ -244,7 +260,13 @@ target_ulong helper_mfc0_mvpconf1(CPUMIPSState *env)
 
 target_ulong helper_mfc0_random(CPUMIPSState *env)
 {
-    return (int32_t)cpu_mips_get_random(env);
+    uint32_t idx = cpu_mips_get_random(env);
+
+    /* MIPS-I presents Random's index in bits [13:8] rather than [5:0]. */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        idx <<= 8;
+    }
+    return (int32_t)idx;
 }
 
 target_ulong helper_mfc0_tcstatus(CPUMIPSState *env)
@@ -504,6 +526,17 @@ void helper_mtc0_index(CPUMIPSState *env, target_ulong arg1)
 {
     uint32_t index_p = env->CP0_Index & 0x80000000;
     uint32_t tlb_index = arg1 & 0x7fffffff;
+
+    /*
+     * MIPS-I keeps the TLB index in Index[13:8].  The bound test below is
+     * written for the MIPS III/IV [5:0] layout, and an R3000 write of, say,
+     * index 1 (0x100) would fail it and be silently discarded, pinning
+     * every tlbwi to entry 0 -- so normalise the MIPS-I field first.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        env->CP0_Index = index_p | (((arg1 >> 8) & 0x3f) << 8);
+        return;
+    }
     if (tlb_index < env->tlb->nb_tlb) {
         if (env->insn_flags & ISA_MIPS_R6) {
             index_p |= arg1 & 0x80000000;

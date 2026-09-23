@@ -306,8 +306,10 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
     if (env->CP0_Config3 & (1 << CP0C3_CMGCR)) {
         env->CP0_CMGCRBase = 0x1fbf8000 >> 4;
     }
-    env->CP0_EntryHi_ASID_mask = (env->CP0_Config5 & (1 << CP0C5_MI)) ?
-            0x0 : (env->CP0_Config4 & (1 << CP0C4_AE)) ? 0x3ff : 0xff;
+    env->CP0_EntryHi_ASID_mask =
+            (env->cpu_model->mmu_type == MMU_TYPE_R3000) ? 0xfc0 :  /* PID[11:6] */
+            (env->CP0_Config5 & (1 << CP0C5_MI)) ? 0x0 :
+            (env->CP0_Config4 & (1 << CP0C4_AE)) ? 0x3ff : 0xff;
     env->CP0_Status = (1 << CP0St_BEV) | (1 << CP0St_ERL);
     if (env->insn_flags & INSN_LOONGSON2F) {
         /* Loongson-2F has those bits hardcoded to 1 */

@@ -62,6 +62,40 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
         return;
     }
     tlb->EHINV = 0;
+    if (r3k) {
+        /*
+         * MIPS-I R2000/R3000: one 4 KiB page per entry, the VPN includes
+         * VA[12] (there is no odd/even pair), and there is a single EntryLo
+         * register (CP0 $2).  The layout, read out of IRIX 4.0.5's wirepda():
+         *      PFN[31:12]  N[11]  D[10]  V[9]  G[8]
+         * (software bits live below bit 8).  Using the R4000 positions, as
+         * we used to, reads the kernel's V (bit 9) as our bit-3 zero, so
+         * every valid MIPS-I entry was stored invalid, and the odd half came
+         * from the never-written EntryLo1.
+         */
+        tlb->VPN = env->CP0_EntryHi & TARGET_PAGE_MASK;
+#if defined(TARGET_MIPS64)
+        tlb->VPN &= env->SEGMask;
+#endif
+        tlb->ASID = env->CP0_EntryHi & 0xfc0;   /* PID[11:6] */
+        tlb->MMID = 0;
+        tlb->PageMask = 0;
+        tlb->XI0 = 0;
+        tlb->RI0 = 0;
+        tlb->XI1 = 0;
+        tlb->RI1 = 0;
+        tlb->G = (env->CP0_EntryLo0 & 0x100) != 0;
+        tlb->V0 = (env->CP0_EntryLo0 & 0x200) != 0;
+        tlb->D0 = (env->CP0_EntryLo0 & 0x400) != 0;
+        /* N (bit 11) is the non-cacheable bit: present it as uncached. */
+        tlb->C0 = (env->CP0_EntryLo0 & 0x800) ? 2 : 0;
+        tlb->PFN[0] = env->CP0_EntryLo0 & 0xfffff000;
+        tlb->V1 = 0;
+        tlb->D1 = 0;
+        tlb->C1 = 0;
+        tlb->PFN[1] = 0;
+        return;
+    }
     tlb->VPN = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
 #if defined(TARGET_MIPS64)
     tlb->VPN &= env->SEGMask;
@@ -73,32 +107,6 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
     tlb->RI0 = 0;
     tlb->XI1 = 0;
     tlb->RI1 = 0;
-    if (r3k) {
-        /*
-         * MIPS-I R2000/R3000 EntryLo shares its layout with the R4000 only
-         * in the PFN field: the control bits sit at different positions.
-         *      R3000:  PFN[25:6]  N[5]  D[4]  V[3]  G[2]
-         *      R4000:  PFN[27:6]  C[5:3] D[2]  V[1]  G[0]
-         * Decoding the R3000 fields at the R4000 positions makes every
-         * valid MIPS-I entry look invalid (V read from the N bit), so the
-         * MIPS-I interpretation must be used on an MMU_TYPE_R3000 part.
-         * MIPS-I has no XI/RI, so those stay zero.
-         */
-        tlb->G = (env->CP0_EntryLo0 & env->CP0_EntryLo1 & 0x4) != 0;
-        tlb->V0 = (env->CP0_EntryLo0 & 0x8) != 0;
-        tlb->D0 = (env->CP0_EntryLo0 & 0x10) != 0;
-        /* N (bit 5) is the non-cacheable bit: present it as uncached. */
-        tlb->C0 = (env->CP0_EntryLo0 & 0x20) ? 2 : 0;
-        /* MIPS-I PFN is bits 25:6 (20 bits); bits 31:26 are unused. */
-        tlb->PFN[0] = ((get_tlb_pfn_from_entrylo(env->CP0_EntryLo0) & 0xfffff)
-                       & ~mask) << 12;
-        tlb->V1 = (env->CP0_EntryLo1 & 0x8) != 0;
-        tlb->D1 = (env->CP0_EntryLo1 & 0x10) != 0;
-        tlb->C1 = (env->CP0_EntryLo1 & 0x20) ? 2 : 0;
-        tlb->PFN[1] = ((get_tlb_pfn_from_entrylo(env->CP0_EntryLo1) & 0xfffff)
-                       & ~mask) << 12;
-        return;
-    }
     tlb->G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
     tlb->V0 = (env->CP0_EntryLo0 & 2) != 0;
     tlb->D0 = (env->CP0_EntryLo0 & 4) != 0;
@@ -147,6 +155,7 @@ static void r4k_helper_tlbinvf(CPUMIPSState *env)
 static void r4k_helper_tlbwi(CPUMIPSState *env)
 {
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
+    bool r3k = (env->cpu_model->mmu_type == MMU_TYPE_R3000);
     target_ulong VPN;
     uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     uint32_t MMID = env->CP0_MemoryMapID;
@@ -157,9 +166,12 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
 
     MMID = mi ? MMID : (uint32_t) ASID;
 
-    idx = (env->CP0_Index & ~0x80000000) % env->tlb->nb_tlb;
+    /* MIPS-I holds the TLB index in Index[13:8]; MIPS III/IV in Index[5:0]. */
+    idx = r3k ? ((env->CP0_Index >> 8) & (env->tlb->nb_tlb - 1)) :
+                ((env->CP0_Index & ~0x80000000) % env->tlb->nb_tlb);
     tlb = &env->tlb->mmu.r4k.tlb[idx];
-    VPN = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
+    VPN = r3k ? (env->CP0_EntryHi & TARGET_PAGE_MASK) :
+                (env->CP0_EntryHi & (TARGET_PAGE_MASK << 1));
 #if defined(TARGET_MIPS64)
     VPN &= env->SEGMask;
 #endif
@@ -170,12 +182,13 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
      * discarded, but it has to read the same bits as the fill or a rewritten
      * MIPS-I entry could keep a stale translation alive.
      */
-    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
-        G = (env->CP0_EntryLo0 & env->CP0_EntryLo1 & 0x4) != 0;
-        V0 = (env->CP0_EntryLo0 & 0x8) != 0;
-        D0 = (env->CP0_EntryLo0 & 0x10) != 0;
-        V1 = (env->CP0_EntryLo1 & 0x8) != 0;
-        D1 = (env->CP0_EntryLo1 & 0x10) != 0;
+    if (r3k) {
+        /* MIPS-I: PFN[31:12] N[11] D[10] V[9] G[8], single entry. */
+        G = (env->CP0_EntryLo0 & 0x100) != 0;
+        V0 = (env->CP0_EntryLo0 & 0x200) != 0;
+        D0 = (env->CP0_EntryLo0 & 0x400) != 0;
+        V1 = 0;
+        D1 = 0;
     } else {
         G = env->CP0_EntryLo0 & env->CP0_EntryLo1 & 1;
         V0 = (env->CP0_EntryLo0 & 2) != 0;
@@ -217,6 +230,7 @@ static void r4k_helper_tlbwr(CPUMIPSState *env)
 static void r4k_helper_tlbp(CPUMIPSState *env)
 {
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
+    bool r3k = (env->cpu_model->mmu_type == MMU_TYPE_R3000);
     r4k_tlb_t *tlb;
     target_ulong mask;
     target_ulong tag;
@@ -229,8 +243,9 @@ static void r4k_helper_tlbp(CPUMIPSState *env)
     MMID = mi ? MMID : (uint32_t) ASID;
     for (i = 0; i < env->tlb->nb_tlb; i++) {
         tlb = &env->tlb->mmu.r4k.tlb[i];
-        /* 1k pages are not supported. */
-        mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
+        /* 1k pages are not supported; MIPS-I entries are single 4 KiB. */
+        mask = r3k ? ~TARGET_PAGE_MASK :
+                     (tlb->PageMask | ~(TARGET_PAGE_MASK << 1));
         tag = env->CP0_EntryHi & ~mask;
         VPN = tlb->VPN & ~mask;
 #if defined(TARGET_MIPS64)
@@ -240,7 +255,7 @@ static void r4k_helper_tlbp(CPUMIPSState *env)
         /* Check ASID/MMID, virtual page number & size */
         if ((tlb->G == 1 || tlb_mmid == MMID) && VPN == tag && !tlb->EHINV) {
             /* TLB match */
-            env->CP0_Index = i;
+            env->CP0_Index = r3k ? ((uint32_t)i << 8) : i;
             break;
         }
     }
@@ -280,6 +295,7 @@ static inline uint64_t get_entrylo_pfn_from_tlb(uint64_t tlb_pfn)
 static void r4k_helper_tlbr(CPUMIPSState *env)
 {
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
+    bool r3k = (env->cpu_model->mmu_type == MMU_TYPE_R3000);
     uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     uint32_t MMID = env->CP0_MemoryMapID;
     uint32_t tlb_mmid;
@@ -287,7 +303,8 @@ static void r4k_helper_tlbr(CPUMIPSState *env)
     int idx;
 
     MMID = mi ? MMID : (uint32_t) ASID;
-    idx = (env->CP0_Index & ~0x80000000) % env->tlb->nb_tlb;
+    idx = r3k ? ((env->CP0_Index >> 8) & (env->tlb->nb_tlb - 1)) :
+                ((env->CP0_Index & ~0x80000000) % env->tlb->nb_tlb);
     tlb = &env->tlb->mmu.r4k.tlb[idx];
 
     tlb_mmid = mi ? tlb->MMID : (uint32_t) tlb->ASID;
@@ -307,6 +324,16 @@ static void r4k_helper_tlbr(CPUMIPSState *env)
         env->CP0_EntryHi = mi ? tlb->VPN : tlb->VPN | tlb->ASID;
         env->CP0_MemoryMapID = tlb->MMID;
         env->CP0_PageMask = tlb->PageMask;
+        if (r3k) {
+            /* PFN[31:12] N[11] D[10] V[9] G[8]. */
+            env->CP0_EntryLo0 = tlb->PFN[0] |
+                        (tlb->C0 == 2 ? 0x800u : 0) |
+                        (tlb->D0 ? 0x400u : 0) |
+                        (tlb->V0 ? 0x200u : 0) |
+                        (tlb->G ? 0x100u : 0);
+            env->CP0_EntryLo1 = 0;
+            return;
+        }
         env->CP0_EntryLo0 = tlb->G | (tlb->V0 << 1) | (tlb->D0 << 2) |
                         ((uint64_t)tlb->RI0 << CP0EnLo_RI) |
                         ((uint64_t)tlb->XI0 << CP0EnLo_XI) | (tlb->C0 << 3) |
@@ -442,6 +469,7 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
     uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
     uint32_t MMID = env->CP0_MemoryMapID;
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
+    bool r3k = (env->cpu_model->mmu_type == MMU_TYPE_R3000);
     uint32_t tlb_mmid;
     int i;
 
@@ -449,8 +477,13 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
 
     for (i = 0; i < env->tlb->tlb_in_use; i++) {
         r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
-        /* 1k pages are not supported. */
-        target_ulong mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
+        /*
+         * 1k pages are not supported.  MIPS-I R2000/R3000 entries are a
+         * single 4 KiB page, so VA[12] is part of the virtual page number
+         * rather than an odd/even selector.
+         */
+        target_ulong mask = r3k ? ~TARGET_PAGE_MASK :
+                                  (tlb->PageMask | ~(TARGET_PAGE_MASK << 1));
         target_ulong tag = address & ~mask;
         target_ulong VPN = tlb->VPN & ~mask;
 #if defined(TARGET_MIPS64)
@@ -461,7 +494,7 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
         tlb_mmid = mi ? tlb->MMID : (uint32_t) tlb->ASID;
         if ((tlb->G == 1 || tlb_mmid == MMID) && VPN == tag && !tlb->EHINV) {
             /* TLB match */
-            int n = !!(address & mask & ~(mask >> 1));
+            int n = r3k ? 0 : !!(address & mask & ~(mask >> 1));
             /* Check access rights */
             if (!(n ? tlb->V1 : tlb->V0)) {
                 return TLBRET_INVALID;
@@ -1298,20 +1331,33 @@ void mips_cpu_do_interrupt(CPUState *cs)
         if ((env->error_code & EXCP_TLB_NOMATCH) &&
             (env->cpu_model->mmu_type == MMU_TYPE_R3000 ||
              !(env->CP0_Status & (1 << CP0St_EXL)))) {
-#if defined(TARGET_MIPS64)
-            int R = env->CP0_BadVAddr >> 62;
-            int UX = (env->CP0_Status & (1 << CP0St_UX)) != 0;
-            int KX = (env->CP0_Status & (1 << CP0St_KX)) != 0;
-
-            if ((R != 0 || UX) && (R != 3 || KX) &&
-                (!(env->insn_flags & (INSN_LOONGSON2E | INSN_LOONGSON2F)))) {
+            if (env->cpu_model->mmu_type == MMU_TYPE_R3000 &&
+                env->CP0_BadVAddr >= 0x80000000u) {
+                /*
+                 * The MIPS-I UTLB-refill vector is only for kuseg: kseg0
+                 * and kseg1 are unmapped, so a miss on an address at or
+                 * above 0x80000000 is a kseg2 miss, which must take the
+                 * general vector.  The UTLB handler walks Context as if
+                 * the address were a user VA, so sending a kseg2 miss
+                 * there (as the R4000 rule does) faults recursively.
+                 */
                 offset = 0x080;
             } else {
-#endif
-                offset = 0x000;
 #if defined(TARGET_MIPS64)
-            }
+                int R = env->CP0_BadVAddr >> 62;
+                int UX = (env->CP0_Status & (1 << CP0St_UX)) != 0;
+                int KX = (env->CP0_Status & (1 << CP0St_KX)) != 0;
+
+                if ((R != 0 || UX) && (R != 3 || KX) &&
+                    (!(env->insn_flags & (INSN_LOONGSON2E | INSN_LOONGSON2F)))) {
+                    offset = 0x080;
+                } else {
 #endif
+                    offset = 0x000;
+#if defined(TARGET_MIPS64)
+                }
+#endif
+            }
         }
         goto set_EPC;
     case EXCP_TLBS:
@@ -1326,20 +1372,33 @@ void mips_cpu_do_interrupt(CPUState *cs)
         if ((env->error_code & EXCP_TLB_NOMATCH) &&
             (env->cpu_model->mmu_type == MMU_TYPE_R3000 ||
              !(env->CP0_Status & (1 << CP0St_EXL)))) {
-#if defined(TARGET_MIPS64)
-            int R = env->CP0_BadVAddr >> 62;
-            int UX = (env->CP0_Status & (1 << CP0St_UX)) != 0;
-            int KX = (env->CP0_Status & (1 << CP0St_KX)) != 0;
-
-            if ((R != 0 || UX) && (R != 3 || KX) &&
-                (!(env->insn_flags & (INSN_LOONGSON2E | INSN_LOONGSON2F)))) {
+            if (env->cpu_model->mmu_type == MMU_TYPE_R3000 &&
+                env->CP0_BadVAddr >= 0x80000000u) {
+                /*
+                 * The MIPS-I UTLB-refill vector is only for kuseg: kseg0
+                 * and kseg1 are unmapped, so a miss on an address at or
+                 * above 0x80000000 is a kseg2 miss, which must take the
+                 * general vector.  The UTLB handler walks Context as if
+                 * the address were a user VA, so sending a kseg2 miss
+                 * there (as the R4000 rule does) faults recursively.
+                 */
                 offset = 0x080;
             } else {
-#endif
-                offset = 0x000;
 #if defined(TARGET_MIPS64)
-            }
+                int R = env->CP0_BadVAddr >> 62;
+                int UX = (env->CP0_Status & (1 << CP0St_UX)) != 0;
+                int KX = (env->CP0_Status & (1 << CP0St_KX)) != 0;
+
+                if ((R != 0 || UX) && (R != 3 || KX) &&
+                    (!(env->insn_flags & (INSN_LOONGSON2E | INSN_LOONGSON2F)))) {
+                    offset = 0x080;
+                } else {
 #endif
+                    offset = 0x000;
+#if defined(TARGET_MIPS64)
+                }
+#endif
+            }
         }
         goto set_EPC;
     case EXCP_AdEL:
