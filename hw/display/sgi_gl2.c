@@ -124,7 +124,7 @@ struct SGIGL2State {
      * 32-bit value is written through the FBCrgbcolor/FBCrgbwrten registers
      * and scanned out as RGB or a colormap index.
      */
-    uint32_t *fb;
+    uint32_t *fb[2];
     uint8_t cmap[GL2_NMAP][GL2_NCOLOR][3];
     uint16_t dc_flags;            /* DC4 flag register */
     uint8_t cur_map;              /* DC4 map selected for scanout */
@@ -156,6 +156,15 @@ struct SGIGL2State {
     uint16_t fbc_flags;           /* last FBCflags command */
     uint16_t fbc_out;             /* FBC output register (reset/version) */
     uint16_t ge_flags;
+
+    /*
+     * UC4 configuration and mode registers, latched from FBCconfig (0x16).
+     * The wire word is a 32-bit "myconfig": the low half is the CFR
+     * (DISPLAYA/DISPLAYB/UPDATEA/UPDATEB/...), the high half the MDR
+     * (UC_SWIZZLE/UC_DOUBLE/...).  See uc4.h and imattrib.h's im_outconfig().
+     */
+    uint16_t cfr;                 /* UC4 CFR: display/update buffer select */
+    uint16_t mdr;                 /* UC4 MDR: UC_DOUBLE selects double buffer */
 
     /*
      * GE command pipe (GEPORT, write-only).  Every write is a big-endian
@@ -200,6 +209,45 @@ struct SGIGL2State {
 static void gl2_update_irq(SGIGL2State *s);
 
 /*
+ * Double buffering.  The CFR's UPDATEA/UPDATEB bits pick the buffer the UC4
+ * and GE draw into, DISPLAYA/DISPLAYB the one the DC4 scans out.  Only when
+ * the MDR's UC_DOUBLE bit is set (FBCconfig) do A and B name two distinct
+ * memories; otherwise everything uses buffer A, which is the console's and
+ * the traced demos' single-buffered mode.
+ */
+#define UC_CFR_DISPLAYA 0x1
+#define UC_CFR_DISPLAYB 0x2
+#define UC_CFR_UPDATEA  0x4
+#define UC_CFR_UPDATEB  0x8
+#define UC_MDR_DOUBLE   0x2
+
+static int gl2_wbuf_idx(SGIGL2State *s)
+{
+    if (!(s->mdr & UC_MDR_DOUBLE)) {
+        return 0;
+    }
+    return (s->cfr & UC_CFR_UPDATEB) && !(s->cfr & UC_CFR_UPDATEA) ? 1 : 0;
+}
+
+static int gl2_dbuf_idx(SGIGL2State *s)
+{
+    if (!(s->mdr & UC_MDR_DOUBLE)) {
+        return 0;
+    }
+    return (s->cfr & UC_CFR_DISPLAYB) && !(s->cfr & UC_CFR_DISPLAYA) ? 1 : 0;
+}
+
+static uint32_t *gl2_wbuf(SGIGL2State *s)
+{
+    return s->fb[gl2_wbuf_idx(s)];
+}
+
+static uint32_t *gl2_dbuf(SGIGL2State *s)
+{
+    return s->fb[gl2_dbuf_idx(s)];
+}
+
+/*
  * Write the planes selected by a 2-bit write-enable *we* with the matching
  * bits of *color*, leaving the other planes untouched.  *shift* is 0 for the
  * A/B group and 2 for the C/D group.  This is what makes an erase that sets
@@ -234,7 +282,7 @@ static void gl2_set_pixel(SGIGL2State *s, int x, int y, uint32_t val)
     if ((unsigned)x >= GL2_XDIM || (unsigned)y >= GL2_YDIM) {
         return;
     }
-    s->fb[y * GL2_XDIM + x] = val;
+    gl2_wbuf(s)[y * GL2_XDIM + x] = val;
 }
 
 static void gl2_fill_rect(SGIGL2State *s, int x0, int y0, int x1, int y1)
@@ -245,7 +293,7 @@ static void gl2_fill_rect(SGIGL2State *s, int x0, int y0, int x1, int y1)
         for (x = x0; x <= x1; x++) {
             if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
                 gl2_set_pixel(s, x, y,
-                              gl2_planes(s, s->fb[y * GL2_XDIM + x]));
+                              gl2_planes(s, gl2_wbuf(s)[y * GL2_XDIM + x]));
             }
         }
     }
@@ -276,7 +324,7 @@ static void gl2_drawchar(SGIGL2State *s)
             bit = (w >> (15 - gx)) & 1;
             if (bit && (unsigned)px < GL2_XDIM && (unsigned)py < GL2_YDIM) {
                 gl2_set_pixel(s, px, py,
-                              gl2_planes(s, s->fb[py * GL2_XDIM + px]));
+                              gl2_planes(s, gl2_wbuf(s)[py * GL2_XDIM + px]));
             }
         }
     }
@@ -328,7 +376,7 @@ static void gl2_exec(SGIGL2State *s, unsigned cmd, uint16_t val)
         int x = (int16_t)s->buf[UC_XSB], y = (int16_t)s->buf[UC_YSB];
 
         if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
-            uint8_t old = s->fb[y * GL2_XDIM + x];
+            uint8_t old = gl2_wbuf(s)[y * GL2_XDIM + x];
 
             old = gl2_blend(old, s->color_ab, s->we_ab, 0);
             gl2_set_pixel(s, x, y, old);
@@ -339,7 +387,7 @@ static void gl2_exec(SGIGL2State *s, unsigned cmd, uint16_t val)
         int x = (int16_t)s->buf[UC_XSB], y = (int16_t)s->buf[UC_YSB];
 
         if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
-            uint8_t old = s->fb[y * GL2_XDIM + x];
+            uint8_t old = gl2_wbuf(s)[y * GL2_XDIM + x];
 
             old = gl2_blend(old, s->color_cd, s->we_cd, 2);
             gl2_set_pixel(s, x, y, old);
@@ -429,7 +477,7 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
                 int x = (int16_t)s->buf[UC_XSB];
                 int y = (int16_t)s->buf[UC_YSB];
                 if ((unsigned)x < GL2_XDIM && (unsigned)y < GL2_YDIM) {
-                    return s->fb[y * GL2_XDIM + x];
+                    return gl2_wbuf(s)[y * GL2_XDIM + x];
                 }
             }
             if (cmd == UC_READFONT) {
@@ -567,7 +615,7 @@ static void gl2_gfx_update(void *opaque)
     for (y = 0; y < GL2_YDIM; y++) {
         uint32_t *row = dest + (GL2_YDIM - 1 - y) * GL2_XDIM;
         for (x = 0; x < GL2_XDIM; x++) {
-            uint32_t c = s->fb[y * GL2_XDIM + x];
+            uint32_t c = gl2_dbuf(s)[y * GL2_XDIM + x];
 
             if ((s->dc_flags & DC_RGBMODE) && s->nplanes > 8) {
                 row[x] = rgb_to_pixel32((c >> 16) & 0xff,
@@ -601,7 +649,7 @@ static void gl2_draw_pixel(SGIGL2State *s, unsigned x, unsigned y)
     if (x >= GL2_XDIM || y >= GL2_YDIM) {
         return;
     }
-    p = &s->fb[y * GL2_XDIM + x];
+    p = &gl2_wbuf(s)[y * GL2_XDIM + x];
     *p = gl2_planes(s, *p);
     s->dirty = true;
 }
@@ -634,7 +682,7 @@ static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
             if ((unsigned)px >= GL2_XDIM || (unsigned)py >= GL2_YDIM) {
                 continue;
             }
-            p = &s->fb[py * GL2_XDIM + px];
+            p = &gl2_wbuf(s)[py * GL2_XDIM + px];
             if (s->nplanes > 8 && s->rgb_valid) {
                 *p = gl2_planes(s, *p);
             } else {
@@ -735,6 +783,19 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         }
         break;
 
+    case 0x16:                          /* FBCconfig: CFR + MDR */
+        /*
+         * The packet is im_passcmd(3,FBCconfig) followed by the 32-bit
+         * myconfig long, so the two operands are its high and low halves.
+         * The CFR's DISPLAYA/DISPLAYB bits select which buffer the DC4
+         * scans out; the MDR's UC_DOUBLE bit enables double buffering.
+         */
+        if (nargs >= 2) {
+            s->mdr = args[0];
+            s->cfr = args[1];
+        }
+        break;
+
     case 0x12:                          /* FBCpoint: x, y */
         if (nargs >= 2) {
             gl2_draw_pixel(s, args[0], args[1]);
@@ -760,6 +821,31 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
             gl2_draw_glyph(s, offset, w, h, xoff, yoff);
             s->char_x += width;
         }
+        break;
+
+    case 0x25:                          /* FBCfeedback: matrix feedback */
+        /*
+         * saveeverything() issues FBCfeedback then spins on
+         * `while (FBCflags & INTERRUPT_BIT_)`, expecting the FBC to raise a
+         * programmed interrupt with code _INTFEEDBACK in FBCdata.  Without it
+         * the kernel textport wedges TX_BUSY (and saveeverything's wait never
+         * ends).  The matrix payload itself is not modelled; raising the
+         * interrupt is what releases the wait.
+         */
+        s->fbc_out = 20;                /* _INTFEEDBACK */
+        s->prog_int_pending = true;
+        gl2_update_irq(s);
+        break;
+
+    case 0x27:                          /* FBCreadcharposn: char position */
+        /*
+         * The matching wait in saveeverything() for the character position,
+         * expecting _INTCHPOSN in FBCdata.  The position itself is already
+         * tracked (char_x/char_y).
+         */
+        s->fbc_out = 7;                 /* _INTCHPOSN */
+        s->prog_int_pending = true;
+        gl2_update_irq(s);
         break;
 
     case 0x26:                          /* FBCeof: pipe reached end of frame */
@@ -875,7 +961,7 @@ static void gl2_fill_poly(SGIGL2State *s)
         for (k = 0; k + 1 < nx; k += 2) {
             int x;
             for (x = MAX(xs[k], 0); x <= MIN(xs[k + 1], GL2_XDIM - 1); x++) {
-                uint32_t *p = &s->fb[y * GL2_XDIM + x];
+                uint32_t *p = &gl2_wbuf(s)[y * GL2_XDIM + x];
 
                 if (s->nplanes > 8 && s->rgb_valid) {
                     *p = gl2_planes(s, *p);
@@ -1020,6 +1106,21 @@ static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 (unsigned)addr, (unsigned long long)val, size);
     }
     if (addr < 0x1000) {
+        /*
+         * GETOKEN (offset 0) is written to flush the pipe / request a token
+         * and carries no command.  LASTGE (offset 0x800) is the "last
+         * priority" command port the library's im_last_* macros use for the cursor and
+         * the FBC feedback/readcharposn probes; those are real passthru
+         * packets, so feed them through the same assembler.
+         */
+        if (addr == 0x800) {
+            if (size == 4) {
+                gl2_ge_word(s, (val >> 16) & 0xffff);
+                gl2_ge_word(s, val & 0xffff);
+            } else {
+                gl2_ge_word(s, val & 0xffff);
+            }
+        }
         return;                     /* GETOKEN: token/port control */
     }
     if (size == 4) {
@@ -1067,17 +1168,17 @@ static void gl2_test_pattern(SGIGL2State *s)
             } else {
                 c = (x * 255) / GL2_XDIM;             /* horizontal ramp */
             }
-            s->fb[y * GL2_XDIM + x] = c;
+            gl2_wbuf(s)[y * GL2_XDIM + x] = c;
         }
     }
     /* white border */
     for (x = 0; x < GL2_XDIM; x++) {
-        s->fb[x] = 255;
-        s->fb[(GL2_YDIM - 1) * GL2_XDIM + x] = 255;
+        gl2_wbuf(s)[x] = 255;
+        gl2_wbuf(s)[(GL2_YDIM - 1) * GL2_XDIM + x] = 255;
     }
     for (y = 0; y < GL2_YDIM; y++) {
-        s->fb[y * GL2_XDIM] = 255;
-        s->fb[y * GL2_XDIM + GL2_XDIM - 1] = 255;
+        gl2_wbuf(s)[y * GL2_XDIM] = 255;
+        gl2_wbuf(s)[y * GL2_XDIM + GL2_XDIM - 1] = 255;
     }
 }
 
@@ -1135,6 +1236,8 @@ static void gl2_reset(DeviceState *dev)
     s->micro_slice = s->micro_block = 0;
     s->fbc_flags = 0;
     s->fbc_out = 0;
+    s->cfr = 0;
+    s->mdr = 0;
     s->ge_flags = 0;
     s->ge_in_cmd = false;
     s->ge_pending = false;
@@ -1160,12 +1263,13 @@ static void gl2_reset(DeviceState *dev)
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
                   + NANOSECONDS_PER_SECOND / 60);
     }
-    if (s->fb) {
-        memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
+    if (s->fb[0]) {
+        memset(s->fb[0], 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
+        memset(s->fb[1], 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
     }
     memset(s->font, 0, sizeof(s->font));
     gl2_cmap_default(s);
-    if (s->testpattern && s->fb) {
+    if (s->testpattern && s->fb[0]) {
         gl2_test_pattern(s);
     }
     s->dirty = true;
@@ -1184,7 +1288,8 @@ static void gl2_init(Object *obj)
     SGIGL2State *s = SGI_GL2(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
+    s->fb[0] = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
+    s->fb[1] = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
     s->retrace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gl2_retrace_timer, s);
     s->vert_clear_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        gl2_vert_clear_timer, s);
