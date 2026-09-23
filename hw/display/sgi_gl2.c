@@ -1122,18 +1122,21 @@ static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     if (addr < 0x1000) {
         /*
          * GETOKEN (offset 0) is written to flush the pipe / request a token
-         * and carries no command.  LASTGE (offset 0x800) is the "last
-         * priority" command port the library's im_last_* macros use for the cursor and
-         * the FBC feedback/readcharposn probes; those are real passthru
-         * packets, so feed them through the same assembler.
+         * and carries no command; LASTGE (offset 0x800) is the "last
+         * priority" command port the library's im_last_* macros use for the
+         * cursor and the FBC feedback/readcharposn probes, so feed those
+         * through the command assembler.
          *
-         * Either write means the pipe has reached command dispatch, which is
-         * where a pending HOSTFLAG request is answered: the FBC drops
-         * HOSTFLAG and raises the cursor interrupt (_INTCURSOR=19) that
-         * fbc_progintr() uses to clear gl_fbcstatus, unblocking
-         * saveeverything()'s `while (gl_fbcstatus & HOSTFLAG)`.
+         * A pending HOSTFLAG request is answered when the kernel writes
+         * GEnoop to GETOKEN to force command dispatch (fbc_intr does exactly
+         * `GETOKEN = GEnoop`); the FBC then drops HOSTFLAG and raises the
+         * cursor interrupt (_INTCURSOR=19) that fbc_progintr() uses to clear
+         * gl_fbcstatus, unblocking saveeverything()'s
+         * `while (gl_fbcstatus & HOSTFLAG)`.  The 0xff08 that tx_repaint
+         * writes to GETOKEN is not a dispatch request and must not answer it,
+         * or the cursor interrupt fires far more often than fbc_intr intends.
          */
-        if (s->fbc_hostflag) {
+        if (addr == 0 && (val & 0xffff) == 0x000f && s->fbc_hostflag) {
             s->fbc_hostflag = false;
             s->fbc_out = 19;            /* _INTCURSOR */
             s->prog_int_pending = true;
