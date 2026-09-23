@@ -891,6 +891,22 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     return s->stcir[1];
   }
   /*
+   * IOC3 serial DMA control (SSCR_A 0xb8 / SSCR_B 0xd4).  SSCR_PAUSE_STATE
+   * reflects SSCR_DMA_PAUSE: ioc3_open() asserts DMA_PAUSE and spins until
+   * PAUSE_STATE reads back set, so without this the console open times out and
+   * the serial console goes silent right after the banner.  The reset /
+   * RX-drain command bits are self-clearing.
+   */
+  if (off == 0x2000b8 || off == 0x2000d4) {
+    int port = (off == 0x2000d4);
+    uint32_t v = s->sscr[port] & ~0x88000000u; /* RX_DRAIN|RESET self-clear */
+
+    if (v & 0x20000000u) { /* SSCR_DMA_PAUSE */
+      v |= 0x40000000u;    /* SSCR_PAUSE_STATE */
+    }
+    return v;
+  }
+  /*
    * IOC3 GenericPIO block: GPCR (control; set at +0x34, clear at +0x38) and
    * GPDR (data, +0x3c).  The PROM drives a PHY reset through GPCR; serve the
    * latched control/data.
@@ -1105,6 +1121,19 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
 
     s->stpir[port] = val;
     sgi_baseio_sio_tx_drain(s, port);
+    return;
+  }
+  /* IOC3 serial DMA control: latch SSCR, clearing the self-clearing cmd bits. */
+  if (off == 0x2000b8 || off == 0x2000d4) {
+    int port = (off == 0x2000d4);
+
+    s->sscr[port] = val & ~0x88000000u;
+    return;
+  }
+  /* SIO_IR (0x1c) is write-1-to-clear; our TX is always empty (SA_TX_MT stays
+   * set), so the clear is a harmless no-op -- accept it rather than log it as
+   * an unimplemented register. */
+  if (off == 0x20001c) {
     return;
   }
   /* IOC3 GenericPIO block: GPCR set (+0x34) / clear (+0x38), GPDR (+0x3c). */

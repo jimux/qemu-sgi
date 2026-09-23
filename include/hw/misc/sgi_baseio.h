@@ -179,6 +179,11 @@ struct SGIBaseIOState {
   uint32_t stpir[2];
   uint32_t stcir[2];
 
+  /* IOC3 serial DMA control (SSCR_A 0xb8 / SSCR_B 0xd4).  SSCR_PAUSE_STATE is
+   * derived from SSCR_DMA_PAUSE on read (ioc3_open() spins on it); the reset /
+   * RX-drain command bits are self-clearing. */
+  uint32_t sscr[2];
+
   /* IOC3 SuperIO interrupt-enable register (IES 0x20 sets, IEC 0x24 clears,
    * both read back this mask).  SIO_IR (0x1c) reports TX-empty (we drain
    * synchronously).  See io/sio_ioc3.c and sys/PCI/ioc3.h. */
