@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/irq.h"
 #include "hw/scsi/sgi_qlisp.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
@@ -81,6 +82,18 @@ static uint16_t ql_reg_get(SGIQLispState *s, hwaddr off)
 static void ql_reg_put(SGIQLispState *s, hwaddr off, uint16_t v)
 {
     s->reg[(off & (QLISP_REGS_SIZE - 1)) >> 1] = v;
+}
+
+/*
+ * Drive the RISC interrupt line from BUS_ISR_RISC_INT, so a command completion
+ * wakes the host's ql interrupt handler instead of relying only on its status
+ * poll.  Called whenever the bus-status register changes.
+ */
+static void qlisp_update_irq(SGIQLispState *s)
+{
+    bool level = (ql_reg_get(s, QL_BUS_ISR) & BUS_ISR_RISC_INT) != 0;
+
+    qemu_set_irq(s->irq, level);
 }
 
 static uint16_t ql_mbox_get(SGIQLispState *s, int n)
@@ -245,6 +258,7 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
     ql_mbox_put(s, 5, s->rsp.in);
     ql_reg_put(s, QL_BUS_ISR,
                ql_reg_get(s, QL_BUS_ISR) | BUS_ISR_RISC_INT);
+    qlisp_update_irq(s);
 
     if (qlisp_dbg()) {
         qemu_log_mask(LOG_UNIMP,
@@ -774,6 +788,7 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         ql_reg_put(s, off, val & 0xffff);
         break;
     }
+    qlisp_update_irq(s);
 }
 
 static const MemoryRegionOps qlisp_ops = {
@@ -800,11 +815,14 @@ static void qlisp_reset(DeviceState *dev)
     s->sg_off = 0;
     memset(&s->req, 0, sizeof(s->req));
     memset(&s->rsp, 0, sizeof(s->rsp));
+    qlisp_update_irq(s);
 }
 
 static void qlisp_realize(DeviceState *dev, Error **errp)
 {
     SGIQLispState *s = SGI_QLISP(dev);
+
+    qdev_init_gpio_out(dev, &s->irq, 1);
 
     memory_region_init_io(&s->regs, OBJECT(dev), &qlisp_ops, s,
                           "sgi-qlisp-regs", QLISP_REGS_SIZE);

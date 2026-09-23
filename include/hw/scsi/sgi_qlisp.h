@@ -234,6 +234,14 @@ struct SGIQLispState {
 
     /* SCSI backend (legacy -drive property) */
     BlockBackend *blk;
+
+    /*
+     * RISC interrupt output.  Asserted while the ISP has a command/bus-status
+     * interrupt pending (BUS_ISR_RISC_INT); the host driver clears it by
+     * reading the response queue and acking (HCCR CLEAR_RISC_INT / semaphore
+     * release).  The BaseIO bridge routes this to a PCI interrupt line.
+     */
+    qemu_irq irq;
 };
 
 /*
