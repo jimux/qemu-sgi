@@ -759,6 +759,14 @@ static void sgi_ip27_init(MachineState *machine) {
    * aliased (both 16 MB halves -> the same flat physical page) or the RW
    * globals land at the wrong phys and read zero -- see
    * r4k_repin_if_kernel_entry.  Latent on every other machine (pinned_vpn 0).
+   *
+   * Still required (measured, leg 139): the trace of every tlbwi/tlbwr for this
+   * VPN across a whole boot shows ONLY the PROM's flush loop at 0x1fc058fc
+   * (dmtc0 zero,EntryLo0/1) plus our pin -- no guest code installs a valid K2
+   * entry.  With the pin disabled (IP27_NOPIN=1) the kernel takes a fetch
+   * exception on its first K2 instruction (start, badva=pc=0xc00000000001a7b4,
+   * exc=26 access=2) instead of running.  So this is a genuine emulation gap:
+   * the executed loader never leaves the K2 mapping the real firmware would.
    */
   mips_cpu_pin_kernel_mapping(IP27_K2_BASE, 0, IP27_K2_PAGEMASK,
                               IP27_K2_FLAGS);
