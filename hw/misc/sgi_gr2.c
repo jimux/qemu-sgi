@@ -22,6 +22,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/sgi_gr2.h"
 #include "trace.h"
+#include <math.h>
 
 /* Vertical retrace, as a real CRT would produce it.  The board raises its GIO
  * interrupt at ~60 Hz once started; the pulse is asserted for the blanking
@@ -883,6 +884,298 @@ static uint32_t sgi_gr2_guest_pc(void)
     return 0;
 }
 
+/* ------------------------------------------------------------------------- *
+ * GE7 3D: transform + Z-raster for the immediate-mode GL token stream.
+ *
+ * The offline decoder (tmp/indy-video-xz/b2/tools/gr2_ge7_decode.py) is the
+ * oracle for this: it established that object-space vertices are sent on token
+ * 2659, three floats at a time; that a polygon is a triangle fan delimited by
+ * bgnpolygon/endpolygon (420/1454 .. 65/1125); and that the transform is
+ * projection * modelview applied as column-major M*v (libgl emits the
+ * transpose of IRIS GL's internal row-major matrices).  The offline numbers
+ * agree that MV is a rigid rotation (det +1), that every vertex has w>0, and
+ * that the whole bust lands inside the canonical volume.  The viewport is the
+ * one thing the FIFO carries that the offline pass did not use: gl_g_viewport
+ * puts x on token 60 and (y,w,h) on the next three PUC_DATA words.
+ * ------------------------------------------------------------------------- */
+
+static inline float sgi_gr2_u2f(uint32_t v)
+{
+    union { uint32_t u; float f; } x;
+
+    x.u = v;
+    return x.f;
+}
+
+/* Map an intensity level (0..15) to a palette index by nearest luminance, so
+ * the shaded bust uses whatever palette the guest programmed rather than a
+ * guessed index.  Rebuilt per polygon batch: 16 x 256 comparisons. */
+static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[16])
+{
+    int g, i;
+
+    for (g = 0; g < 16; g++) {
+        int target = g * 17;
+        int best = 0, bestd = 1 << 30;
+
+        for (i = 0; i < 256; i++) {
+            uint32_t rgb = s->ramdac[i];
+            int r = (rgb >> 16) & 0xff;
+            int gg = (rgb >> 8) & 0xff;
+            int b = rgb & 0xff;
+            int lum = (r * 77 + gg * 150 + b * 29) >> 8;
+            int d = lum - target;
+
+            if (d < 0) {
+                d = -d;
+            }
+            if (d < bestd) {
+                bestd = d;
+                best = i;
+            }
+        }
+        lut[g] = (uint8_t)best;
+    }
+}
+
+/* Transform an object-space point by projection*modelview.  Returns false if
+ * the point is behind the eye (w <= 0) so it is skipped rather than projected
+ * through the eye. */
+static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
+                              float *sx, float *sy, float *sz)
+{
+    float cam[4], clip[4];
+    int r, c;
+
+    if (!s->ge_mv_valid || !s->ge_proj_valid) {
+        return false;
+    }
+    for (r = 0; r < 4; r++) {
+        cam[r] = s->ge_mv[3 * 4 + r]; /* v[3] = 1 */
+        for (c = 0; c < 3; c++) {
+            cam[r] += s->ge_mv[c * 4 + r] * p[c];
+        }
+    }
+    for (r = 0; r < 4; r++) {
+        clip[r] = 0.0f;
+        for (c = 0; c < 4; c++) {
+            clip[r] += s->ge_proj[c * 4 + r] * cam[c];
+        }
+    }
+    if (clip[3] <= 0.0f) {
+        return false;
+    }
+    *sx = clip[0] / clip[3];
+    *sy = clip[1] / clip[3];
+    *sz = clip[2] / clip[3];
+    return true;
+}
+
+/* Rasterise the buffered polygon (a triangle fan) into `scanout`, Z-buffered.
+ * The viewport maps NDC to pixels; if the guest has not yet sent one, fall
+ * back to the whole screen. */
+static void sgi_gr2_ge7_draw(SGIGr2State *s)
+{
+    float nx[SGI_GR2_GE7_MAX_VERTS], ny[SGI_GR2_GE7_MAX_VERTS];
+    float nz[SGI_GR2_GE7_MAX_VERTS];
+    float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
+    float sz[SGI_GR2_GE7_MAX_VERTS];
+    int vx, vy, vw, vh;
+    unsigned i;
+    uint8_t lut[16];
+
+    if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
+        return;
+    }
+    if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
+        vx = s->vp_x;
+        vy = s->vp_y;
+        vw = s->vp_w;
+        vh = s->vp_h;
+    } else {
+        vx = 0;
+        vy = 0;
+        vw = SGI_GR2_SCREEN_W;
+        vh = SGI_GR2_SCREEN_H;
+    }
+    for (i = 0; i < s->ge_poly_n; i++) {
+        float cx, cy, cz;
+        float px, py;
+        int c;
+
+        if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz)) {
+            return; /* part of the polygon is behind the eye: skip it whole */
+        }
+        px = vx + (cx + 1.0f) * 0.5f * vw;
+        py = vy + (1.0f - (cy + 1.0f) * 0.5f) * vh; /* viewport y from the top */
+        sx[i] = px;
+        sy[i] = py;
+        sz[i] = cz;
+        /* rotate the normal by the modelview for shading */
+        nx[i] = ny[i] = nz[i] = 0.0f;
+        for (c = 0; c < 3; c++) {
+            nx[i] += s->ge_mv[c * 4 + 0] * s->ge_normal[c];
+            ny[i] += s->ge_mv[c * 4 + 1] * s->ge_normal[c];
+            nz[i] += s->ge_mv[c * 4 + 2] * s->ge_normal[c];
+        }
+    }
+    sgi_gr2_ge7_greylut(s, lut);
+    for (i = 1; i + 1 < s->ge_poly_n; i++) {
+        float ax = sx[0], ay = sy[0], az = sz[0];
+        float bx = sx[i], by = sy[i], bz = sz[i];
+        float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1];
+        float lx = nx[i], ly = ny[i], lz = nz[i];
+        float len = lx * lx + ly * ly + lz * lz;
+        float inten;
+        int minx, maxx, miny, maxy, x, y;
+        int idx;
+        float area;
+
+        if (len > 0.0f) {
+            len = sqrtf(len);
+            inten = (lx * 0.3f + ly * 0.4f + lz * 0.86f) / len;
+        } else {
+            inten = 0.5f;
+        }
+        if (inten < 0.0f) {
+            inten = -inten;
+        }
+        if (inten > 1.0f) {
+            inten = 1.0f;
+        }
+        idx = lut[2 + (int)(inten * 13.0f)];
+
+        minx = (int)MIN(ax, MIN(bx, cx));
+        maxx = (int)MAX(ax, MAX(bx, cx)) + 1;
+        miny = (int)MIN(ay, MIN(by, cy));
+        maxy = (int)MAX(ay, MAX(by, cy)) + 1;
+        minx = MAX(minx, 0);
+        miny = MAX(miny, 0);
+        maxx = MIN(maxx, SGI_GR2_SCREEN_W - 1);
+        maxy = MIN(maxy, SGI_GR2_SCREEN_H - 1);
+
+        area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (area == 0.0f) {
+            continue;
+        }
+        for (y = miny; y <= maxy; y++) {
+            for (x = minx; x <= maxx; x++) {
+                float w0 = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area;
+                float w1 = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area;
+                float w2 = 1.0f - w0 - w1;
+                float z;
+                size_t o;
+
+                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+                    continue;
+                }
+                z = w1 * bz + w2 * cz + w0 * az;
+                o = (size_t)y * SGI_GR2_SCREEN_W + x;
+                if (z < s->ge_zbuf[o]) {
+                    s->ge_zbuf[o] = z;
+                    sgi_gr2_put(s, x, y, idx);
+                }
+            }
+        }
+        s->ge_polys++;
+    }
+    s->ge_3d_seen = true;
+}
+
+/* Feed one FIFO token word to the GE7 3D path.  Returns true if the token was
+ * a 3D command port (so the caller can skip unrelated paths if it wants). */
+static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
+{
+    uint32_t v = (uint32_t)value;
+
+    /* Any token that is not the viewport's own data word closes an armed
+     * viewport early (its three words are always contiguous). */
+    if (s->vp_armed && offset != SGI_GR2_GE7_VIEWPORT &&
+        offset != SGI_GR2_HQ_TOKEN_START) {
+        s->vp_armed = false;
+    }
+
+    switch (offset) {
+    case SGI_GR2_GE7_VIEWPORT:
+        s->vp_x = (int)v;
+        s->vp_n = 1;
+        s->vp_armed = true;
+        s->vp_valid = false;
+        break;
+    case SGI_GR2_HQ_TOKEN_START: /* token 479: viewport's (y,w,h) or GE data */
+        if (s->vp_armed) {
+            if (s->vp_n == 1) {
+                s->vp_y = (int)v;
+            } else if (s->vp_n == 2) {
+                s->vp_w = (int)v;
+            } else if (s->vp_n == 3) {
+                s->vp_h = (int)v;
+                s->vp_valid = true;
+                s->vp_armed = false;
+            }
+            s->vp_n++;
+        }
+        break;
+    case SGI_GR2_GE7_MV:
+        s->ge_mv[s->ge_mv_n++] = sgi_gr2_u2f(v);
+        if (s->ge_mv_n == 16) {
+            s->ge_mv_n = 0;
+            s->ge_mv_valid = true;
+            /* A fresh modelview begins a frame: clear the Z-buffer to "far"
+             * (0x7f7f7f7f ~ +3.4e38) so the previous frame does not occlude
+             * it. */
+            if (s->ge_zbuf) {
+                memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+                       SGI_GR2_SCREEN_H * sizeof(float));
+            }
+        }
+        break;
+    case SGI_GR2_GE7_PROJ:
+        s->ge_proj[s->ge_proj_n++] = sgi_gr2_u2f(v);
+        if (s->ge_proj_n == 16) {
+            s->ge_proj_n = 0;
+            s->ge_proj_valid = true;
+        }
+        break;
+    case SGI_GR2_GE7_TEX:
+        break; /* texture matrix: not modelled, the bust is untextured */
+    case SGI_GR2_GE7_NORMAL:
+        switch (s->ge_n_n++) {
+        case 0: s->ge_normal[0] = sgi_gr2_u2f(v); break;
+        case 1: s->ge_normal[1] = sgi_gr2_u2f(v); break;
+        case 2: s->ge_normal[2] = sgi_gr2_u2f(v); s->ge_n_n = 0; break;
+        }
+        break;
+    case SGI_GR2_GE7_VTX:
+        switch (s->ge_v_n++) {
+        case 0: s->ge_vx = sgi_gr2_u2f(v); break;
+        case 1: s->ge_vy = sgi_gr2_u2f(v); break;
+        case 2:
+            s->ge_vz = sgi_gr2_u2f(v);
+            s->ge_v_n = 0;
+            if (s->ge_poly_n < SGI_GR2_GE7_MAX_VERTS) {
+                s->ge_poly[s->ge_poly_n][0] = s->ge_vx;
+                s->ge_poly[s->ge_poly_n][1] = s->ge_vy;
+                s->ge_poly[s->ge_poly_n][2] = s->ge_vz;
+                s->ge_poly_n++;
+            }
+            break;
+        }
+        break;
+    case SGI_GR2_GE7_BGN:
+    case SGI_GR2_GE7_BGN_B:
+        s->ge_poly_n = 0;
+        break;
+    case SGI_GR2_GE7_END:
+    case SGI_GR2_GE7_END_B:
+        sgi_gr2_ge7_draw(s);
+        s->ge_poly_n = 0;
+        break;
+    default:
+        break;
+    }
+}
+
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIGr2State *s = SGI_GR2(opaque);
@@ -992,6 +1285,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * the whole register block. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
         trace_sgi_gr2_fifo(offset, value, size);
+        /* The GE7 3D command ports ride the same FIFO as the 2D RE3 ops; feed
+         * them the token before the 2D paths see it. */
+        if (size == 4) {
+            sgi_gr2_ge7_token(s, offset, value);
+        }
         /* Arm the drain flush; it fires only once the token stream pauses, which
          * is when real hardware would have executed the op. */
         if (s->fifo_flush_timer) {
@@ -1640,6 +1938,12 @@ static void sgi_gr2_fifo_flush_cb(void *opaque)
         sgi_gr2_re3_flush_fill(s);
         sgi_gr2_re3_reset_subop(s);
     }
+    /* A paused token stream is the end of a draw batch.  For the 3D path the
+     * whole bust was just rasterised, so refresh the display once here rather
+     * than on every endpolygon (which would rescan 1280x1024 5000 times). */
+    if (s->ge_3d_seen) {
+        sgi_gr2_update_display(s);
+    }
 }
 
 static void sgi_gr2_realize(DeviceState *dev, Error **errp)
@@ -1670,6 +1974,12 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
                             (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
         s->scanout332 = g_new0(uint8_t,
                                (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        /* GE7 Z-buffer.  Allocated up front and cleared to "far" (0x7f7f7f7f
+         * ~ +3.4e38) so the first frame draws. */
+        s->ge_zbuf = g_new(float,
+                           (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+               SGI_GR2_SCREEN_H * sizeof(float));
         s->con = graphic_console_init(dev, 0, &sgi_gr2_gfx_ops, s);
         qemu_console_resize(s->con, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
     }

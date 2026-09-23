@@ -72,6 +72,30 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE_STRIDE   0x400
 #define SGI_GR2_GE_UNITS    8
 
+/* GE7 3D command ports in the token FIFO (offset = FIFO base + token*4).  The
+ * vocabulary is the immediate-mode IRIS GL path libgl emits; names and token
+ * numbers are read off libgl's own store sites (progress_notes/indy/xz-gr2/74,
+ * 76) and confirmed against the captured powerflip stream:
+ *   60   gl_g_viewport : x on the token, then (y,w,h) as three PUC_DATA words
+ *   53   gl_i_n3f      : unit normal, three floats
+ *   2659 gl_i_v3f      : object-space vertex, three floats
+ *   55/56/57           : modelview / projection / texture matrix slots
+ *   420/1454           : bgnpolygon / bgnpolygon_b
+ *   65/1125            : endpolygon / endpolygon_b
+ * A polygon is a triangle fan of object-space vertices the GE7 transforms by
+ * projection*modelview and rasterises into the framebuffer. */
+#define SGI_GR2_GE7_VIEWPORT 0x400f0 /* token 60                          */
+#define SGI_GR2_GE7_NORMAL   0x400d4 /* token 53                          */
+#define SGI_GR2_GE7_MV       0x400dc /* token 55, 16 floats               */
+#define SGI_GR2_GE7_PROJ     0x400e0 /* token 56, 16 floats               */
+#define SGI_GR2_GE7_TEX      0x400e4 /* token 57, texture matrix          */
+#define SGI_GR2_GE7_VTX      0x4298c /* token 2659, three floats          */
+#define SGI_GR2_GE7_BGN      0x40690 /* token 420                         */
+#define SGI_GR2_GE7_BGN_B    0x416b8 /* token 1454                        */
+#define SGI_GR2_GE7_END      0x40104 /* token 65                          */
+#define SGI_GR2_GE7_END_B    0x41194 /* token 1125                        */
+#define SGI_GR2_GE7_MAX_VERTS 64     /* vertices buffered per polygon     */
+
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
 #define SGI_GR2_HQ_MYSTERY  0x6a07c /* presence magic, read by Gr2Probe */
 #define SGI_GR2_HQ_MAGIC    0xdeadbeefu
@@ -378,6 +402,37 @@ struct SGIGr2State {
     uint16_t vc1_reg[SGI_GR2_VC1_REG_WORDS];
     uint16_t vc1_sram[SGI_GR2_VC1_SRAM_WORDS];
     bool retrace_active;
+
+    /* GE7 3D path (the powerflip bust).  See the SGI_GR2_GE7_* ports above.
+     * Matrices arrive 16 words at a time on their slot; a matrix is only valid
+     * once a whole 16-word run has landed, so partial runs are never used.
+     * Vertices/normals arrive three floats at a time.  A completed polygon is
+     * transformed by projection*modelview and Z-rasterised into `scanout`. */
+    /* The matrices and polygon buffer are read by GCC's auto-vectoriser with
+     * ALIGNED SSE ops, so their offset in the struct must actually be 16-byte
+     * aligned; without this the misaligned `mulps` raises #GP. */
+    float ge_mv[16] __attribute__((aligned(16)));   /* token 55: modelview  */
+    float ge_proj[16] __attribute__((aligned(16))); /* token 56: projection */
+    unsigned ge_mv_n;              /* words of the current modelview run     */
+    unsigned ge_proj_n;            /* words of the current projection run    */
+    bool ge_mv_valid;
+    bool ge_proj_valid;
+    int vp_x;                      /* token 60 + 3 PUC_DATA: viewport x,y,w,h */
+    int vp_y;
+    int vp_w;
+    int vp_h;
+    unsigned vp_n;                 /* viewport words collected               */
+    bool vp_armed;                 /* token 60 seen, awaiting three words    */
+    bool vp_valid;
+    float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
+    unsigned ge_poly_n;
+    float ge_normal[3];            /* current vertex normal                  */
+    float ge_nx, ge_ny, ge_nz;     /* normal words collected                 */
+    float ge_vx, ge_vy, ge_vz;     /* vertex words collected                 */
+    unsigned ge_n_n, ge_v_n;       /* words collected for normal / vertex     */
+    float *ge_zbuf;                /* SCREEN_W*SCREEN_H depth, lazily made   */
+    bool ge_3d_seen;               /* a polygon has been rasterised          */
+    unsigned long ge_polys;        /* polygons rasterised (trace/diagnostics) */
 };
 
 #endif /* HW_MISC_SGI_GR2_H */
