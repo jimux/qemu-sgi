@@ -56,6 +56,10 @@ throwaway:
         /*  all except 68000 */
         fmt = cpu_lduw_be_mmuidx_ra(env, sp, MMU_KERNEL_IDX, 0);
         sp += 2;
+        if (getenv("SGI_BERR_LOG")) {
+            fprintf(stderr, "SGI BERR RTE fmt=%04x pc=%08x sr=%04x sp=%08x\n",
+                    fmt, env->pc, sr, sp);
+        }
         switch (fmt >> 12) {
         case 0:
             break;
@@ -427,6 +431,13 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
         }
 
         do_stack_frame(env, &sp, 7, oldsr, 0, env->pc);
+        if (getenv("SGI_BERR_LOG")) {
+            fprintf(stderr, "SGI BERR PUSH vec=%d pc=%08x sr=%04x ssw=%08x "
+                    "ea=%08x sp=%08x ext=%d\n",
+                    cs->exception_index, (unsigned)last_pc, oldsr,
+                    (unsigned)env->mmu.ssw, (unsigned)env->mmu.ar,
+                    sp, env->ext_tlb_fill != NULL);
+        }
         env->mmu.fault = false;
         if (qemu_loglevel_mask(CPU_LOG_INT)) {
             qemu_log("            "
