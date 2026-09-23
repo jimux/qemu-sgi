@@ -101,11 +101,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_PEN_TOKEN     0x40574 /* token 349: glyph pen x          */
 #define SGI_GR2_RE3_PEN_MAX       64      /* pens recorded per sub-op        */
 #define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
+#define SGI_GR2_RE3_TILE_TOKEN    0x404ec /* token 315: tile/pattern data port */
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
 #define SGI_GR2_RE3_IMAGE_TOKEN   0x40558 /* token 342: expDrawImage24       */
 #define SGI_GR2_RE3_IMG_MAX       256     /* 342 groups recorded per sub-op  */
 #define SGI_GR2_RE3_COPY_TOKEN    0x40550 /* token 340: expCopyRect marker   */
 #define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
+/* The value token 331 carries is the DDX op type | 0x1000.  0x100b is
+ * expTileRects (ref/GR2-DDX-STORE-SEQUENCES.txt:213), the op that tiles the
+ * root weave: a short header whose words [3] and [4] are the tile width and
+ * height, then (w*h/4) words of an 8bpp bitmap, one tile pixel per byte, four
+ * bytes per word MSB first.  Repeated over the destination. */
+#define SGI_GR2_RE3_TILE_OP       0x100b  /* token 331 value: expTileRects   */
 #define SGI_GR2_RE3_DONE_TOKEN    0x407a8 /* token 490: op terminator        */
 /* The PUC_DATA words of one sub-op, kept so the rect list can be decoded from
  * the DDX store order rather than from a guessed tail heuristic.  A solid-rect
@@ -281,6 +288,17 @@ struct SGIGr2State {
     uint32_t re3_copy_v[7];
     unsigned re3_copy_n;
     bool re3_copy_active;
+    /* expTileRects (token 331 value 0x100b): the op tiles a bitmap over the
+     * destination.  The root weave is a 16x16 tile repeated across the screen. */
+    bool re3_tile_seen;
+    uint32_t re3_tile_word0; /* the first tile word, streamed via token 315 */
+    /* The clip rectangle list that precedes expTileRects: the DDX writes one
+     * expValidateClip per exposed rect (token 304, four (x1,y1,x2,y2) words, no
+     * colour token, 490-terminated) and then the tile fill.  The tile is
+     * repeated inside this list, not over the whole screen — it is what leaves
+     * the toolchest and Console untouched. */
+    uint32_t re3_clip[64][4];
+    unsigned re3_nclip;
     /* The name-label's row: the top y of the last solid rect drawn in the label
      * bar colour (222).  The DDX does not put the text y on the wire, and the
      * label bar is drawn just before its glyphs, so this is the structural link

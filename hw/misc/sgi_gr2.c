@@ -223,6 +223,77 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
     sgi_gr2_update_display(s);
 }
 
+/* expTileRects repeats the tile across its destination.  The destination is the
+ * clip rectangle list that immediately precedes the op (one expValidateClip per
+ * exposed rect, seen as a 304 with four coordinate words, no colour token, 490
+ * terminated).  When no list was supplied the whole screen is the destination
+ * (the 4Dwm startup repaint of the root). */
+static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n;
+    uint32_t w, h, nwords;
+    unsigned r;
+
+    if (n < 7) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    w = s->re3_data[3];
+    h = s->re3_data[4];
+    if (w == 0 || h == 0 || (w & 3) || w > SGI_GR2_SCREEN_W ||
+        h > SGI_GR2_SCREEN_H) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    nwords = (w * h) / 4;
+    if (nwords == 0 || 7 + nwords - 1 > n) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    if (!s->scanout) {
+        return;
+    }
+    if (s->re3_nclip == 0) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    for (r = 0; r < s->re3_nclip; r++) {
+        int rx1, ry1, rx2, ry2, x, y;
+
+        rx1 = s->re3_clip[r][0];
+        ry1 = s->re3_clip[r][1];
+        rx2 = s->re3_clip[r][2];
+        ry2 = s->re3_clip[r][3];
+        if (rx1 < 0) {
+            rx1 = 0;
+        }
+        if (ry1 < 0) {
+            ry1 = 0;
+        }
+        if (rx2 > SGI_GR2_SCREEN_W) {
+            rx2 = SGI_GR2_SCREEN_W;
+        }
+        if (ry2 > SGI_GR2_SCREEN_H) {
+            ry2 = SGI_GR2_SCREEN_H;
+        }
+        for (y = ry1; y < ry2; y++) {
+            unsigned row = (unsigned)(y % h) * w;
+
+            for (x = rx1; x < rx2; x++) {
+                uint32_t word, p = row + (unsigned)(x % w);
+
+                word = (p / 4 == 0) ? s->re3_tile_word0
+                                    : s->re3_data[7 + (p / 4 - 1)];
+                sgi_gr2_put(s, x, y,
+                            (word >> (8 * (3 - (p % 4)))) & 0xff);
+            }
+        }
+    }
+    trace_sgi_gr2_re3_tile(w, h);
+    s->re3_nclip = 0;
+    sgi_gr2_update_display(s);
+}
+
 /* Number of trailing rectangle groups in the current sub-op's PUC_DATA.  The
  * DDX's expDrawSolidRects/expStippledFillRects store the geometry as groups of
  * four (x1,y1,x2,y2) after a short non-rectangle prefix ("0xff 0x3 0x0", and for
@@ -662,6 +733,27 @@ static void sgi_gr2_re3_copy_rect(SGIGr2State *s, int sx, int sy, int w, int h,
  * at. */
 static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
 {
+    if (s->re3_solid_seen && s->re3_data_n == 4 && !s->re3_colour_valid) {
+        /* expValidateClip: one exposed rectangle for a following tile fill.  It
+         * carries the 304 marker and four (x1,y1,x2,y2) words but no colour, so
+         * it is a clip rectangle, not a fill.  The tile op that follows repeats
+         * its bitmap inside this list. */
+        if (s->re3_nclip < ARRAY_SIZE(s->re3_clip)) {
+            s->re3_clip[s->re3_nclip][0] = s->re3_data[0];
+            s->re3_clip[s->re3_nclip][1] = s->re3_data[1];
+            s->re3_clip[s->re3_nclip][2] = s->re3_data[2];
+            s->re3_clip[s->re3_nclip][3] = s->re3_data[3];
+            s->re3_nclip++;
+        }
+        return;
+    }
+    if (s->re3_tile_seen) {
+        /* expTileRects: tile a bitmap across the screen (the root weave).  The
+         * op streams the tile via token 315 and PUC_DATA, so decide it here from
+         * the packet itself rather than from any rect heuristic. */
+        sgi_gr2_re3_tile_rects(s);
+        return;
+    }
     if (s->re3_image_seen) {
         /* expDrawImage24: a colour image, not a fill.  Checked first because its
          * 4316 PUC_DATA words and 196 342 markers match no other shape. */
@@ -741,6 +833,8 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_data_overflow = false;
     s->re3_copy_active = false;
     s->re3_copy_n = 0;
+    s->re3_tile_seen = false;
+    s->re3_tile_word0 = 0;
 }
 
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
@@ -972,6 +1066,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (size == 4 && offset == SGI_GR2_RE3_OP_TOKEN) {
         sgi_gr2_re3_flush_fill(s);
         sgi_gr2_re3_reset_subop(s);
+        /* The op type is (type | 0x1000); 0x100b is expTileRects, which streams
+         * its tile bitmap and repaints the root.  Remember it for the flush that
+         * runs when the next op's 331 arrives.  Any other op ends the clip list
+         * the tile fill consumes. */
+        s->re3_tile_seen = (value == SGI_GR2_RE3_TILE_OP);
     }
     if (size == 4 && offset == SGI_GR2_RE3_MODE_TOKEN) {
         s->re3_rop = (uint32_t)value;
@@ -1019,6 +1118,14 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == SGI_GR2_RE3_SPANS_TOKEN) {
         s->re3_spans_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_TILE_TOKEN) {
+        /* expTileRects streams its tile bitmap's first word on the tile data
+         * port; the rest arrives as PUC_DATA.  Keep it so the tile can be
+         * reconstructed from both streams. */
+        if (s->re3_tile_seen) {
+            s->re3_tile_word0 = (uint32_t)value;
+        }
     }
     if (size == 4 && offset == SGI_GR2_RE3_FG_TOKEN) {
         s->re3_fg = value & 0xff;
