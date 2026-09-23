@@ -511,7 +511,7 @@ sgi_crime_re_ppwrite(int off, uint64_t value, int size) "pp off=0x%x val=0x%016"
 sgi_crime_re_tri(int v0x, int v0y, int v1x, int v1y, int v2x, int v2y, int inside, int wrote, uint32_t winoff, uint32_t clipmode) "tri v0=(%d,%d) v1=(%d,%d) v2=(%d,%d) inside=%d wrote=%d winoff=0x%08x clip=0x%08x"
 sgi_crime_re_texreg(uint32_t off, uint64_t val) "texreg off=0x%x val=0x%016"PRIx64
 sgi_crime_re_depthreg(uint32_t off, uint64_t val) "depthreg off=0x%x val=0x%016"PRIx64
-sgi_crime_re_depth_tri(uint32_t drawmode, uint32_t depth_mode, int64_t z0, int64_t dzdx, int64_t dzdy, int inside, int zpass, int zfail, int wrote) "depth-tri dm=0x%08x dmod=0x%08x z0=%"PRId64" dzdx=%"PRId64" dzdy=%"PRId64" inside=%d zpass=%d zfail=%d wrote=%d"
+sgi_crime_re_depth_tri(uint32_t drawmode, uint32_t depth_mode, int64_t z0, int64_t dzdx, int64_t dzdy, int inside, int zpass, int zfail, int wrote, uint32_t prim) "depth-tri dm=0x%08x dmod=0x%08x z0=%"PRId64" dzdx=%"PRId64" dzdy=%"PRId64" inside=%d zpass=%d zfail=%d wrote=%d prim=0x%08x"
 sgi_crime_re_textlb(int entry, uint64_t val) "tlb_tex[%d] = 0x%016"PRIx64
 sgi_crime_re_tex_tri(uint32_t mode, uint64_t format, int64_t sq0, int64_t tq0, int32_t q0, int32_t dqdx, int32_t dqdy, int32_t stshift, uint32_t winoff) "tex-tri mode=0x%08x format=0x%016"PRIx64" sq0=%"PRId64" tq0=%"PRId64" q0=%d dqdx=%d dqdy=%d stshift=%d winoff=0x%08x"
 sgi_crime_re_tex_slope(int64_t dsqdx, int64_t dsqdy, int64_t dtqdx, int64_t dtqdy) "tex-slope dsqdx=%"PRId64" dsqdy=%"PRId64" dtqdx=%"PRId64" dtqdy=%"PRId64

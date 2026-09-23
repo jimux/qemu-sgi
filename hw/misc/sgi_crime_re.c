@@ -899,14 +899,30 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
     /*
      * Depth test (DrawMode.enDepthTest, spec §7.3.7.17 Table 7-25).  The
      * plane registers are 25.12 (§7.3.7.16); libGLcore programs z0 at the
-     * *floored first vertex* of the primitive — measured in
-     * __glCrmFillTriangle: it clears the low 6 bits of Vertex.GL[0].x/y
-     * (f20/f22 = floor(v0) - v0) and forms z0 = (z_v0 + A*f20 + B*f22)
-     * *4096.  Evaluate z at the pixel in the same GL/window space; the
-     * WinOffset.dst translation cancels in the difference.
+     * floored *reference* vertex of the primitive — measured in
+     * __glCrmFillTriangle: it clears the low 6 bits of the reference
+     * vertex's x/y (f20/f22 = floor(ref) - ref) and forms
+     * z0 = (z_ref + A*f20 + B*f22) * 4096.
+     *
+     * The reference is NOT always Vertex.GL[0].  __glCrmFillTriangle (and
+     * __glCrmFlatZTriangle) pick the reference pointer t0 = a1 (vertex 0)
+     * or a3 (vertex 2) with a movn/movz pair keyed on the sign of the first
+     * vertex's x and a 5th "flag" argument, and the SAME choice is encoded
+     * in the value they store to the Primitive register (RE + 0x2060):
+     *   flag==0, x0>=0 -> prim 0x203, ref = v0     flag!=0, x0>=0 -> 0x200, ref = v2
+     *   flag==0, x0<0  -> prim 0x201, ref = v2     flag!=0, x0<0  -> 0x202, ref = v0
+     * i.e. ref = v0 exactly when (prim & 2) != 0 (disasm of __glCrmFlatTriangle
+     * 0xda43d30 and __glCrmFlatZTriangle 0x0da43e1c; the stored prim value
+     * reaches us as (t2 << 16)).  Assuming v0 unconditionally put a
+     * per-triangle constant offset (dzdx*dvx + dzdy*dvy) on every triangle
+     * whose reference is v2 — half of them here — so the depth test picked
+     * the wrong triangle per pixel and the object broke up into a patchwork
+     * of different triangles' Gouraud colours (the "rainbow streaks").
      */
     bool depth_enable = (s->drawmode & DM_ENDEPTHTEST) != 0;
-    int64_t refx = vx[0] >> 6, refy = vy[0] >> 6;
+    bool ref_v0 = (((s->primitive >> 16) & 0xff) & 0x2) != 0;
+    int ref_idx = ref_v0 ? 0 : 2;
+    int64_t refx = vx[ref_idx] >> 6, refy = vy[ref_idx] >> 6;
     int zfail_n = 0, zpass_n = 0;
     /*
      * The Shade planes are absolute in DESTINATION-BUFFER coordinates (the
@@ -1001,7 +1017,7 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
         trace_sgi_crime_re_depth_tri(s->drawmode, s->depth_mode,
                                      s->depth_z0, s->depth_dzdx,
                                      s->depth_dzdy, inside_n,
-                                     zpass_n, zfail_n, wrote_n);
+                                     zpass_n, zfail_n, wrote_n, s->primitive);
     }
 }
 
