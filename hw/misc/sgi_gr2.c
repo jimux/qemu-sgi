@@ -1140,18 +1140,52 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     }
     sgi_gr2_ge7_greylut(s, lut);
     for (i = 1; i + 1 < s->ge_poly_n; i++) {
-        float ax = sx[0], ay = sy[0], az = sz[0];
-        float bx = sx[i], by = sy[i], bz = sz[i];
-        float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1];
-        float i0 = iv[0], i1 = iv[i], i2 = iv[i + 1];
+        float ax = sx[0], ay = sy[0], az = sz[0], i0 = iv[0];
+        float bx = sx[i], by = sy[i], bz = sz[i], i1 = iv[i];
+        float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1], i2 = iv[i + 1];
+        int64_t fx0, fy0, fx1, fy1, fx2, fy2;
+        int64_t area, e0, e1, e2;
+        float w0, w1, w2, inv;
         int minx, maxx, miny, maxy, x, y;
-        int idx;
-        float area;
 
-        minx = (int)MIN(ax, MIN(bx, cx));
-        maxx = (int)MAX(ax, MAX(bx, cx)) + 1;
-        miny = (int)MIN(ay, MIN(by, cy));
-        maxy = (int)MAX(ay, MAX(by, cy)) + 1;
+        /* Fixed-point edge functions with four sub-pixel bits.  Coordinates
+         * become multiples of 1/16 and pixel centres sit at (x*16+8).  Done in
+         * integers so a shared edge is bit-identical for the two triangles that
+         * meet there and the top-left rule can hand it to exactly one of them,
+         * which no epsilon in floating point can guarantee. */
+        fx0 = (int64_t)lroundf(ax * 16.0f);
+        fy0 = (int64_t)lroundf(ay * 16.0f);
+        fx1 = (int64_t)lroundf(bx * 16.0f);
+        fy1 = (int64_t)lroundf(by * 16.0f);
+        fx2 = (int64_t)lroundf(cx * 16.0f);
+        fy2 = (int64_t)lroundf(cy * 16.0f);
+        area = (fx1 - fx0) * (fy2 - fy0) - (fy1 - fy0) * (fx2 - fx0);
+        if (area == 0) {
+            continue;
+        }
+        if (area < 0) {
+            /* Normalise winding so all three edge functions are non-negative
+             * inside the triangle.  Swap the B and C vertices and everything
+             * interpolated with them. */
+            float tf;
+
+            tf = bx; bx = cx; cx = tf;
+            tf = by; by = cy; cy = tf;
+            tf = bz; bz = cz; cz = tf;
+            tf = i1; i1 = i2; i2 = tf;
+            fx1 = (int64_t)lroundf(bx * 16.0f);
+            fy1 = (int64_t)lroundf(by * 16.0f);
+            fx2 = (int64_t)lroundf(cx * 16.0f);
+            fy2 = (int64_t)lroundf(cy * 16.0f);
+            area = -area;
+        }
+        inv = 1.0f / (float)area;
+        /* Pixel-centre bounding box, one pixel of slack for the fixed-point
+         * rounding. */
+        minx = (int)(MIN(fx0, MIN(fx1, fx2)) >> 4) - 1;
+        maxx = (int)(MAX(fx0, MAX(fx1, fx2)) >> 4) + 1;
+        miny = (int)(MIN(fy0, MIN(fy1, fy2)) >> 4) - 1;
+        maxy = (int)(MAX(fy0, MAX(fy1, fy2)) >> 4) + 1;
         /* Clip to the drawable: the GL viewport (plus its window origin) is the
          * only region a GL client may paint.  Without this the transformed
          * vertices spill over the window frame and neighbouring windows. */
@@ -1166,48 +1200,49 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         if (minx > maxx || miny > maxy) {
             continue;
         }
+        /* Top-left tie-break for the edges: a pixel whose centre lies exactly
+         * on a shared edge is claimed by the triangle for which that edge is a
+         * top or left edge, so exactly one of the two writes it. */
+        for (y = miny; y <= maxy; y++) {
+            for (x = minx; x <= maxx; x++) {
+                int64_t px = (int64_t)x * 16 + 8;
+                int64_t py = (int64_t)y * 16 + 8;
+                float ig, z;
+                size_t o;
+                int li;
 
-        area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-        if (area == 0.0f) {
-            continue;
-        }
-        /* Half-pixel edge tolerance: a pixel whose centre is up to half a pixel
-         * outside an edge is still filled.  Adjacent triangles from the guest's
-         * mesh meet with a slight vertex mismatch, so without this a hairline
-         * crack opens along shared edges.  The barycentric weight changes by
-         * |edge|/(2*area) per pixel, so the tolerance is that times 0.5. */
-        {
-            float aa = fabsf(area);
-            float e0 = 0.5f * hypotf(bx - ax, by - ay) / aa;
-            float e1 = 0.5f * hypotf(cx - ax, cy - ay) / aa;
-            float e2 = 0.5f * hypotf(cx - bx, cy - by) / aa;
-            float e = MAX(e0, MAX(e1, e2));
-
-            for (y = miny; y <= maxy; y++) {
-                for (x = minx; x <= maxx; x++) {
-                    float w0 = ((bx - ax) * (y - ay) - (by - ay) * (x - ax)) / area;
-                    float w1 = ((x - ax) * (cy - ay) - (y - ay) * (cx - ax)) / area;
-                    float w2 = 1.0f - w0 - w1;
-                    float ig;
-                    float z;
-                    size_t o;
-                    int li;
-
-                    if (w0 < -e || w1 < -e || w2 < -e) {
-                        continue;
-                    }
-                    /* Gouraud: interpolate the per-vertex intensity, then map
-                     * it to the nearest palette luminance. */
-                    ig = MIN(MAX(w1 * i1 + w2 * i2 + w0 * i0, 0.0f), 1.0f);
-                    li = (int)(ig * 31.0f + 0.5f);
-                    li = MIN(MAX(li, 0), 31);
-                    idx = lut[li];
-                    z = w1 * bz + w2 * cz + w0 * az;
-                    o = (size_t)y * SGI_GR2_SCREEN_W + x;
-                    if (z < s->ge_zbuf[o]) {
-                        s->ge_zbuf[o] = z;
-                        sgi_gr2_put(s, x, y, idx);
-                    }
+                /* e0 for edge A->B, e1 for B->C, e2 for C->A. */
+                e0 = (fx1 - fx0) * (py - fy0) - (fy1 - fy0) * (px - fx0);
+                e1 = (fx2 - fx1) * (py - fy1) - (fy2 - fy1) * (px - fx1);
+                e2 = (fx0 - fx2) * (py - fy2) - (fy0 - fy2) * (px - fx2);
+                if (e0 < 0 || e1 < 0 || e2 < 0) {
+                    continue;
+                }
+                if (e0 == 0 &&
+                    !((fy1 == fy0 && fx1 > fx0) || fy1 > fy0)) {
+                    continue;
+                }
+                if (e1 == 0 &&
+                    !((fy2 == fy1 && fx2 > fx1) || fy2 > fy1)) {
+                    continue;
+                }
+                if (e2 == 0 &&
+                    !((fy0 == fy2 && fx0 > fx2) || fy0 > fy2)) {
+                    continue;
+                }
+                /* Barycentrics from the integer edge functions: e1 is weight
+                 * of A, e2 of B, e0 of C. */
+                w0 = (float)e1 * inv;
+                w1 = (float)e2 * inv;
+                w2 = (float)e0 * inv;
+                ig = MIN(MAX(w0 * i0 + w1 * i1 + w2 * i2, 0.0f), 1.0f);
+                li = (int)(ig * 31.0f + 0.5f);
+                li = MIN(MAX(li, 0), 31);
+                z = w0 * az + w1 * bz + w2 * cz;
+                o = (size_t)y * SGI_GR2_SCREEN_W + x;
+                if (z < s->ge_zbuf[o]) {
+                    s->ge_zbuf[o] = z;
+                    sgi_gr2_put(s, x, y, lut[li]);
                 }
             }
         }
