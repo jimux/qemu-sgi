@@ -331,6 +331,60 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
     sgi_gr2_update_display(s);
 }
 
+/* Draw a colour image (expDrawImage24, token 342).  Each 342 starts one run and
+ * streams, through PUC_DATA, a group of (y, width, 1, nwords, 2, 0) followed by
+ * nwords 32-bit words, each holding four 8-bit palette indices, most significant
+ * byte first.  The rows of a 98x98 icon arrive as two runs (x=459 w=64 and
+ * x=523 w=34) and every group is padded with 0xdeadbeef out to 22 PUC_DATA words.
+ * The run x is 342's value; its data index is recorded at write time, so the
+ * decoder needs no guessed geometry.  The indices are written to scanout as-is;
+ * the palette is applied there, like every other RE3 draw. */
+static void sgi_gr2_re3_draw_image(SGIGr2State *s)
+{
+    unsigned k;
+
+    if (!s->scanout) {
+        return;
+    }
+    for (k = 0; k < s->re3_nimg; k++) {
+        unsigned off = s->re3_img_off[k];
+        uint32_t x = s->re3_img_x[k];
+        uint32_t y, w, nwords, j, p;
+
+        if (off + 6 > s->re3_data_n) {
+            break;
+        }
+        y = s->re3_data[off];
+        w = s->re3_data[off + 1];
+        nwords = s->re3_data[off + 3];
+        if (w == 0 || w > SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
+            x >= SGI_GR2_SCREEN_W || nwords > SGI_GR2_RE3_DATA_MAX) {
+            trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+            continue;
+        }
+        if (off + 6 + nwords > s->re3_data_n) {
+            nwords = s->re3_data_n - (off + 6);
+        }
+        if (k == 0) {
+            trace_sgi_gr2_re3_image(x, y, w, s->re3_nimg);
+        }
+        for (j = 0; j < nwords; j++) {
+            uint32_t word = s->re3_data[off + 6 + j];
+
+            for (p = 0; p < 4; p++) {
+                uint32_t px = x + j * 4 + p;
+
+                if (px >= x + w || px >= SGI_GR2_SCREEN_W) {
+                    break;
+                }
+                s->scanout[y * SGI_GR2_SCREEN_W + px] =
+                    (word >> (24 - 8 * p)) & 0xff;
+            }
+        }
+    }
+    sgi_gr2_update_display(s);
+}
+
 /* Draw a polyline (libgd token 302).  After the same "0xff 0x3 0x0" prefix come
  * three header words (0x3ab, 0xc6, 0x2a0 in every op) then one or more contours
  * as (x,y) vertex pairs, each closed by repeating its first vertex.  These are
@@ -507,6 +561,12 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
  * at. */
 static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
 {
+    if (s->re3_image_seen) {
+        /* expDrawImage24: a colour image, not a fill.  Checked first because its
+         * 4316 PUC_DATA words and 196 342 markers match no other shape. */
+        sgi_gr2_re3_draw_image(s);
+        return;
+    }
     if (s->re3_stipple_valid) {
         /* Stippled rect list: the root backdrop is one full-screen rect, but a
          * stippled sub-op with its own small rects (a cursor, a shade band) must
@@ -569,6 +629,8 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
     s->re3_mono_seen = false;
+    s->re3_image_seen = false;
+    s->re3_nimg = 0;
     s->re3_npens = 0;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
@@ -773,6 +835,15 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == SGI_GR2_RE3_MONO_TOKEN) {
         s->re3_mono_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_IMAGE_TOKEN) {
+        /* One image run: remember its x and where its PUC_DATA group begins. */
+        if (s->re3_nimg < SGI_GR2_RE3_IMG_MAX) {
+            s->re3_img_x[s->re3_nimg] = (uint32_t)value;
+            s->re3_img_off[s->re3_nimg] = s->re3_data_n;
+            s->re3_nimg++;
+        }
+        s->re3_image_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_PEN_TOKEN) {
         /* The pen x for one glyph piece; remember where its data starts. */
@@ -1032,6 +1103,8 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
     s->re3_mono_seen = false;
+    s->re3_image_seen = false;
+    s->re3_nimg = 0;
     s->re3_npens = 0;
     s->re3_label_y = 0;
     s->re3_label_valid = false;

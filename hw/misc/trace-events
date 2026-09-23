@@ -552,5 +552,6 @@ sgi_gr2_puc_span(uint8_t idx, uint32_t rgb, uint32_t x0, uint32_t x1, uint32_t y
 sgi_gr2_re3_rect(uint8_t colour, uint32_t rgb, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2) "GR2 re3 rect colour=%u rgb=0x%06x (%u,%u)-(%u,%u)"
 sgi_gr2_re3_seg(uint8_t colour, uint32_t rgb, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) "GR2 re3 seg colour=%u rgb=0x%06x (%u,%u)-(%u,%u)"
 sgi_gr2_re3_spanstip(uint8_t colour, uint32_t rgb, uint32_t x, uint32_t y, uint32_t count) "GR2 re3 spanstip colour=%u rgb=0x%06x (%u,%u) count=%u"
+sgi_gr2_re3_image(uint32_t x, uint32_t y, uint32_t w, uint32_t runs) "GR2 re3 image x=%u y=%u w=%u runs=%u"
 sgi_gr2_re3_unmatched(uint32_t rop, uint32_t ndata) "GR2 re3 unmatched rop=0x%x ndata=%u"
 sgi_gr2_ramdac(uint32_t index, uint32_t rgb) "GR2 ramdac idx=%u rgb=0x%06x"

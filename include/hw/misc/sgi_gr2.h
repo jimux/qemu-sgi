@@ -81,14 +81,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_PEN_MAX       64      /* pens recorded per sub-op        */
 #define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
+#define SGI_GR2_RE3_IMAGE_TOKEN   0x40558 /* token 342: expDrawImage24       */
+#define SGI_GR2_RE3_IMG_MAX       256     /* 342 groups recorded per sub-op  */
 #define SGI_GR2_RE3_OP_TOKEN      0x4052c /* token 331: op/mode              */
 #define SGI_GR2_RE3_DONE_TOKEN    0x407a8 /* token 490: op terminator        */
 /* The PUC_DATA words of one sub-op, kept so the rect list can be decoded from
  * the DDX store order rather than from a guessed tail heuristic.  A solid-rect
  * sub-op carries a short prefix then groups of four; the weave op's 1024 span
  * spans arrive before its own 331, so a per-sub-op buffer of this size is ample
- * and the span words are discarded when the 331 resets the buffer. */
-#define SGI_GR2_RE3_DATA_MAX      512
+ * and the span words are discarded when the 331 resets the buffer.  The image op
+ * (expDrawImage24) is the exception: one 98x98 8bpp icon streams 4316 data words
+ * in 196 groups, so the buffer must hold a whole image. */
+#define SGI_GR2_RE3_DATA_MAX      4608
 #define SGI_GR2_HQ_NUMGE       0x6a044
 #define SGI_GR2_HQ_FIFO_FULL_T 0x6a054 /* full-timeout, driver writes 100    */
 #define SGI_GR2_HQ_FIFO_EMPTY_T 0x6a058 /* empty-timeout                     */
@@ -231,6 +235,16 @@ struct SGIGr2State {
     uint32_t re3_pen_val[SGI_GR2_RE3_PEN_MAX];
     unsigned re3_pen_off[SGI_GR2_RE3_PEN_MAX];
     unsigned re3_npens;
+    /* Colour images (expDrawImage24).  Token 342 starts one run: the value is the
+     * run's x, and the PUC_DATA that follows is (y, width, 1, nwords, 2, 0) then
+     * nwords 32-bit words of 4 8-bit palette indices each (MSB byte first).
+     * Scanlines are streamed as two runs (x=459 w=64 and x=523 w=34 for the
+     * 98x98 EZsetup icon); the run position and its data index are recorded so
+     * the decoder can walk the groups, and rows are padded with 0xdeadbeef. */
+    uint32_t re3_img_x[SGI_GR2_RE3_IMG_MAX];
+    unsigned re3_img_off[SGI_GR2_RE3_IMG_MAX];
+    unsigned re3_nimg;
+    bool re3_image_seen;
     /* The name-label's row: the top y of the last solid rect drawn in the label
      * bar colour (222).  The DDX does not put the text y on the wire, and the
      * label bar is drawn just before its glyphs, so this is the structural link
