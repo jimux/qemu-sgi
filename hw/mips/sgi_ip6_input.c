@@ -141,8 +141,15 @@ static int sgi_ip6_peer_write(Chardev *chr, const uint8_t *buf, int len)
                  * The 0xaa branch is the DEGRADED path: it stores layout
                  * 0xcc ("unknown") and keeps retrying -- which is what we
                  * were doing.  So: reply 0x6e, then the layout id.
+                 *
+                 * MEASURED layout 0 == USA: the PROM's layout handler
+                 * (0xbfc22c60) reads the stored byte and returns WITHOUT
+                 * remapping when it is zero (bfc22d28: beqz v0, ...); a
+                 * nonzero value selects an entry of the national keymap
+                 * table at 0xbfc34e20 (bfc22d30..bfc22d50).  So this must
+                 * be 0, not 1 -- 1 would select the first national map.
                  */
-                uint8_t reply[2] = { 0x6e, 1 };   /* 0x6e, then US layout 1 */
+                uint8_t reply[2] = { 0x6e, 0 };   /* 0x6e, then US layout 0 */
                 qemu_log_mask(LOG_UNIMP,
                               "sgi-ip6-kbd: queueing 6e + layout %02x\n",
                               reply[1]);
