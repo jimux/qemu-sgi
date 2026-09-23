@@ -53,6 +53,7 @@ typedef struct DisasContext {
     int gi;
     bool crcp;
     bool scache;
+    bool perf_zero;
 } DisasContext;
 
 #define DISAS_STOP       DISAS_TARGET_0

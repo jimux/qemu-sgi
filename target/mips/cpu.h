@@ -1209,6 +1209,18 @@ typedef struct CPUArchState {
      */
     bool count_realtime;
 
+    /*
+     * Report the R10000 on-chip performance counters/controls (CP0 reg 25
+     * sel 1..7) as zero instead of the generic "unimplemented" ~0.  IRIX's
+     * R10000 scheduler-clock path (ml/R10Kasm.s r10k_perf_overflow_intr)
+     * treats a negative counter with control bit 4 set as an overflow, so
+     * ~0 makes every IP7 scheduler tick divert to hwperf_intr() and return
+     * without calling clock()/resetcounter() -- lbolt then never advances
+     * and IP7 livelocks.  Zero models an idle (non-overflowing) counter.
+     * Set for IP27 (SN0); zero elsewhere.
+     */
+    bool perf_zero;
+
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;

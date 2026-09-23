@@ -5727,6 +5727,20 @@ static void gen_mfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
         }
         break;
     case CP0_REGISTER_25:
+        /*
+         * On a machine that reports its R10000 performance unit as idle
+         * (env->perf_zero, set by IP27/SN0), every CP0 reg 25 sel must read 0
+         * rather than the generic unimplemented ~0.  IRIX's
+         * r10k_perf_overflow_intr() reads a counter and treats a negative
+         * value plus control bit 4 as an overflow, so ~0 makes its scheduler
+         * tick handler bail into hwperf_intr() without ever calling
+         * clock()/resetcounter(); IP7 then livelocks and lbolt freezes.
+         */
+        if (ctx->perf_zero) {
+            register_name = "Performance";
+            tcg_gen_movi_tl(arg, 0);
+            break;
+        }
         switch (sel) {
         case CP0_REG25__PERFCTL0:
             gen_mfc0_load32(arg, offsetof(CPUMIPSState, CP0_Performance0));
@@ -15107,6 +15121,7 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->mi = (env->CP0_Config5 >> CP0C5_MI) & 1;
     ctx->gi = (env->CP0_Config5 >> CP0C5_GI) & 3;
     ctx->crcp = (env->CP0_Config5 >> CP0C5_CRCP) & 1;
+    ctx->perf_zero = env->perf_zero;
 #ifndef CONFIG_USER_ONLY
     ctx->scache = env->scache_size > 0;
 #else

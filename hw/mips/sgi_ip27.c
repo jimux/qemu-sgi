@@ -745,6 +745,13 @@ static void sgi_ip27_init(MachineState *machine) {
      * virtual clock racing ahead and livelocking IP7 (see cp0_timer.c).
      */
     env->count_realtime = true;
+    /*
+     * Model the R10000 on-chip performance unit as idle (CP0 reg 25 reads 0).
+     * IRIX's scheduler-clock handler checks it before resetting COUNT, and
+     * QEMU's generic "unimplemented = ~0" makes that check falsely report an
+     * overflow, so clock() never runs and IP7 livelocks.  See cpu.h perf_zero.
+     */
+    env->perf_zero = true;
 
     cpu_mips_irq_init_cpu(c);
     cpu_mips_clock_init(c);
