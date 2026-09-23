@@ -35,6 +35,15 @@
  * compiled-in env at power-on, so a fresh QEMU sees the last saved env, and
  * it is never touched when no sidecar exists (stock boot is byte-identical).
  *
+ * The sidecar path is PER-INSTANCE.  The device property "nvram-file" (or
+ * "-global sgi-o2-flash.nvram-file=<path>") sets it explicitly; when unset,
+ * the sgi-o2 machine derives it from the first disk's image as
+ * "<image>.o2nvram".  A fixed name would be shared by every O2 launched from
+ * the same working directory, so one VM's `setenv` would silently change
+ * another's env.  Only a diskless (PROM-only) O2, which has no disk to key
+ * on, falls back to the cwd-relative "sgi_o2_nvram.bin"; pass the global
+ * explicitly if such an instance needs isolation.
+ *
  * Copyright (c) 2024 the QEMU project
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

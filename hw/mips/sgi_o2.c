@@ -70,6 +70,7 @@
 #include "qemu/datadir.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/option.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/block-backend.h"
@@ -853,6 +854,57 @@ static void sgi_o2_install_exc_vectors(void) {
 /* -machine autoload=off forces the flash env AutoLoad value to "N". */
 static bool sgi_o2_autoload = true;
 
+/*
+ * Default flash-env sidecar path.
+ *
+ * The sidecar must be per-instance.  The old default was a fixed
+ * "sgi_o2_nvram.bin" resolved against QEMU's working directory, so every O2
+ * launched from the same directory shared one env file and one VM's
+ * `setenv` silently changed another's — a real cross-talk hazard for
+ * harnesses and parallel runs.  Derive the path from the first disk's image
+ * instead, the way other per-disk state is kept: "<image>.o2nvram".  Two O2s
+ * can now only share an env file if they share a disk image, which is
+ * already unsafe for other reasons.  A diskless (PROM-only) O2 has no disk
+ * to key on, so it falls back to the historical cwd-relative name.
+ *
+ * An explicit "-global sgi-o2-flash.nvram-file=<path>" (or the "nvram-file"
+ * property) always wins: the machine only fills the default when it is
+ * unset.  The derivation is documented in include/hw/misc/sgi_o2flash.h and
+ * in pyirix_qemu/machine_profiles.py.
+ */
+static char *sgi_o2_default_nvram_path(void)
+{
+  BlockBackend *blk;
+  DriveInfo *dinfo;
+  char *cd_path = NULL;
+
+  for (blk = blk_next(NULL); blk; blk = blk_next(blk)) {
+    const char *file;
+
+    dinfo = blk_legacy_dinfo(blk);
+    if (!dinfo || !dinfo->opts) {
+      continue;
+    }
+    file = qemu_opt_get(dinfo->opts, "file");
+    if (!file || !*file) {
+      continue;
+    }
+    if (dinfo->media_cd) {
+      /* Remember a CD-ROM only as a last resort; the boot disk wins. */
+      if (!cd_path) {
+        cd_path = g_strconcat(file, ".o2nvram", NULL);
+      }
+      continue;
+    }
+    g_free(cd_path);
+    return g_strconcat(file, ".o2nvram", NULL);
+  }
+  if (cd_path) {
+    return cd_path;
+  }
+  return g_strdup("sgi_o2_nvram.bin");
+}
+
 static void sgi_o2_init(MachineState *machine) {
   MemoryRegion *system_memory = get_system_memory();
   DeviceState *flash_dev;
@@ -993,10 +1045,15 @@ static void sgi_o2_init(MachineState *machine) {
   sgi_o2_flash_set_mace(flash_dev, mace_dev);
   {
     SGIO2FlashState *fl = SGI_O2_FLASH(flash_dev);
-    /* Per-machine sidecar in the working directory, like the Indy NVRAM
-     * files; overridable with -global sgi-o2-flash.nvram-file=... */
+    /*
+     * Per-instance sidecar derived from the first disk ("<image>.o2nvram"),
+     * so two O2s in the same working directory cannot share an env file.
+     * Overridable with -global sgi-o2-flash.nvram-file=..., which is
+     * honoured because a set property is left alone here.
+     */
     if (!fl->nvram_filename) {
-      qdev_prop_set_string(flash_dev, "nvram-file", "sgi_o2_nvram.bin");
+      g_autofree char *sidecar = sgi_o2_default_nvram_path();
+      qdev_prop_set_string(flash_dev, "nvram-file", sidecar);
     }
     /* Machine-level convenience override: -machine autoload=off. */
     if (fl->autoload && !sgi_o2_autoload) {
