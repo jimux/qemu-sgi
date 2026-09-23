@@ -304,7 +304,28 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
     stw_be_p(st + 0x08, completion);
     stw_be_p(st + 0x0a, scsi_status);
     stw_be_p(st + 0x0c, status_flags);
-    stw_be_p(st + 0x0e, QL_SS_GOT_STATUS | QL_SS_TRANSFER_COMPLETE);
+    /*
+     * The ISP auto-senses: on CHECK CONDITION the firmware returns the sense
+     * bytes in this status entry.  The driver (io/ql.c) only reads
+     * req_sense_data when SS_GOT_SENSE is set in state_flags -- without it the
+     * driver issues its own REQUEST SENSE, which finds nothing (the auto-sense
+     * already consumed it) and logs "request sense failed", so every command
+     * retries.  Set the flag whenever we hand over sense bytes.
+     */
+    {
+        uint16_t state = QL_SS_GOT_STATUS | QL_SS_TRANSFER_COMPLETE;
+
+        /*
+         * Sense is meaningful only for CHECK CONDITION (0x02): the firmware
+         * auto-senses after one.  Setting the flag on a GOOD completion makes
+         * the driver record stale/empty sense and dk_chkcond() retries it
+         * ("invalid sense data, error cause unknown").
+         */
+        if (sense && sense_len && scsi_status == 0x02) {
+            state |= QL_SS_GOT_SENSE;
+        }
+        stw_be_p(st + 0x0e, state);
+    }
     stw_be_p(st + 0x10, sense_len);
     stw_be_p(st + 0x12, 0);          /* time */
     stl_be_p(st + 0x14, residual);
@@ -395,6 +416,16 @@ static void ql_scsi_command_complete(SCSIRequest *req, size_t residual)
 {
     SGIQLispState *s = req->hba_private;
 
+    /* Log which CDB drew a non-GOOD status (CHECK CONDITION etc.) so a
+     * genuinely unsupported command (e.g. READ TOC on scsi-cd) is visible. */
+    if (qlisp_dbg() && req->status != 0) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-qlisp: NONGOOD bus=%d cdb=%02x%02x%02x%02x%02x%02x "
+                      "status=0x%02x sense_len=%u\n",
+                      s->busnr, req->cmd.buf[0], req->cmd.buf[1],
+                      req->cmd.buf[2], req->cmd.buf[3], req->cmd.buf[4],
+                      req->cmd.buf[5], req->status, req->sense_len);
+    }
     s->cur_req = NULL;
     ql_write_status(s, QL_SCS_COMPLETE, req->status, 0, residual,
                     req->sense, req->sense_len);

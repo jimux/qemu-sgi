@@ -174,6 +174,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 #define QL_SCS_TRANSPORT_ERROR   0x0003
 #define QL_SS_GOT_TARGET         0x0200   /* state flag */
 #define QL_SS_GOT_STATUS         0x1000   /* state flag */
+#define QL_SS_GOT_SENSE          0x2000   /* state flag: req_sense_data valid */
 #define QL_SS_TRANSFER_COMPLETE  0x4000   /* state flag */
 #define QL_SST_TIMEOUT           0x0040   /* status flag: selection timeout */
 
