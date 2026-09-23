@@ -225,6 +225,13 @@ static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
         } else {
             uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, x1, y1, w, h);
 
+            /* The name-label bars are drawn as solid rects in colour 222 just
+             * before their glyphs; remember the row so the glyph blit has a
+             * baseline (the DDX does not put the text y on the wire). */
+            if (s->re3_colour == 222) {
+                s->re3_label_y = (int)y1;
+                s->re3_label_valid = true;
+            }
             trace_sgi_gr2_re3_rect(s->re3_colour, rgb, x1, y1, x2, y2);
         }
     }
@@ -392,6 +399,73 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
     sgi_gr2_update_display(s);
 }
 
+/* Draw the name-label glyphs (expDrawMonoImage).  Token 349 is written TWICE
+ * per glyph with the pen x, each followed by a piece (f0,f1,h) and h/2 bitmap
+ * words.  A glyph is the two pieces STACKED from its top row (drawing them at
+ * the same x is what makes the letters readable, not side by side); each piece
+ * is 8 px wide, high byte = row 2k, low byte = row 2k+1, bit 15 the leftmost.
+ * Set bits take the current colour.  The text y is not on the wire — the DDX
+ * bakes the origin in — so it comes from the label bar (colour 222) drawn just
+ * before the glyphs; without one the op is flagged, not placed by guesswork. */
+static void sgi_gr2_re3_draw_text(SGIGr2State *s)
+{
+    unsigned p;
+    bool any = false;
+
+    if (!s->re3_label_valid) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    for (p = 0; p + 1 < s->re3_npens; p += 2) {
+        uint32_t pen = s->re3_pen_val[p];
+        int y = s->re3_label_y + 3;
+        unsigned half;
+
+        for (half = 0; half < 2; half++) {
+            unsigned off = s->re3_pen_off[p + half];
+            uint32_t f0, f1, h, k;
+
+            if (off + 3 > s->re3_data_n) {
+                continue;
+            }
+            f0 = s->re3_data[off];
+            f1 = s->re3_data[off + 1];
+            h = s->re3_data[off + 2];
+            if (f0 >= SGI_GR2_SCREEN_W || f1 >= SGI_GR2_SCREEN_H ||
+                h < 2 || h > 64 || (h & 1) ||
+                off + 3 + h / 2 > s->re3_data_n) {
+                continue;
+            }
+            for (k = 0; k < h / 2; k++) {
+                uint32_t w = s->re3_data[off + 3 + k];
+                int b;
+
+                for (b = 0; b < 8; b++) {
+                    int xx = (int)pen + b, r0 = y + 2 * (int)k;
+
+                    if (xx >= SGI_GR2_SCREEN_W) {
+                        break;
+                    }
+                    if (r0 < SGI_GR2_SCREEN_H && ((w >> (15 - b)) & 1)) {
+                        s->scanout[r0 * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+                    }
+                    if (r0 + 1 < SGI_GR2_SCREEN_H && ((w >> (7 - b)) & 1)) {
+                        s->scanout[(r0 + 1) * SGI_GR2_SCREEN_W + xx] =
+                            s->re3_colour;
+                    }
+                }
+            }
+            y += (int)h;
+            any = true;
+        }
+    }
+    if (!any) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    sgi_gr2_update_display(s);
+}
+
 /* Evaluate the pending draw sub-op.  Called at token 331 (which starts a new
  * sub-op) and token 490 (the terminator), because one 490-terminated region can
  * hold several 331 sub-ops: the grainy root's stipple and the panel's own
@@ -413,6 +487,10 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         /* expSolidSpans: a span list, not a fill.  The PUC path draws the
          * weave spans inline; the DDX span op itself paints nothing here. */
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    if (s->re3_mono_seen) {
+        sgi_gr2_re3_draw_text(s);
         return;
     }
     if (s->re3_poly_seen) {
@@ -453,6 +531,8 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_line_seen = false;
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
+    s->re3_mono_seen = false;
+    s->re3_npens = 0;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_fg_valid = false;
@@ -653,6 +733,18 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == SGI_GR2_RE3_POLY_TOKEN) {
         s->re3_poly_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_MONO_TOKEN) {
+        s->re3_mono_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_PEN_TOKEN) {
+        /* The pen x for one glyph piece; remember where its data starts. */
+        if (s->re3_npens < SGI_GR2_RE3_PEN_MAX) {
+            s->re3_pen_val[s->re3_npens] = (uint32_t)value & 0xffff;
+            s->re3_pen_off[s->re3_npens] = s->re3_data_n;
+            s->re3_npens++;
+        }
+        s->re3_mono_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_SOLID_TOKEN) {
         s->re3_solid_seen = true;
@@ -902,6 +994,10 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_line_seen = false;
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
+    s->re3_mono_seen = false;
+    s->re3_npens = 0;
+    s->re3_label_y = 0;
+    s->re3_label_valid = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_stipple = 0;
