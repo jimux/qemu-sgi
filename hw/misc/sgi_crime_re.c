@@ -648,13 +648,13 @@ static inline uint8_t crim_shade_clamp(int32_t v9_12)
 }
 
 /* Emit one fragment: shade -> clip -> stipple -> ROP/mask write. */
-static void sgi_crime_re_emit(SGICRIMEREState *s, int wx, int wy,
+static bool sgi_crime_re_emit(SGICRIMEREState *s, int wx, int wy,
                               uint32_t color, CrimStipple *st,
                               bool line_stipple)
 {
     int x, y;
     if (!sgi_crime_re_clip_pass(s, wx, wy, &x, &y)) {
-        return;
+        return false;
     }
     bool draw = true;
     if (line_stipple) {
@@ -670,6 +670,7 @@ static void sgi_crime_re_emit(SGICRIMEREState *s, int wx, int wy,
         sgi_crime_re_put_pixel(s, s->bufmode_dst, x, y, color);
     }
     crim_stipple_step(st);
+    return draw;
 }
 
 /*
@@ -686,19 +687,27 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
 {
     /*
      * @@SEMANTICS@@ — the O2 IP32CRM32 libGLcore uploads a GL triangle vertex
-     * as a 13.6 fixed-point coordinate in the LOW 16 bits of Vertex.GL[n].x/y;
-     * the HIGH 16 bits carry a constant 0x4804 field (verified identical for
-     * gr_osview windows of different size and position, i.e. not an origin).
-     * The previous code consumed the full 32-bit word as an integer pixel
-     * coordinate, so every vertex landed at ~1.2e9, the ±4096 clamp rejected
-     * the whole triangle, and no GL triangle ever drew. Decode the low 16 bits
-     * as 13.6; the rest of the rasterizer already evaluates its edge functions
-     * at px*64+32 (13.6) and emits integer px.
+     * as a 13.6 fixed-point coordinate in Vertex.GL[n].x/y, expressed against
+     * the **+4096 window-space origin** (the same convention the PixelXfer
+     * image path uses), with bit 23 set as a valid/format flag.  Live data:
+     * a textured-cube vertex reads 0x00840380; masking bit 23 and shifting
+     * the 13.6 value gives (0x040380 >> 6) = 4110 = 4096 + 14, and the
+     * window's WinOffset.dst (-4064) maps it to framebuffer 32+14 — exactly
+     * the window at +32.  (gr_osview's 0x48040c1f has the same structure:
+     * & 0x7fffff = 0x040c1f -> 4096+48.)
+     *
+     * The previous code masked to the LOW 16 bits, which throws away the
+     * +4096 origin (bit 18 / 0x40000): it produced window-local 14 instead of
+     * 4110, so the WinOffset translation drove every fragment negative and
+     * the screen-mask clip rejected the whole triangle (measured: inside>0
+     * but wrote=0 for every tex_cube triangle).  Decode the 23-bit field;
+     * the rasterizer below still evaluates edge functions at px*64+32 (13.6)
+     * and emits integer px, and clip_pass applies WinOffset.dst.
      */
     int64_t vx[3], vy[3];
     for (int i = 0; i < 3; i++) {
-        vx[i] = (int64_t)(int32_t)(s->vertex_gl[i][0] & 0xffff);
-        vy[i] = (int64_t)(int32_t)(s->vertex_gl[i][1] & 0xffff);
+        vx[i] = (int64_t)(int32_t)(s->vertex_gl[i][0] & 0x007fffff);
+        vy[i] = (int64_t)(int32_t)(s->vertex_gl[i][1] & 0x007fffff);
     }
 
     /* edge i = (v[i] -> v[i+1]); A=dy, B=-dx, C computed so E(v[i])=0 */
@@ -713,14 +722,21 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
     }
 
     /*
-     * Winding: for CCW vertex order the interior is the *negative*
-     * half-plane of each edge; flip all signs if the signed area says
-     * so (the spec assumes CW; libGLcore's GL coordinate flip can
-     * deliver either).
+     * Winding: the edge functions above are the NEGATIVE of the standard
+     * cross-product edge function, so the interior is where Ei >= 0 only
+     * for the winding that puts the opposite vertex on the positive side.
+     * E_i(v[i+2]) == -area2, so the interior is the positive half-plane of
+     * all three edges exactly when area2 <= 0.  Flip all signs only when
+     * area2 > 0.  (The previous test flipped on area2 < 0, which inverted
+     * the interior for the winding libGLcore actually emits: every GL
+     * triangle evaluated to zero inside pixels — live libGLcore data for a
+     * textured cube gave vertices v0=(49,29) v1=(29,29) v2=(29,49),
+     * area2<0, and the flip rejected the whole triangle.  X-mode 2D fills
+     * do not use this path, which is why the desktop never exposed it.)
      */
     int64_t area2 = (vx[1] - vx[0]) * (vy[2] - vy[0])
                   - (vx[2] - vx[0]) * (vy[1] - vy[0]);
-    if (area2 < 0) {
+    if (area2 > 0) {
         for (int i = 0; i < 3; i++) {
             A[i] = -A[i]; B[i] = -B[i]; C[i] = -C[i];
         }
@@ -735,7 +751,9 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
     int miny = (int)(minyf >> 6), maxy = (int)(maxyf >> 6);
     maxx++; maxy++;                   /* exclusive bounds */
 
-    const int BOUND = 4096;           /* hard safety bound (2k screen) */
+    /* GL vertex space carries a +4096 origin, so the hard safety bound must
+     * clear it (an X-mode triangle sits below 2k; a GL one at 4096..4176). */
+    const int BOUND = 8192;
     if (minx < -BOUND) { minx = -BOUND; }
     if (miny < -BOUND) { miny = -BOUND; }
     if (maxx > BOUND) { maxx = BOUND; }
@@ -745,6 +763,19 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
     CrimStipple st;
     sgi_crime_re_stipple_init(s, &st);
     bool poly_stipple = (s->drawmode & DM_ENPOLYSTIPPLE) != 0;
+    int inside_n = 0, wrote_n = 0;
+    /*
+     * The Shade planes are absolute in DESTINATION-BUFFER coordinates (the
+     * host folds the buffer origin into the R0/A coefficients), and the
+     * raster evaluates its edge functions in the primitive's own space —
+     * X pixels, or GL pixels against the +4096 origin.  Convert to the
+     * buffer coordinate before evaluating the planes: for GL that is
+     * px + WinOffset.dst, exactly the translation clip_pass() applies.
+     * Evaluating at the raw GL coordinate (px ~4096) drove the 9.12 planes
+     * far out of range, so whole models shaded to black.
+     */
+    int shx = (int16_t)(s->winoffset_dst >> 16);
+    int shy = (int16_t)(s->winoffset_dst & 0xffff);
 
     for (int py = miny; py < maxy; py++) {
         /* edge functions at the row start (pixel centers, 19.6 space) */
@@ -756,6 +787,7 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
         for (int px = minx; px < maxx; px++) {
             bool inside = ex[0] >= 0 && ex[1] >= 0 && ex[2] >= 0;
             if (inside) {
+                inside_n++;
                 uint32_t color = s->shade_fgcolor;
                 if (smooth) {
                     /*
@@ -767,27 +799,34 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                      * this pixel directly.
                      */
                     int32_t r = (int32_t)s->shade_plane[0]
-                              + (int32_t)s->shade_plane[4] * px
-                              + (int32_t)s->shade_plane[6] * py;
+                              + (int32_t)s->shade_plane[4] * (px + shx)
+                              + (int32_t)s->shade_plane[6] * (py + shy);
                     int32_t g = (int32_t)s->shade_plane[1]
-                              + (int32_t)s->shade_plane[5] * px
-                              + (int32_t)s->shade_plane[7] * py;
+                              + (int32_t)s->shade_plane[5] * (px + shx)
+                              + (int32_t)s->shade_plane[7] * (py + shy);
                     int32_t b = (int32_t)s->shade_plane[2]
-                              + (int32_t)s->shade_plane[8] * px
-                              + (int32_t)s->shade_plane[10] * py;
+                              + (int32_t)s->shade_plane[8] * (px + shx)
+                              + (int32_t)s->shade_plane[10] * (py + shy);
                     int32_t a = (int32_t)s->shade_plane[3]
-                              + (int32_t)s->shade_plane[9] * px
-                              + (int32_t)s->shade_plane[11] * py;
+                              + (int32_t)s->shade_plane[9] * (px + shx)
+                              + (int32_t)s->shade_plane[11] * (py + shy);
                     color = ((uint32_t)crim_shade_clamp(r) << 24)
                           | ((uint32_t)crim_shade_clamp(g) << 16)
                           | ((uint32_t)crim_shade_clamp(b) << 8)
                           | (uint32_t)crim_shade_clamp(a);
                 }
-                sgi_crime_re_emit(s, px, py, color, &st, poly_stipple);
+                if (sgi_crime_re_emit(s, px, py, color, &st, poly_stipple)) {
+                    wrote_n++;
+                }
             }
             ex[0] += A[0]; ex[1] += A[1]; ex[2] += A[2];
         }
     }
+    trace_sgi_crime_re_tri((int)(vx[0] >> 6), (int)(vy[0] >> 6),
+                           (int)(vx[1] >> 6), (int)(vy[1] >> 6),
+                           (int)(vx[2] >> 6), (int)(vy[2] >> 6),
+                           inside_n, wrote_n,
+                           s->winoffset_dst, s->clipmode);
 }
 
 /*

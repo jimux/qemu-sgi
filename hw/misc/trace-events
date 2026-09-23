@@ -508,6 +508,7 @@ sgi_crime_re_ltlb_write(int lin, int entry, uint64_t val) "tlb_lin[%d][%d] = 0x%
 sgi_crime_re_bufmode(uint32_t src, uint32_t dst) "bufmode src=0x%08x dst=0x%08x"
 sgi_crime_re_xfer(uint32_t srcmode, uint32_t dstmode, uint32_t srcaddr, uint32_t xstep, uint32_t ystep, uint32_t clipmode, uint32_t winoffdst, uint32_t dm, int x1, int y1) "xfer src=0x%08x dst=0x%08x addr=0x%08x xs=%u ys=%u clip=0x%08x winoff=0x%08x dm=0x%08x (%d,%d)"
 sgi_crime_re_ppwrite(int off, uint64_t value, int size) "pp off=0x%x val=0x%016"PRIx64" size=%d"
+sgi_crime_re_tri(int v0x, int v0y, int v1x, int v1y, int v2x, int v2y, int inside, int wrote, uint32_t winoff, uint32_t clipmode) "tri v0=(%d,%d) v1=(%d,%d) v2=(%d,%d) inside=%d wrote=%d winoff=0x%08x clip=0x%08x"
 
 # sgi_vice.c (O2 VICE — tier-i register/DMA skeleton)
 sgi_vice_reg_read(uint64_t off, unsigned size) "VICE read off=0x%"PRIx64" size=%u"
