@@ -307,8 +307,11 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
 
         if (x >= SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
             count == 0 || count > 64) {
+            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
             break;
         }
+        trace_sgi_gr2_re3_spanstip(s->re3_colour, s->ramdac[s->re3_colour],
+                                   x, y, count);
         for (k = 0; k < count; k++) {
             uint32_t xx = x + k;
 
@@ -489,16 +492,22 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
         return;
     }
-    if (s->re3_mono_seen) {
+    if (s->re3_spanstip_seen) {
+        /* Checked before the mono-image path: token 312 marks BOTH
+         * expImageGlyphBlt and expOpStippledFillRects, so a span op carries the
+         * 312 marker without any glyph in it.  The 347 span token is the one
+         * that actually says "span list", and drawing such an op as text would
+         * drop the whole cube (EZsetup's icon). */
+        sgi_gr2_re3_draw_stippled_spans(s);
+        return;
+    }
+    if (s->re3_mono_seen && s->re3_npens) {
+        /* Glyphs need a 349 pen to be placed; a 312 with no pen is not text. */
         sgi_gr2_re3_draw_text(s);
         return;
     }
     if (s->re3_poly_seen) {
         sgi_gr2_re3_draw_polygon(s);
-        return;
-    }
-    if (s->re3_spanstip_seen) {
-        sgi_gr2_re3_draw_stippled_spans(s);
         return;
     }
     if (s->re3_line_seen) {
