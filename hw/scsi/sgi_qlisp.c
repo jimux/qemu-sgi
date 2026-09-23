@@ -168,10 +168,33 @@ static uint16_t ql_ld16(const uint8_t *p)
  * whose LOW 32 bits are the physical address; with <=4GB RAM the low word is
  * the physical address, so mask it off distinguishably by the high word.
  */
-static uint64_t ql_dma_to_phys(uint64_t a)
+static uint64_t ql_dma_to_phys(SGIQLispState *s, uint64_t a)
 {
+    /*
+     * The bridge parent may install a translation for its ATE-mapped PCI DMA
+     * window (BRIDGE_DMA_MAPPED_BASE 0x40000000): the IRIX ql driver publishes
+     * the ring bases as PCI addresses from pciio_dmatrans_addr(), which must be
+     * run back through the bridge's ATE RAM to reach system memory.  Returns
+     * the input unchanged when it does not apply, so the direct handling below
+     * still runs.
+     */
+    if (s->dma_xlate) {
+        uint64_t p = s->dma_xlate(s->dma_xlate_arg, a);
+
+        if (p != a) {
+            return p;
+        }
+    }
     if (a >> 32) {
         return a & 0xffffffffULL;
+    }
+    /*
+     * K1 (0xa0000000-0xbfffffff) is direct-mapped; the request/response queue
+     * bases the driver publishes can be K1 kernel virtuals.  Data dsegs are
+     * 64-bit bridge dirmap addresses (high word set) and are handled above.
+     */
+    if (a >= 0xa0000000ULL && a < 0xc0000000ULL) {
+        return a - 0xa0000000ULL;
     }
     return a >= QL_DMA_DIRECT_BASE ? a - QL_DMA_DIRECT_BASE : a;
 }
@@ -180,7 +203,7 @@ static uint64_t ql_dma_to_phys(uint64_t a)
 static bool ql_get_entry(SGIQLispState *s, uint64_t addr, uint8_t *raw,
                          uint8_t *e)
 {
-    if (dma_memory_read(&address_space_memory, ql_dma_to_phys(addr), raw,
+    if (dma_memory_read(&address_space_memory, ql_dma_to_phys(s, addr), raw,
                         QL_ENTRY_SIZE,
                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return false;
@@ -228,11 +251,11 @@ static bool ql_sg_move(SGIQLispState *s, uint8_t *buf, uint32_t len,
         n = MIN(len, g->len - s->sg_off);
         if (to_host) {
             address_space_write(&address_space_memory,
-                                ql_dma_to_phys(g->addr) + s->sg_off,
+                                ql_dma_to_phys(s, g->addr) + s->sg_off,
                                 MEMTXATTRS_UNSPECIFIED, buf, n);
         } else {
             address_space_read(&address_space_memory,
-                               ql_dma_to_phys(g->addr) + s->sg_off,
+                               ql_dma_to_phys(s, g->addr) + s->sg_off,
                                MEMTXATTRS_UNSPECIFIED, buf, n);
         }
         s->sg_off += n;
@@ -271,7 +294,7 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
         ql_munge(st, sizeof(st));
     }
     dma_memory_write(&address_space_memory,
-                     ql_dma_to_phys(s->rsp.base) +
+                     ql_dma_to_phys(s, s->rsp.base) +
                          (uint64_t)s->rsp.in * QL_ENTRY_SIZE,
                      st, QL_ENTRY_SIZE, MEMTXATTRS_UNSPECIFIED);
 
@@ -517,7 +540,7 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
             }
             if (len && rambase + len <= ARRAY_SIZE(s->risc_ram) &&
                 dma_memory_read(&address_space_memory,
-                                ql_dma_to_phys(host), buf,
+                                ql_dma_to_phys(s, host), buf,
                                 len * 2, MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
                 for (i = 0; i < len; i++) {
                     s->risc_ram[rambase + i] = buf[i ^ 1];
@@ -803,6 +826,26 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (s->rsp.count) {
             s->rsp.out = val % s->rsp.count;
         }
+        break;
+    case QL_MBOX4:
+        /*
+         * Host publishes the request-queue in-pointer; the real RISC fetches
+         * the new entries and posts responses (raising the interrupt).  Process
+         * eagerly here so an interrupt-driven driver (the IRIX kernel ql module,
+         * which does not poll bus_isr after ringing the doorbell) completes.
+         * The ARCS standalone driver polls, so it never needed this.  Ported
+         * verbatim from octane d426f34070 ("wire onboard PCI QLogic interrupts").
+         */
+        if (qlisp_dbg()) {
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: MBOX4 doorbell in=%u fw=%d cnt=%u "
+                          "out=%u base=0x%llx\n",
+                          (unsigned)(val & 0xffff), s->firmware_running,
+                          s->req.count, s->req.out,
+                          (unsigned long long)s->req.base);
+        }
+        ql_reg_put(s, off, val & 0xffff);
+        ql_process_requests(s);
         break;
     case QL_HCCR:
     case 0xc0:

@@ -213,6 +213,18 @@ struct SGIQLispState {
      */
     bool control_munge;
 
+    /*
+     * Optional DMA-address translation installed by the bridge parent.  The
+     * IRIX ql driver programs the request/response ring bases with PCI
+     * addresses out of pciio_dmatrans_addr(); on IP27 (and IP30) those fall in
+     * the BRIDGE ATE-mapped PCI DMA window (BRIDGE_DMA_MAPPED_BASE 0x40000000)
+     * and must be run back through the bridge's ATE RAM to reach system memory.
+     * NULL => no translation (identity/direct handling only), which is how the
+     * ARCS standalone driver's 64-bit dirmap addresses are decoded.
+     */
+    uint64_t (*dma_xlate)(void *arg, uint64_t pci_addr);
+    void *dma_xlate_arg;
+
     /* request/response queues */
     QLQueue req;
     QLQueue rsp;
