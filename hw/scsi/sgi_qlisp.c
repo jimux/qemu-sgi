@@ -306,9 +306,9 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
 
     if (qlisp_dbg()) {
         qemu_log_mask(LOG_UNIMP,
-                      "sgi-qlisp: STS handle=%u comp=0x%x scsi=0x%x resid=%u "
-                      "sense=%u slot=%u rsp_base=0x%llx mbox5=%u\n",
-                      s->cur_handle, completion, scsi_status, residual,
+                      "sgi-qlisp: STS inst=%u handle=%u comp=0x%x scsi=0x%x "
+                      "resid=%u sense=%u slot=%u rsp_base=0x%llx mbox5=%u\n",
+                      s->busnr, s->cur_handle, completion, scsi_status, residual,
                       sense_len, (s->rsp.in + s->rsp.count - 1) % s->rsp.count,
                       (unsigned long long)s->rsp.base, s->rsp.in);
     }
@@ -451,12 +451,14 @@ static void ql_process_requests(SGIQLispState *s)
 
         if (qlisp_dbg()) {
             qemu_log_mask(LOG_UNIMP,
-                          "sgi-qlisp: CMD out=%u in=%u etype=0x%x handle=%u "
+                          "sgi-qlisp: CMD inst=%u out=%u in=%u etype=0x%x "
+                          "handle=%u req_base=0x%llx cnt=%u "
                           "tgt=%u lun=%u cdb_len=%u seg=%u cdb=%02x%02x%02x%02x"
                           "%02x%02x\n",
-                          s->req.out, in, etype, s->cur_handle, e[0x0a],
-                          e[0x0b], cdb_len, seg_cnt, cdb[0], cdb[1], cdb[2],
-                          cdb[3], cdb[4], cdb[5]);
+                          s->busnr, s->req.out, in, etype, s->cur_handle,
+                          (unsigned long long)s->req.base, s->req.count,
+                          e[0x0a], e[0x0b], cdb_len, seg_cnt, cdb[0], cdb[1],
+                          cdb[2], cdb[3], cdb[4], cdb[5]);
         }
         s->nsg = 0;
         s->sg_idx = 0;
@@ -611,6 +613,12 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
         s->req.out = idx;
         ql_mbox_put(s, 5, idx);
         sts = MBOX_STS_COMMAND_COMPLETE;
+        if (qlisp_dbg()) {
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: INIT-REQ inst=%u base=0x%llx cnt=%u "
+                          "idx=%u\n", s->busnr,
+                          (unsigned long long)base, depth, idx);
+        }
         break;
 
     case MBOX_CMD_INIT_RESPONSE_QUEUE:
@@ -623,6 +631,14 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
         s->rsp.in = 0;
         ql_mbox_put(s, 5, idx);
         sts = MBOX_STS_COMMAND_COMPLETE;
+        if (qlisp_dbg()) {
+            qemu_log_mask(LOG_UNIMP,
+                          "sgi-qlisp: INIT-RSP inst=%u base=0x%llx cnt=%u "
+                          "idx=%u (req still base=0x%llx cnt=%u out=%u)\n",
+                          s->busnr, (unsigned long long)base, depth, idx,
+                          (unsigned long long)s->req.base, s->req.count,
+                          s->req.out);
+        }
         break;
 
     case MBOX_CMD_INIT_REQUEST_QUEUE_64:
@@ -720,8 +736,8 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
     {
         static unsigned long dbg_cnt;
         qemu_log_mask(LOG_UNIMP,
-                      "sgi-qlisp: #%lu mbox cmd=0x%x in=%d sts=0x%x\n",
-                      dbg_cnt++, cmd, ql_mbox_get(s, 1), sts);
+                      "sgi-qlisp: #%lu inst=%u mbox cmd=0x%x in=%d sts=0x%x\n",
+                      dbg_cnt++, s->busnr, cmd, ql_mbox_get(s, 1), sts);
     }
     if (qlisp_taildbg() && cmd == MBOX_CMD_MAILBOX_REGISTER_TEST) {
         qlisp_taildbg_budget = 400;
@@ -838,10 +854,10 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          */
         if (qlisp_dbg()) {
             qemu_log_mask(LOG_UNIMP,
-                          "sgi-qlisp: MBOX4 doorbell in=%u fw=%d cnt=%u "
-                          "out=%u base=0x%llx\n",
-                          (unsigned)(val & 0xffff), s->firmware_running,
-                          s->req.count, s->req.out,
+                          "sgi-qlisp: MBOX4 doorbell inst=%u in=%u fw=%d "
+                          "cnt=%u out=%u base=0x%llx\n",
+                          s->busnr, (unsigned)(val & 0xffff),
+                          s->firmware_running, s->req.count, s->req.out,
                           (unsigned long long)s->req.base);
         }
         ql_reg_put(s, off, val & 0xffff);
