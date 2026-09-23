@@ -225,6 +225,18 @@ struct SGIBaseIOState {
   uint32_t stpir[2];
   uint32_t stcir[2];
 
+  /* IOC3 serial DMA RX half (port A console input).  The hardware is the
+   * producer: SRPIR advances as bytes land in the RX_A ring (base+4096),
+   * SRCIR is the guest's consumer (written with SRCIR_ARM), SRTR is the RX
+   * timeout interval.  See the sgi_baseio_sio_rx() comment. */
+  uint32_t srpir;
+  uint32_t srcir;
+  uint32_t srtr;
+  /* Latched when the IRIX console driver takes the RX ring over: the PROM
+   * leaves SBBR programmed by its serial_dma diagnostic, so "ring base set"
+   * alone cannot distinguish the kernel console from the PROM's 16550. */
+  bool rx_kernel;
+
   /* IOC3 serial DMA control (SSCR_A 0xb8 / SSCR_B 0xd4).  SSCR_PAUSE_STATE is
    * derived from SSCR_DMA_PAUSE on read (ioc3_open() spins on it); the reset /
    * RX-drain command bits are self-clearing. */
