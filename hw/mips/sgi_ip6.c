@@ -1386,6 +1386,26 @@ static void main_cpu_reset(void *opaque)
     cpu_reset(CPU(cpu));
 }
 
+/*
+ * The IP6 devices are created with qdev_realize(..., NULL), so they are not
+ * parented into the qbus tree that qemu_devices_reset() walks: a machine
+ * reset never reaches them.  The CPU is covered by main_cpu_reset() above;
+ * the SCSI controller is registered here so its reset (and, through the
+ * controller's child bus, the resets of the attached disks) run both on the
+ * cold reset QEMU performs at machine start and on every later reset.
+ *
+ * Without this, QEMU's scsi-disk never has its max_lba initialised, and
+ * a driver that takes its geometry from the SGI volume header instead of
+ * issuing READ CAPACITY (IRIX 4.0.5's dksc) has every request past LBA 0
+ * rejected with LBA_OUT_OF_RANGE.
+ */
+static void sgi_ip6_scsi_reset(void *opaque)
+{
+    SGIip6State *s = opaque;
+
+    device_cold_reset(DEVICE(s->scsi));
+}
+
 static void sgi_ip6_init(MachineState *machine)
 {
     SGIip6State *s = &ip6_state;
@@ -1535,6 +1555,7 @@ static void sgi_ip6_init(MachineState *machine)
     /* WD33C93 SCSI controller. */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
     qdev_realize(DEVICE(s->scsi), NULL, &error_fatal);
+    qemu_register_reset(sgi_ip6_scsi_reset, s);
     scsi_bus_legacy_handle_cmdline(&s->scsi->bus);
     qdev_connect_gpio_out_named(DEVICE(s->scsi), "irq", 0,
                                 qemu_allocate_irq(sgi_ip6_scsi_irq, s, 0));
