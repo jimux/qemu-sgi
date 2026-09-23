@@ -156,6 +156,15 @@ struct SGIGL2State {
     uint16_t fbc_flags;           /* last FBCflags command */
     uint16_t fbc_out;             /* FBC output register (reset/version) */
     uint16_t ge_flags;
+    /*
+     * HOSTFLAG handshake: writing FBCflags with MAINTSEL2 (HOSTFLAG, 0x4) set
+     * asks the FBC to interrupt at command dispatch.  The kernel sets it in
+     * fbc_intr() (kgl/fbc.c) to force a cursor interrupt and spins in
+     * saveeverything()'s `while (gl_fbcstatus & HOSTFLAG)` until the FBC
+     * reaches dispatch and raises _INTCURSOR, which fbc_progintr() handles by
+     * clearing the flag.  We latch the request and raise it at dispatch.
+     */
+    bool fbc_hostflag;
 
     /*
      * UC4 configuration and mode registers, latched from FBCconfig (0x16).
@@ -520,6 +529,11 @@ static void gl2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         case R_FBC_FLAGS & ~0x3ff:
             s->fbc_flags = v;
             s->micro_access = (v == 0xfe || v == 0xff); /* WRITE/READMICRO */
+            /* MAINTSEL2: ask for an interrupt at FBC command dispatch. */
+            s->fbc_hostflag = (v & 0x4) != 0;
+            if (s->trace && s->fbc_hostflag) {
+                fprintf(stderr, "gl2: HOSTFLAG set (FBCflags=0x%04x)\n", v);
+            }
             break;
         case R_FBC_DATA & ~0x3ff: {
             unsigned low = (off & 0x3ff) >> 1;
@@ -1112,7 +1126,22 @@ static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
          * priority" command port the library's im_last_* macros use for the cursor and
          * the FBC feedback/readcharposn probes; those are real passthru
          * packets, so feed them through the same assembler.
+         *
+         * Either write means the pipe has reached command dispatch, which is
+         * where a pending HOSTFLAG request is answered: the FBC drops
+         * HOSTFLAG and raises the cursor interrupt (_INTCURSOR=19) that
+         * fbc_progintr() uses to clear gl_fbcstatus, unblocking
+         * saveeverything()'s `while (gl_fbcstatus & HOSTFLAG)`.
          */
+        if (s->fbc_hostflag) {
+            s->fbc_hostflag = false;
+            s->fbc_out = 19;            /* _INTCURSOR */
+            s->prog_int_pending = true;
+            gl2_update_irq(s);
+            if (s->trace) {
+                fprintf(stderr, "gl2: HOSTFLAG dispatch -> _INTCURSOR\n");
+            }
+        }
         if (addr == 0x800) {
             if (size == 4) {
                 gl2_ge_word(s, (val >> 16) & 0xffff);
@@ -1236,6 +1265,7 @@ static void gl2_reset(DeviceState *dev)
     s->micro_slice = s->micro_block = 0;
     s->fbc_flags = 0;
     s->fbc_out = 0;
+    s->fbc_hostflag = false;
     s->cfr = 0;
     s->mdr = 0;
     s->ge_flags = 0;
