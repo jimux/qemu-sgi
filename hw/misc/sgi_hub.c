@@ -1107,8 +1107,16 @@ static void sgi_hub_reset(DeviceState *dev) {
   s->pi_err_stack[0] = 0;
   s->pi_err_stack[1] = PI_ERR_STACK_RST0;
 
-  /* MD_SLOTID_USTAT: FPGA/flash ready, slot id 0. */
-  s->slotid_ustat = 0x10;
+  /*
+   * MD_SLOTID_USTAT: bit 4 = FPGA/flash ready; bits [2:0] are the node board's
+   * slot id.  The kernel's hub_slotbits_to_slot() masks MSU_SN0_SLOTID_MASK (7)
+   * and indexes nodeslot_table[], whose entries 0 and 1 are
+   * SLOTNUM_INVALID_CLASS -- so slot id 0 produced "/hw/module/../slot/Invalid0"
+   * for every board, which is why no hwgraph bridge vertex could be built.  A
+   * single-node Origin 200 is the MotherBoard, whose node slot is 1 (index 7,
+   * SLOTNUM_NODE_CLASS|1).
+   */
+  s->slotid_ustat = 0x10 | 0x7;
 
   /* II: hub widget id, working XIO link, all widgets accessible. */
   s->ii_wcr = HUB_XIO_WIDGET_ID;
