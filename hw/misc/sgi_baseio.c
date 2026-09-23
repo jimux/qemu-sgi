@@ -398,6 +398,11 @@ static void sgi_baseio_phy_init(SGIBaseIOState *s) {
 
 static int sgi_baseio_rxtrace = -1;
 
+/* Defined below with the bridge-interrupt delivery block; the RX/TX engines
+ * latch EISR asynchronously and must re-evaluate the Ethernet line. */
+static void sgi_baseio_int_sync(SGIBaseIOState *s);
+static void sgi_baseio_eth_irq_sync(SGIBaseIOState *s);
+
 static void sgi_baseio_eth_deliver(SGIBaseIOState *s, const uint8_t *buf,
                                    size_t len) {
   uint32_t emcr = s->eth_regs[SGI_IOC3_EMCR];
@@ -484,6 +489,7 @@ static void sgi_baseio_eth_deliver(SGIBaseIOState *s, const uint8_t *buf,
   s->eth_rxprod = (s->eth_rxprod + IOC3_RXDSZ) % IOC3_RX_RING_BYTES;
   s->eth_regs[SGI_IOC3_ERPIR] = s->eth_rxprod;
   s->eth_regs[SGI_IOC3_EISR] |= IOC3_EISR_RXTHRESHINT;
+  sgi_baseio_eth_irq_sync(s);
 }
 
 static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
@@ -539,6 +545,7 @@ static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
   }
   s->eth_regs[SGI_IOC3_ETCIR] = s->eth_txcons;
   s->eth_regs[SGI_IOC3_EISR] |= IOC3_EISR_TXEMPTY;
+  sgi_baseio_eth_irq_sync(s);
 }
 
 static bool sgi_baseio_eth_can_receive(NetClientState *nc) {
@@ -886,6 +893,24 @@ static void sgi_baseio_ioc3_irq_sync(SGIBaseIOState *s) {
   sgi_baseio_int_sync(s);
 }
 
+/*
+ * IOC3 Ethernet interrupt condition: EISR & EIER (sys/PCI/ioc3.h; the ef
+ * driver programs EIER in ef_init and clears EISR write-1-to-clear in ef_intr).
+ * The Ethernet MAC sits on PCI slot 0 INTA = bridge line 0, whose connected
+ * vector is 11 (ef_intr).  Keeping the line in int_line -- rather than only
+ * OR-ing it into the INT_STATUS read -- is what lets sgi_baseio_int_sync send
+ * the vector to the hub and, crucially, deassert it once the driver clears
+ * EISR; a level held past the handler's clear is an interrupt livelock.
+ */
+static void sgi_baseio_eth_irq_sync(SGIBaseIOState *s) {
+  if (s->eth_regs[SGI_IOC3_EISR] & s->eth_regs[SGI_IOC3_EIER]) {
+    s->int_line |= 1u << SGI_BASEIO_INT_DEV_ETH;
+  } else {
+    s->int_line &= ~(1u << SGI_BASEIO_INT_DEV_ETH);
+  }
+  sgi_baseio_int_sync(s);
+}
+
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
 
@@ -1125,14 +1150,13 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
    * 0x10c, reset-status 0x114, mode 0x11c, device 0x124, host-error 0x12c,
    * and one address register per device line at 0x134 + n*8.  pcibr reads
    * status to identify the asserting line; the address register holds the
-   * host|vector the bridge sends to the hub.  The IOC3 Ethernet condition is
-   * kept on status bit 0 for the PROM enet_ioc3_loop diagnostic.
+   * host|vector the bridge sends to the hub.  The IOC3 Ethernet line (bit 0)
+   * is maintained in int_line by sgi_baseio_eth_irq_sync, so status is a
+   * faithful mirror of the asserted device lines (and falls when the driver
+   * clears EISR).
    */
   if (off == 0x104) {
     uint32_t st = s->int_line;
-    if (s->eth_regs[SGI_IOC3_EISR] & s->eth_regs[SGI_IOC3_EIER]) {
-      st |= 1u << 0;
-    }
     if (sgi_baseio_intdbg()) {
       qemu_log_mask(LOG_UNIMP,
                     "BASEIO rd INT_STATUS -> 0x%x (line=0x%x enable=0x%x "
@@ -1359,6 +1383,7 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
         s->eth_rxprod = 0;
         s->eth_txcons = 0;
         memset(s->eth_regs, 0, sizeof(s->eth_regs));
+        sgi_baseio_eth_irq_sync(s);
       } else if (!(old & 0x00010000u) && (val & 0x00010000u) && s->nic) {
         /*
          * RXEN 0->1: the ef driver clears RXEN in ef_close and re-enables it
@@ -1368,6 +1393,23 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
          */
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
       }
+    } else if (idx == SGI_IOC3_EISR) {
+      /*
+       * EISR is write-1-to-clear: both the kernel if_ef and the ARCS ef driver
+       * read it and write the read value back to clear exactly those bits
+       * (if_ef.c ef_intr).  Storing the value instead would leave every
+       * acknowledged status bit set, holding bridge line 0 and vector 11
+       * asserted forever.
+       */
+      s->eth_regs[idx] &= ~val;
+      sgi_baseio_eth_irq_sync(s);
+    } else if (idx == SGI_IOC3_EIER) {
+      /*
+       * EIER is the interrupt enable mask; the ef driver enables all but
+       * TXEMPTY in ef_init.  The Ethernet line follows EISR & EIER.
+       */
+      s->eth_regs[idx] = val;
+      sgi_baseio_eth_irq_sync(s);
     } else if (idx == SGI_IOC3_ETPIR) {
       s->eth_regs[idx] = val;
       sgi_baseio_eth_tx_drain(s);

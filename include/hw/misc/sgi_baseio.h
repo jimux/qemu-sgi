@@ -80,6 +80,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
  * only ever sees it while its own poll loop happens to be running and hangs on
  * the first command that actually sleeps on the mailbox semaphore.
  */
+#define SGI_BASEIO_INT_DEV_ETH    0
 #define SGI_BASEIO_INT_DEV_QLISP0 1
 #define SGI_BASEIO_INT_DEV_QLISP1 2
 #define SGI_BASEIO_INT_DEV_IOC3   4
