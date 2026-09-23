@@ -527,13 +527,18 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
 }
 
 /* Draw the name-label glyphs (expDrawMonoImage).  Token 349 is written TWICE
- * per glyph with the pen x, each followed by a piece (f0,f1,h) and h/2 bitmap
- * words.  A glyph is the two pieces STACKED from its top row (drawing them at
- * the same x is what makes the letters readable, not side by side); each piece
- * is 8 px wide, high byte = row 2k, low byte = row 2k+1, bit 15 the leftmost.
- * Set bits take the current colour.  The text y is not on the wire — the DDX
- * bakes the origin in — so it comes from the label bar (colour 222) drawn just
- * before the glyphs; without one the op is flagged, not placed by guesswork. */
+ * per glyph with the pen x; each is followed by a piece header (f0,f1,h) and
+ * the piece's bitmap.  A piece is h rows tall and SIXTEEN pixels wide, packed
+ * TWO rows per 32-bit word: row 2k is the high half (bits 31-16), row 2k+1 the
+ * low half (bits 15-0), bit 15 the leftmost pixel.  The word count is
+ * ceil(h/2), so an odd h keeps its last row in the high half — the old code
+ * assumed h even and a 8-px row and dropped half the data, which is why the
+ * horizontal strokes went missing (e reads as c, t loses its bar).  A glyph is
+ * its two pieces STACKED from its top row; drawing them at the same x is what
+ * makes the letters readable.  Set bits take the current colour.  The text y is
+ * not on the wire - the DDX bakes the origin in - so it comes from the label bar
+ * (colour 222) drawn just before the glyphs; without one the op is flagged, not
+ * placed by guesswork. */
 static void sgi_gr2_re3_draw_text(SGIGr2State *s)
 {
     unsigned p;
@@ -543,14 +548,15 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
         return;
     }
-    for (p = 0; p + 1 < s->re3_npens; p += 2) {
+    for (p = 0; p < s->re3_npens; ) {
         uint32_t pen = s->re3_pen_val[p];
         int y = s->re3_label_y + 3;
+        unsigned npieces = (p + 1 < s->re3_npens) ? 2 : 1;
         unsigned half;
 
-        for (half = 0; half < 2; half++) {
+        for (half = 0; half < npieces; half++) {
             unsigned off = s->re3_pen_off[p + half];
-            uint32_t f0, f1, h, k;
+            uint32_t f0, f1, h, k, nwords;
 
             if (off + 3 > s->re3_data_n) {
                 continue;
@@ -558,25 +564,28 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
             f0 = s->re3_data[off];
             f1 = s->re3_data[off + 1];
             h = s->re3_data[off + 2];
+            nwords = (h + 1) / 2;
             if (f0 >= SGI_GR2_SCREEN_W || f1 >= SGI_GR2_SCREEN_H ||
-                h < 2 || h > 64 || (h & 1) ||
-                off + 3 + h / 2 > s->re3_data_n) {
+                h < 1 || h > 64 ||
+                off + 3 + nwords > s->re3_data_n) {
                 continue;
             }
-            for (k = 0; k < h / 2; k++) {
+            for (k = 0; k < nwords; k++) {
                 uint32_t w = s->re3_data[off + 3 + k];
+                int r0 = y + 2 * (int)k;
                 int b;
 
-                for (b = 0; b < 8; b++) {
-                    int xx = (int)pen + b, r0 = y + 2 * (int)k;
+                for (b = 0; b < 16; b++) {
+                    int xx = (int)pen + b;
 
                     if (xx >= SGI_GR2_SCREEN_W) {
                         break;
                     }
-                    if (r0 < SGI_GR2_SCREEN_H && ((w >> (15 - b)) & 1)) {
+                    if (r0 < SGI_GR2_SCREEN_H && ((w >> (31 - b)) & 1)) {
                         sgi_gr2_put(s, xx, r0, s->re3_colour);
                     }
-                    if (r0 + 1 < SGI_GR2_SCREEN_H && ((w >> (7 - b)) & 1)) {
+                    if (2 * k + 1 < h && r0 + 1 < SGI_GR2_SCREEN_H &&
+                        ((w >> (15 - b)) & 1)) {
                         sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
                     }
                 }
@@ -584,6 +593,7 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
             y += (int)h;
             any = true;
         }
+        p += npieces;
     }
     if (!any) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
@@ -790,6 +800,13 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * the whole register block. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
         trace_sgi_gr2_fifo(offset, value, size);
+        /* Arm the drain flush; it fires only once the token stream pauses, which
+         * is when real hardware would have executed the op. */
+        if (s->fifo_flush_timer) {
+            timer_mod(s->fifo_flush_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      SGI_GR2_FIFO_FLUSH_MS);
+        }
     }
     /* RE3 producer, 8-bit mode.  The DDX writes the fill colour (a RAMDAC
      * INDEX) to the RE3 colour token, then pushes the rectangle's geometry as
@@ -1200,6 +1217,23 @@ static void sgi_gr2_reset(DeviceState *dev)
     }
 }
 
+/* The FIFO has gone quiet: run the glyph op still sitting in the buffer.  Glyph
+ * ops are the ones the DDX leaves unterminated - it flushes each by starting the
+ * next glyph's 331 and writes no 490 - so the last glyph of a run (the 't' of
+ * "guest") had no successor to flush it and was dropped.  Every other shape
+ * carries its 490; flushing those on idle would draw ops the DDX never committed
+ * (the root stipple op has no 490, and the pre-registered no-draw negative
+ * expects it absent), so only a pending glyph op is run here. */
+static void sgi_gr2_fifo_flush_cb(void *opaque)
+{
+    SGIGr2State *s = opaque;
+
+    if (s->re3_npens > 0) {
+        sgi_gr2_re3_flush_fill(s);
+        sgi_gr2_re3_reset_subop(s);
+    }
+}
+
 static void sgi_gr2_realize(DeviceState *dev, Error **errp)
 {
     SGIGr2State *s = SGI_GR2(dev);
@@ -1215,6 +1249,8 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
                                     sgi_gr2_retrace_tick, s);
     s->retrace_lower_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                           sgi_gr2_retrace_lower, s);
+    s->fifo_flush_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                       sgi_gr2_fifo_flush_cb, s);
     timer_mod(s->retrace_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / SGI_GR2_RETRACE_HZ);

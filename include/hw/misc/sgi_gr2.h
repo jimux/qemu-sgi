@@ -46,6 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 
 #define SGI_GR2_SHRAM_OFF   0x00000 /* 128 KB shared command/constant RAM */
 #define SGI_GR2_FIFO_OFF    0x40000 /* 128 KB token-addressed command FIFO */
+#define SGI_GR2_FIFO_FLUSH_MS 100   /* pause before an unterminated op is run */
 #define SGI_GR2_HQUCODE_OFF 0x60000 /* 8 K x 32-bit HQ2 microcode RAM */
 #define SGI_GR2_GE_OFF      0x68000 /* GE7 units: 8 x 1 KB RAM0, 0x400 stride */
 #define SGI_GR2_GE_STRIDE   0x400
@@ -293,6 +294,13 @@ struct SGIGr2State {
     qemu_irq irq;
     QEMUTimer *retrace_timer;
     QEMUTimer *retrace_lower_timer;
+    /* Flush a whole sub-op once the FIFO goes quiet.  Every op but the last of a
+     * batch is terminated by the next op's 331 (or a 490), but the DDX does not
+     * always write a 490, so the final op has no successor to flush it - the last
+     * glyph of "guest" was being dropped.  Real hardware drains the FIFO and runs
+     * the op; this timer models that drain, rescheduled on every token write and
+     * firing only after the stream pauses. */
+    QEMUTimer *fifo_flush_timer;
     bool retrace_active;
 };
 
