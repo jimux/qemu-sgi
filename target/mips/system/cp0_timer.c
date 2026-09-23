@@ -25,6 +25,7 @@
 #include "qemu/timer.h"
 #include "system/kvm.h"
 #include "internal.h"
+#include "trace/trace-target_mips_tcg.h"
 
 /*
  * On real R4000-class hardware CP0_Count advances at a fixed hardware rate
@@ -83,6 +84,7 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
 /* Expire the timer.  */
 static void cpu_mips_timer_expire(CPUMIPSState *env)
 {
+    trace_mips_cp0_expire(cpu_mips_get_count_val(env), env->CP0_Compare);
     cpu_mips_timer_update(env);
     if (env->insn_flags & ISA_MIPS_R2) {
         env->CP0_Cause |= 1 << CP0Ca_TI;
@@ -128,6 +130,7 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
 
 void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
 {
+    trace_mips_cp0_compare(cpu_mips_get_count_val(env), value);
     env->CP0_Compare = value;
     if (!(env->CP0_Cause & (1 << CP0Ca_DC))) {
         cpu_mips_timer_update(env);

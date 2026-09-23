@@ -16,3 +16,6 @@ mips_mmu_wildfault(uint64_t addr, uint64_t pc, int exc, int access, uint64_t ent
 # system/tlb_helper.c — TLB entry install tracing (IP27 placer/mapper hunt).
 # kind: 0=tlbwi 1=tlbwr 2=machine pin.  Fires only for the K2/kernel-entry VPN.
 mips_tlb_install(int kind, int idx, uint64_t vpn2, uint64_t elo0, uint64_t elo1, uint64_t pagemask, uint64_t pc) "kind=%d idx=%d vpn2=0x%016"PRIx64" elo0=0x%016"PRIx64" elo1=0x%016"PRIx64" pagemask=0x%016"PRIx64" pc=0x%016"PRIx64
+# system/cp0_timer.c -- CP0 COUNT/COMPARE latency tracing (IP7 livelock hunt).
+mips_cp0_compare(uint32_t count, uint32_t compare) "CP0 compare write count=0x%08x compare=0x%08x"
+mips_cp0_expire(uint32_t count, uint32_t compare) "CP0 timer expire count=0x%08x compare=0x%08x"
