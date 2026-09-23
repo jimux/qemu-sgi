@@ -184,7 +184,15 @@ static void sgi_hub_reset_bh(void *opaque);
  * in ml/SN/mp.c, not a measurement of this counter.) */
 #define SGI_HUB_RTC_HZ 1250000
 static uint64_t sgi_hub_rtc_count(void) {
-  return (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) /
+  /*
+   * Count from the HOST clock at the documented SN0 rate (project clock
+   * doctrine: guest time is locked to the host wall clock, not to emulated CPU
+   * speed).  With QEMU_CLOCK_VIRTUAL the count races ahead of the guest's
+   * modeled rate, so a COMPARE the guest reloads from a read of this counter is
+   * instantly in the past and PI_RT_PEND_A/B re-latches at once -- a
+   * level-interrupt livelock on IP4 (the same class as the CP0 IP7 storm).
+   */
+  return (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) /
                     (1000000000ULL / SGI_HUB_RTC_HZ));
 }
 
@@ -219,7 +227,7 @@ static void sgi_hub_rtc_timer(void *opaque) {
   SGIHubState *s = opaque;
 
   sgi_hub_update_irqs(s);
-  timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+  timer_mod(s->rt_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000);
 }
 
 static uint64_t sgi_hub_pi_read(SGIHubState *s, hwaddr off) {
@@ -348,12 +356,22 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
     s->cc_mask = val;
     break;
   case PI_RT_COMPARE_A:
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "hub RT COMPARE_A=%llu rt_count=%llu pend=%u en=%u\n",
+                  (unsigned long long)val,
+                  (unsigned long long)sgi_hub_rtc_count(),
+                  (unsigned)s->rt_pend[0], (unsigned)s->rt_enable[0]);
     s->rt_compare[0] = val;
     s->rt_pend[0] = 0;
     s->rt_armed[0] = (val != 0);
     sgi_hub_update_irqs(s);
     break;
   case PI_RT_COMPARE_B:
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "hub RT COMPARE_B=%llu rt_count=%llu pend=%u en=%u\n",
+                  (unsigned long long)val,
+                  (unsigned long long)sgi_hub_rtc_count(),
+                  (unsigned)s->rt_pend[1], (unsigned)s->rt_enable[1]);
     s->rt_compare[1] = val;
     s->rt_pend[1] = 0;
     s->rt_armed[1] = (val != 0);
@@ -362,10 +380,14 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
   case PI_RT_PEND_A:
     /* The OS acks the RTC interrupt by writing the pend bit 0; it must not
      * re-assert until COMPARE_A is armed again. */
+    qemu_log_mask(LOG_GUEST_ERROR, "hub RT PEND_A write=%llu pend=%u\n",
+                  (unsigned long long)val, (unsigned)s->rt_pend[0]);
     s->rt_pend[0] = 0;
     sgi_hub_update_irqs(s);
     break;
   case PI_RT_PEND_B:
+    qemu_log_mask(LOG_GUEST_ERROR, "hub RT PEND_B write=%llu pend=%u\n",
+                  (unsigned long long)val, (unsigned)s->rt_pend[1]);
     s->rt_pend[1] = 0;
     sgi_hub_update_irqs(s);
     break;
