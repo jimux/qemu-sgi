@@ -214,6 +214,18 @@ struct SGIHPC1State {
     /* IP20 keyboard HLE input handler (activated in realize) */
     struct QemuInputHandlerState *kbd_ih;
 
+    /*
+     * IP20 mouse HLE (DUART0B). The PROM's Indigo mouse uses the Mouse
+     * Systems 5-byte packet (sgi_ms.c, non-PCMOUSE branch): b0 = 0x80 |
+     * buttons (active low, 0x07 = none), b1+b3 = dx, b2+b4 = dy (the driver
+     * negates dy). There is no config handshake -- the PROM/kernel add the
+     * mouse iff the keyboard probed OK (z8530cons.c).
+     */
+    struct QemuInputHandlerState *mouse_ih;
+    uint8_t mouse_buttons;      /* SGI active-low button byte (0x07 = none) */
+    int32_t mouse_dx;           /* accumulated, screen units (right positive) */
+    int32_t mouse_dy;           /* accumulated, screen units (down positive) */
+
     /* Named IRQ outputs (wired by the machine) */
     qemu_irq cpu_irq[2];    /* INT2 LIO0 -> IP2, LIO1 -> IP3 */
     qemu_irq timer_irq[2];  /* PIT timer0 -> IP4, timer1 -> IP5 */

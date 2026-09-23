@@ -386,6 +386,96 @@ static const QemuInputHandler sgi_hpc1_kbd_handler = {
 
 
 /* ------------------------------------------------------------------ */
+/* IP20 mouse HLE (DUART0B)                                             */
+/* ------------------------------------------------------------------ */
+
+/* Emit one Mouse Systems 5-byte packet on the mouse channel (DUART0B). */
+static void sgi_hpc1_mouse_packet(SGIHPC1State *s, int dx, int dy)
+{
+    uint8_t pkt[5];
+    int dx1, dx2, dy1, dy2, i;
+
+    /*
+     * b1+b3 = dx, b2+b4 = dy; the driver negates dy (sgi_ms.c:
+     * deltay = -(report[2]+report[4])), so the wire's Y grows upward while
+     * ours (like QEMU's) grows downward. Split each delta into two halves
+     * rather than one large byte: a delta byte in 0x80..0x87 satisfies the
+     * driver's issync() test ((b & 0xF8) == 0x80) and would reset its packet
+     * state mid-frame, so keep every emitted byte within +/-120.
+     */
+    dx = dx > 240 ? 240 : (dx < -240 ? -240 : dx);
+    dx1 = dx / 2;
+    dx2 = dx - dx1;
+
+    dy = -dy;                            /* wire Y grows upward */
+    dy = dy > 240 ? 240 : (dy < -240 ? -240 : dy);
+    dy1 = dy / 2;
+    dy2 = dy - dy1;
+
+    pkt[0] = 0x80 | s->mouse_buttons;
+    pkt[1] = (uint8_t)dx1;
+    pkt[2] = (uint8_t)dy1;
+    pkt[3] = (uint8_t)dx2;
+    pkt[4] = (uint8_t)dy2;
+
+    for (i = 0; i < 5; i++) {
+        scc_push_rx(s, 0, 1, pkt[i]);
+    }
+}
+
+static void sgi_hpc1_mouse_event(DeviceState *dev, QemuConsole *src,
+                                 InputEvent *evt)
+{
+    SGIHPC1State *s = SGI_HPC1(dev);
+    InputMoveEvent *move;
+    InputBtnEvent *btn;
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_REL:
+        move = evt->u.rel.data;
+        if (move->axis == INPUT_AXIS_X) {
+            s->mouse_dx += move->value;
+        } else if (move->axis == INPUT_AXIS_Y) {
+            s->mouse_dy += move->value;
+        }
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        btn = evt->u.btn.data;
+        /* Active-low button byte, 0x07 = none; MS order left/mid/right. */
+        switch (btn->button) {
+        case INPUT_BUTTON_LEFT:
+            s->mouse_buttons = btn->down ? (s->mouse_buttons & ~0x04)
+                                         : (s->mouse_buttons | 0x04);
+            break;
+        case INPUT_BUTTON_MIDDLE:
+            s->mouse_buttons = btn->down ? (s->mouse_buttons & ~0x02)
+                                         : (s->mouse_buttons | 0x02);
+            break;
+        case INPUT_BUTTON_RIGHT:
+            s->mouse_buttons = btn->down ? (s->mouse_buttons & ~0x01)
+                                         : (s->mouse_buttons | 0x01);
+            break;
+        default:
+            return;                     /* wheel etc.: not on this mouse */
+        }
+        break;
+    default:
+        return;
+    }
+
+    sgi_hpc1_mouse_packet(s, s->mouse_dx, s->mouse_dy);
+    s->mouse_dx = 0;
+    s->mouse_dy = 0;
+}
+
+static const QemuInputHandler sgi_hpc1_mouse_handler = {
+    .name  = "sgi-hpc1-mouse",
+    .mask  = INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_BTN,
+    .event = sgi_hpc1_mouse_event,
+};
+
+
+/* ------------------------------------------------------------------ */
 /* Interrupt aggregation                                               */
 /* ------------------------------------------------------------------ */
 
@@ -1983,6 +2073,13 @@ static void sgi_hpc1_realize(DeviceState *dev, Error **errp)
     s->kbd_ih = qemu_input_handler_register(dev, &sgi_hpc1_kbd_handler);
     qemu_input_handler_activate(s->kbd_ih);
 
+    /* IP20 mouse HLE on DUART0 channel B (no handshake; present iff kbd is). */
+    s->mouse_buttons = 0x07;            /* Mouse Systems: all buttons up */
+    s->mouse_dx = 0;
+    s->mouse_dy = 0;
+    s->mouse_ih = qemu_input_handler_register(dev, &sgi_hpc1_mouse_handler);
+    qemu_input_handler_activate(s->mouse_ih);
+
     /* WD33C93 SCSI controller */
     s->scsi = WD33C93(qdev_new(TYPE_WD33C93));
     /*
@@ -2138,6 +2235,7 @@ static const VMStateDescription vmstate_sgi_hpc1 = {
         VMSTATE_INT64_ARRAY(pit_load_ns, SGIHPC1State, 3),
         VMSTATE_BOOL_ARRAY(pit_programmed, SGIHPC1State, 3),
         VMSTATE_BOOL_ARRAY(timer_pending, SGIHPC1State, 2),
+        VMSTATE_UINT8(mouse_buttons, SGIHPC1State),
         VMSTATE_STRUCT_2DARRAY(uart, SGIHPC1State,
                                HPC1_NUM_DUARTS, HPC1_DUART_CH, 0,
                                vmstate_sgihpc1_uart, SGIHPC1Uart),
