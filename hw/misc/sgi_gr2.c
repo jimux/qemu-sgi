@@ -255,12 +255,13 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
         return;
     }
     /* The two tile colours are given by the op header, not by the tile pixels:
-     * data[1] is the second colour index and data[2] the base, and the DDX
-     * builds the base as (byte << 3) ("sll v1,v1,0x3" in expTileRects).  The
-     * root weave's header is (data[1]=3, data[2]=1), so the two colours are
-     * 1<<3 = 8 and 8+3 = 11 -- the control's ImdDarkGrey/ImdTeal. */
+     * data[2] is the base and data[1] indexes the second colour.  The DDX forms
+     * the base as (byte << 3) ("sll v1,v1,0x3" in expTileRects), so the root
+     * weave's header (data[1]=3, data[2]=1) gives 1<<3 = 8 and 8 | (3<<1) = 14.
+     * Index 8 is grey and 14 teal, matching the weave the expDrawImage24 restore
+     * paints in the exposed rects (the same grey/teal the control shows). */
     c0 = s->re3_data[2] << 3;
-    c1 = c0 + s->re3_data[1];
+    c1 = c0 | (s->re3_data[1] << 1);
     if (s->re3_nclip == 0) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
@@ -485,6 +486,7 @@ static void sgi_gr2_re3_draw_image(SGIGr2State *s)
         unsigned off = s->re3_img_off[k];
         uint32_t x = s->re3_img_x[k];
         uint32_t y, w, height, nrow, j, p;
+        bool m332;
 
         if (off + 6 > s->re3_data_n) {
             break;
@@ -493,6 +495,11 @@ static void sgi_gr2_re3_draw_image(SGIGr2State *s)
         w = s->re3_data[off + 1];
         height = s->re3_data[off + 2];
         nrow = s->re3_data[off + 3];
+        /* The group header's sixth word selects the pixel interpretation: 0 means
+         * the bytes are RAMDAC indices (the root weave, grey/teal), 2 means they
+         * are direct 3-3-2 (the EZsetup cube and the desktop icons).  Both arrive
+         * as expDrawImage24, so the header is the only discriminator. */
+        m332 = (s->re3_data[off + 5] == 2);
         if (w == 0 || w > SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
             x >= SGI_GR2_SCREEN_W || height == 0 ||
             height > SGI_GR2_SCREEN_H || nrow == 0 ||
@@ -519,7 +526,11 @@ static void sgi_gr2_re3_draw_image(SGIGr2State *s)
                         py >= SGI_GR2_SCREEN_H) {
                         continue;
                     }
-                    sgi_gr2_put332(s, px, py, (word >> (24 - 8 * p)) & 0xff);
+                    if (m332) {
+                        sgi_gr2_put332(s, px, py, (word >> (24 - 8 * p)) & 0xff);
+                    } else {
+                        sgi_gr2_put(s, px, py, (word >> (24 - 8 * p)) & 0xff);
+                    }
                 }
             }
         }
