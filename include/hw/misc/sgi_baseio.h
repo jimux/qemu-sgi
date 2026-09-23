@@ -60,14 +60,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 #define SGI_BASEIO_QLISP1_OFF 0x600000ULL
 
 /*
- * Bridge PCI-interrupt device lines the BaseIO devices wire to.  The IRIX
- * kernel's pcibr programs b_int_addr[line] and sets b_int_enable bit `line`
- * when it connects each device's handler; the observed IP27 programming is
- * QLogic0 -> line 0, QLogic1 -> line 1, IOC3 -> line 4 (the PCI interrupt
- * line each device's config was given).
+ * Bridge PCI-interrupt device lines the BaseIO devices wire to.
+ *
+ * The IRIX kernel's pcibr maps a device's PCI slot and interrupt pin to a
+ * bridge line with pcibr_intr_bits() (io/pcibr.c:5218):
+ *
+ *     SLOT   A B C D          slot 0 = IOC3, slot 1 = ISP0, slot 2 = ISP1
+ *      0     0 4 0 4
+ *      1     1 5 1 5
+ *      2     2 6 2 6
+ *
+ * so with every device on INTA the IOC3 is line 0, ISP0 is line 1 and ISP1 is
+ * line 2.  The IOC3 serial (SuperIO) unit uses INTB, i.e. line 4.  The kernel
+ * then programs b_int_addr[line] and sets b_int_enable bit `line` when it
+ * connects each handler, and the lines land on the vectors we observe:
+ * line 0 -> vec 11 (ef_intr, IOC3 Ethernet), line 1 -> vec 12 (qlintr),
+ * line 4 -> vec 10 (ioc3_intr, serial).  Getting ISP0's line wrong (0 instead
+ * of 1) routes every QLogic interrupt to the Ethernet handler, so the driver
+ * only ever sees it while its own poll loop happens to be running and hangs on
+ * the first command that actually sleeps on the mailbox semaphore.
  */
-#define SGI_BASEIO_INT_DEV_QLISP0 0
-#define SGI_BASEIO_INT_DEV_QLISP1 1
+#define SGI_BASEIO_INT_DEV_QLISP0 1
+#define SGI_BASEIO_INT_DEV_QLISP1 2
 #define SGI_BASEIO_INT_DEV_IOC3   4
 
 /*
