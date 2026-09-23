@@ -1188,6 +1188,16 @@ void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
     cpu_mips_store_status(env, arg1);
     val = env->CP0_Status;
 
+    /*
+     * R2000/R3000 cache control changes where a data access physically lands
+     * (mips_cpu_tlb_fill), and the shadow TLB cannot distinguish the two
+     * routings for the same virtual page, so drop it on any change.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000 &&
+        ((old ^ val) & ((1 << CP0St_ISC) | (1 << CP0St_SWC)))) {
+        tlb_flush(env_cpu(env));
+    }
+
     if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
         qemu_log("Status %08x (%08x) => %08x (%08x) Cause %08x",
                 old, old & env->CP0_Cause & CP0Ca_IP_mask,

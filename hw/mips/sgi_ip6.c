@@ -27,6 +27,8 @@
 #include "hw/core/clock.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/loader.h"
 #include "hw/char/sgi_scn2681.h"
 #include "hw/core/sysbus.h"
@@ -1412,6 +1414,7 @@ static void sgi_ip6_init(MachineState *machine)
     MemoryRegion *system_memory = get_system_memory();
     MemoryRegion *prom = g_new(MemoryRegion, 1);
     MIPSCPU *cpu;
+    DeviceState *dev;
     Clock *cpuclk;
     char *filename;
     int bios_size;
@@ -1434,7 +1437,21 @@ static void sgi_ip6_init(MachineState *machine)
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, 20000000); /* 4D/25: R3000 at 20 MHz */
 
-    cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk, true);
+    /*
+     * 4D/25 (IP6, R3000 at 20 MHz): 64 KiB instruction and 32 KiB data cache
+     * (MAME ip6.cpp: R3000(config, m_cpu, 20_MHz_XTAL, 65536, 32768)).  The
+     * caches have to be modelled, not merely declared: IRIX's mlsetup()
+     * measures them (config_cache/size_cache) and sizes its phead hash table
+     * from the result, so with no cache the probe returns 0, pheadmask comes
+     * out as -1 and meminit dereferences a NULL list pointer.
+     */
+    dev = qdev_new(machine->cpu_type);
+    qdev_prop_set_uint32(dev, "r3000-icache-size", 64 * KiB);
+    qdev_prop_set_uint32(dev, "r3000-dcache-size", 32 * KiB);
+    qdev_connect_clock_in(dev, "clk-in", cpuclk);
+    object_property_set_bool(OBJECT(dev), "big-endian", true, &error_abort);
+    qdev_realize(dev, NULL, &error_abort);
+    cpu = MIPS_CPU(dev);
     cpu_mips_irq_init_cpu(cpu);
     cpu_mips_clock_init(cpu);
     qemu_register_reset(main_cpu_reset, cpu);

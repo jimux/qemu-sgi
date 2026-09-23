@@ -463,6 +463,42 @@ static void mips_cp0_period_set(MIPSCPU *cpu)
     clock_set_source(env->count_clock, cpu->count_div);
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * Allocate the R2000/R3000 primary cache arrays and expose each through its
+ * own CPU address space, so that mips_cpu_tlb_fill() can route isolated-cache
+ * (Status.IsC) data accesses to them.  See r3k_cache in CPUMIPSState.
+ */
+static void r3k_cache_init(MIPSCPU *cpu)
+{
+    CPUMIPSState *env = &cpu->env;
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        const char *prefix = i == 0 ? "r3000-dcache" : "r3000-icache";
+
+        if (env->r3k_cache[i].size == 0) {
+            continue;
+        }
+        memory_region_init_ram(&env->r3k_cache[i].mr, OBJECT(cpu), prefix,
+                               env->r3k_cache[i].size, &error_abort);
+        cpu_address_space_init(CPU(cpu),
+                               i == 0 ? MIPS_ASIDX_DCACHE : MIPS_ASIDX_ICACHE,
+                               prefix, &env->r3k_cache[i].mr);
+    }
+}
+
+/*
+ * The R2000/R3000 isolated-cache address spaces are selected per access by
+ * mips_cpu_tlb_fill() setting attrs.space; everything else uses the normal
+ * memory space (0).
+ */
+static int mips_cpu_asidx_from_attrs(CPUState *cs, MemTxAttrs attrs)
+{
+    return attrs.space <= MIPS_ASIDX_MAX ? attrs.space : 0;
+}
+#endif
+
 static void mips_cpu_realizefn(DeviceState *dev, Error **errp)
 {
     CPUState *cs = CPU(dev);
@@ -509,6 +545,11 @@ static void mips_cpu_realizefn(DeviceState *dev, Error **errp)
                                   (uint64_t)num_lines * dwords_per_line);
         env->scache_ecc = g_new0(uint16_t,
                                  (uint64_t)num_lines * dwords_per_line);
+    }
+
+    /* R2000/R3000 primary caches: only meaningful for the MIPS-I MMU. */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        r3k_cache_init(cpu);
     }
 #endif
     fpu_init(env, env->cpu_model);
@@ -574,12 +615,21 @@ static ObjectClass *mips_cpu_class_by_name(const char *cpu_model)
 static const struct SysemuCPUOps mips_sysemu_ops = {
     .has_work = mips_cpu_has_work,
     .get_phys_page_debug = mips_cpu_get_phys_page_debug,
+    .asidx_from_attrs = mips_cpu_asidx_from_attrs,
     .legacy_vmsd = &vmstate_mips_cpu,
 };
 #endif
 
 static const Property mips_cpu_properties[] = {
     DEFINE_PROP_BOOL("big-endian", MIPSCPU, is_big_endian, TARGET_BIG_ENDIAN),
+    /*
+     * R2000/R3000 primary cache sizes, in bytes (0 = not modelled).  Set by
+     * the machine; see r3k_cache in CPUMIPSState.  Real values for an SGI
+     * 4D/25 (MAME: ip6.cpp, R3000(config, cpu, 20MHz, 65536, 32768)) are
+     * 64 KiB instruction / 32 KiB data.
+     */
+    DEFINE_PROP_UINT32("r3000-icache-size", MIPSCPU, env.r3k_cache[1].size, 0),
+    DEFINE_PROP_UINT32("r3000-dcache-size", MIPSCPU, env.r3k_cache[0].size, 0),
 };
 
 #ifdef CONFIG_TCG
@@ -668,6 +718,7 @@ static void mips_cpu_class_init(ObjectClass *c, const void *data)
     cc->gdb_write_register = mips_cpu_gdb_write_register;
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &mips_sysemu_ops;
+    cc->max_as = MIPS_ASIDX_MAX;
 #endif
     cc->disas_set_info = mips_cpu_disas_set_info;
     cc->gdb_num_core_regs = 73;

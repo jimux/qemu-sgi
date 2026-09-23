@@ -307,7 +307,8 @@ static inline void compute_hflags(CPUMIPSState *env)
                      MIPS_HFLAG_F64 | MIPS_HFLAG_FPU | MIPS_HFLAG_KSU |
                      MIPS_HFLAG_AWRAP | MIPS_HFLAG_DSP | MIPS_HFLAG_DSP_R2 |
                      MIPS_HFLAG_DSP_R3 | MIPS_HFLAG_SBRI | MIPS_HFLAG_MSA |
-                     MIPS_HFLAG_FRE | MIPS_HFLAG_ELPA | MIPS_HFLAG_ERL);
+                     MIPS_HFLAG_FRE | MIPS_HFLAG_ELPA | MIPS_HFLAG_ERL |
+                     MIPS_HFLAG_ISC | MIPS_HFLAG_SWC);
     if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
         /*
          * MIPS-I has no EXL, no ERL and no supervisor mode.  Status[1] is
@@ -321,6 +322,18 @@ static inline void compute_hflags(CPUMIPSState *env)
          */
         if (env->CP0_Status & (1 << CP0St_EXL)) {
             env->hflags |= MIPS_HFLAG_UM;
+        }
+        /*
+         * MIPS-I cache control.  IsC isolates the data cache from memory;
+         * SwC additionally redirects data accesses to the instruction-cache
+         * array.  Both only change where a data access lands, so the TLB
+         * fill path is the only place that has to look at them.
+         */
+        if (env->CP0_Status & (1 << CP0St_ISC)) {
+            env->hflags |= MIPS_HFLAG_ISC;
+            if (env->CP0_Status & (1 << CP0St_SWC)) {
+                env->hflags |= MIPS_HFLAG_SWC;
+            }
         }
     } else {
         if (env->CP0_Status & (1 << CP0St_ERL)) {

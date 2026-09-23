@@ -775,6 +775,12 @@ typedef struct CPUArchState {
 #define CP0St_TS    21
 #define CP0St_SR    20
 #define CP0St_NMI   19
+/*
+ * MIPS-I (R2000/R3000) cache control.  These bits do not exist on the
+ * MIPS III/IV Status register, where 16..18 are ISA/CM/PE.
+ */
+#define CP0St_SWC   17
+#define CP0St_ISC   16
 #define CP0St_IM    8
 #define CP0St_KX    7
 #define CP0St_SX    6
@@ -1168,7 +1174,15 @@ typedef struct CPUArchState {
 #define MIPS_HFLAG_FRE   0x2000000 /* FRE enabled */
 #define MIPS_HFLAG_ELPA  0x4000000
 #define MIPS_HFLAG_ITC_CACHE  0x8000000 /* CACHE instr. operates on ITC tag */
-#define MIPS_HFLAG_ERL   0x10000000 /* error level flag */
+#define MIPS_HFLAG_ERL   0x10000000 /* error level flag                    */
+/*
+ * MIPS-I R2000/R3000 isolated-cache mode (Status.IsC) and cache swap
+ * (Status.SwC).  These affect where a data access is routed, not how it is
+ * translated into TCG, so they are deliberately NOT part of MIPS_HFLAG_TMASK
+ * (which selects translated blocks): only the TLB fill path consults them.
+ */
+#define MIPS_HFLAG_SWC   0x80000000 /* data accesses use the I-cache array */
+#define MIPS_HFLAG_ISC   0x40000000 /* data cache isolated from memory    */
     target_ulong btarget;        /* Jump / branch target               */
     target_ulong bcond;          /* Branch condition (if needed)       */
 
@@ -1200,6 +1214,20 @@ typedef struct CPUArchState {
         AddressSpace as;
         MemoryRegion mr;
     } iocsr;
+
+    /*
+     * R2000/R3000 primary caches.  Status.IsC isolates the cache from
+     * memory: data accesses to cached (non-kseg1) addresses are then served
+     * by one of these arrays -- direct-mapped and tagless, so the array index
+     * is simply phys_addr & (size - 1).  SwC selects the instruction array
+     * for data accesses (how software measures the I-cache size).  size == 0
+     * means the cache is not modelled and IsC has no effect.
+     *   0 = data cache, 1 = instruction cache
+     */
+    struct {
+        uint32_t size;
+        MemoryRegion mr;
+    } r3k_cache[2];
 #endif
 
     const mips_def_t *cpu_model;
@@ -1256,6 +1284,15 @@ uint32_t cpu_rddsp(uint32_t mask_num, CPUMIPSState *env);
 #define MMU_KERNEL_IDX 0
 #define MMU_USER_IDX 2
 #define MMU_ERL_IDX 3
+
+/*
+ * R2000/R3000 isolated-cache address spaces (see r3k_cache in CPUMIPSState).
+ * Address space 0 is the normal memory space; these are selected per-access
+ * through cpu_asidx_from_attrs() while Status.IsC is set.
+ */
+#define MIPS_ASIDX_DCACHE 1
+#define MIPS_ASIDX_ICACHE 2
+#define MIPS_ASIDX_MAX    2
 
 static inline int hflags_mmu_index(uint32_t hflags)
 {
