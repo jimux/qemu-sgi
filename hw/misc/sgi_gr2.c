@@ -102,7 +102,7 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
 static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
                              int x0, int y0, int x1, int y1)
 {
-    int dx, dy, sx, sy, err;
+    int dx, dy, sx, sy, err, e2;
 
     if (!s->scanout) {
         return;
@@ -125,11 +125,16 @@ static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
             y0 < -SGI_GR2_SCREEN_H || y0 > 2 * SGI_GR2_SCREEN_H) {
             break;
         }
-        if (2 * err >= -dy) {
+        /* Both step decisions must see the SAME error term.  Re-reading err
+         * after the first step (the old code did) makes a line overshoot its
+         * endpoint and then wander to the bound below, painting a spurious
+         * trail across the screen - 4421 of 20000 random segments in test. */
+        e2 = 2 * err;
+        if (e2 > -dy) {
             err -= dy;
             x0 += sx;
         }
-        if (2 * err <= dx) {
+        if (e2 < dx) {
             err += dx;
             y0 += sy;
         }
@@ -326,12 +331,13 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
     sgi_gr2_update_display(s);
 }
 
-/* Draw a filled polygon (libgd token 302).  After the same "0xff 0x3 0x0"
- * prefix come three header words (0x3ab, 0xc6, 0x2a0 in every op) then the
- * outline as (x,y) vertex pairs, the last pair repeating the first to close the
- * loop.  Filled with an even-odd scanline walk.  These are the glyph outlines —
- * the X server's text goes through expPolyGlyphBlt, which fills glyphs the same
- * way. */
+/* Draw a polyline (libgd token 302).  After the same "0xff 0x3 0x0" prefix come
+ * three header words (0x3ab, 0xc6, 0x2a0 in every op) then one or more contours
+ * as (x,y) vertex pairs, each closed by repeating its first vertex.  These are
+ * the account icons: the reference shows light interiors with thin black edges,
+ * so the contours are STROKED (fill is the fallback, behind sgi-gr2.poly-stroke).
+ * The payload list is split on the repeated first vertex so one contour is never
+ * joined to the next. */
 #define SGI_GR2_POLY_MAX 64
 static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
 {
@@ -1104,7 +1110,7 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
 static const Property sgi_gr2_properties[] = {
     DEFINE_PROP_BOOL("present", SGIGr2State, present, false),
     DEFINE_PROP_BOOL("scanout-bars", SGIGr2State, scanout_bars, false),
-    DEFINE_PROP_BOOL("poly-stroke", SGIGr2State, poly_stroke, false),
+    DEFINE_PROP_BOOL("poly-stroke", SGIGr2State, poly_stroke, true),
     DEFINE_PROP_UINT8("ges", SGIGr2State, ges, 2),
     DEFINE_PROP_UINT8("bitplanes", SGIGr2State, bitplanes, 24),
     DEFINE_PROP_BOOL("zbuffer", SGIGr2State, zbuffer, true),
