@@ -1097,35 +1097,38 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                       ret);
         break;
     }
-    if (ret == TLBRET_MATCH) {
-        /*
-         * R2000/R3000 isolated cache (Status.IsC).  A data access to a cached
-         * address -- anything but the uncached kseg1 alias -- is served by one
-         * of the modelled primary cache arrays instead of memory.  The cache is
-         * direct-mapped and tagless, so its index is simply
-         * phys & (size - 1); that aliasing is exactly what the PROM's and
-         * IRIX's cache-size probes measure.  Status.SwC redirects data
-         * accesses to the instruction-cache array (how the I-cache size is
-         * measured).  Instruction fetches are unaffected: the cache-management
-         * routines execute from the uncached kseg1 alias.
-         */
-        if ((env->hflags & MIPS_HFLAG_ISC) &&
-            access_type != MMU_INST_FETCH &&
-            ((uint32_t)address >> 29) != 5 &&
-            env->r3k_cache[0].size != 0) {
-            bool swc = env->hflags & MIPS_HFLAG_SWC;
-            uint32_t csize = env->r3k_cache[swc ? 1 : 0].size;
+    /*
+     * R2000/R3000 isolated cache (Status.IsC).  While the cache is isolated an
+     * R2000/R3000 data access is NOT translated: it references the selected
+     * cache array directly, indexed by the low bits of the virtual address.
+     * That is true of every segment, so a load or a store must never fault
+     * here -- the array is the only destination, and it is writable.  This has
+     * to be tested before the get_physical_address() result is acted on: a
+     * kseg2/kuseg access with no TLB entry would otherwise raise a TLB
+     * exception inside an isolate window, which real hardware cannot do.
+     * Instruction fetches are unaffected, so cache-management code keeps
+     * executing from memory.  Status.SwC redirects data accesses to the
+     * instruction-cache array (how software measures the I-cache size).
+     */
+    if ((env->hflags & MIPS_HFLAG_ISC) && !probe &&
+        access_type != MMU_INST_FETCH &&
+        env->r3k_cache[0].size != 0) {
+        bool swc = env->hflags & MIPS_HFLAG_SWC;
+        uint32_t csize = env->r3k_cache[swc ? 1 : 0].size;
+
+        if (csize != 0) {
             MemTxAttrs attrs = {
                 .space = swc ? MIPS_ASIDX_ICACHE : MIPS_ASIDX_DCACHE,
             };
 
-            if (csize != 0) {
-                tlb_set_page_with_attrs(cs, address & TARGET_PAGE_MASK,
-                                        physical & (csize - 1), attrs, prot,
-                                        mmu_idx, TARGET_PAGE_SIZE);
-                return true;
-            }
+            tlb_set_page_with_attrs(cs, address & TARGET_PAGE_MASK,
+                                    (uint32_t)address & (csize - 1), attrs,
+                                    PAGE_READ | PAGE_WRITE | PAGE_EXEC,
+                                    mmu_idx, TARGET_PAGE_SIZE);
+            return true;
         }
+    }
+    if (ret == TLBRET_MATCH) {
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      physical & TARGET_PAGE_MASK, prot,
                      mmu_idx, TARGET_PAGE_SIZE);
