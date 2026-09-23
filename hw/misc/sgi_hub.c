@@ -214,12 +214,46 @@ static void sgi_hub_update_irqs(SGIHubState *s) {
 
   sgi_hub_rtc_poll(s);
   for (i = 0; i < SGI_HUB_MAX_CPUS; i++) {
-    qemu_set_irq(s->irq[i][0], (s->int_pend0 != 0));
-    qemu_set_irq(s->irq[i][1], (s->int_pend1 != 0));
+    /*
+     * CPU slice A (even CPU) is gated by INT_MASK0_A/1_A, slice B by the
+     * _B pair.  int_mask[] is ordered [0]=A mask0, [1]=A mask1, [2]=B mask0,
+     * [3]=B mask1.  The kernel programs the mask in intr_connect_level(),
+     * so a pending vector asserts the CPU line only once its handler is
+     * connected -- and a masked pending bit must not keep IP2/IP3 asserted
+     * or the dispatcher (which masks INT_PENDx by the same value) would
+     * livelock.
+     */
+    int slice = i & 1;
+
+    qemu_set_irq(s->irq[i][0],
+                 (s->int_pend0 & s->int_mask[slice * 2 + 0]) != 0);
+    qemu_set_irq(s->irq[i][1],
+                 (s->int_pend1 & s->int_mask[slice * 2 + 1]) != 0);
     /* L4 (RTC): asserted while a pend bit is latched and the slice is
      * enabled.  The OS reads PI_RT_PEND_x and acks by writing it 0. */
     qemu_set_irq(s->irq[i][2], s->rt_pend[i] && s->rt_enable[i]);
   }
+}
+
+void sgi_hub_raise_vector(SGIHubState *s, unsigned vec, int level) {
+  if (vec < 64) {
+    if (level) {
+      s->int_pend0 |= 1ULL << vec;
+    } else {
+      s->int_pend0 &= ~(1ULL << vec);
+    }
+  } else if (vec < 128) {
+    uint64_t bit = 1ULL << (vec - 64);
+
+    if (level) {
+      s->int_pend1 |= bit;
+    } else {
+      s->int_pend1 &= ~bit;
+    }
+  } else {
+    return;
+  }
+  sgi_hub_update_irqs(s);
 }
 
 /* The RTC interrupt can fire while the CPU is idle, so poll it on a timer. */

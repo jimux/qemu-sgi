@@ -139,4 +139,17 @@ struct SGIHubState {
   QEMUTimer *rt_timer;
 };
 
+/*
+ * Raise or clear one interrupt vector in the hub's INT_PEND0/1 sets.
+ *
+ * A device on an XIO widget (e.g. the BaseIO bridge) sends an interrupt to the
+ * hub carrying the vector the kernel programmed into that device's bridge
+ * b_int_addr register.  The hub latches it here; the matching INT_MASK bit
+ * then asserts the CPU's IP2 (INT_PEND0) or IP3 (INT_PEND1) line, and the
+ * kernel's intpend0()/intpend1() dispatch reads the bit and clears it via
+ * PI_INT_PEND_MOD.  `vec` is the raw field (0..127): 0..63 index INT_PEND0,
+ * 64..127 index INT_PEND1.
+ */
+void sgi_hub_raise_vector(SGIHubState *s, unsigned vec, int level);
+
 #endif /* HW_MISC_SGI_HUB_H */
