@@ -681,7 +681,8 @@ static bool sgi_crime_re_emit(SGICRIMEREState *s, int wx, int wy,
  * and encodes the traversal direction in Primitive.edgeType).
  *
  * Vertices arrive as 13.6 fixed point; we evaluate edge functions at
- * pixel centers in 13.6 space (x*64+32) with 64-bit intermediates.
+ * pixel centers in 13.6 space (x*64+32) with 64-bit intermediates, and
+ * step the x coefficient by A*64 per pixel (one pixel is 64 units).
  */
 static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
 {
@@ -819,7 +820,20 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                     wrote_n++;
                 }
             }
-            ex[0] += A[0]; ex[1] += A[1]; ex[2] += A[2];
+            /*
+             * Step in x by one PIXEL.  The sample point is in 13.6 fixed
+             * point, so advancing to the next pixel adds 64 to x, and the
+             * edge function E = A*x + B*y + C (A = dy, B = -dx, both 13.6)
+             * therefore changes by A*64 — NOT by A.  Stepping by A made the
+             * effective x-gradient 64x too shallow, so on the tiny (~1-3 px)
+             * triangles of a GL scene the three half-planes almost never
+             * intersected: measured live on `ideas`, 14421/17504 triangles
+             * logged inside=0 though clearly non-degenerate, and the ones
+             * that did fill drew stretched horizontal slivers.  (Large
+             * triangles such as tex_cube's happened to fill their bbox, which
+             * is why it looked like a flat white square.)
+             */
+            ex[0] += A[0] * 64; ex[1] += A[1] * 64; ex[2] += A[2] * 64;
         }
     }
     trace_sgi_crime_re_tri((int)(vx[0] >> 6), (int)(vy[0] >> 6),
