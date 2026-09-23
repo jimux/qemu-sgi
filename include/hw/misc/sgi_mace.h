@@ -387,6 +387,14 @@ enum {
 #define AUD_RING_ID_DAC2       2      /* ring id 2: audio out #2 */
 
 /*
+ * Host-capture staging FIFO: bytes read from the input voice (S16 BE
+ * stereo frames) between DMA ticks, drained four frames at a time into
+ * one 32-byte input ring block.  Sized to decouple the host backend's
+ * read cadence from the codec frame rate without unbounded latency.
+ */
+#define AUD_IN_BUF_SIZE        16384
+
+/*
  * ISA interrupt bits for audio (spec §5.1.3 table): bits 0..7, all in
  * the "audio" group (CRIME slot 6, kernel MACE_PERIPH_AUDIO).
  */
@@ -796,8 +804,14 @@ struct SGIMACEState {
      */
     AudioBackend *audio_be;             /* -audiodev backend (may be NULL) */
     SWVoiceOut *audio_voice;            /* host playback voice           */
+    SWVoiceIn *audio_voice_in;          /* host capture voice            */
     QEMUTimer *audio_dma_timer;         /* DMA engine tick                */
     int64_t audio_tick_ns;              /* ns per 32-byte ring block      */
+    /* staging FIFO for captured host bytes (S16 BE stereo frames) */
+    uint8_t audio_in_buf[AUD_IN_BUF_SIZE];
+    unsigned audio_in_head;
+    unsigned audio_in_tail;
+    unsigned audio_in_count;
 
     uint64_t audio_cntrl_stat;          /* 0x00 CNTRL_STAT               */
     uint64_t audio_codec_reg;           /* 0x08 codec addr/control latch */

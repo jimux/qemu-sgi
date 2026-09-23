@@ -690,7 +690,120 @@ static int sgi_mace_audio_rate(SGIMACEState *s)
     return rate1;
 }
 
-/* (Re)open the host playback voice with the codec's current format. */
+/*
+ * ADC sample rate: the input channel's clock is routed by CLK_SRC_SELECT
+ * bits 1:0 to one of the three generators (a3_init_codec programs
+ * ADC<-CG2, reg 15 = 0xD0A), exactly as the DACs use bits 9:8 / 11:10.
+ */
+static int sgi_mace_audio_adc_rate(SGIMACEState *s)
+{
+    static const int rate_reg[4] = {
+        AUD_DEFAULT_RATE,          /* 0: fixed 48kHz              */
+        AD1843_REG_CG1_RATE,        /* 1: clock generator 1        */
+        AD1843_REG_CG2_RATE,        /* 2: clock generator 2        */
+        AD1843_REG_CG3_RATE,        /* 3: clock generator 3        */
+    };
+    int src = s->ad1843_reg[AD1843_REG_CLK_SRC] & 3;
+    int rate = (src == 0) ? AUD_DEFAULT_RATE : s->ad1843_reg[rate_reg[src]];
+
+    if (rate < 4000 || rate > 54000) {
+        return AUD_DEFAULT_RATE;
+    }
+    return rate;
+}
+
+/*
+ * Rate the DMA tick should be paced at: the codec clocks the output and
+ * input converters independently.  When any output channel is enabled
+ * the DAC rate governs (the normal a3 use is play and record at one
+ * rate); a capture-only session is paced by the ADC rate -- otherwise
+ * the input ring would be filled at the DAC's default 48kHz while the
+ * host voice delivers the ADC's rate, and the recording would run at
+ * the wrong speed (frequency-shifted by the rate ratio).
+ */
+static int sgi_mace_audio_tick_rate(SGIMACEState *s)
+{
+    int ch;
+
+    for (ch = 1; ch < AUD_CHAN_NUM; ch++) {
+        uint64_t ctrl = s->audio_ch_ctrl[ch];
+
+        if (!(ctrl & AUD_CHAN_RESET) && (ctrl & AUD_CHAN_DMA_ENABLE)) {
+            return sgi_mace_audio_rate(s);
+        }
+    }
+    return sgi_mace_audio_adc_rate(s);
+}
+
+/* Drain N bytes from the host-capture staging FIFO. */
+static void sgi_mace_audio_in_pop(SGIMACEState *s, uint8_t *dst, unsigned n)
+{
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        dst[i] = s->audio_in_buf[s->audio_in_head];
+        s->audio_in_head = (s->audio_in_head + 1) % AUD_IN_BUF_SIZE;
+    }
+    s->audio_in_count -= n;
+}
+
+/*
+ * Host capture callback: the backend has `avail` bytes of captured
+ * audio (S16 BE stereo frames).  Copy them into the staging FIFO; if
+ * the FIFO is full the excess is dropped (real capture hardware clips
+ * rather than blocking the source).
+ */
+static void sgi_mace_audio_in_cb(void *opaque, int avail)
+{
+    SGIMACEState *s = opaque;
+    uint8_t tmp[1024];
+
+    if (!s->audio_voice_in) {
+        return;
+    }
+    while (avail > 0 && s->audio_in_count < AUD_IN_BUF_SIZE) {
+        size_t room = AUD_IN_BUF_SIZE - s->audio_in_count;
+        size_t want = MIN((size_t)avail, MIN(sizeof(tmp), room));
+        size_t n = AUD_read(s->audio_voice_in, tmp, want);
+        size_t i;
+
+        if (n == 0) {
+            break;
+        }
+        for (i = 0; i < n; i++) {
+            s->audio_in_buf[s->audio_in_tail] = tmp[i];
+            s->audio_in_tail = (s->audio_in_tail + 1) % AUD_IN_BUF_SIZE;
+        }
+        s->audio_in_count += n;
+        avail -= n;
+    }
+}
+
+/* (Re)open the host capture voice with the codec's ADC format. */
+static void sgi_mace_audio_open_capture(SGIMACEState *s)
+{
+    struct audsettings as;
+
+    if (!s->audio_be) {
+        return;
+    }
+    if (s->audio_voice_in) {
+        AUD_close_in(s->audio_be, s->audio_voice_in);
+        s->audio_voice_in = NULL;
+    }
+    as.freq = sgi_mace_audio_adc_rate(s);
+    as.nchannels = 2;
+    as.fmt = AUDIO_FORMAT_S16;
+    as.endianness = 1;    /* big-endian (MIPS) sample pairs */
+    s->audio_voice_in = AUD_open_in(s->audio_be, NULL, "sgi-mace-audio-in",
+                                    s, sgi_mace_audio_in_cb, &as);
+    if (s->audio_voice_in) {
+        s->audio_in_head = s->audio_in_tail = s->audio_in_count = 0;
+        AUD_set_active_in(s->audio_voice_in, true);
+    }
+}
+
+/* (Re)open the host voices with the codec's current format. */
 static void sgi_mace_audio_open_voice(SGIMACEState *s)
 {
     struct audsettings as;
@@ -709,6 +822,7 @@ static void sgi_mace_audio_open_voice(SGIMACEState *s)
     s->audio_voice = AUD_open_out(s->audio_be, s->audio_voice, "sgi-mace-audio",
                                   s, sgi_mace_audio_out_cb, &as);
     AUD_set_active_out(s->audio_voice, true);
+    sgi_mace_audio_open_capture(s);
 }
 
 /* Number of 32-byte blocks pending in one channel's ring. */
@@ -866,12 +980,40 @@ static void sgi_mace_audio_tick(void *opaque)
             /* ring drained below the threshold: the driver refills */
             sgi_mace_audio_irq_update(s);
         } else {
-            /* input channel: deliver silence while there is room */
+            /*
+             * Input channel: deliver captured host audio while there is
+             * room.  The ADC is 16-bit stereo; each tick carries four
+             * stereo pairs (one 32-byte ring block), the codec's frame
+             * rate.  A short or absent host buffer is padded with
+             * silence (a real ADC underrun), so the ring cadence and
+             * the MSC/UST counters stay exact.
+             */
             if (sgi_mace_audio_depth(s, ch) <= AUD_RING_SIZE - AUD_RING_BLOCK) {
                 hwaddr base = (s->isa_ringbase & ~0x7fffULL);
                 uint8_t blk[AUD_RING_BLOCK];
+                int i;
 
-                memset(blk, 0, sizeof(blk));
+                for (i = 0; i < 4; i++) {
+                    int16_t l = 0, r = 0;
+                    uint32_t lf, rf;
+
+                    if (s->audio_in_count >= 4) {
+                        uint8_t fr[4];
+
+                        sgi_mace_audio_in_pop(s, fr, 4);
+                        l = (int16_t)lduw_be_p(fr);
+                        r = (int16_t)lduw_be_p(fr + 2);
+                    }
+                    /*
+                     * Ring pair: L in bits 55:32, R in bits 23:0, each
+                     * a 16-bit sample left-justified (<<8) into a
+                     * sign-extended 24-bit field -- the inverse of the
+                     * output path's decode (spec §3.5.1/§3.5.2.1).
+                     */
+                    lf = (uint32_t)((int32_t)l << 8);
+                    rf = (uint32_t)((int32_t)r << 8);
+                    stq_be_p(blk + i * 8, ((uint64_t)lf << 32) | rf);
+                }
                 address_space_write(&address_space_memory,
                                     base + (s->audio_ch_wptr[ch]
                                             & (AUD_RING_SIZE - AUD_RING_BLOCK)),
@@ -894,14 +1036,13 @@ static void sgi_mace_audio_tick(void *opaque)
 
 static void sgi_mace_audio_start_engine(SGIMACEState *s)
 {
+    int rate;
+
     if (!s->audio_dma_timer) {
         return;
     }
-    if (s->audio_tick_ns == 0) {
-        int rate = sgi_mace_audio_rate(s);
-
-        s->audio_tick_ns = (int64_t)4 * 1000000000 / rate;
-    }
+    rate = sgi_mace_audio_tick_rate(s);
+    s->audio_tick_ns = (int64_t)4 * 1000000000 / rate;
     timer_mod_ns(s->audio_dma_timer,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->audio_tick_ns);
 }
@@ -1054,6 +1195,11 @@ static void sgi_mace_audio_write(SGIMACEState *s, hwaddr aud_off,
                         s->audio_ch_rptr[ch] = 0;
                         s->audio_ch_wptr[ch] = 0;
                         s->audio_ch_mscust[ch] = 0;
+                        if (ch == 0) {
+                            /* drop captured samples queued before the reset */
+                            s->audio_in_head = s->audio_in_tail =
+                                s->audio_in_count = 0;
+                        }
                         sgi_mace_audio_irq_update(s);
                         return;
                     }
