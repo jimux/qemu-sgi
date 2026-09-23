@@ -806,6 +806,21 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     return 0x00400000; /* SIO_CR_ARB_DIAG_IDLE */
   }
   /*
+   * IOC3 SuperIO interrupt registers (sys/PCI/ioc3.h: SIO_IR 0x01c, IES 0x020,
+   * IEC 0x024).  We drain the serial TX synchronously, so SIO_IR reports
+   * SA_TX_MT (TX empty) at all times -- ioc3_wrflush() spins on that bit and
+   * the console output path stalls without it.  IES/IEC are a set/clear pair
+   * over ONE enable register and BOTH offsets read back the current mask; the
+   * driver reads the enable at 0x20, so storing only the written offset leaves
+   * it stale and the interrupt dispatcher retries forever.
+   */
+  if (off == 0x20001c) {
+    return 0x00000001u; /* SIO_IR_SA_TX_MT */
+  }
+  if (off == 0x200020 || off == 0x200024) {
+    return s->sio_ienb;
+  }
+  /*
    * IOC3 GenericPIO block: GPCR (control; set at +0x34, clear at +0x38) and
    * GPDR (data, +0x3c).  The PROM drives a PHY reset through GPCR; serve the
    * latched control/data.
@@ -991,6 +1006,19 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   }
   /* IOC3 SuperIO control/data registers (SIO_CR 0x200028, +0x2c): accepted. */
   if (off == SGI_BASEIO_IOC3_SIO_CR || off == 0x20002c) {
+    return;
+  }
+  /*
+   * IOC3 SuperIO interrupt-enable set/clear pair (ioc3.h: IES 0x020 sets,
+   * IEC 0x024 clears the bits of one register).  Both offsets read back the
+   * same mask (handled in the read path).
+   */
+  if (off == 0x200020) {
+    s->sio_ienb |= val;
+    return;
+  }
+  if (off == 0x200024) {
+    s->sio_ienb &= ~val;
     return;
   }
   /* IOC3 GenericPIO block: GPCR set (+0x34) / clear (+0x38), GPDR (+0x3c). */

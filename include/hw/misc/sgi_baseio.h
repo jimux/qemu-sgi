@@ -171,6 +171,11 @@ struct SGIBaseIOState {
    */
   uint32_t wid_id;
 
+  /* IOC3 SuperIO interrupt-enable register (IES 0x20 sets, IEC 0x24 clears,
+   * both read back this mask).  SIO_IR (0x1c) reports TX-empty (we drain
+   * synchronously).  See io/sio_ioc3.c and sys/PCI/ioc3.h. */
+  uint32_t sio_ienb;
+
   /* Bridge free-running counter/timer (offset 0x100): bit0 = enable. */
   uint32_t timer_en;
 
