@@ -663,6 +663,16 @@ static void ql_do_mbox_cmd(SGIQLispState *s)
     }
 
     ql_mbox_put(s, 0, sts);
+    /*
+     * The RISC raises its host interrupt when a mailbox reply is ready, the
+     * same as for a command completion.  The driver needs it: ql_mbox_cmd()
+     * blocks in psema(mbox_done_sema) and only its interrupt handler
+     * (ql_service_mbox_interrupt) runs the matching vsema, so without the
+     * interrupt a mailbox command issued outside the ISR never completes.
+     */
+    ql_reg_put(s, QL_BUS_ISR,
+               ql_reg_get(s, QL_BUS_ISR) | BUS_ISR_RISC_INT);
+    qlisp_update_irq(s);
     {
         static unsigned long dbg_cnt;
         qemu_log_mask(LOG_UNIMP,
