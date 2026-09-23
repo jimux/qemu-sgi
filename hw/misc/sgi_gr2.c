@@ -538,74 +538,61 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
     sgi_gr2_update_display(s);
 }
 
-/* Draw the name-label glyphs (expDrawMonoImage).  Token 349 is written TWICE
- * per glyph with the pen x; each is followed by a piece header (f0,f1,h) and
- * the piece's bitmap.  A piece is h rows tall and SIXTEEN pixels wide, packed
- * TWO rows per 32-bit word: row 2k is the high half (bits 31-16), row 2k+1 the
- * low half (bits 15-0), bit 15 the leftmost pixel.  The word count is
- * ceil(h/2), so an odd h keeps its last row in the high half — the old code
- * assumed h even and a 8-px row and dropped half the data, which is why the
- * horizontal strokes went missing (e reads as c, t loses its bar).  A glyph is
- * its two pieces STACKED from its top row; drawing them at the same x is what
- * makes the letters readable.  Set bits take the current colour.  The text y is
- * not on the wire - the DDX bakes the origin in - so it comes from the label bar
- * (colour 222) drawn just before the glyphs; without one the op is flagged, not
- * placed by guesswork. */
+/* Draw the text glyphs (expDrawMonoImage).  Token 349 is the pen x; it is
+ * followed by a piece header (f0, f1, h) and the piece's bitmap.  The first
+ * header word f0 is the piece's DESTINATION Y - verified by placing every glyph
+ * run at y=f0: "Login name:", the four account names, and the "Log in"/"Help"
+ * buttons all land correctly, and the second piece of a glyph carries f0+8, one
+ * piece-height lower, so no separate stacking rule is needed.  (The old code
+ * used a y latched from a colour-222 bar, which only existed for the account
+ * names, so the static labels were dropped.)
+ *
+ * A piece is h rows tall and SIXTEEN pixels wide, packed TWO rows per 32-bit
+ * word: row 2k is the high half (bits 31-16), row 2k+1 the low half (bits 15-0),
+ * bit 15 the leftmost pixel.  The word count is ceil(h/2), so an odd h keeps its
+ * last row in the high half.  Set bits take the current colour. */
 static void sgi_gr2_re3_draw_text(SGIGr2State *s)
 {
     unsigned p;
     bool any = false;
 
-    if (!s->re3_label_valid) {
-        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
-        return;
-    }
-    for (p = 0; p < s->re3_npens; ) {
+    for (p = 0; p < s->re3_npens; p++) {
+        unsigned off = s->re3_pen_off[p];
         uint32_t pen = s->re3_pen_val[p];
-        int y = s->re3_label_y + 3;
-        unsigned npieces = (p + 1 < s->re3_npens) ? 2 : 1;
-        unsigned half;
+        uint32_t f0, h, k, nwords;
 
-        for (half = 0; half < npieces; half++) {
-            unsigned off = s->re3_pen_off[p + half];
-            uint32_t f0, f1, h, k, nwords;
+        if (off + 3 > s->re3_data_n) {
+            continue;
+        }
+        f0 = s->re3_data[off];       /* destination y */
+        h = s->re3_data[off + 2];
+        nwords = (h + 1) / 2;
+        if (f0 >= SGI_GR2_SCREEN_H || pen >= SGI_GR2_SCREEN_W ||
+            h < 1 || h > 64 ||
+            off + 3 + nwords > s->re3_data_n) {
+            continue;
+        }
+        for (k = 0; k < nwords; k++) {
+            uint32_t w = s->re3_data[off + 3 + k];
+            int r0 = (int)f0 + 2 * (int)k;
+            int b;
 
-            if (off + 3 > s->re3_data_n) {
-                continue;
-            }
-            f0 = s->re3_data[off];
-            f1 = s->re3_data[off + 1];
-            h = s->re3_data[off + 2];
-            nwords = (h + 1) / 2;
-            if (f0 >= SGI_GR2_SCREEN_W || f1 >= SGI_GR2_SCREEN_H ||
-                h < 1 || h > 64 ||
-                off + 3 + nwords > s->re3_data_n) {
-                continue;
-            }
-            for (k = 0; k < nwords; k++) {
-                uint32_t w = s->re3_data[off + 3 + k];
-                int r0 = y + 2 * (int)k;
-                int b;
+            for (b = 0; b < 16; b++) {
+                int xx = (int)pen + b;
 
-                for (b = 0; b < 16; b++) {
-                    int xx = (int)pen + b;
-
-                    if (xx >= SGI_GR2_SCREEN_W) {
-                        break;
-                    }
-                    if (r0 < SGI_GR2_SCREEN_H && ((w >> (31 - b)) & 1)) {
-                        sgi_gr2_put(s, xx, r0, s->re3_colour);
-                    }
-                    if (2 * k + 1 < h && r0 + 1 < SGI_GR2_SCREEN_H &&
-                        ((w >> (15 - b)) & 1)) {
-                        sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
-                    }
+                if (xx >= SGI_GR2_SCREEN_W) {
+                    break;
+                }
+                if (r0 < SGI_GR2_SCREEN_H && ((w >> (31 - b)) & 1)) {
+                    sgi_gr2_put(s, xx, r0, s->re3_colour);
+                }
+                if (2 * k + 1 < h && r0 + 1 < SGI_GR2_SCREEN_H &&
+                    ((w >> (15 - b)) & 1)) {
+                    sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
                 }
             }
-            y += (int)h;
-            any = true;
         }
-        p += npieces;
+        any = true;
     }
     if (!any) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
