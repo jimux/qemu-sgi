@@ -486,6 +486,38 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
                       b, bpp, true);
 }
 
+/*
+ * @@SEMANTICS@@ — an MTE fill's per-byte write-enable is MTE.byteMask, NOT
+ * DrawMode.enColorByteMask.  The two are separate registers and the MTE
+ * engine has no DrawMode; routing an MTE fill's store through
+ * sgi_crime_re_put_pixel() made it apply whatever DrawMode.enColorByteMask
+ * happened to hold, which is the pixel-pipe's mask.
+ *
+ * Observed live (fm dirview canvas): the DDX paints the background with a
+ * stippled MTE CLEAR at fg=0x729c9c00 (scheme AlternateBackground4) while
+ * DrawMode.enColorByteMask is 0x1 / 0x3, so put_pixel wrote only bytes 0/1
+ * of the ABGR word (A, B) and dropped R and G — the canvas scanned out as
+ * B-only blue (0,0,191) instead of teal (159,191,191 after gamma).  The
+ * MTE's own byteMask was 0xeeeeeeee (every byte lane enabled), i.e. the
+ * guest asked for all four bytes.  Derive the nibble from MTE.byteMask
+ * (per-byte enable: a nonzero byte lane writes) and impose it for the fill.
+ */
+static void sgi_crime_re_put_pixel_mte(SGICRIMEREState *s, uint32_t bufmode,
+                                       int x, int y, uint32_t color)
+{
+    uint32_t saved = s->drawmode;
+    uint32_t nib = 0;
+
+    for (int k = 0; k < 4; k++) {
+        if ((s->mte_bytemask >> (8 * k)) & 0xff) {
+            nib |= (1u << k);
+        }
+    }
+    s->drawmode = (saved & ~DM_ENCOLORBYTEMASK) | ((nib & 0xf) << 3);
+    sgi_crime_re_put_pixel(s, bufmode, x, y, color);
+    s->drawmode = saved;
+}
+
 /* ------------------------------------------------------------------ */
 /* Clip / scissor test                                                  */
 /* ------------------------------------------------------------------ */
@@ -1340,7 +1372,7 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
                     !((mask >> (31 - (bit & 31))) & 1)) {
                     continue;
                 }
-                sgi_crime_re_put_pixel(s, bufmode, x, y, fg);
+                sgi_crime_re_put_pixel_mte(s, bufmode, x, y, fg);
             }
         }
         return;
