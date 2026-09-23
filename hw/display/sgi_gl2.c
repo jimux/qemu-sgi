@@ -138,7 +138,13 @@ struct SGIGL2State {
      */
     MemoryRegion ge;
     uint16_t ge_cmd;
-    uint16_t ge_args[64];
+    /*
+     * Operand buffer.  A passthru header's count field is 7 bits, so a packet
+     * carries at most 128 words; FBCloadmasks sends up to 121 (font RAM) and
+     * FBCdrawchars up to 121 (glyph descriptors), so the buffer must hold the
+     * whole packet or the tail is silently dropped.
+     */
+    uint16_t ge_args[160];
     unsigned ge_nargs;            /* operands collected for the current cmd */
     unsigned ge_need;             /* operands the current cmd still wants */
     bool ge_in_cmd;
@@ -535,7 +541,8 @@ static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
     int hit = 0;
 
     for (gy = 0; gy < h; gy++) {
-        uint16_t wd = s->font[(s->font_base + offset + gy) % GL2_FONT_WORDS];
+        uint16_t wd = s->font[(s->font_base + offset + gy)
+                              % GL2_FONT_WORDS];
 
         for (gx = 0; gx < 8; gx++) {
             int px, py;
