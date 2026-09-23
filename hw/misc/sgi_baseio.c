@@ -745,6 +745,57 @@ static void sgi_baseio_tod_write(SGIBaseIOState *s, hwaddr off, uint64_t val) {
   s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
+/*
+ * IOC3 serial DMA TX ring -- the kernel console data path.  io/sio_ioc3.c
+ * do_ioc3_write() packs console bytes into a ring of 8-byte entries (4 data
+ * bytes + 4 status/control, IOC3_TXCB_VALID in the SC byte), then stores the
+ * new producer in STPIR.  The kernel's console output BLOCKS until the
+ * hardware consumes the entries, advances STCIR and reports TX-empty
+ * (SIO_IR_SA_TX_MT) -- so without this model the first kernel printf after the
+ * console switches to interrupt-driven output stalls (observed: everything
+ * stops right after "Setting rbaud to 19200").  We drain synchronously: walk
+ * STCIR up to STPIR, emit each valid data byte on the console chardev, and the
+ * read path keeps SIO_IR reporting SA_TX_MT.  Ported from octane's sgi_bridge
+ * (84b3de6551) at the IP27 IOC3 offsets (IOC3 base 0x200000; A STPIR 0xbc /
+ * STCIR 0xc0, B 0xd8/0xdc, SBBR 0xb0/0xb4).
+ */
+#define SGI_BASEIO_SIO_RING_MASK 0x0ff8u
+#define SGI_BASEIO_TXCB_VALID 0x40
+static void sgi_baseio_sio_tx_drain(SGIBaseIOState *s, int port) {
+  uint64_t base = ((uint64_t)s->sbbr_h << 32) | (s->sbbr_l & ~1u);
+  uint32_t prod = s->stpir[port] & SGI_BASEIO_SIO_RING_MASK;
+  uint32_t cons = s->stcir[port] & SGI_BASEIO_SIO_RING_MASK;
+  int guard;
+
+  /* IP27: hardware_init() programs sbbr_l with the system physical address in
+   * the low word; a nonzero top word is a DMA alias we drop (cf. sgi_qlisp). */
+  base &= 0xffffffffULL;
+  if (!base) {
+    return; /* ring not configured yet: do not read phys 0 */
+  }
+  if (port) {
+    base += 8192; /* TX_B is the third 4K ring */
+  }
+  for (guard = 0; cons != prod && guard < 4096; guard++) {
+    uint8_t entry[8];
+    int x;
+
+    if (dma_memory_read(&address_space_memory, base + cons, entry,
+                        sizeof(entry), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+      break;
+    }
+    for (x = 0; x < 4; x++) {
+      if (entry[4 + x] & SGI_BASEIO_TXCB_VALID) {
+        uint8_t b = entry[x];
+
+        qemu_chr_fe_write_all(&s->ioc3_uart.chr, &b, 1);
+      }
+    }
+    cons = (cons + sizeof(entry)) & SGI_BASEIO_SIO_RING_MASK;
+  }
+  s->stcir[port] = cons;
+}
+
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
 
@@ -819,6 +870,25 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   }
   if (off == 0x200020 || off == 0x200024) {
     return s->sio_ienb;
+  }
+  /* IOC3 serial DMA ring base (SBBR) and per-port producer/consumer. */
+  if (off == 0x2000b0) {
+    return s->sbbr_h;
+  }
+  if (off == 0x2000b4) {
+    return s->sbbr_l;
+  }
+  if (off == 0x2000bc) {
+    return s->stpir[0];
+  }
+  if (off == 0x2000c0) {
+    return s->stcir[0];
+  }
+  if (off == 0x2000d8) {
+    return s->stpir[1];
+  }
+  if (off == 0x2000dc) {
+    return s->stcir[1];
   }
   /*
    * IOC3 GenericPIO block: GPCR (control; set at +0x34, clear at +0x38) and
@@ -1019,6 +1089,22 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   }
   if (off == 0x200024) {
     s->sio_ienb &= ~val;
+    return;
+  }
+  /* IOC3 serial DMA ring: latch the base (SBBR) and drain on a STPIR write. */
+  if (off == 0x2000b0) {
+    s->sbbr_h = val;
+    return;
+  }
+  if (off == 0x2000b4) {
+    s->sbbr_l = val;
+    return;
+  }
+  if (off == 0x2000bc || off == 0x2000d8) {
+    int port = (off == 0x2000d8);
+
+    s->stpir[port] = val;
+    sgi_baseio_sio_tx_drain(s, port);
     return;
   }
   /* IOC3 GenericPIO block: GPCR set (+0x34) / clear (+0x38), GPDR (+0x3c). */

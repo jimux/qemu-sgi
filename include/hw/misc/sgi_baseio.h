@@ -171,6 +171,14 @@ struct SGIBaseIOState {
    */
   uint32_t wid_id;
 
+  /* IOC3 serial DMA ring (the kernel console data path, io/sio_ioc3.c): ring
+   * base (SBBR_H/L) and per-port producer/consumer (STPIR/STCIR).  We drain the
+   * TX ring synchronously and emit the bytes on the console chardev. */
+  uint32_t sbbr_h;
+  uint32_t sbbr_l;
+  uint32_t stpir[2];
+  uint32_t stcir[2];
+
   /* IOC3 SuperIO interrupt-enable register (IES 0x20 sets, IEC 0x24 clears,
    * both read back this mask).  SIO_IR (0x1c) reports TX-empty (we drain
    * synchronously).  See io/sio_ioc3.c and sys/PCI/ioc3.h. */
