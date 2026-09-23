@@ -101,6 +101,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
                                      /* a window move (note 79)            */
 #define SGI_GR2_GE7_MAX_VERTS 64     /* vertices buffered per polygon     */
 
+/* Line and triangle-mesh primitives, from the libgl disassembly: gl_i_bgnline
+ * writes 380 and 1110, gl_i_endline writes 87, gl_i_bgntmesh writes 70 and
+ * 1095, gl_i_endtmesh writes 74, gl_i_zclear writes 159.  The line vertex is
+ * gl_v2f/gl_v2i (token 4707) carrying two coordinates; the mesh vertex is the
+ * ordinary position token 2659, with no normals in the stream. */
+#define SGI_GR2_GE7_BGNLINE    0x405f0 /* token 380                        */
+#define SGI_GR2_GE7_BGNLINE_B  0x41158 /* token 1110                       */
+#define SGI_GR2_GE7_ENDLINE    0x4015c /* token 87                         */
+#define SGI_GR2_GE7_V2F        0x4498c /* token 4707, two coordinates      */
+#define SGI_GR2_GE7_BGNTMESH   0x40118 /* token 70                         */
+#define SGI_GR2_GE7_BGNTMESH_B 0x4111c /* token 1095                       */
+#define SGI_GR2_GE7_ENDTMESH   0x40128 /* token 74                         */
+#define SGI_GR2_GE7_ZCLEAR     0x4027c /* token 159                        */
+#define SGI_GR2_GE7_MAX_LVERTS 256    /* line vertices buffered            */
+
 /* Phong material/light state, one float per token write (the client repeats
  * the token for each component).  See note 75: 117 ambient_sum, 118/119
  * emission, 120/121 ambient, 122/123 diffuse (+alpha), 124/125 specular,
@@ -458,6 +473,11 @@ struct SGIGr2State {
     float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
     float ge_vnormal[SGI_GR2_GE7_MAX_VERTS][3]; /* its per-vertex normals     */
     unsigned ge_poly_n;
+    bool ge_strip;                 /* current run is a triangle mesh (strip)  */
+    float ge_line[SGI_GR2_GE7_MAX_LVERTS][2]; /* buffered line vertices      */
+    unsigned ge_line_n;
+    float ge_line_pending[2];      /* line vertex coordinates collected       */
+    unsigned ge_line_pn;
     float ge_normal[3];            /* current vertex normal                  */
     float ge_nx, ge_ny, ge_nz;     /* normal words collected                 */
     float ge_vx, ge_vy, ge_vz;     /* vertex words collected                 */

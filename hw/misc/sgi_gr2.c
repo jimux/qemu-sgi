@@ -1009,6 +1009,44 @@ static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
 /* Rasterise the buffered polygon (a triangle fan) into `scanout`, Z-buffered.
  * The viewport maps NDC to pixels; if the guest has not yet sent one, fall
  * back to the whole screen. */
+/* Evaluate the guest's Phong model for one eye-space normal and return the
+ * intensity (0..1).  Shared by the triangle and line rasterisers. */
+static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
+                               float lx, float ly, float lz,
+                               float hx, float hy, float hz, float shininess)
+{
+    float nn[3], ndl, ndh, col[3];
+    float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    int c;
+
+    if (nl > 1e-9f) {
+        nn[0] = n[0] / nl;
+        nn[1] = n[1] / nl;
+        nn[2] = n[2] / nl;
+    } else {
+        nn[0] = 0.0f;
+        nn[1] = 0.0f;
+        nn[2] = 1.0f;
+    }
+    /* Two-sided, as for the triangles: a normal facing away is flipped. */
+    if (nn[2] < 0.0f) {
+        nn[0] = -nn[0];
+        nn[1] = -nn[1];
+        nn[2] = -nn[2];
+    }
+    ndl = MAX(nn[0] * lx + nn[1] * ly + nn[2] * lz, 0.0f);
+    ndh = MAX(nn[0] * hx + nn[1] * hy + nn[2] * hz, 0.0f);
+    for (c = 0; c < 3; c++) {
+        col[c] = s->ge_emission[c] +
+                 s->ge_ambient[c] * s->ge_ambient_sum[c] +
+                 s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
+                                    s->ge_specular[c] * powf(ndh, shininess));
+        col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
+    }
+    return MIN(MAX(0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2],
+                   0.0f), 1.0f);
+}
+
 static void sgi_gr2_ge7_draw(SGIGr2State *s)
 {
     float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
@@ -1080,7 +1118,6 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     for (i = 0; i < s->ge_poly_n; i++) {
         float cx, cy, cz;
         float px, py;
-        float een[3], nn[3], col[3], inten;
         int c;
 
         if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz)) {
@@ -1092,55 +1129,24 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         sy[i] = py;
         sz[i] = cz;
         /* Rotate this vertex's own normal into eye space (the object-space
-         * normal was captured with the vertex, not shared per polygon). */
-        for (c = 0; c < 3; c++) {
-            een[c] = s->ge_mv[c * 4 + 0] * s->ge_vnormal[i][0] +
-                     s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
-                     s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
-        }
+         * normal was captured with the vertex, not shared per polygon), then
+         * shade it with the guest's material and light. */
         {
-            float nl = sqrtf(een[0] * een[0] + een[1] * een[1] +
-                             een[2] * een[2]);
-            float ndl, ndh;
+            float een[3];
 
-            if (nl > 1e-9f) {
-                nn[0] = een[0] / nl;
-                nn[1] = een[1] / nl;
-                nn[2] = een[2] / nl;
-            } else {
-                nn[0] = 0.0f;
-                nn[1] = 0.0f;
-                nn[2] = 1.0f;
-            }
-            /* Two-sided: the guest sends front and back material (tokens
-             * 120/122/124 and 121/123/125), so a normal facing away from the
-             * eye is flipped rather than left unlit. */
-            if (nn[2] < 0.0f) {
-                nn[0] = -nn[0];
-                nn[1] = -nn[1];
-                nn[2] = -nn[2];
-            }
-            ndl = nn[0] * lx + nn[1] * ly + nn[2] * lz;
-            ndl = MAX(ndl, 0.0f);
-            ndh = nn[0] * hx + nn[1] * hy + nn[2] * hz;
-            ndh = MAX(ndh, 0.0f);
-            /* Phong: emission + ambient_sum*ambient + lcolor*(diffuse*N.L +
-             * specular*(N.H)^s).  All terms are the guest's values. */
             for (c = 0; c < 3; c++) {
-                col[c] = s->ge_emission[c] +
-                         s->ge_ambient[c] * s->ge_ambient_sum[c] +
-                         s->ge_lcolor[c] *
-                             (s->ge_diffuse[c] * ndl +
-                              s->ge_specular[c] * powf(ndh, shininess));
-                col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
+                een[c] = s->ge_mv[c * 4 + 0] * s->ge_vnormal[i][0] +
+                         s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
+                         s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
             }
-            inten = 0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2];
-            iv[i] = MIN(MAX(inten, 0.0f), 1.0f);
+            iv[i] = sgi_gr2_ge7_inten(s, een, lx, ly, lz, hx, hy, hz,
+                                      shininess);
         }
     }
     sgi_gr2_ge7_greylut(s, lut);
     for (i = 1; i + 1 < s->ge_poly_n; i++) {
-        float ax = sx[0], ay = sy[0], az = sz[0], i0 = iv[0];
+        unsigned ia = s->ge_strip ? i - 1 : 0; /* fan apex, or strip prev-2 */
+        float ax = sx[ia], ay = sy[ia], az = sz[ia], i0 = iv[ia];
         float bx = sx[i], by = sy[i], bz = sz[i], i1 = iv[i];
         float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1], i2 = iv[i + 1];
         int64_t fx0, fy0, fx1, fy1, fx2, fy2;
@@ -1247,6 +1253,107 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
             }
         }
         s->ge_polys++;
+    }
+    s->ge_3d_seen = true;
+}
+
+/* Draw the buffered line vertices (BGNLINE 380/1110 .. ENDLINE 87).  Each
+ * vertex is a gl_v2f pair; it is promoted to 3D with z=0 and carried through
+ * the same projection*modelview and viewport as the triangles, then the
+ * segment is plotted.  Intensity comes from the same material/light state. */
+static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
+{
+    int vx, vy, vw, vh;
+    uint8_t pl[32];
+    float lx, ly, lz, hx, hy, hz;
+    float nx[3] = { 0.0f, 0.0f, 1.0f };
+    float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
+    float pz[SGI_GR2_GE7_MAX_LVERTS];
+    unsigned i;
+    const float shininess = 8.0f;
+    int idx;
+
+    if (s->ge_line_n < 2 || !s->scanout || !s->ge_zbuf) {
+        return;
+    }
+    if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
+        vx = s->vp_x; vy = s->vp_y; vw = s->vp_w; vh = s->vp_h;
+    } else {
+        vx = 0; vy = 0; vw = SGI_GR2_SCREEN_W; vh = SGI_GR2_SCREEN_H;
+    }
+    vx += s->ge_win_x;
+    vy += s->ge_win_y;
+    {
+        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
+                   s->ge_lpos[1] * s->ge_lpos[1] +
+                   s->ge_lpos[2] * s->ge_lpos[2];
+
+        if (s->ge_mat_valid && ll > 1e-6f) {
+            ll = sqrtf(ll);
+            lx = s->ge_lpos[0] / ll;
+            ly = s->ge_lpos[1] / ll;
+            lz = s->ge_lpos[2] / ll;
+        } else {
+            lx = 0.0f; ly = 0.0f; lz = 1.0f;
+        }
+        hx = lx; hy = ly; hz = lz + 1.0f;
+        ll = sqrtf(hx * hx + hy * hy + hz * hz);
+        if (ll > 1e-6f) {
+            hx /= ll; hy /= ll; hz /= ll;
+        }
+    }
+    sgi_gr2_ge7_greylut(s, pl);
+    idx = pl[MIN(MAX((int)(sgi_gr2_ge7_inten(s, nx, lx, ly, lz, hx, hy, hz,
+                                             shininess) * 31.0f + 0.5f),
+                     0), 31)];
+    for (i = 0; i < s->ge_line_n; i++) {
+        float p[3];
+        float cx, cy, cz;
+
+        p[0] = s->ge_line[i][0];
+        p[1] = s->ge_line[i][1];
+        p[2] = 0.0f;
+        if (!sgi_gr2_ge7_xform(s, p, &cx, &cy, &cz)) {
+            px[i] = -1e9f;
+            continue;
+        }
+        px[i] = vx + (cx + 1.0f) * 0.5f * vw;
+        py[i] = vy + (1.0f - (cy + 1.0f) * 0.5f) * vh;
+        pz[i] = cz;
+    }
+    for (i = 1; i < s->ge_line_n; i++) {
+        float x0 = px[i - 1], y0 = py[i - 1], z0 = pz[i - 1];
+        float x1 = px[i], y1 = py[i], z1 = pz[i];
+        int steps, st;
+
+        if (x0 < -1e8f || x1 < -1e8f) {
+            continue;
+        }
+        steps = (int)MAX(fabsf(x1 - x0), fabsf(y1 - y0));
+        if (steps <= 0) {
+            continue;
+        }
+        if (steps > 4096) {
+            steps = 4096;
+        }
+        for (st = 0; st <= steps; st++) {
+            float t = (float)st / (float)steps;
+            int x = (int)(x0 + (x1 - x0) * t + 0.5f);
+            int y = (int)(y0 + (y1 - y0) * t + 0.5f);
+            float z = z0 + (z1 - z0) * t;
+            size_t o;
+
+            x = MAX(x, vx); y = MAX(y, vy);
+            if (x >= SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
+                x >= vx + vw || y >= vy + vh) {
+                continue;
+            }
+            o = (size_t)y * SGI_GR2_SCREEN_W + x;
+            if (z < s->ge_zbuf[o]) {
+                s->ge_zbuf[o] = z;
+                sgi_gr2_put(s, x, y, (uint8_t)idx);
+            }
+        }
     }
     s->ge_3d_seen = true;
 }
@@ -1412,11 +1519,50 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
     case SGI_GR2_GE7_BGN:
     case SGI_GR2_GE7_BGN_B:
         s->ge_poly_n = 0;
+        s->ge_strip = false;
         break;
     case SGI_GR2_GE7_END:
     case SGI_GR2_GE7_END_B:
         sgi_gr2_ge7_draw(s);
         s->ge_poly_n = 0;
+        s->ge_strip = false;
+        break;
+    case SGI_GR2_GE7_BGNLINE:
+    case SGI_GR2_GE7_BGNLINE_B:
+        s->ge_line_n = 0;
+        s->ge_line_pn = 0;
+        break;
+    case SGI_GR2_GE7_V2F:
+        /* gl_v2f/gl_v2i: two coordinates per vertex (token 4707). */
+        s->ge_line_pending[s->ge_line_pn++] = sgi_gr2_u2f(v);
+        if (s->ge_line_pn == 2) {
+            s->ge_line_pn = 0;
+            if (s->ge_line_n < SGI_GR2_GE7_MAX_LVERTS) {
+                s->ge_line[s->ge_line_n][0] = s->ge_line_pending[0];
+                s->ge_line[s->ge_line_n][1] = s->ge_line_pending[1];
+                s->ge_line_n++;
+            }
+        }
+        break;
+    case SGI_GR2_GE7_ENDLINE:
+        sgi_gr2_ge7_draw_lines(s);
+        s->ge_line_n = 0;
+        break;
+    case SGI_GR2_GE7_BGNTMESH:
+    case SGI_GR2_GE7_BGNTMESH_B:
+        s->ge_poly_n = 0;
+        s->ge_strip = true;
+        break;
+    case SGI_GR2_GE7_ENDTMESH:
+        sgi_gr2_ge7_draw(s);
+        s->ge_poly_n = 0;
+        s->ge_strip = false;
+        break;
+    case SGI_GR2_GE7_ZCLEAR:
+        if (s->ge_zbuf) {
+            memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+                   SGI_GR2_SCREEN_H * sizeof(float));
+        }
         break;
     default:
         break;
