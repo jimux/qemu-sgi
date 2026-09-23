@@ -924,19 +924,6 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
     int ref_idx = ref_v0 ? 0 : 2;
     int64_t refx = vx[ref_idx] >> 6, refy = vy[ref_idx] >> 6;
     int zfail_n = 0, zpass_n = 0;
-    /*
-     * The Shade planes are absolute in DESTINATION-BUFFER coordinates (the
-     * host folds the buffer origin into the R0/A coefficients), and the
-     * raster evaluates its edge functions in the primitive's own space —
-     * X pixels, or GL pixels against the +4096 origin.  Convert to the
-     * buffer coordinate before evaluating the planes: for GL that is
-     * px + WinOffset.dst, exactly the translation clip_pass() applies.
-     * Evaluating at the raw GL coordinate (px ~4096) drove the 9.12 planes
-     * far out of range, so whole models shaded to black.
-     */
-    int shx = (int16_t)(s->winoffset_dst >> 16);
-    int shy = (int16_t)(s->winoffset_dst & 0xffff);
-
     for (int py = miny; py < maxy; py++) {
         /* edge functions at the row start (pixel centers, 19.6 space) */
         int64_t ex[3];
@@ -951,25 +938,32 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                 uint32_t color = s->shade_fgcolor;
                 if (smooth) {
                     /*
-                     * Gouraud: shade planes are 9.12 fixed point with
-                     * origin at the buffer origin (the host computes
-                     * z0 + A*(Xs-x0) + B*(Ys-y0) already; the register
-                     * values ARE absolute: r0 etc. are "initial value"
-                     * at the stepper start). We evaluate the plane at
-                     * this pixel directly.
+                     * Gouraud: the shade planes are 9.12 two's-complement
+                     * (spec §7.3.7.1 Table 16) and, exactly like Depth.Zs,
+                     * are anchored at the FLOORED reference vertex:
+                     * __glCrmFillTriangle forms R0 = refc + dRdx*f20 +
+                     * dRdy*f22 with f20/f22 = floor(ref) - ref (the same
+                     * fractional offsets it uses for z0).  So the value at
+                     * pixel p is R0 + dRdx*(p - floor(ref)).  Evaluating
+                     * from a fixed origin instead (the old px + WinOffset.dst)
+                     * adds a per-triangle constant dRdx*(shx + floor(refx))
+                     * — tens of pixels' worth of gradient on this scene —
+                     * so the object's sub-pixel mesh shaded to a pastel
+                     * rainbow with saturated white patches.  refx/refy are
+                     * the same floored reference used by the depth plane.
                      */
                     int32_t r = (int32_t)s->shade_plane[0]
-                              + (int32_t)s->shade_plane[4] * (px + shx)
-                              + (int32_t)s->shade_plane[6] * (py + shy);
+                              + (int32_t)s->shade_plane[4] * (px - refx)
+                              + (int32_t)s->shade_plane[6] * (py - refy);
                     int32_t g = (int32_t)s->shade_plane[1]
-                              + (int32_t)s->shade_plane[5] * (px + shx)
-                              + (int32_t)s->shade_plane[7] * (py + shy);
+                              + (int32_t)s->shade_plane[5] * (px - refx)
+                              + (int32_t)s->shade_plane[7] * (py - refy);
                     int32_t b = (int32_t)s->shade_plane[2]
-                              + (int32_t)s->shade_plane[8] * (px + shx)
-                              + (int32_t)s->shade_plane[10] * (py + shy);
+                              + (int32_t)s->shade_plane[8] * (px - refx)
+                              + (int32_t)s->shade_plane[10] * (py - refy);
                     int32_t a = (int32_t)s->shade_plane[3]
-                              + (int32_t)s->shade_plane[9] * (px + shx)
-                              + (int32_t)s->shade_plane[11] * (py + shy);
+                              + (int32_t)s->shade_plane[9] * (px - refx)
+                              + (int32_t)s->shade_plane[11] * (py - refy);
                     color = ((uint32_t)crim_shade_clamp(r) << 24)
                           | ((uint32_t)crim_shade_clamp(g) << 16)
                           | ((uint32_t)crim_shade_clamp(b) << 8)
