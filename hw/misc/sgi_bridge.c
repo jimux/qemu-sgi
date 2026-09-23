@@ -1213,7 +1213,7 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
                 if (getenv("SGIBRIDGE_RXDBG") && s->dbg_rx_bytes > 0 &&
                     s->dbg_sir_reads <= 200) {
                     fprintf(stderr, "SIRRD#%llu val=%08x\n",
-                            (unsigned long long)s->dbg_sir_reads, val);
+                            (unsigned long long)s->dbg_sir_reads, (unsigned)val);
                 }
             }
         }
@@ -1284,6 +1284,21 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
     if (getenv("SGIBRIDGE_RXDBG") && offset >= 0x130 && offset < 0x170) {
         fprintf(stderr, "BINTADDR W [%06llx] = %08llx\n",
                 (unsigned long long)offset, (unsigned long long)val);
+    }
+    /*
+     * Broad register-write trace for the RX-interrupt retry loop: log every
+     * bridge/IOC3 register store once the first RX byte has arrived, so we can
+     * see where ioc3_write_ireg() actually lands (the dispatcher calls it on
+     * every retry, before vsema()).
+     */
+    if (getenv("SGIBRIDGE_RXDBG") && s->dbg_rx_bytes > 0) {
+        static unsigned regw;
+        if (regw < 240) {
+            regw++;
+            fprintf(stderr, "REGW#%u off=%06llx val=%08llx size=%u\n",
+                    regw, (unsigned long long)offset,
+                    (unsigned long long)val, size);
+        }
     }
     if (getenv("IOC3_SIO_DEBUG") && offset >= 0x600000 && offset < 0x600100) {
         fprintf(stderr, "IOC3SIO W [%06llx] = %08llx size=%u\n",
@@ -1381,8 +1396,8 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             if (getenv("SGIBRIDGE_RXDBG") && s->dbg_sir_writes <= 60) {
                 s->dbg_sir_writes++;
                 fprintf(stderr, "SIRWR#%llu val=%08x -> sir=%08x\n",
-                        (unsigned long long)s->dbg_sir_writes, val,
-                        s->ioc3_regs[IOC3_IDX(offset)]);
+                        (unsigned long long)s->dbg_sir_writes, (unsigned)val,
+                        (unsigned)s->ioc3_regs[IOC3_IDX(offset)]);
             }
             if (val & IOC3_SIO_IR_SA_RX_TIMER) {
                 s->dbg_rx_timer_acks++;
@@ -1391,20 +1406,34 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                      (s->dbg_rx_timer_acks & 0x3ff) == 0)) {
                     fprintf(stderr, "RXACK#%llu rx_timer val=%08x raises=%llu "
                             "bytes=%llu sir_reads=%llu\n",
-                            (unsigned long long)s->dbg_rx_timer_acks, val,
+                            (unsigned long long)s->dbg_rx_timer_acks, (unsigned)val,
                             (unsigned long long)s->dbg_irq_raises,
                             (unsigned long long)s->dbg_rx_bytes,
                             (unsigned long long)s->dbg_sir_reads);
                 }
             }
             sgi_bridge_ioc3_sio_irq_update(s);
-        } else if (offset == IOC3_SIO_IES_OFF) {
-            s->ioc3_sio_ienb |= val;    /* SuperIO interrupt enable set   */
-            s->ioc3_regs[IOC3_IDX(offset)] = s->ioc3_sio_ienb;
-            sgi_bridge_ioc3_sio_irq_update(s);
-        } else if (offset == IOC3_SIO_IEC_OFF) {
-            s->ioc3_sio_ienb &= ~val;   /* SuperIO interrupt enable clear */
-            s->ioc3_regs[IOC3_IDX(offset)] = s->ioc3_sio_ienb;
+        } else if (offset == IOC3_SIO_IES_OFF || offset == IOC3_SIO_IEC_OFF) {
+            /*
+             * IES and IEC are a set/clear pair over ONE interrupt-enable
+             * register: a write sets (IES) or clears (IEC) bits, and BOTH
+             * offsets read back the current mask (ioc3.h exposes the same
+             * offsets as the read-only sio_ies_ro/sio_iec_ro).
+             * The driver reads the enable via 0x20, so storing the result only
+             * at the written offset leaves the reader with a stale mask.
+             * That mattered: ioc3_intr() disables the SIO sources by writing
+             * sio_iec and then re-reads pending = sio_ir & enable@0x20 to
+             * decide whether to retry -- with the stale 0x20 the pending never
+             * cleared and the dispatcher spun until its semaphore overflowed
+             * (sema.c vsema assert).  Keep both in step.
+             */
+            if (offset == IOC3_SIO_IES_OFF) {
+                s->ioc3_sio_ienb |= val;    /* enable set   */
+            } else {
+                s->ioc3_sio_ienb &= ~val;   /* enable clear */
+            }
+            s->ioc3_regs[IOC3_IDX(IOC3_SIO_IES_OFF)] = s->ioc3_sio_ienb;
+            s->ioc3_regs[IOC3_IDX(IOC3_SIO_IEC_OFF)] = s->ioc3_sio_ienb;
             sgi_bridge_ioc3_sio_irq_update(s);
         } else if (offset == IOC3_PORT_A_STPIR_OFF ||
                    offset == IOC3_PORT_B_STPIR_OFF) {
