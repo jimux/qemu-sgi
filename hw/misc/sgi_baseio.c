@@ -1738,6 +1738,16 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
                                 &s->isp[0].regs);
     memory_region_add_subregion(&s->iomem, SGI_BASEIO_QLISP1_OFF,
                                 &s->isp[1].regs);
+    /*
+     * The kernel pcibr packs the ISP memory BAR into the 2 MB DevIO1 window at
+     * +0x100000, reaching channel 1 at 0x500000.  Expose the same register file
+     * there as an alias (a MemoryRegion can only have one parent).
+     */
+    memory_region_init_alias(&s->isp1_kern_alias_mr, OBJECT(s),
+                             "sgi-baseio-qlisp1-kern-alias",
+                             &s->isp[1].regs, 0, QLISP_REGS_SIZE);
+    memory_region_add_subregion(&s->iomem, SGI_BASEIO_QLISP1_KERN_OFF,
+                                &s->isp1_kern_alias_mr);
   }
   /* Each ISP channel asserts its bridge PCI-interrupt device line. */
   qdev_connect_gpio_out(DEVICE(&s->isp[0]), 0,

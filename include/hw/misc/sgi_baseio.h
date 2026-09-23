@@ -52,16 +52,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
 
 /*
  * BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 1 and 2).  Register
- * (DevIO) windows within the node IO widget (widget 8) window.  The IRIX kernel
- * pcibr maps each ISP memory BAR through a Bridge DevIO window at 1 MB
- * granularity (BRIDGE_DEV_OFF_ADDR_SHFT 20); with the 2 MB DevIO1 window it
- * packs both channels at offsets 0x400000 and 0x500000 (measured: the kernel's
- * ql_init drives channel 1 at widget+0x500000).  (An earlier model pinned
- * channel 1 at 0x600000 per the BAR value 0x08600000, but the BAR is the PCI
- * bus address, not the xio PIO window the CPU uses.)
+ * (DevIO) windows within the node IO widget (widget 8) window.
+ *
+ * Channel 1 is reachable at TWO xio offsets, because the PROM and the IRIX
+ * kernel program the Bridge DevIO windows differently (we do not model
+ * b_devio, so both mappings must be exposed):
+ *   0x600000 - the PROM diag/ARCS mapping (BAR 0x08600000);
+ *   0x500000 - the kernel pcibr packing, which puts the second 1 MB-aligned
+ *              ISP window inside the 2 MB DevIO1 window at +0x100000.
+ * Measured: PROM diag drives /slot/io1/ql at 0x600000; the kernel ql_init
+ * drives channel 1 at 0x500000.
  */
 #define SGI_BASEIO_QLISP0_OFF 0x400000ULL
-#define SGI_BASEIO_QLISP1_OFF 0x500000ULL
+#define SGI_BASEIO_QLISP1_OFF 0x600000ULL
+#define SGI_BASEIO_QLISP1_KERN_OFF 0x500000ULL
 
 /*
  * Bridge PCI-interrupt device lines the BaseIO devices wire to.
@@ -195,6 +199,10 @@ struct SGIBaseIOState {
 
   /* On-board QLogic ISP1020 SCSI channels (PCI slots 1,2); widget-8 only. */
   SGIQLispState isp[2];
+  /* Alias of channel 1's register file at the kernel's DevIO1 packing offset
+   * (0x500000); the PROM reaches the same channel at 0x600000.  See
+   * SGI_BASEIO_QLISP1_KERN_OFF. */
+  MemoryRegion isp1_kern_alias_mr;
 
   uint32_t nasid;
   uint32_t widget;
