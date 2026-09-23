@@ -619,7 +619,7 @@ static const MemoryRegionOps sgi_ip6_lio_ops = {
  */
 static void sgi_ip6_parity_update(SGIip6State *s)
 {
-    bool want = (s->cpucfg & (CPUCFG_BAD | CPUCFG_RPAR)) || s->parity_bad > 0;
+    bool want = (s->cpucfg & CPUCFG_BAD) || s->parity_bad > 0;
 
     if (want && !s->parity_mapped) {
         if (!s->parity) {
@@ -637,43 +637,71 @@ static void sgi_ip6_parity_update(SGIip6State *s)
     }
 }
 
-static uint64_t sgi_ip6_parity_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * Bad-parity bits live one per byte in a shadow map indexed by quad, the same
+ * layout MAME's ctl1 uses: quad = (addr >> 3), and within the quad the bit is
+ * (word << 2) | byte, i.e. ((addr >> 2) & 1) * 4 + (addr & 3).
+ */
+static inline unsigned sgi_ip6_parity_bit(hwaddr addr)
+{
+    return ((addr >> 2) & 1) * 4 + (addr & 3);
+}
+
+static MemTxResult sgi_ip6_parity_read(void *opaque, hwaddr addr,
+                                       uint64_t *data, unsigned size,
+                                       MemTxAttrs attrs)
 {
     SGIip6State *s = opaque;
     uint8_t tmp[8];
     uint64_t val = 0;
     unsigned i;
+    bool error = false;
 
     address_space_read(&s->parity_as, addr, MEMTXATTRS_UNSPECIFIED, tmp, size);
 
-    if (s->cpucfg & CPUCFG_RPAR) {
-        bool error = false;
-
+    if ((s->cpucfg & CPUCFG_RPAR) && s->parity) {
         for (i = 0; i < size; i++) {
-            unsigned hwaddr_i = addr + i;
-            unsigned bit = (addr & 4) * 4 + i;
-            unsigned idx = hwaddr_i >> 3;
+            hwaddr a = addr + i;
 
-            if (s->parity && (s->parity[idx] & (1 << bit))) {
-                s->parerr |= (PARERR_B0 >> i) | PARERR_CPU;
+            if (s->parity[a >> 3] & (1 << sgi_ip6_parity_bit(a))) {
+                /*
+                 * The PARERR byte bit follows the byte lane the access
+                 * touches, not the index within this transfer: MAME derives
+                 * it from the mem_mask lane, so a lone byte load at lane 1
+                 * sets PARERR_B1.  The PROM tests each lane separately and
+                 * checks parerr & 0xf0 against the expected lane bit.
+                 */
+                s->parerr |= (PARERR_B0 >> (a & 3)) | PARERR_CPU;
                 error = true;
             }
-        }
-        if (error) {
-            s->erradr = addr;
-            /* MAME asserts the CPU bus error; reading erradr clears it. */
-            qemu_set_irq(s->cpu->env.irq[5], 1);
         }
     }
 
     for (i = 0; i < size; i++) {
         val = (val << 8) | tmp[i];
     }
-    return val;
+    *data = val;
+
+    if (error) {
+        /*
+         * A parity error on a read is a synchronous bus error, exactly as
+         * MAME wires ctl1's cpuberr to the CPU's berr input.  Returning
+         * MEMTX_ERROR makes the load itself take a data bus error, which is
+         * what the PROM's parity test arms a handler for; raising an
+         * interrupt instead would let the load complete normally and the test
+         * would report failure.  MAME's erradr_r() drops the bus error line,
+         * which QEMU needs no equivalent for: the exception is delivered on
+         * the faulting access rather than latched.
+         */
+        s->erradr = addr;
+        return MEMTX_ERROR;
+    }
+    return MEMTX_OK;
 }
 
-static void sgi_ip6_parity_write(void *opaque, hwaddr addr, uint64_t data,
-                                 unsigned size)
+static MemTxResult sgi_ip6_parity_write(void *opaque, hwaddr addr,
+                                        uint64_t data, unsigned size,
+                                        MemTxAttrs attrs)
 {
     SGIip6State *s = opaque;
     uint8_t tmp[8];
@@ -683,8 +711,9 @@ static void sgi_ip6_parity_write(void *opaque, hwaddr addr, uint64_t data,
         tmp[i] = (data >> (8 * (size - 1 - i))) & 0xff;
 
         if (s->parity) {
-            unsigned bit = (addr & 4) * 4 + i;
-            unsigned idx = (addr + i) >> 3;
+            hwaddr a = addr + i;
+            unsigned bit = sgi_ip6_parity_bit(a);
+            unsigned idx = a >> 3;
 
             if (s->cpucfg & CPUCFG_BAD) {
                 if (!(s->parity[idx] & (1 << bit))) {
@@ -699,11 +728,17 @@ static void sgi_ip6_parity_write(void *opaque, hwaddr addr, uint64_t data,
     }
 
     address_space_write(&s->parity_as, addr, MEMTXATTRS_UNSPECIFIED, tmp, size);
+
+    /* MAME removes the tap once no bad-parity bits are left. */
+    if (s->parity_bad == 0) {
+        sgi_ip6_parity_update(s);
+    }
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps sgi_ip6_parity_ops = {
-    .read = sgi_ip6_parity_read,
-    .write = sgi_ip6_parity_write,
+    .read_with_attrs = sgi_ip6_parity_read,
+    .write_with_attrs = sgi_ip6_parity_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -720,7 +755,12 @@ static uint64_t sgi_ip6_err_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (off) {
     case 0x00:
-        /* Reading erradr clears the CPU bus-error interrupt. */
+        /*
+         * Reading erradr drops the bus-error line (MAME's erradr_r clears the
+         * ctl1 cpuberr latch, and the ip6 driver additionally deasserts IRQ5
+         * here).  A parity fault is now delivered as a synchronous data bus
+         * error, so only the legacy IRQ5 deassert remains.
+         */
         qemu_set_irq(s->cpu->env.irq[5], 0);
         return s->erradr;
     case 0x04:
@@ -766,12 +806,29 @@ static const MemoryRegionOps sgi_ip6_err_ops = {
 static uint64_t sgi_ip6_clrerr_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
+    unsigned i;
 
-    if ((addr & 7) == 4) {
-        return s->parerr;
+    if (addr >= 4) {
+        /*
+         * PARERR sits in byte lane 1 of the word at offset 4, i.e. at
+         * 0x1faa0005 (MAME maps it with umask32(0x00ff0000)), which is why
+         * the PROM reads it with a byte load at 0xbfaa0005.
+         */
+        uint32_t lane = (uint32_t)s->parerr << 16;
+        uint64_t v = 0;
+
+        for (i = 0; i < size; i++) {
+            unsigned lane_byte = (addr + i) & 3;
+
+            v = (v << 8) | ((lane >> (24 - 8 * lane_byte)) & 0xff);
+        }
+        return v;
     }
-    /* Writing/reading a clear register clears that parity source's flag. */
-    s->parerr &= ~(PARERR_BYTE | (1 << (addr & 7)));
+
+    /* Reading the clear register clears that parity source's flag. */
+    for (i = 0; i < size; i++) {
+        s->parerr &= ~(PARERR_BYTE | (1 << ((addr + i) & 7)));
+    }
     return 0;
 }
 
@@ -779,8 +836,15 @@ static void sgi_ip6_clrerr_write(void *opaque, hwaddr addr, uint64_t data,
                                  unsigned size)
 {
     SGIip6State *s = opaque;
+    unsigned i;
 
-    s->parerr &= ~(PARERR_BYTE | (1 << (addr & 7)));
+    /* PARERR is read-only; writes land only on the clear register. */
+    if (addr >= 4) {
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        s->parerr &= ~(PARERR_BYTE | (1 << ((addr + i) & 7)));
+    }
 }
 
 static const MemoryRegionOps sgi_ip6_clrerr_ops = {
