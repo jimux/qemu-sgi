@@ -18,7 +18,9 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/display/sgi_gl2.h"
 #include "ui/console.h"
@@ -96,6 +98,16 @@ struct SGIGL2State {
     QemuConsole *con;
 
     /*
+     * Vertical-retrace interrupt.  The BPC asserts it every field; the kernel
+     * fbc_intr() sees FBCflags NEWVERT_BIT_ clear, does its retrace work
+     * (which flushes the textport) and resets it through GEflags.  We pulse
+     * the line on the read that services it.
+     */
+    QEMUTimer *retrace_timer;
+    bool vert_pending;
+    bool prog_int_pending;
+
+    /*
      * Bitplane value per pixel.  The UC4 writes planes A/B (colourAB/wrtenAB)
      * and C/D (colourCD/wrtenCD); the DC4 looks the resulting plane code up
      * in the colormap.  Storing the code (not the physical planes) is
@@ -169,6 +181,8 @@ struct SGIGL2State {
     bool trace;
     bool dirty;
 };
+
+static void gl2_update_irq(SGIGL2State *s);
 
 /*
  * Write the planes selected by a 2-bit write-enable *we* with the matching
@@ -333,8 +347,27 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
         switch (off & ~0x3ff) {
         case R_FBC_PIXEL & ~0x3ff:
             return 0;
-        case R_FBC_FLAGS & ~0x3ff:
-            return 0;
+        case R_FBC_FLAGS & ~0x3ff: {
+            /*
+             * FBCflags: NEWVERT_BIT_ (0x80) and INTERRUPT_BIT_ (0x10) are
+             * low-active.  A pending vertical retrace reports NEWVERT clear;
+             * the read is what services it.  A pending programmed interrupt
+             * reports INTERRUPT clear and is dismissed with FBCclrint.
+             */
+            uint16_t v = 0;
+
+            if (!s->vert_pending) {
+                v |= 0x80;
+            }
+            if (!s->prog_int_pending) {
+                v |= 0x10;
+            }
+            if (s->vert_pending) {
+                s->vert_pending = false;
+                gl2_update_irq(s);
+            }
+            return v;
+        }
         case R_FBC_DATA & ~0x3ff: {
             unsigned low = (off & 0x3ff) >> 1;
             unsigned idx = s->micro_block * 512 + low;
@@ -396,7 +429,10 @@ static void gl2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         }
         switch (off & ~0x3ff) {
         case R_FBC_PIXEL & ~0x3ff:
-            break;              /* clear interrupt / misc */
+            /* FBCclrint: dismiss a programmed interrupt. */
+            s->prog_int_pending = false;
+            gl2_update_irq(s);
+            break;
         case R_FBC_FLAGS & ~0x3ff:
             s->fbc_flags = v;
             s->micro_access = (v == 0xfe || v == 0xff); /* WRITE/READMICRO */
@@ -677,6 +713,8 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         for (i = 0; i + 1 < nargs; i++) {
             if (args[i] == 0x000e) {
                 s->fbc_out = 10;        /* _INTPIXEL32 */
+                s->prog_int_pending = true;
+                gl2_update_irq(s);
                 break;
             }
         }
@@ -951,6 +989,27 @@ static void gl2_test_pattern(SGIGL2State *s)
     }
 }
 
+/* Raise the FBC/GF interrupt line while a retrace or programmed interrupt is
+ * pending. */
+static void gl2_update_irq(SGIGL2State *s)
+{
+    qemu_set_irq(s->irq, s->vert_pending || s->prog_int_pending);
+}
+
+/* One vertical-retrace interval (~60 Hz), host-timed on the virtual clock. */
+static void gl2_retrace_timer(void *opaque)
+{
+    SGIGL2State *s = opaque;
+
+    s->vert_pending = true;
+    gl2_update_irq(s);
+    if (s->retrace_timer) {
+        timer_mod(s->retrace_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                  + NANOSECONDS_PER_SECOND / 60);
+    }
+}
+
 static void gl2_reset(DeviceState *dev)
 {
     SGIGL2State *s = SGI_GL2(dev);
@@ -981,6 +1040,13 @@ static void gl2_reset(DeviceState *dev)
     s->font_base = 0;
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
+    s->vert_pending = false;
+    s->prog_int_pending = false;
+    if (s->retrace_timer) {
+        timer_mod(s->retrace_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                  + NANOSECONDS_PER_SECOND / 60);
+    }
     if (s->fb) {
         memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
     }
@@ -1006,6 +1072,7 @@ static void gl2_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
+    s->retrace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gl2_retrace_timer, s);
     memory_region_init_io(&s->mmio, obj, &gl2_ops, s, "sgi-gl2",
                           GL2_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);

@@ -36,7 +36,7 @@ struct IRIS3130MachineState {
     MachineState parent;
 
     M68kCPU cpu;
-    bool irq_pending[4];
+    bool irq_pending[5];
 };
 
 static void iris3130_cpu_reset(void *opaque)
@@ -68,6 +68,7 @@ static const struct {
     { 5, 0x45 },        /* 2190 disk completion -> multibus 5 (69)    */
     { 6, 0x50 },        /* DUART0 -> uart0 (80)                       */
     { 6, 0x51 },        /* DUART1 -> uart1 (81)                       */
+    { 3, 0x43 },        /* GF2 FBC retrace -> multibus 3 (67)         */
 };
 
 static void iris3130_ip2_irq(void *opaque, int n, int level)
@@ -175,6 +176,13 @@ static void iris3130_init(MachineState *machine)
         memory_region_add_subregion_overlap(sgi_ip2_mbio_region(board),
                                             0x2000,
                                             sgi_gl2_mmio_region(gl2), 1);
+        /*
+         * The GF2 FBC vertical-retrace interrupt is Multibus level 3, which
+         * the IP2 vector ROM maps to vector 0x43 -> Xmbintr3 -> ivectors[3]
+         * = fbc_intr (sys/ipII/evec.h, sys/ipII/locore.c, autoconf.c).  It is
+         * NOT the disk's level 5 / 0x45.
+         */
+        sysbus_connect_irq(SYS_BUS_DEVICE(gl2), 0, irq[4]);
         /* The GF2 Geometry Engine command pipe (GEPORT/GETOKEN). */
         memory_region_add_subregion_overlap(get_system_memory(), 0x60000000,
                                             sgi_gl2_ge_region(gl2), 1);
