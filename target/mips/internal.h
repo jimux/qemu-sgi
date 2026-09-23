@@ -308,14 +308,30 @@ static inline void compute_hflags(CPUMIPSState *env)
                      MIPS_HFLAG_AWRAP | MIPS_HFLAG_DSP | MIPS_HFLAG_DSP_R2 |
                      MIPS_HFLAG_DSP_R3 | MIPS_HFLAG_SBRI | MIPS_HFLAG_MSA |
                      MIPS_HFLAG_FRE | MIPS_HFLAG_ELPA | MIPS_HFLAG_ERL);
-    if (env->CP0_Status & (1 << CP0St_ERL)) {
-        env->hflags |= MIPS_HFLAG_ERL;
-    }
-    if (!(env->CP0_Status & (1 << CP0St_EXL)) &&
-        !(env->CP0_Status & (1 << CP0St_ERL)) &&
-        !(env->hflags & MIPS_HFLAG_DM)) {
-        env->hflags |= (env->CP0_Status >> CP0St_KSU) &
-                       MIPS_HFLAG_KSU;
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I has no EXL, no ERL and no supervisor mode.  Status[1] is
+         * KUc, the current kernel/user bit (1 = user); Status[2] is IEp, not
+         * ERL; and Status[4:3] are KUo/IEo, the *saved outer* mode, not the
+         * current KSU.  Deriving the mode from the MIPS III/IV KSU field
+         * (as the else branch below does) reads the outer mode instead: after
+         * an exception push taken from user mode, KUc is 0 (kernel) but KUo
+         * is 1, so the CPU would still look like user mode and the handler's
+         * first mtc0 would raise CpU ("kernel used coprocessor").
+         */
+        if (env->CP0_Status & (1 << CP0St_EXL)) {
+            env->hflags |= MIPS_HFLAG_UM;
+        }
+    } else {
+        if (env->CP0_Status & (1 << CP0St_ERL)) {
+            env->hflags |= MIPS_HFLAG_ERL;
+        }
+        if (!(env->CP0_Status & (1 << CP0St_EXL)) &&
+            !(env->CP0_Status & (1 << CP0St_ERL)) &&
+            !(env->hflags & MIPS_HFLAG_DM)) {
+            env->hflags |= (env->CP0_Status >> CP0St_KSU) &
+                           MIPS_HFLAG_KSU;
+        }
     }
 #if defined(TARGET_MIPS64)
     if ((env->insn_flags & ISA_MIPS3) &&

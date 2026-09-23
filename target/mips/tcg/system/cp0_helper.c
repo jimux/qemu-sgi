@@ -884,6 +884,16 @@ void helper_dmtc0_entrylo1(CPUMIPSState *env, uint64_t arg1)
 
 void helper_mtc0_context(CPUMIPSState *env, target_ulong arg1)
 {
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I Context keeps PTEBase in bits[31:21] and BadVPN in [20:0]
+         * (see the fault-time fill in tlb_helper.c); the MIPS III/IV mask
+         * below would stop the low two bits of PTEBase from being written.
+         */
+        env->CP0_Context = (env->CP0_Context & 0x001FFFFF) |
+                           (arg1 & ~0x001FFFFF);
+        return;
+    }
     env->CP0_Context = (env->CP0_Context & 0x007FFFFF) | (arg1 & ~0x007FFFFF);
 }
 
@@ -1101,7 +1111,20 @@ void helper_mtc0_count(CPUMIPSState *env, target_ulong arg1)
 void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 {
     target_ulong old, val, mask;
-    mask = (TARGET_PAGE_MASK << 1) | env->CP0_EntryHi_ASID_mask;
+    /*
+     * MIPS-I R2000/R3000 EntryHi is VPN[31:12] | PID[11:6] | software[5:0]:
+     * VA[12] is part of the virtual page number because there is a single
+     * 4 KiB page per entry.  The MIPS III/IV layout below clears VA[12] (it
+     * is the odd/even selector there), which silently drops bit 12 of an
+     * R3000 VPN -- IRIX's kseg2 PDA at 0xffffb000 gets stored as 0xffffa000
+     * and then never matches the tag 0xffffb000, so its first access takes a
+     * TLB refill trap that recurses forever.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        mask = TARGET_PAGE_MASK | env->CP0_EntryHi_ASID_mask;
+    } else {
+        mask = (TARGET_PAGE_MASK << 1) | env->CP0_EntryHi_ASID_mask;
+    }
     if (((env->CP0_Config4 >> CP0C4_IE) & 0x3) >= 2) {
         mask |= 1 << CP0EnHi_EHINV;
     }

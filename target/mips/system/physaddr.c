@@ -129,7 +129,29 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
     /* effective address (modified for KVM T&E kernel segments) */
     target_ulong address = real_address;
 
-    if (address <= USEG_LIMIT) {
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I R2000/R3000 segment map.  32-bit virtual address space with
+         * no SegCtl: kuseg (0x00000000-0x7fffffff) and kseg2
+         * (0xc0000000-0xffffffff) are TLB-mapped, while kseg0
+         * (0x80000000-0x9fffffff) and kseg1 (0xa0000000-0xbfffffff) are
+         * unmapped direct windows.  Effective addresses are sign-extended into
+         * the 64-bit registers, so classify from the low 32 bits -- otherwise
+         * IRIX's kseg2 PDA at 0xffffb000 (sign-extended to 0xffffffffffffb000)
+         * is mistaken for 64-bit kseg3 and takes a TLB refill trap that
+         * recurses forever.
+         */
+        uint32_t va = (uint32_t)real_address;
+
+        if (va < 0x80000000u || va >= 0xc0000000u) {
+            ret = env->tlb->map_address(env, physical, prot, real_address,
+                                        access_type);
+        } else {
+            *physical = va & 0x1fffffffu;
+            *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+            ret = TLBRET_MATCH;
+        }
+    } else if (address <= USEG_LIMIT) {
         /* useg */
         uint16_t segctl;
 

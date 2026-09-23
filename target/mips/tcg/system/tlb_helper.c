@@ -506,7 +506,12 @@ static int r4k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
                 return TLBRET_RI;
             }
             if (access_type != MMU_DATA_STORE || (n ? tlb->D1 : tlb->D0)) {
-                *physical = tlb->PFN[n] | (address & (mask >> 1));
+                /* MIPS-I has a single 4 KiB page per entry, so the whole
+                 * low 12 bits are the in-page offset; the R4000 layout uses
+                 * half of Mask as the odd/even selector.  Using mask >> 1
+                 * for the R3000 drops VA[12] from the offset. */
+                *physical = tlb->PFN[n] |
+                            (address & (r3k ? mask : (mask >> 1)));
                 *prot = PAGE_READ;
                 if (n ? tlb->D1 : tlb->D0) {
                     *prot |= PAGE_WRITE;
@@ -683,8 +688,22 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
     if (!(env->hflags & MIPS_HFLAG_DM)) {
         env->CP0_BadVAddr = address;
     }
-    env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
-                       ((address >> 9) & 0x007ffff0);
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I Context is PTEBase[31:21] | BadVPN[20:2] | 00, with BadVPN =
+         * VA[30:12]: 19 bits, because there is a single 4 KiB page per entry
+         * and VA[12] is part of the VPN.  The MIPS III/IV formula below drops
+         * VA[12] (it is the odd/even selector there), so a refill that
+         * indexes the PTE table from Context loads from the wrong slot --
+         * IRIX's refill does exactly that with `lw k0,0(k0)` after
+         * `sll k0,k0,1`, and lands in unmapped kseg2.
+         */
+        env->CP0_Context = (env->CP0_Context & 0xffe00000) |
+                           ((address >> 10) & 0x001ffffc);
+    } else {
+        env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
+                           ((address >> 9) & 0x007ffff0);
+    }
     env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
                        (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
                        (address & (TARGET_PAGE_MASK << 1));
