@@ -549,6 +549,44 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
 
         cs->exception_index = EXCP_ACCESS;
         cpu_loop_exit(cs);
+    } else if (response == MEMTX_DECODE_ERROR &&
+               (physaddr & 0xf0000000) == 0x50000000) {
+        /*
+         * The 68020/68030 deliver a bus error for a failed bus cycle as
+         * well.  The IP2 board relies on this for its absent-board test:
+         * a Multibus I/O access with no board fitted must fault so the
+         * PROM's probe and the kernel's autoconfig conclude the device is
+         * absent, exactly as the translation-time fault (ext_tlb_fill < 0)
+         * already does.  The Multibus I/O segment is 0x5xxxxxxx; the check
+         * keeps every other decode error on QEMU's permissive default so
+         * unrelated firmware probes still read back zero.
+         *
+         * The kernel takes the same EXCP_ACCESS path and reads the faulting
+         * address from mmu.ar.
+         */
+        env->mmu.ssw = M68K_ATC_040;
+        switch (size) {
+        case 1:
+            env->mmu.ssw |= M68K_BA_SIZE_BYTE;
+            break;
+        case 2:
+            env->mmu.ssw |= M68K_BA_SIZE_WORD;
+            break;
+        case 4:
+            env->mmu.ssw |= M68K_BA_SIZE_LONG;
+            break;
+        }
+        if (access_type == MMU_INST_FETCH) {
+            env->mmu.ssw |= M68K_TM_040_CODE;
+        } else {
+            env->mmu.ssw |= M68K_TM_040_DATA;
+        }
+        if (access_type != MMU_DATA_STORE) {
+            env->mmu.ssw |= M68K_RW_040;
+        }
+        env->mmu.ar = addr;
+        cs->exception_index = EXCP_ACCESS;
+        cpu_loop_exit(cs);
     }
 }
 

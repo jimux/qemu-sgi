@@ -743,18 +743,28 @@ static void ip2190_go(SGIIP2State *s)
     qemu_set_irq(s->ip_irq_out, 1);
 }
 
-static uint64_t ip2_mbio_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * Multibus I/O space.  Only the Interphase 2190 registers are modelled; the
+ * sgi-gl2 device owns its window as a higher-priority subregion.  Every other
+ * offset must fail the transaction, exactly as real hardware does with no
+ * board fitted, so the PROM's board probe and the kernel's autoconfig read a
+ * bus error and conclude the board is absent.  A permissive window made
+ * autoconfig find phantom controllers whose init then busy-waits forever.
+ */
+static MemTxResult ip2_mbio_read(void *opaque, hwaddr addr, uint64_t *data,
+                                 unsigned size, MemTxAttrs attrs)
 {
     SGIIP2State *s = opaque;
 
     if (addr == IP2190_R0) {
-        return s->ip_done ? IP2190_DONE : 0;
+        *data = s->ip_done ? IP2190_DONE : 0;
+        return MEMTX_OK;
     }
-    return 0;
+    return MEMTX_DECODE_ERROR;
 }
 
-static void ip2_mbio_write(void *opaque, hwaddr addr, uint64_t val,
-                           unsigned size)
+static MemTxResult ip2_mbio_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size, MemTxAttrs attrs)
 {
     SGIIP2State *s = opaque;
 
@@ -768,24 +778,24 @@ static void ip2_mbio_write(void *opaque, hwaddr addr, uint64_t val,
             qemu_set_irq(s->ip_irq_out, 0);
             ip2190_go(s);
         }
-        break;
+        return MEMTX_OK;
     case IP2190_R1:
         s->ip_iopb_addr[0] = val;
-        break;
+        return MEMTX_OK;
     case IP2190_R3:
         s->ip_iopb_addr[2] = val;
-        break;
+        return MEMTX_OK;
     case IP2190_R2:
         s->ip_iopb_addr[1] = val;
-        break;
+        return MEMTX_OK;
     default:
-        break;
+        return MEMTX_DECODE_ERROR;
     }
 }
 
 static const MemoryRegionOps ip2_mbio_ops = {
-    .read = ip2_mbio_read,
-    .write = ip2_mbio_write,
+    .read_with_attrs = ip2_mbio_read,
+    .write_with_attrs = ip2_mbio_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
