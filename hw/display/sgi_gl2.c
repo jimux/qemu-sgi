@@ -109,12 +109,14 @@ struct SGIGL2State {
     bool prog_int_pending;
 
     /*
-     * Bitplane value per pixel.  The UC4 writes planes A/B (colourAB/wrtenAB)
-     * and C/D (colourCD/wrtenCD); the DC4 looks the resulting plane code up
-     * in the colormap.  Storing the code (not the physical planes) is
-     * invisible to the guest, which only reads back through READPIXEL.
+     * Plane value per pixel, one bit per installed bitplane (nplanes wide).
+     * For the console's 4-plane mode the UC4 writes planes A/B
+     * (colourAB/wrtenAB) and C/D (colourCD/wrtenCD) and the DC4 looks the low
+     * bits up in the colormap; for the demos' RGB/multimap modes the full
+     * 32-bit value is written through the FBCrgbcolor/FBCrgbwrten registers
+     * and scanned out as RGB or a colormap index.
      */
-    uint8_t *fb;
+    uint32_t *fb;
     uint8_t cmap[GL2_NMAP][GL2_NCOLOR][3];
     uint16_t dc_flags;            /* DC4 flag register */
     uint8_t cur_map;              /* DC4 map selected for scanout */
@@ -122,6 +124,9 @@ struct SGIGL2State {
     uint16_t buf[UC_NBUF];        /* UC4 buffer file */
     uint16_t color_ab, color_cd;
     uint16_t we_ab, we_cd;
+    uint32_t rgb_color, rgb_we;   /* 32-bit RGB plane colour / write-enable */
+    bool rgb_valid;               /* rgb registers in force (else A/B/C/D) */
+    unsigned nplanes;             /* installed BP3 planes (device property) */
     uint16_t ucr;
     uint16_t scrmaskx, scrmasky;
     uint16_t fmaddr;              /* current FM (font/pattern) address */
@@ -192,22 +197,30 @@ static void gl2_update_irq(SGIGL2State *s);
  * only WE plane B (as the PROM's cursor/erase steps do) leave plane A -- where
  * the character was drawn -- intact.
  */
-static uint8_t gl2_blend(uint8_t old, uint16_t color, uint16_t we, int shift)
+static uint32_t gl2_blend(uint32_t old, uint16_t color, uint16_t we, int shift)
 {
-    uint16_t mask = (we & 3) << shift;
+    uint32_t mask = (we & 3) << shift;
 
     return (old & ~mask) | (((color & 3) << shift) & mask);
 }
 
-/* The plane code a FILLRECT/DRAWCHAR/DRAWPIXEL would write for this pixel. */
-static uint8_t gl2_planes(SGIGL2State *s, uint8_t old)
+/*
+ * The plane value a FILLRECT/DRAWCHAR/DRAWPIXEL would write for this pixel.
+ * The demos drive the 32-bit FBCrgbcolor/FBCrgbwrten registers; the kernel
+ * console uses the A/B and C/D colour pairs.  Whichever command wrote last
+ * selects the path.
+ */
+static uint32_t gl2_planes(SGIGL2State *s, uint32_t old)
 {
+    if (s->nplanes > 8 && s->rgb_valid) {
+        return (old & ~s->rgb_we) | (s->rgb_color & s->rgb_we);
+    }
     old = gl2_blend(old, s->color_ab, s->we_ab, 0);
     old = gl2_blend(old, s->color_cd, s->we_cd, 2);
     return old;
 }
 
-static void gl2_set_pixel(SGIGL2State *s, int x, int y, uint8_t val)
+static void gl2_set_pixel(SGIGL2State *s, int x, int y, uint32_t val)
 {
     if ((unsigned)x >= GL2_XDIM || (unsigned)y >= GL2_YDIM) {
         return;
@@ -532,9 +545,15 @@ static void gl2_gfx_update(void *opaque)
     for (y = 0; y < GL2_YDIM; y++) {
         uint32_t *row = dest + (GL2_YDIM - 1 - y) * GL2_XDIM;
         for (x = 0; x < GL2_XDIM; x++) {
-            uint8_t c = s->fb[y * GL2_XDIM + x];
-            uint8_t *rgb = s->cmap[s->cur_map][c];
-            row[x] = rgb_to_pixel32(rgb[0], rgb[1], rgb[2]);
+            uint32_t c = s->fb[y * GL2_XDIM + x];
+
+            if ((s->dc_flags & DC_RGBMODE) && s->nplanes > 8) {
+                row[x] = rgb_to_pixel32((c >> 16) & 0xff,
+                                        (c >> 8) & 0xff, c & 0xff);
+            } else {
+                uint8_t *rgb = s->cmap[s->cur_map][c & 0xff];
+                row[x] = rgb_to_pixel32(rgb[0], rgb[1], rgb[2]);
+            }
         }
     }
     dpy_gfx_update(s->con, 0, 0, GL2_XDIM, GL2_YDIM);
@@ -555,14 +574,13 @@ static const MemoryRegionOps gl2_ops = {
 /* Plot one pixel with the current FBC colour and write-enable state. */
 static void gl2_draw_pixel(SGIGL2State *s, unsigned x, unsigned y)
 {
-    uint8_t *p;
+    uint32_t *p;
 
     if (x >= GL2_XDIM || y >= GL2_YDIM) {
         return;
     }
     p = &s->fb[y * GL2_XDIM + x];
-    *p = gl2_blend(*p, s->color_ab, s->we_ab, 0);
-    *p = gl2_blend(*p, s->color_cd, s->we_cd, 2);
+    *p = gl2_planes(s, *p);
     s->dirty = true;
 }
 
@@ -583,7 +601,7 @@ static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
 
         for (gx = 0; gx < 8; gx++) {
             int px, py;
-            uint8_t *p;
+            uint32_t *p;
 
             if (!(wd & (0x8000 >> gx))) {
                 continue;
@@ -595,7 +613,9 @@ static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
                 continue;
             }
             p = &s->fb[py * GL2_XDIM + px];
-            {
+            if (s->nplanes > 8 && s->rgb_valid) {
+                *p = gl2_planes(s, *p);
+            } else {
                 /* The kernel leaves the plane write-enable at 0 for the
                  * textport and relies on the FBC's char masks; treat 0 as
                  * "all planes" so the glyph lands. */
@@ -634,9 +654,13 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
     switch (cmd) {
     case 0x04:                          /* FBCrgbcolor */
     case 0x05:                          /* FBCrgbwrten */
-        if (nargs >= 2) {
-            /* w0: plane enables for A/B (bits 0-1) and C/D (bits 2-3);
-             * w1: matching colour bits. */
+        /*
+         * The short form drives the A/B and C/D plane pairs.  A long form
+         * (the kernel's gl_getplaneinfo() sends a short then a long
+         * 0xffffffff) additionally latches the 32-bit RGB registers, which
+         * only the multi-plane demo modes use.
+         */
+        if (nargs >= 1) {
             if (cmd == 0x04) {
                 s->color_ab = args[0];
                 s->color_cd = args[0];
@@ -645,12 +669,23 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
                 s->we_cd = args[0];
             }
         }
+        if (nargs >= 3) {
+            uint32_t val = ((uint32_t)args[nargs - 2] << 16) | args[nargs - 1];
+
+            if (cmd == 0x04) {
+                s->rgb_color = val;
+            } else {
+                s->rgb_we = val;
+            }
+            s->rgb_valid = true;
+        }
         break;
 
     case 0x14:                          /* FBCcolor (colour index) */
         if (nargs >= 1) {
             s->color_ab = args[0];
             s->color_cd = args[0];
+            s->rgb_valid = false;
         }
         break;
 
@@ -658,6 +693,7 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         if (nargs >= 1) {
             s->we_ab = args[0];
             s->we_cd = args[0];
+            s->rgb_valid = false;
         }
         break;
 
@@ -801,9 +837,14 @@ static void gl2_fill_poly(SGIGL2State *s)
         for (k = 0; k + 1 < nx; k += 2) {
             int x;
             for (x = MAX(xs[k], 0); x <= MIN(xs[k + 1], GL2_XDIM - 1); x++) {
-                uint8_t *p = &s->fb[y * GL2_XDIM + x];
-                *p = gl2_blend(*p, s->color_ab, we_ab, 0);
-                *p = gl2_blend(*p, s->color_cd, we_cd, 2);
+                uint32_t *p = &s->fb[y * GL2_XDIM + x];
+
+                if (s->nplanes > 8 && s->rgb_valid) {
+                    *p = gl2_planes(s, *p);
+                } else {
+                    *p = gl2_blend(*p, s->color_ab, we_ab, 0);
+                    *p = gl2_blend(*p, s->color_cd, we_cd, 2);
+                }
             }
         }
     }
@@ -1044,6 +1085,8 @@ static void gl2_reset(DeviceState *dev)
     s->font_base = 0;
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
+    s->rgb_color = s->rgb_we = 0;
+    s->rgb_valid = false;
     s->vert_pending = false;
     s->prog_int_pending = false;
     if (s->retrace_timer) {
@@ -1052,7 +1095,7 @@ static void gl2_reset(DeviceState *dev)
                   + NANOSECONDS_PER_SECOND / 60);
     }
     if (s->fb) {
-        memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
+        memset(s->fb, 0, (size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
     }
     memset(s->font, 0, sizeof(s->font));
     gl2_cmap_default(s);
@@ -1075,7 +1118,7 @@ static void gl2_init(Object *obj)
     SGIGL2State *s = SGI_GL2(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint8_t));
+    s->fb = g_malloc0((size_t)GL2_XDIM * GL2_YDIM * sizeof(uint32_t));
     s->retrace_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gl2_retrace_timer, s);
     s->no_retrace = getenv("SGI_GL2_NO_RETRACE") != NULL;
     memory_region_init_io(&s->mmio, obj, &gl2_ops, s, "sgi-gl2",
@@ -1100,6 +1143,8 @@ MemoryRegion *sgi_gl2_ge_region(DeviceState *dev)
 static const Property gl2_properties[] = {
     DEFINE_PROP_BOOL("testpattern", SGIGL2State, testpattern, false),
     DEFINE_PROP_BOOL("trace", SGIGL2State, trace, false),
+    /* Installed BP3 bitplanes: 4 for the console, 24/32 for the GL demos. */
+    DEFINE_PROP_UINT32("nplanes", SGIGL2State, nplanes, 4),
 };
 
 static void gl2_class_init(ObjectClass *oc, const void *data)
