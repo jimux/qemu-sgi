@@ -324,6 +324,19 @@ static void ql_write_status(SGIQLispState *s, uint16_t completion,
         if (sense && sense_len && scsi_status == 0x02) {
             state |= QL_SS_GOT_SENSE;
         }
+        if (sense_len && getenv("QLISP_SENSE_DBG")) {
+            static unsigned sn;
+            if (sn < 60) {
+                sn++;
+                fprintf(stderr, "QLSENSE#%u status=0x%02x len=%u "
+                        "b0=%02x b1=%02x b2=%02x b3=%02x b4=%02x\n",
+                        sn, scsi_status, sense_len,
+                        sense[0], sense_len > 1 ? sense[1] : 0,
+                        sense_len > 2 ? sense[2] : 0,
+                        sense_len > 3 ? sense[3] : 0,
+                        sense_len > 4 ? sense[4] : 0);
+            }
+        }
         stw_be_p(st + 0x0e, state);
     }
     stw_be_p(st + 0x10, sense_len);
