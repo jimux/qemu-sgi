@@ -133,16 +133,16 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
     sgi_gr2_update_display(s);
 }
 
-/* Paint a solid-rect sub-op's rectangle list.  The DDX's expDrawSolidRects
- * stores the geometry as PUC_DATA words in groups of four (x1,y1,x2,y2) after a
- * short non-rectangle prefix ("0xff 0x3 0x0", sometimes preceded by the clip
- * bounds 0x4ff 0x0 0x3ff).  Rather than assume the prefix length, walk back
- * from the end while each four-word group is a sane rectangle, so the prefix is
- * left alone: the longest valid suffix is the list.  This is the layout read
- * off the DDX store sequences (note 31), not a guessed (w,h) tail. */
-static void sgi_gr2_re3_paint_rect_list(SGIGr2State *s, uint8_t colour)
+/* Number of trailing rectangle groups in the current sub-op's PUC_DATA.  The
+ * DDX's expDrawSolidRects/expStippledFillRects store the geometry as groups of
+ * four (x1,y1,x2,y2) after a short non-rectangle prefix ("0xff 0x3 0x0", and for
+ * some ops the clip bounds 0x4ff 0x0 0x3ff before it).  Rather than assume the
+ * prefix length, walk back from the end while each group is a sane rectangle:
+ * the longest valid suffix is the list, and the prefix is left alone.  This is
+ * the layout read off the DDX store sequences (note 31), not a guessed tail. */
+static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
 {
-    unsigned n = s->re3_data_n, groups = 0, g;
+    unsigned n = s->re3_data_n, groups = 0;
 
     while ((groups + 1) * 4 <= n) {
         unsigned o = n - (groups + 1) * 4;
@@ -156,6 +156,17 @@ static void sgi_gr2_re3_paint_rect_list(SGIGr2State *s, uint8_t colour)
         }
         groups++;
     }
+    return groups;
+}
+
+/* Paint a sub-op's rectangle list, flat (expDrawSolidRects) or stippled
+ * (expStippledFillRects).  The rectangles are painted in payload order. */
+static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
+{
+    unsigned n = s->re3_data_n;
+    unsigned groups = sgi_gr2_re3_rect_groups(s), g;
+    uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
+
     if (groups == 0) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
@@ -164,10 +175,17 @@ static void sgi_gr2_re3_paint_rect_list(SGIGr2State *s, uint8_t colour)
         unsigned o = n - g * 4;
         uint32_t x1 = s->re3_data[o], y1 = s->re3_data[o + 1];
         uint32_t x2 = s->re3_data[o + 2], y2 = s->re3_data[o + 3];
-        uint32_t rgb = sgi_gr2_re3_fill(s, colour, x1, y1,
-                                        x2 - x1 + 1, y2 - y1 + 1);
+        int w = x2 - x1 + 1, h = y2 - y1 + 1;
 
-        trace_sgi_gr2_re3_rect(colour, rgb, x1, y1, x2, y2);
+        if (stippled) {
+            sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
+                                     x1, y1, w, h);
+            trace_sgi_gr2_re3_rect(fg, s->ramdac[fg], x1, y1, x2, y2);
+        } else {
+            uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, x1, y1, w, h);
+
+            trace_sgi_gr2_re3_rect(s->re3_colour, rgb, x1, y1, x2, y2);
+        }
     }
 }
 
@@ -182,14 +200,10 @@ static void sgi_gr2_re3_paint_rect_list(SGIGr2State *s, uint8_t colour)
 static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
 {
     if (s->re3_stipple_valid) {
-        uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
-
-        /* The stippled sub-op is the full-screen backdrop; the panel's own
-         * rects arrive as the nested solid sub-op that follows it. */
-        sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
-                                 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
-        trace_sgi_gr2_re3_stipple(fg, s->re3_colour, s->re3_stipple,
-                                  SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+        /* Stippled rect list: the root backdrop is one full-screen rect, but a
+         * stippled sub-op with its own small rects (a cursor, a shade band) must
+         * paint only those — painting the whole screen here would wipe them. */
+        sgi_gr2_re3_paint_rects(s, true);
         return;
     }
     if (s->re3_spans_seen) {
@@ -204,7 +218,7 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
          * painting it would wipe the weave, so a non-zero mode is flagged, not
          * painted, until its meaning is pinned. */
         if (s->re3_rop == 0) {
-            sgi_gr2_re3_paint_rect_list(s, s->re3_colour);
+            sgi_gr2_re3_paint_rects(s, false);
         } else {
             trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
         }
