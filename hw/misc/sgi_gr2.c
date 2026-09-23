@@ -230,6 +230,25 @@ static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
     }
 }
 
+/* Where the current sub-op's real payload begins: just past the LAST
+ * "0xff 0x3 0x0" prefix.  A sub-op can hold more than one primitive (a nested
+ * 331 leaves two prefixes in the buffer), and the payload belongs to the last
+ * one — searching forward instead reads the pen colour/pattern words of the
+ * inner primitive as geometry (that produced a stray diagonal across the
+ * panel).  Returns the word count unchanged when no prefix is found. */
+static unsigned sgi_gr2_re3_payload_start(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n, i;
+
+    for (i = n; i >= 3; i--) {
+        if (s->re3_data[i - 3] == 0xff && s->re3_data[i - 2] == 3 &&
+            s->re3_data[i - 1] == 0) {
+            return i;
+        }
+    }
+    return n;
+}
+
 /* Draw a segment-list sub-op (expSegmentSS/expLineSS).  The DDX writes the pen
  * colour once, then the "0xff 0x3 0x0" prefix, then the geometry as groups of
  * four (x0,y0,x1,y1), ending with one or more (1280,1024) sentinels.  Locate the
@@ -238,16 +257,12 @@ static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
  * the panel outline and the label strokes. */
 static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
 {
-    unsigned n = s->re3_data_n, i, start = n;
+    unsigned n = s->re3_data_n, i, start = sgi_gr2_re3_payload_start(s);
 
-    for (i = 0; i + 3 < n; i++) {
-        if (s->re3_data[i] == 0xff && s->re3_data[i + 1] == 3 &&
-            s->re3_data[i + 2] == 0) {
-            start = i + 3;
-            break;
-        }
-    }
-    if (start >= n) {
+    if (start >= n || (n - start) % 4 != 0) {
+        /* A payload that does not tile into (x0,y0,x1,y1) groups exactly is a
+         * framing we do not understand — flag it rather than read a stray
+         * diagonal out of it. */
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
     }
@@ -273,16 +288,9 @@ static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
  * clear bits are left alone (the stipple is transparent). */
 static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
 {
-    unsigned n = s->re3_data_n, i, k, start = n;
+    unsigned n = s->re3_data_n, i, k, start = sgi_gr2_re3_payload_start(s);
 
-    for (i = 0; i + 3 < n; i++) {
-        if (s->re3_data[i] == 0xff && s->re3_data[i + 1] == 3 &&
-            s->re3_data[i + 2] == 0) {
-            start = i + 3;
-            break;
-        }
-    }
-    if (start >= n) {
+    if (start >= n || (n - start) % 4 != 0) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
     }
@@ -302,6 +310,82 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
             }
             if ((pattern >> (31 - (k & 31))) & 1) {
                 s->scanout[y * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+            }
+        }
+    }
+    sgi_gr2_update_display(s);
+}
+
+/* Draw a filled polygon (libgd token 302).  After the same "0xff 0x3 0x0"
+ * prefix come three header words (0x3ab, 0xc6, 0x2a0 in every op) then the
+ * outline as (x,y) vertex pairs, the last pair repeating the first to close the
+ * loop.  Filled with an even-odd scanline walk.  These are the glyph outlines —
+ * the X server's text goes through expPolyGlyphBlt, which fills glyphs the same
+ * way. */
+#define SGI_GR2_POLY_MAX 64
+static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
+{
+    int vx[SGI_GR2_POLY_MAX], vy[SGI_GR2_POLY_MAX];
+    unsigned n = s->re3_data_n, i, start = n, nv = 0;
+    int ymin, ymax, sy;
+
+    start = sgi_gr2_re3_payload_start(s);
+    if (start + 3 < n && s->re3_data[start] == 0x3ab &&
+        s->re3_data[start + 1] == 0xc6 && s->re3_data[start + 2] == 0x2a0) {
+        /* The three-word header that precedes the outline in every op. */
+        start += 3;
+    }
+    if (start >= n || (n - start) % 2 != 0) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    for (i = start; i + 1 < n && nv < SGI_GR2_POLY_MAX; i += 2) {
+        int x = s->re3_data[i], y = s->re3_data[i + 1];
+
+        if (x < 0 || x >= SGI_GR2_SCREEN_W || y < 0 || y >= SGI_GR2_SCREEN_H) {
+            break;
+        }
+        vx[nv] = x;
+        vy[nv] = y;
+        nv++;
+    }
+    if (nv < 3) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    ymin = ymax = vy[0];
+    for (i = 1; i < nv; i++) {
+        ymin = MIN(ymin, vy[i]);
+        ymax = MAX(ymax, vy[i]);
+    }
+    for (sy = ymin; sy <= ymax; sy++) {
+        int xs[SGI_GR2_POLY_MAX];
+        unsigned m = 0, k;
+        int j;
+
+        for (i = 0; i < nv; i++) {
+            unsigned jj = (i + 1) % nv;
+            int y0 = vy[i], y1 = vy[jj], x0 = vx[i], x1 = vx[jj];
+
+            if ((y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy)) {
+                xs[m++] = x0 + (int)(((int64_t)(sy - y0) * (x1 - x0)) /
+                                     (y1 - y0));
+            }
+        }
+        for (k = 1; k < m; k++) {
+            int t = xs[k];
+
+            for (j = k; j > 0 && xs[j - 1] > t; j--) {
+                xs[j] = xs[j - 1];
+            }
+            xs[j] = t;
+        }
+        for (k = 0; k + 1 < m; k += 2) {
+            int xa = MAX(xs[k], 0), xb = MIN(xs[k + 1], SGI_GR2_SCREEN_W - 1);
+            int xx;
+
+            for (xx = xa; xx <= xb; xx++) {
+                s->scanout[sy * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
             }
         }
     }
@@ -329,6 +413,10 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         /* expSolidSpans: a span list, not a fill.  The PUC path draws the
          * weave spans inline; the DDX span op itself paints nothing here. */
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    if (s->re3_poly_seen) {
+        sgi_gr2_re3_draw_polygon(s);
         return;
     }
     if (s->re3_spanstip_seen) {
@@ -364,6 +452,7 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_spans_seen = false;
     s->re3_line_seen = false;
     s->re3_spanstip_seen = false;
+    s->re3_poly_seen = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_fg_valid = false;
@@ -561,6 +650,9 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == SGI_GR2_RE3_SPANSTIP_TOKEN) {
         s->re3_spanstip_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_POLY_TOKEN) {
+        s->re3_poly_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_SOLID_TOKEN) {
         s->re3_solid_seen = true;
@@ -809,6 +901,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_spans_seen = false;
     s->re3_line_seen = false;
     s->re3_spanstip_seen = false;
+    s->re3_poly_seen = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_stipple = 0;
