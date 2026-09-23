@@ -621,6 +621,16 @@ static void serial_receive1(void *opaque, const uint8_t *buf, int size)
     serial_update_irq(s);
 }
 
+void serial_receive_bytes(struct SerialState *s, const uint8_t *buf, int size)
+{
+    serial_receive1(s, buf, size);
+}
+
+int serial_can_receive_bytes(struct SerialState *s)
+{
+    return serial_can_receive(s);
+}
+
 static void serial_event(void *opaque, QEMUChrEvent event)
 {
     SerialState *s = opaque;

@@ -82,6 +82,23 @@ struct SerialState {
 extern const VMStateDescription vmstate_serial;
 extern const MemoryRegionOps serial_io_ops;
 
+/*
+ * Push bytes into the UART's receive path exactly as the chardev backend would.
+ * A device that shares one backend between this 16550 and a DMA receive ring
+ * (IOC3 SIO RX) owns the chardev handlers and forwards to the UART through
+ * this, rather than each side registering its own handlers (a chardev has a
+ * single frontend).
+ */
+void serial_receive_bytes(struct SerialState *s, const uint8_t *buf, int size);
+
+/*
+ * The UART's own receive capacity (FIFO space, or rbr empty without FIFO).
+ * A device sharing the backend advertises this while the 16550 is the
+ * consumer, so a burst into a non-FIFO UART does not lose all but the first
+ * byte.
+ */
+int serial_can_receive_bytes(struct SerialState *s);
+
 #define TYPE_SERIAL "serial"
 OBJECT_DECLARE_SIMPLE_TYPE(SerialState, SERIAL)
 
