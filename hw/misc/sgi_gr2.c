@@ -96,6 +96,47 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
     return rgb;
 }
 
+/* RE3 line segment (expSegmentSS/expLineSS).  In the 8-bit mode the pen colour
+ * is a RAMDAC index, so the framebuffer stores the index traced here.  Bresenham
+ * clipped to the screen. */
+static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
+                             int x0, int y0, int x1, int y1)
+{
+    int dx, dy, sx, sy, err;
+
+    if (!s->scanout) {
+        return;
+    }
+    dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    sx = x0 < x1 ? 1 : -1;
+    sy = y0 < y1 ? 1 : -1;
+    err = dx - dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < SGI_GR2_SCREEN_W &&
+            y0 >= 0 && y0 < SGI_GR2_SCREEN_H) {
+            s->scanout[y0 * SGI_GR2_SCREEN_W + x0] = colour;
+        }
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        /* Bound the walk so a wild coordinate cannot spin. */
+        if (x0 < -SGI_GR2_SCREEN_W || x0 > 2 * SGI_GR2_SCREEN_W ||
+            y0 < -SGI_GR2_SCREEN_H || y0 > 2 * SGI_GR2_SCREEN_H) {
+            break;
+        }
+        if (2 * err >= -dy) {
+            err -= dy;
+            x0 += sx;
+        }
+        if (2 * err <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+    sgi_gr2_update_display(s);
+}
+
 /* RE3 stippled-rectangle fill: the DDX arms a 32-bit stipple pattern on token
  * 318 and a foreground colour index on token 314, then streams the rectangle.
  * Render one pixel per bit of the pattern, repeating every 32 columns — bit 31
@@ -189,6 +230,41 @@ static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
     }
 }
 
+/* Draw a segment-list sub-op (expSegmentSS/expLineSS).  The DDX writes the pen
+ * colour once, then the "0xff 0x3 0x0" prefix, then the geometry as groups of
+ * four (x0,y0,x1,y1), ending with one or more (1280,1024) sentinels.  Locate the
+ * prefix rather than assume its offset (some ops carry the clip bounds before
+ * it), then read groups of four until a coordinate leaves the screen.  This is
+ * the panel outline and the label strokes. */
+static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n, i, start = n;
+
+    for (i = 0; i + 3 < n; i++) {
+        if (s->re3_data[i] == 0xff && s->re3_data[i + 1] == 3 &&
+            s->re3_data[i + 2] == 0) {
+            start = i + 3;
+            break;
+        }
+    }
+    if (start >= n) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    for (i = start; i + 3 < n; i += 4) {
+        uint32_t x0 = s->re3_data[i], y0 = s->re3_data[i + 1];
+        uint32_t x1 = s->re3_data[i + 2], y1 = s->re3_data[i + 3];
+
+        if (x0 >= SGI_GR2_SCREEN_W || y0 >= SGI_GR2_SCREEN_H ||
+            x1 >= SGI_GR2_SCREEN_W || y1 >= SGI_GR2_SCREEN_H) {
+            break;
+        }
+        sgi_gr2_re3_line(s, s->re3_colour, x0, y0, x1, y1);
+        trace_sgi_gr2_re3_seg(s->re3_colour, s->ramdac[s->re3_colour],
+                              x0, y0, x1, y1);
+    }
+}
+
 /* Evaluate the pending draw sub-op.  Called at token 331 (which starts a new
  * sub-op) and token 490 (the terminator), because one 490-terminated region can
  * hold several 331 sub-ops: the grainy root's stipple and the panel's own
@@ -210,6 +286,10 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         /* expSolidSpans: a span list, not a fill.  The PUC path draws the
          * weave spans inline; the DDX span op itself paints nothing here. */
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    if (s->re3_line_seen) {
+        sgi_gr2_re3_draw_segments(s);
         return;
     }
     if (s->re3_solid_seen) {
@@ -235,6 +315,7 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
 {
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
+    s->re3_line_seen = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_fg_valid = false;
@@ -426,6 +507,9 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (size == 4 && offset == SGI_GR2_RE3_MODE_TOKEN) {
         s->re3_rop = (uint32_t)value;
         s->re3_rop_valid = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_LINE_TOKEN) {
+        s->re3_line_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_SOLID_TOKEN) {
         s->re3_solid_seen = true;
@@ -672,6 +756,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_colour_valid = false;
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
+    s->re3_line_seen = false;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_stipple = 0;
