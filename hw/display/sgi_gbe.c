@@ -44,6 +44,16 @@
 #include "framebuffer.h"
 
 /*
+ * Content-shadow span sizes for the dirty-region scanout.  A tile span is
+ * 512 bytes at every depth (128 px x 32 bpp or 512 px x 8 bpp), its overlay
+ * byte slice is at most 512 bytes, and the last byte is the "overlay
+ * present" flag.
+ */
+#define SPAN_NORMAL 512
+#define SPAN_OVR    512
+#define SPAN_SHADOW 1056
+
+/*
  * Update the derived raster geometry from the programmed timing regs.
  * vt_xymax = (vtotal << 12) | htotal (written last by gbeSetTimingRegs).
  */
@@ -510,17 +520,22 @@ static bool sgi_gbe_scanout(SGIGBEState *s, bool force)
     int sh = surface_height(surface);
 
     /*
-     * Dirty-region scanout.  Snapshot and clear the VGA dirty bitmap once
-     * per call; then decode only the tile scanlines whose backing bytes the
-     * guest wrote since the last scanout.  A control change (cmap/WID/DID/
-     * DMA geometry/cursor glyph) sets scan_dirty and passes force=true.
-     * With no ram link (any machine that does not set it) snap stays NULL
-     * and every line decodes, i.e. the previous full-frame behaviour.
+     * Dirty-region scanout (content-based).  Each screen span's raw source
+     * bytes (normal plane + overlay) are compared against the copy decoded
+     * last frame; an unchanged span is skipped.  A control change (cmap/
+     * WID/DID/DMA geometry/cursor glyph) sets scan_dirty and passes
+     * force=true, so the cached layout is rebuilt.  Content comparison is
+     * used instead of QEMU's VGA dirty bitmap because the IRIX tile
+     * manager writes tiles through the 0x80000000 no-ECC RAM alias, whose
+     * writes are not recorded on the low RAM block's dirty bitmap (an
+     * alias MemoryRegion has no ram_block), which silently dropped tiles
+     * drawn that way (seen as the Console icon never appearing).
      */
-    DirtyBitmapSnapshot *snap = NULL;
-    if (!force && s->ram) {
-        snap = memory_region_snapshot_and_clear_dirty(
-            s->ram, 0, s->ram_size, DIRTY_MEMORY_VGA);
+    size_t spans = (size_t)height * w;
+    if (spans > (size_t)s->span_shadow_spans) {
+        g_free(s->span_shadow);
+        s->span_shadow = g_malloc0(spans * SPAN_SHADOW);
+        s->span_shadow_spans = spans;
     }
     bool decoded_any = force;
 
@@ -652,29 +667,23 @@ static bool sgi_gbe_scanout(SGIGBEState *s, bool force)
                 }
 
                 /*
-                 * Skip a tile scanline whose backing bytes (normal plane
-                 * and overlay) the guest did not touch since the last
-                 * scanout.  Range-test only addresses inside ram; a tile
-                 * descriptor pointing outside (e.g. a SEG1 alias form)
-                 * falls back to decoding.  Cursor rows are forced dirty
-                 * above.
+                 * Content-based dirty check: decode this span only when its
+                 * raw source bytes (normal plane + overlay) or overlay
+                 * presence changed since the last decode, or a control
+                 * change / cursor line forced it.  The shadow is indexed by
+                 * screen span (row, tx), so a tile moving or its bytes
+                 * changing both decode; this holds for any write path.
                  */
-                bool line_dirty = force || !snap;
-                if (snap && !line_dirty) {
-                    hwaddr lo = tile_base + 512 * line;
-                    hwaddr sz = MIN(nbytes, 512 * 4);
-                    if (lo + sz <= s->ram_size) {
-                        line_dirty = memory_region_snapshot_get_dirty(
-                            s->ram, snap, lo, sz);
-                    } else {
-                        line_dirty = true;
-                    }
+                uint8_t *spsh = s->span_shadow +
+                                ((size_t)y * w + tx) * SPAN_SHADOW;
+                bool line_dirty = force;
+                if (!line_dirty) {
+                    bool sh_ovr = spsh[SPAN_SHADOW - 1] != 0;
+                    line_dirty = (sh_ovr != have_ovr) ||
+                        memcmp(buf, spsh, MIN(nbytes, SPAN_NORMAL)) != 0;
                     if (!line_dirty && have_ovr) {
-                        lo = obase + 512 * (y & 127);
-                        sz = MIN(pix_here, 512);
-                        line_dirty = (lo + sz > s->ram_size) ||
-                            memory_region_snapshot_get_dirty(
-                                s->ram, snap, lo, sz);
+                        line_dirty = memcmp(ovr_buf, spsh + SPAN_NORMAL,
+                                            MIN(pix_here, SPAN_OVR)) != 0;
                     }
                 }
                 if (!line_dirty && y >= cr_y0 && y < cr_y1) {
@@ -684,6 +693,12 @@ static bool sgi_gbe_scanout(SGIGBEState *s, bool force)
                     x += pix_here;
                     continue;
                 }
+                /* Record what is being decoded so the next frame can skip. */
+                memcpy(spsh, buf, MIN(nbytes, SPAN_NORMAL));
+                if (have_ovr) {
+                    memcpy(spsh + SPAN_NORMAL, ovr_buf, MIN(pix_here, SPAN_OVR));
+                }
+                spsh[SPAN_SHADOW - 1] = have_ovr ? 1 : 0;
                 decoded_any = true;
 
                 for (int i = 0; i < pix_here && x < width; i++, x++) {
@@ -955,7 +970,6 @@ static bool sgi_gbe_scanout(SGIGBEState *s, bool force)
     /* ---- cursor compositing (spec §2.10) ---- */
     sgi_gbe_composite_cursor(s, surface);
 
-    g_free(snap);
     s->scan_dirty = false;
     return decoded_any;
 }
@@ -1642,14 +1656,15 @@ static void sgi_gbe_realize(DeviceState *dev, Error **errp)
                          1024);
 
     /*
-     * Dirty-region scanout: the tile data lives in the machine's RAM, so
-     * enable VGA dirty logging on that block and let the scanout decode
-     * only tile scanlines the guest touched.  Without a ram link the
-     * scanout keeps its previous decode-everything behaviour.
+     * Dirty-region scanout: the tile data lives in the machine's RAM.  The
+     * scanout keeps a content shadow of the last-decoded span bytes and
+     * skips unchanged spans; the ram link is kept for the RAM sizing used
+     * by the scanout.  (QEMU's VGA dirty bitmap is deliberately not used:
+     * the guest writes tiles through the 0x80000000 no-ECC alias, whose
+     * writes are not recorded on this block's dirty bitmap.)
      */
     if (s->ram) {
         s->ram_size = memory_region_size(s->ram);
-        memory_region_set_log(s->ram, true, DIRTY_MEMORY_VGA);
     }
 }
 

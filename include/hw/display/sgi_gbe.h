@@ -229,6 +229,20 @@ struct SGIGBEState {
      */
     MemoryRegion *ram;
     uint64_t ram_size;
+    /*
+     * Content shadow for the dirty-region scanout: one entry per screen
+     * span (scan_height * w), holding the raw normal-plane and overlay
+     * bytes last decoded at that (y, tx).  A span whose source bytes are
+     * unchanged (and that no control change or cursor move forced) is
+     * skipped.  This is immune to the write path: the IRIX tile manager
+     * writes tiles through the 0x80000000 no-ECC alias, whose writes
+     * QEMU's VGA dirty bitmap does not record on the low RAM block (an
+     * alias has no ram_block), so a dirty-bitmap scanout silently dropped
+     * tiles written that way (observed: the Console icon absent until an
+     * unrelated control change).
+     */
+    uint8_t *span_shadow;
+    int span_shadow_spans;
     uint32_t crs_pos_seen;
     uint32_t crs_ctrl_seen;
 };
