@@ -224,14 +224,15 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
 }
 
 /* expTileRects repeats the tile across its destination.  The destination is the
- * clip rectangle list that immediately precedes the op (one expValidateClip per
- * exposed rect, seen as a 304 with four coordinate words, no colour token, 490
- * terminated).  When no list was supplied the whole screen is the destination
- * (the 4Dwm startup repaint of the root). */
+ * clip rectangle list set by the preceding expValidateClip ops (one per exposed
+ * rect, seen as a 304 with four coordinate words, no colour token, 490
+ * terminated).  The list persists until a tile consumes it; the startup
+ * clusters that precede any list are left alone rather than filled full-screen,
+ * which is what keeps the toolchest. */
 static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
 {
     unsigned n = s->re3_data_n;
-    uint32_t w, h, nwords;
+    uint32_t w, h, nwords, c0, c1;
     unsigned r;
 
     if (n < 7) {
@@ -253,6 +254,13 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
     if (!s->scanout) {
         return;
     }
+    /* The two tile colours are given by the op header, not by the tile pixels:
+     * data[1] is the second colour index and data[2] the base, and the DDX
+     * builds the base as (byte << 3) ("sll v1,v1,0x3" in expTileRects).  The
+     * root weave's header is (data[1]=3, data[2]=1), so the two colours are
+     * 1<<3 = 8 and 8+3 = 11 -- the control's ImdDarkGrey/ImdTeal. */
+    c0 = s->re3_data[2] << 3;
+    c1 = c0 + s->re3_data[1];
     if (s->re3_nclip == 0) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
         return;
@@ -281,11 +289,19 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
 
             for (x = rx1; x < rx2; x++) {
                 uint32_t word, p = row + (unsigned)(x % w);
+                uint8_t v, idx;
 
                 word = (p / 4 == 0) ? s->re3_tile_word0
                                     : s->re3_data[7 + (p / 4 - 1)];
-                sgi_gr2_put(s, x, y,
-                            (word >> (8 * (3 - (p % 4)))) & 0xff);
+                v = (word >> (8 * (3 - (p % 4)))) & 0xff;
+                if (v == (s->re3_data[1] & 0xff)) {
+                    idx = c1;
+                } else if (v == (s->re3_data[2] & 0xff)) {
+                    idx = c0;
+                } else {
+                    idx = v;
+                }
+                sgi_gr2_put(s, x, y, idx);
             }
         }
     }
