@@ -20,6 +20,7 @@
 #define HW_MISC_SGI_BASEIO_H
 
 #include "hw/char/serial.h"
+#include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/scsi/sgi_qlisp.h"
 #include "net/net.h"
@@ -57,6 +58,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
  */
 #define SGI_BASEIO_QLISP0_OFF 0x400000ULL
 #define SGI_BASEIO_QLISP1_OFF 0x600000ULL
+
+/*
+ * Bridge PCI-interrupt device lines the BaseIO devices wire to.  The IRIX
+ * kernel's pcibr programs b_int_addr[line] and sets b_int_enable bit `line`
+ * when it connects each device's handler; the observed IP27 programming is
+ * QLogic0 -> line 0, QLogic1 -> line 1, IOC3 -> line 4 (the PCI interrupt
+ * line each device's config was given).
+ */
+#define SGI_BASEIO_INT_DEV_QLISP0 0
+#define SGI_BASEIO_INT_DEV_QLISP1 1
+#define SGI_BASEIO_INT_DEV_IOC3   4
 
 /*
  * IOC3 SSRAM (256 KB address space, may not be fully populated), accessed for
@@ -210,6 +222,32 @@ struct SGIBaseIOState {
 
   /* PCI config-space writes to slot 0 (IOC3), via the bridge config window. */
   uint32_t pci_cfg0[0x40];
+
+  /*
+   * Bridge PCI-interrupt aggregation (sys/PCI/bridge.h).  A BaseIO device
+   * asserts one of the bridge's eight device lines; when that line is enabled
+   * (b_int_enable) the bridge sends the vector programmed in b_int_addr[line]
+   * to the hub, which latches it into INT_PEND0/1.  The kernel's pcibr then
+   * reads b_int_status to identify the line.
+   */
+  uint32_t int_enable;        /* BRIDGE_INT_ENABLE (0x10c) */
+  uint32_t int_line;          /* currently asserted device lines, bit n = line n */
+  uint32_t int_addr[8];       /* BRIDGE_INT_ADDR(n) (0x134 + n*8): host|vector */
+  uint32_t int_rst_stat;      /* BRIDGE_INT_RST_STAT (0x114) */
+  uint32_t int_mode;          /* BRIDGE_INT_MODE (0x11c) */
+  uint32_t int_device;        /* BRIDGE_INT_DEVICE (0x124): line -> slot map */
+  uint32_t int_host_err;      /* BRIDGE_INT_HOST_ERR (0x12c) */
+  /* Vector delivered to the hub per line (the ack we must send on deassert). */
+  int int_delivered[8];
+
+  /* SIO interrupt condition (sio_ir & sio_ienb): we report SA_TX_MT. */
+  uint32_t sio_ir_pending;
+
+  /* Aggregate bridge-interrupt output (error/status; informational). */
+  qemu_irq int_out;
+
+  /* Hub this bridge delivers vectors to (SGIHubState *), set by the machine. */
+  void *hub;
 
   /*
    * Bridge external SSRAM (BRIDGE_EXT_SSRAM) backing storage, at DEVIO0+0x80000

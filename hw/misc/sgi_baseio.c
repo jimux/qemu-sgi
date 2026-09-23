@@ -20,6 +20,7 @@
 #include "hw/core/boards.h"
 #include "hw/char/serial.h"
 #include "hw/misc/sgi_baseio.h"
+#include "hw/misc/sgi_hub.h"
 #include "chardev/char.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
@@ -796,6 +797,68 @@ static void sgi_baseio_sio_tx_drain(SGIBaseIOState *s, int port) {
   s->stcir[port] = cons;
 }
 
+/*
+ * Bridge PCI-interrupt delivery (sys/PCI/bridge.h).
+ *
+ * A BaseIO device asserts one of the bridge's eight device lines.  While that
+ * line is enabled in b_int_enable the bridge sends the interrupt vector the
+ * kernel programmed in b_int_addr[line] to the hub, which latches it into
+ * INT_PEND0/1 (mirroring the real XIO interrupt message); on deassert the
+ * vector is cleared.  The kernel's pcibr then reads b_int_status to find the
+ * line and its driver clears the device at the source.
+ */
+static void sgi_baseio_int_sync(SGIBaseIOState *s) {
+  int n;
+
+  for (n = 0; n < 8; n++) {
+    bool asserted = (s->int_line & s->int_enable & (1u << n)) != 0;
+
+    if (asserted) {
+      unsigned vec = s->int_addr[n] & 0xff;
+
+      if (vec && s->int_delivered[n] < 0) {
+        if (s->hub) {
+          sgi_hub_raise_vector(s->hub, vec, 1);
+        }
+        s->int_delivered[n] = vec;
+      }
+    } else if (s->int_delivered[n] >= 0) {
+      if (s->hub) {
+        sgi_hub_raise_vector(s->hub, s->int_delivered[n], 0);
+      }
+      s->int_delivered[n] = -1;
+    }
+  }
+  qemu_set_irq(s->int_out, (s->int_line & s->int_enable & 0xffff) != 0);
+}
+
+/* A device line (wired as a qemu_irq input) asserted or deasserted. */
+static void sgi_baseio_dev_irq(void *opaque, int n, int level) {
+  SGIBaseIOState *s = opaque;
+
+  if (level) {
+    s->int_line |= 1u << n;
+  } else {
+    s->int_line &= ~(1u << n);
+  }
+  sgi_baseio_int_sync(s);
+}
+
+/*
+ * IOC3 SuperIO interrupt condition: sio_ir & sio_ienb.  We drain the serial
+ * TX synchronously so sio_ir reports SA_TX_MT; the kernel enables that bit in
+ * do_ioc3_write() and expects the serial ISR to run to disable DMA / deliver
+ * the low-water notification, so the IOC3 line must follow the enable mask.
+ */
+static void sgi_baseio_ioc3_irq_sync(SGIBaseIOState *s) {
+  if (s->sio_ir_pending & s->sio_ienb) {
+    s->int_line |= 1u << SGI_BASEIO_INT_DEV_IOC3;
+  } else {
+    s->int_line &= ~(1u << SGI_BASEIO_INT_DEV_IOC3);
+  }
+  sgi_baseio_int_sync(s);
+}
+
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
 
@@ -1031,20 +1094,37 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     return 0xffffffff;
   }
   /*
-   * BRIDGE_INT_STATUS (0x104): one bit per PCI device (bit N = device N).
-   * The IOC3 is device 0; it asserts its interrupt line while any enabled
-   * Ethernet interrupt condition is pending (EISR & EIER).  The PROM
-   * enet_ioc3_loop diagnostic reads this after TX_EMPTY.
+   * Bridge interrupt registers (sys/PCI/bridge.h): status 0x104, enable
+   * 0x10c, reset-status 0x114, mode 0x11c, device 0x124, host-error 0x12c,
+   * and one address register per device line at 0x134 + n*8.  pcibr reads
+   * status to identify the asserting line; the address register holds the
+   * host|vector the bridge sends to the hub.  The IOC3 Ethernet condition is
+   * kept on status bit 0 for the PROM enet_ioc3_loop diagnostic.
    */
   if (off == 0x104) {
-    uint32_t st = 0;
+    uint32_t st = s->int_line;
     if (s->eth_regs[SGI_IOC3_EISR] & s->eth_regs[SGI_IOC3_EIER]) {
       st |= 1u << 0;
     }
     return st;
   }
+  if (off == 0x10c) {
+    return s->int_enable;
+  }
   if (off == 0x114) {
-    return 0;
+    return s->int_rst_stat;
+  }
+  if (off == 0x11c) {
+    return s->int_mode;
+  }
+  if (off == 0x124) {
+    return s->int_device;
+  }
+  if (off == 0x12c) {
+    return s->int_host_err;
+  }
+  if (off >= 0x134 && off < 0x174 && ((off - 0x134) & 7) == 0) {
+    return s->int_addr[(off - 0x134) >> 3];
   }
   /*
    * Bridge external SSRAM / IOC3 byte-bus SRAM window at bridge+0x280000
@@ -1101,10 +1181,44 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
    */
   if (off == 0x200020) {
     s->sio_ienb |= val;
+    sgi_baseio_ioc3_irq_sync(s);
     return;
   }
   if (off == 0x200024) {
     s->sio_ienb &= ~val;
+    sgi_baseio_ioc3_irq_sync(s);
+    return;
+  }
+  /*
+   * Bridge PCI-interrupt registers: latch b_int_enable / b_int_addr and
+   * re-deliver; absorb the mode/device/host-error/reset-status registers the
+   * kernel programs (int_rst_stat is write-1-to-clear and we hold no error
+   * bits).
+   */
+  if (off == 0x10c) {
+    s->int_enable = val;
+    sgi_baseio_int_sync(s);
+    return;
+  }
+  if (off == 0x114) {
+    s->int_rst_stat &= ~val;
+    return;
+  }
+  if (off == 0x11c) {
+    s->int_mode = val;
+    return;
+  }
+  if (off == 0x124) {
+    s->int_device = val;
+    return;
+  }
+  if (off == 0x12c) {
+    s->int_host_err = val;
+    return;
+  }
+  if (off >= 0x134 && off < 0x174 && ((off - 0x134) & 7) == 0) {
+    s->int_addr[(off - 0x134) >> 3] = val;
+    sgi_baseio_int_sync(s);
     return;
   }
   /* IOC3 serial DMA ring: latch the base (SBBR) and drain on a STPIR write. */
@@ -1354,6 +1468,20 @@ static const MemoryRegionOps sgi_baseio_uart_ops = {
 
 static void sgi_baseio_reset(DeviceState *dev) {
   SGIBaseIOState *s = SGI_BASEIO(dev);
+  int i;
+
+  s->int_enable = 0;
+  s->int_line = 0;
+  s->int_rst_stat = 0;
+  s->int_mode = 0;
+  s->int_device = 0;
+  s->int_host_err = 0;
+  memset(s->int_addr, 0, sizeof(s->int_addr));
+  for (i = 0; i < 8; i++) {
+    s->int_delivered[i] = -1;
+  }
+  /* We drain the serial TX synchronously, so SA_TX_MT is always set. */
+  s->sio_ir_pending = 0x00000001u;
 
   sgi_baseio_ds_board_init(&s->ds_board);
   sgi_baseio_ds_reset(&s->ds_board);
@@ -1379,6 +1507,14 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
   SGIBaseIOState *s = SGI_BASEIO(dev);
   Chardev *chr;
   int i;
+
+  /*
+   * Bridge PCI-interrupt aggregation: eight device-line inputs (BaseIO
+   * devices assert them) and one aggregate output the machine may route.  The
+   * per-line vectors are delivered to the hub through the `hub` pointer.
+   */
+  qdev_init_gpio_in(dev, sgi_baseio_dev_irq, 8);
+  qdev_init_gpio_out(dev, &s->int_out, 1);
 
   memory_region_init_io(&s->iomem, OBJECT(s), &sgi_baseio_ops, s, "sgi-baseio",
                         SGI_BASEIO_WINDOW_SIZE);
@@ -1437,6 +1573,11 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
     memory_region_add_subregion(&s->iomem, SGI_BASEIO_QLISP1_OFF,
                                 &s->isp[1].regs);
   }
+  /* Each ISP channel asserts its bridge PCI-interrupt device line. */
+  qdev_connect_gpio_out(DEVICE(&s->isp[0]), 0,
+                        qdev_get_gpio_in(dev, SGI_BASEIO_INT_DEV_QLISP0));
+  qdev_connect_gpio_out(DEVICE(&s->isp[1]), 0,
+                        qdev_get_gpio_in(dev, SGI_BASEIO_INT_DEV_QLISP1));
 
   /*
    * IOC3 Ethernet NIC.  The machine claims the default -nic/-netdev backend
