@@ -93,6 +93,15 @@ static void iris3130_ip2_irq(void *opaque, int n, int level)
         m68k_set_irq_level(&s->cpu, iris3130_ip2_lines[best].level,
                            iris3130_ip2_lines[best].vector);
     }
+    if (getenv("SGI_IP2IRQ_TRACE")) {
+        fprintf(stderr, "IP2IRQ n=%d lvl=%d pend=[%d%d%d%d%d] best=%d "
+                "-> set %d/%#x sr=%#x\n",
+                n, level, s->irq_pending[0], s->irq_pending[1],
+                s->irq_pending[2], s->irq_pending[3], s->irq_pending[4],
+                best, best < 0 ? 0 : iris3130_ip2_lines[best].level,
+                best < 0 ? 0 : iris3130_ip2_lines[best].vector,
+                (unsigned)s->cpu.env.sr);
+    }
 }
 
 bool sgi_gl2_user_read(uint32_t *pc_out)
