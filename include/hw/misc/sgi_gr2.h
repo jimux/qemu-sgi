@@ -267,6 +267,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
  * index 1's last 0x1c write would otherwise overwrite its red.  */
 #define SGI_GR2_XMAP_PAL_BANK_INSTALLED 0x11 /* normal map, written last */
 #define SGI_GR2_XMAP_PAL_BANK_ALT       0x10 /* same map; the weave lives here */
+/* The XMAP CLUT bank selected by addrhi 0x1c is the 4-entry OVERLAY map
+ * (measured while a 4Dwm menu is posted: entries 1/2/3 = red/white/black, entry
+ * 0 left unprogrammed = transparent).  This bank is what makes overlay windows
+ * visible, not the 24-bit map. */
+#define SGI_GR2_XMAP_PAL_BANK_OVERLAY   0x1c
+#define SGI_GR2_OVL_COLOURS             4
 /* The three BT457 RAMDACs, one per colour channel.  Each has an address
  * register at +0 and a 256-entry palette/gamma RAM at +4 which auto-increments
  * its address after every write (the +8/+0xc registers are command/overlay and
@@ -324,6 +330,16 @@ struct SGIGr2State {
      * index.  At scanout a flagged pixel is expanded 3-3-2, an unflagged one
      * goes through ramdac[], so both visual modes coexist on the same screen. */
     uint8_t *scanout332;
+    /* Overlay plane (2 bits/pixel; one byte per pixel here).  0 is TRANSPARENT
+     * — the main plane shows through — and 1..3 index the 4-entry overlay
+     * colormap.  4Dwm menus are depth-2 override-redirect windows: the DDX
+     * draws them with the SAME RE3 rect ops as the main plane but under mode
+     * 309 == 3, and those ops were previously dropped, which is why the menu
+     * was invisible.  They are routed to this buffer and composited over the
+     * main plane at scanout, overlay-over-main, index 0 transparent. */
+    uint8_t *overlay;
+    uint32_t ovl_ramdac[SGI_GR2_OVL_COLOURS];
+    bool ovl_ramdac_set;
     bool scanout_bars; /* fill a colour-bar test pattern (P0.4 step a) */
     bool poly_stroke;  /* 302 op: stroke its path instead of filling (test seam) */
 
