@@ -1114,6 +1114,15 @@ void sgi_router_connect(SGIRouterState *r, int port, SGIHubState *hub) {
   }
 }
 
+void sgi_router_reset(SGIRouterState *r) {
+  if (!r || !r->regs) {
+    return;
+  }
+  memset(r->regs, 0, SGI_ROUTER_REG_WORDS * sizeof(uint64_t));
+  r->regs[RR_SCRATCH_REG0 / 8] = r->nic & RSCR0_NIC_MASK;
+  sgi_ds2502_reset(&r->ds);
+}
+
 void sgi_hub_set_router(SGIHubState *s, SGIRouterState *r) { s->router = r; }
 
 /* Which router port this hub is plugged into (0 = not connected). */
@@ -1517,8 +1526,13 @@ static void sgi_hub_ii_write(SGIHubState *s, hwaddr off, uint64_t val) {
     s->ii_iiwa = val;
     break;
   case IIO_ILCSR:
-    /* Keep the modelled link reported as working. */
-    s->ii_ilcsr = val | IIO_ILCSR_LINK_WORKING;
+    /*
+     * Keep the modelled link reported as working only when an IO board is
+     * actually attached; a node with nothing on its xtalk port reports the
+     * link down so the kernel's early_probe_for_widget() takes the
+     * XWIDGET_PART_NUM_NONE path instead of probing an unbacked widget.
+     */
+    s->ii_ilcsr = val | (s->io_attached ? IIO_ILCSR_LINK_WORKING : 0);
     break;
   case IIO_SCRATCH_REG0:
     s->ii_scratch[0] = val;
@@ -1693,9 +1707,21 @@ static void sgi_hub_reset(DeviceState *dev) {
   s->ii_wcr = HUB_XIO_WIDGET_ID;
   s->ii_iowa = 0x1ff;
   s->ii_iiwa = 0x1ff;
-  s->ii_ilcsr = IIO_ILCSR_LINK_WORKING;
+  s->ii_ilcsr = s->io_attached ? IIO_ILCSR_LINK_WORKING : 0;
   s->ii_scratch[0] = 0;
   s->ii_scratch[1] = 0;
+
+  /*
+   * The attached router is machine-owned, not a DeviceState, so it is not
+   * reset by the device-reset walk.  The kernel's use of reset_system() (and
+   * the panic-restart path) ends in qemu_system_reset_request(), which resets
+   * this hub but otherwise leaves the router register file intact --
+   * including RR_SCRATCH_REG1 held at 0xffff by discovery's fence, which then
+   * makes the recovery boot's cache_router_nic() time out and fall back to
+   * single-node.  Reset the router's volatile state here so every device reset
+   * also releases the router lock and re-seeds RR_SCRATCH_REG0.
+   */
+  sgi_router_reset(s->router);
 
   sgi_hub_update_irqs(s);
 }
@@ -1739,6 +1765,7 @@ static const Property sgi_hub_properties[] = {
     DEFINE_PROP_UINT32("num-cpus", SGIHubState, num_cpus, 1),
     DEFINE_PROP_UINT32("slot-id", SGIHubState, slot_id, 7),
     DEFINE_PROP_UINT64("mem-config", SGIHubState, mem_config, 0),
+    DEFINE_PROP_BOOL("io-attached", SGIHubState, io_attached, true),
 };
 
 static void sgi_hub_class_init(ObjectClass *klass, const void *data) {

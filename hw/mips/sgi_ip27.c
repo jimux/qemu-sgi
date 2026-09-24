@@ -125,6 +125,12 @@ static uint64_t ip27_swin_phys(uint32_t nasid, uint32_t wid) {
 
 void sgi_ip27_local_reset(void);
 
+/*
+ * The machine's single router (NULL in single-node mode), kept file-scope so
+ * sgi_ip27_local_reset() can re-initialise it on a guest-requested reset.
+ */
+static SGIRouterState *ip27_router;
+
 static void main_cpu_reset(void *opaque) {
   MIPSCPU *cpu = opaque;
   cpu_reset(CPU(cpu));
@@ -156,6 +162,14 @@ static void main_cpu_reset(void *opaque) {
  */
 void sgi_ip27_local_reset(void) {
   CPUState *c;
+
+  /*
+   * The router is machine-owned, not a DeviceState, so it has no QEMU reset.
+   * Discovery's fence leaves RR_SCRATCH_REG1 held (0xffff) across a panic, and
+   * without this the post-panic recovery boot cannot re-lock the router and
+   * falls back to single-node (leg 184/185).  Re-init its volatile state here.
+   */
+  sgi_router_reset(ip27_router);
 
   CPU_FOREACH(c) {
     main_cpu_reset(MIPS_CPU(c));
@@ -1008,6 +1022,15 @@ static void sgi_ip27_init(MachineState *machine) {
      */
     qdev_prop_set_uint32(h, "slot-id", (i == 0) ? 7 : 6);
     qdev_prop_set_uint64(h, "mem-config", sgi_ip27_mem_config(node_ram));
+    /*
+     * Node 1 is a CPU-dead memory brick with no IO board, so its hub's
+     * IIO_LLP_CSR must report the xtalk link DOWN.  The kernel's per-node
+     * io_graph_init() -> early_probe_for_widget() then sets
+     * XWIDGET_PART_NUM_NONE and returns without probing the widget, instead of
+     * reading an unbacked node-1 IO widget (PIO read error -> FRU analysis ->
+     * KERNEL FAULT).  Grounded in ml/SN/iograph.c:395-417.
+     */
+    qdev_prop_set_bit(h, "io-attached", i == 0);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(h), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(h), 0, ip27_swin_phys(i, IP27_HUB_WIDGET));
     hubs[i] = SGI_HUB(h);
@@ -1080,6 +1103,7 @@ static void sgi_ip27_init(MachineState *machine) {
     sgi_router_connect(router, 5, hubs[0]);
     sgi_hub_set_router(hubs[0], router);
     sgi_hub_set_router(hubs[1], router);
+    ip27_router = router;
   }
 
   /*

@@ -99,6 +99,17 @@ struct SGIHubState {
    * klhwg_connect_hubs() gets GRAPH_DUP adding the hub->router edge.
    */
   uint32_t slot_id;
+  /*
+   * Whether an IO board (BaseIO bridge) is attached to this hub's xtalk port.
+   * The hub's IIO_LLP_CSR reports the link up only then.  On a two-node
+   * Origin the second node here is a CPU-dead memory brick with no IO board,
+   * and the kernel's io_graph_init() -> early_probe_for_widget() must observe
+   * the link DOWN so it sets XWIDGET_PART_NUM_NONE and skips the widget probe
+   * instead of reading an unbacked node-1 widget and taking a PIO error
+   * (ml/SN/iograph.c:395-417).  Default true keeps node 0 / single node
+   * unchanged.
+   */
+  bool io_attached;
 
   /* PI: CPU presence/enable and per-slice state. */
   uint64_t cpu_present[SGI_HUB_MAX_CPUS];
@@ -265,6 +276,18 @@ typedef struct SGIRouterState {
 void sgi_router_init(SGIRouterState *r, uint32_t nic, uint32_t chipin,
                      uint32_t revision);
 void sgi_router_connect(SGIRouterState *r, int port, SGIHubState *hub);
+
+/*
+ * Re-initialise a router's volatile state on a system reset: clear the
+ * register file (RR_SCRATCH_REG1 in particular, which discovery's fence uses
+ * as a lock and can leave held at 0xffff after a panic) and re-seed
+ * RR_SCRATCH_REG0 with the cached NIC, then reset the 1-wire slave.  The port
+ * graph is topology, not volatile state, and is left intact.  Called from the
+ * hub's device reset (the path the kernel's reset_system() reaches) and from
+ * sgi_ip27_local_reset(), so a recovery boot re-acquires the router lock
+ * instead of degrading to single-node.
+ */
+void sgi_router_reset(SGIRouterState *r);
 
 /* Attach a router as this hub's NI link (NULL = single-node, no peer). */
 void sgi_hub_set_router(SGIHubState *s, SGIRouterState *r);
