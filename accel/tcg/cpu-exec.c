@@ -883,10 +883,17 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
     return false;
 }
 
+/* Weak hook: a target may provide sgi_kprobe() to log entry to specific guest
+ * functions (SGI_KPROBE=1).  Defined in target/m68k/translate.c. */
+void sgi_kprobe(CPUState *cpu, vaddr pc) __attribute__((weak));
+
 static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                     vaddr pc, TranslationBlock **last_tb,
                                     int *tb_exit)
 {
+    if (sgi_kprobe) {
+        sgi_kprobe(cpu, pc);
+    }
     trace_exec_tb(tb, pc);
     tb = cpu_tb_exec(cpu, tb, tb_exit);
     if (*tb_exit != TB_EXIT_REQUESTED) {
