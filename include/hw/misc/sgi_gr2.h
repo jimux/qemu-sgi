@@ -135,6 +135,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_LCOLOR      0x401f8 /* token 126, light colour RGB     */
 #define SGI_GR2_GE7_MAX_LIGHTS  3      /* light slots the shade sums       */
 #define SGI_GR2_GE7_LPOS        0x401fc /* token 127, light position XYZ   */
+#define SGI_GR2_GE7_LIGHT_SEL   0x40200 /* token 128, (5, light number)    */
 #define SGI_GR2_GE7_LMCOLOR     0x40204 /* token 129, lighting model       */
 
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
@@ -525,13 +526,16 @@ struct SGIGr2State {
     float ge_lcolor[3];            /* token 126: light colour RGB            */
     float ge_lpos[3];              /* token 127: light position XYZ          */
     float ge_ambient_sum[3];       /* token 117: summed ambient RGB          */
-    /* The guest binds up to three lights and animates their positions; each
-     * bind writes a fresh 3-float lpos run.  A completed run replaces one slot
-     * round-robin and the shade sums the valid ones.  A single-light guest
-     * fills one slot; the others stay invalid and contribute nothing. */
+    /* The guest binds several lights and animates them.  Token 128 is a
+     * two-word selector (5, light-number) that names the light whose colour
+     * and position runs follow, so each light gets its own slot rather than a
+     * round-robin guess.  shade() sums the valid ones. */
     float ge_lights[SGI_GR2_GE7_MAX_LIGHTS][3];
+    float ge_light_color[SGI_GR2_GE7_MAX_LIGHTS][3];
     bool ge_light_valid[SGI_GR2_GE7_MAX_LIGHTS];
-    unsigned ge_light_next;
+    unsigned ge_light_cur;         /* light chosen by the last token 128     */
+    float ge_lsel[2];              /* words of the token-128 selector run    */
+    unsigned ge_lsel_n;
     unsigned ge_lpos_n;            /* words collected for the current light   */
     hwaddr ge_mat_tok;             /* last material token (run boundary)     */
     unsigned ge_mat_n;             /* components collected in the run        */

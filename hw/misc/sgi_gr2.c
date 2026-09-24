@@ -1153,9 +1153,9 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
         ndl = MAX(nn[0] * l[0] + nn[1] * l[1] + nn[2] * l[2], 0.0f);
         ndh = MAX(nn[0] * h[0] + nn[1] * h[1] + nn[2] * h[2], 0.0f);
         for (c = 0; c < 3; c++) {
-            col[c] += s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
-                                         s->ge_specular[c] *
-                                         powf(ndh, shininess));
+            col[c] += s->ge_light_color[li][c] * (s->ge_diffuse[c] * ndl +
+                                                  s->ge_specular[c] *
+                                                  powf(ndh, shininess));
         }
         any = true;
     }
@@ -1498,20 +1498,21 @@ static void sgi_gr2_ge7_mat_word(SGIGr2State *s, float *dst, hwaddr tok,
 }
 
 /* One component of a light position (token 127).  Each bind writes a complete
- * 3-float run, so a finished run becomes the next light slot round-robin;
- * that is how a guest binding several lights is represented. */
+ * 3-float run, and the run belongs to the light token 128 selected last, so
+ * it lands in that light's own slot. */
 static void sgi_gr2_ge7_light_word(SGIGr2State *s, float f)
 {
+    unsigned li = s->ge_light_cur;
+
     s->ge_lpos[s->ge_lpos_n++] = f;
     if (s->ge_lpos_n < 3) {
         return;
     }
     s->ge_lpos_n = 0;
-    s->ge_lights[s->ge_light_next][0] = s->ge_lpos[0];
-    s->ge_lights[s->ge_light_next][1] = s->ge_lpos[1];
-    s->ge_lights[s->ge_light_next][2] = s->ge_lpos[2];
-    s->ge_light_valid[s->ge_light_next] = true;
-    s->ge_light_next = (s->ge_light_next + 1) % SGI_GR2_GE7_MAX_LIGHTS;
+    s->ge_lights[li][0] = s->ge_lpos[0];
+    s->ge_lights[li][1] = s->ge_lpos[1];
+    s->ge_lights[li][2] = s->ge_lpos[2];
+    s->ge_light_valid[li] = true;
     s->ge_mat_valid = true;
 }
 
@@ -1636,8 +1637,31 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
     case SGI_GR2_GE7_EMISSION:
         sgi_gr2_ge7_mat_word(s, s->ge_emission, offset, sgi_gr2_u2f(v));
         break;
+    case SGI_GR2_GE7_LIGHT_SEL:
+        /* Two-word selector, (5, light-number): the colour and position runs
+         * that follow belong to that light.  The selector also ends any run in
+         * progress, so the next light's vector starts clean. */
+        s->ge_lsel[s->ge_lsel_n++] = sgi_gr2_u2f(v);
+        s->ge_mat_n = 0;
+        s->ge_lpos_n = 0;
+        if (s->ge_lsel_n == 2) {
+            s->ge_lsel_n = 0;
+            if ((int)s->ge_lsel[0] == 5) {
+                unsigned li = (unsigned)(int)s->ge_lsel[1];
+
+                if (li < SGI_GR2_GE7_MAX_LIGHTS) {
+                    s->ge_light_cur = li;
+                }
+            }
+        }
+        break;
     case SGI_GR2_GE7_LCOLOR:
-        sgi_gr2_ge7_mat_word(s, s->ge_lcolor, offset, sgi_gr2_u2f(v));
+        sgi_gr2_ge7_mat_word(s, s->ge_light_color[s->ge_light_cur], offset,
+                             sgi_gr2_u2f(v));
+        /* Keep the flat ge_lcolor too: it is the colour the no-lights
+         * headlight fallback uses in shade(). */
+        memcpy(s->ge_lcolor, s->ge_light_color[s->ge_light_cur],
+               sizeof(s->ge_lcolor));
         break;
     case SGI_GR2_GE7_LPOS:
         sgi_gr2_ge7_light_word(s, sgi_gr2_u2f(v));
