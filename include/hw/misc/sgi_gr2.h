@@ -432,6 +432,17 @@ struct SGIGr2State {
     int re3_last_rect_x;
     int re3_last_rect_y;
     bool re3_last_rect_valid;
+    /* Bounding box of the overlay-plane menu currently established by its
+     * background fills (mode-3 colour 1).  The overlay's ONLY retire mechanism
+     * is the menu's own overlay clear (a mode-3 colour-0 fill of this same
+     * rect), so any overlay stroke that leaves this box is never erased and
+     * would sit on the screen forever; clip strokes to it.  Cleared by the
+     * colour-0 fill. */
+    int ovl_clip_x1;
+    int ovl_clip_y1;
+    int ovl_clip_x2;
+    int ovl_clip_y2;
+    bool ovl_clip_valid;
     int re3_label_y;
     bool re3_label_valid;
     /* IP20 Xsgi's glyph piece, read straight from the stream (see the token
