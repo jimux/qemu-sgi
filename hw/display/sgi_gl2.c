@@ -220,6 +220,7 @@ struct SGIGL2State {
 
     /* Kernel textport state (FBCcharposnabs / FBCdrawchars). */
     int16_t char_x, char_y;
+    bool charpos_pending;         /* a charposnabs expects the next GEpoint */
     uint16_t font_base;           /* FBCbaseaddress: added to glyph offsets */
 
     bool testpattern;
@@ -908,6 +909,17 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         }
         fprintf(stderr, "\n");
     }
+    if (buf_trace_on() &&
+        (cmd == 0x1a || (cmd & 0xff) == 0x12 || cmd == 0x1c || cmd == 0x1b)) {
+        const char *nm = cmd == 0x1c ? "DRAWCHARS" :
+                                cmd == 0x1a ? "CHARPOSNABS" :
+                                cmd == 0x1b ? "CHARPOSNREL" : "GEPT";
+        fprintf(stderr, "GEPOS %s cmd=%#x nargs=%u:", nm, cmd, nargs);
+        for (i = 0; i < nargs && i < 10; i++) {
+            fprintf(stderr, " %04x", args[i]);
+        }
+        fprintf(stderr, "\n");
+    }
     switch (cmd) {
     case 0x04:                          /* FBCrgbcolor */
     case 0x05:                          /* FBCrgbwrten */
@@ -1018,8 +1030,22 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
 
     case 0x1a:                          /* FBCcharposnabs: GEpoint, x, y */
         if (nargs >= 3) {
+            /*
+             * Inline form (the kernel textport, im_passcmd(4/6)): the
+             * coordinates ride in the packet.
+             */
             s->char_x = (int16_t)args[1];
             s->char_y = (int16_t)args[2];
+            s->charpos_pending = false;
+        } else {
+            /*
+             * Bare form (the GL library's im_cmov2i: im_passcmd(1,
+             * FBCcharposnabs) followed by a separate GEpoint).  Arm the
+             * latch so only the GEpoint that follows is taken as the
+             * character position -- GEpoint is also used for ordinary
+             * drawing, and latching those corrupted char_x/char_y.
+             */
+            s->charpos_pending = true;
         }
         break;
 
@@ -1270,11 +1296,23 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
                     s->poly_n++;
                 }
             } else if (s->ge_poly_op == 0x12) {
-                /* GEpoint sets the current point; the following
-                 * FBCcharposnabs (no operands) latches it as the character
-                 * position -- this is how im_cmov2i positions text. */
-                s->char_x = x;
-                s->char_y = y;
+                /* GEpoint sets the current point; a preceding bare
+                 * FBCcharposnabs latches it as the character position
+                 * (im_cmov2i).  Keep the latch armed across unrelated
+                 * GEpoints so it is never stolen by a drawing command. */
+                if (buf_trace_on()) {
+                    fprintf(stderr, "GEPTRAW isd=%d ncoord=%d paired=%d "
+                            "w=%04x %04x %04x %04x %04x %04x -> x=%d y=%d\n",
+                            s->ge_poly_isd, s->ge_poly_ncoord,
+                            s->charpos_pending, s->ge_poly_w[0],
+                            s->ge_poly_w[1], s->ge_poly_w[2], s->ge_poly_w[3],
+                            s->ge_poly_w[4], s->ge_poly_w[5], x, y);
+                }
+                if (s->charpos_pending) {
+                    s->char_x = x;
+                    s->char_y = y;
+                    s->charpos_pending = false;
+                }
             }
             s->ge_poly_got = 0;
         }
@@ -1518,6 +1556,7 @@ static void gl2_reset(DeviceState *dev)
     s->ge_cmd = 0;
     memset(s->ge_args, 0, sizeof(s->ge_args));
     s->char_x = s->char_y = 0;
+    s->charpos_pending = false;
     s->font_base = 0;
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
