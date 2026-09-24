@@ -735,9 +735,28 @@ static bool sgi_crime_re_clip_pass(SGICRIMEREState *s, int wx, int wy,
     int y = wy + (int16_t)(s->winoffset_dst & 0xffff);
 
     if (dm & DM_ENSCISSORTEST) {
-        uint32_t lo = s->scissor_lo, hi = s->scissor_hi;
-        int minx = (hi >> 16) & 0xffff, miny = hi & 0xffff;
-        int maxx = (lo >> 16) & 0xffff, maxy = lo & 0xffff;
+        /*
+         * @@SEMANTICS@@ — Scissor (CRIME 1.5 spec §7.3.1.9 Table 7-10): a
+         * 64-bit window-relative rectangle, bits [63:48]=min.x,
+         * [47:32]=min.y, [31:16]=max.x, [15:0]=max.y.  crmSetAndGo writes it
+         * as the same two-word pair as ScrMask: the register at 0x048 (held
+         * here in scissor_lo) is the HIGH word = the min corner, and 0x04c
+         * (scissor_hi) is the low word = the max corner.  Measured live: a
+         * 640x512 GL window is programmed 0x1000100012801200 = min
+         * (4096,4096), max (4736,4608), exactly the window in +4096 GL
+         * window space; the clip is applied in window coordinates.
+         *
+         * clip_pass read min from scissor_hi and max from scissor_lo, so
+         * every enabled scissor was empty (min 4736 >= max 4096) and
+         * rejected every fragment.  Measured on atlantis: 10826 triangles,
+         * inside>0, wrote=0 (WinOffset.dst=-4032, window on screen);
+         * powerflip, solidview and mandel (which also set enScissorTest)
+         * stayed at the clear colour for the same reason.  tex_cube never
+         * sets enScissorTest, which is why it alone rendered.
+         */
+        uint32_t mn = s->scissor_lo, mx = s->scissor_hi;
+        int minx = (mn >> 16) & 0xffff, miny = mn & 0xffff;
+        int maxx = (mx >> 16) & 0xffff, maxy = mx & 0xffff;
         if (wx < minx || wx >= maxx || wy < miny || wy >= maxy) {
             return false;
         }
