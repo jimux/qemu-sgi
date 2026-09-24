@@ -1346,6 +1346,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     float vcol[SGI_GR2_GE7_MAX_VERTS][3]; /* per-vertex shaded RGB           */
     int vx, vy, vw, vh;
     unsigned i;
+    unsigned poly_px = 0; /* pixels this polygon paints (trace diagnostic) */
     const float shininess = 8.0f;
 
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
@@ -1521,11 +1522,16 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                 if (z < s->ge_zbuf[o]) {
                     s->ge_zbuf[o] = z;
                     sgi_gr2_put332(s, x, y, sgi_gr2_ge7_332(s, col, x, y));
+                    poly_px++;
                 }
             }
         }
         s->ge_polys++;
     }
+    trace_sgi_gr2_ge7_poly(s->ge_poly_n, (int)poly_px,
+                           (int)(vcol[0][0] * 255.0f + 0.5f),
+                           (int)(vcol[0][1] * 255.0f + 0.5f),
+                           (int)(vcol[0][2] * 255.0f + 0.5f));
     s->ge_3d_seen = true;
 }
 
