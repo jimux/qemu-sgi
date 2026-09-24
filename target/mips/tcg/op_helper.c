@@ -389,6 +389,8 @@ static void ip6hook_log(const char *fmt, ...)
 void helper_ip6_pchook(CPUMIPSState *env)
 {
     int i;
+    static uint32_t ip6_last_num;
+    uint32_t proc = (uint32_t)cpu_ldl_data(env, 0xffffb0a0u);
 
     ip6hook_log("IP6HOOK: pc=%08x cause=%08x sr=%08x epc=%08x badv=%08x "
             "ra=%08x\n", (uint32_t)env->active_tc.PC, env->CP0_Cause,
@@ -404,8 +406,9 @@ void helper_ip6_pchook(CPUMIPSState *env)
         uint32_t ua1 = (uint32_t)cpu_ldl_data(env, fp + 32);
         uint32_t ua2 = (uint32_t)cpu_ldl_data(env, fp + 36);
         uint32_t ua3 = (uint32_t)cpu_ldl_data(env, fp + 40);
+        ip6_last_num = num;
         ip6hook_log("IP6SYS call n=%08x a0=%08x a1=%08x a2=%08x a3=%08x "
-                    "ra=%08x\n", num, ua0, ua1, ua2, ua3,
+                    "proc=%08x ra=%08x\n", num, ua0, ua1, ua2, ua3, proc,
                     (uint32_t)env->active_tc.gpr[31]);
         if (num == 0x3edu) {   /* open: log the path string */
             char sbuf[40];
@@ -420,6 +423,30 @@ void helper_ip6_pchook(CPUMIPSState *env)
             sbuf[k] = 0;
             ip6hook_log("IP6SYS open path=\"%s\" flags=%x mode=%x\n", sbuf,
                         ua1, ua2);
+        }
+        if (num == 0x423u) {   /* execve: log the path */
+            char ebuf[40];
+            int k;
+            for (k = 0; k < 39; k++) {
+                int c = cpu_ldub_data(env, ua0 + k);
+                if (c == 0) {
+                    break;
+                }
+                ebuf[k] = c;
+            }
+            ebuf[k] = 0;
+            ip6hook_log("IP6SYS execve path=\"%s\" proc=%08x\n", ebuf, proc);
+        }
+        if (num == 0x3e9u) {   /* exit: status */
+            ip6hook_log("IP6SYS exit status=%08x proc=%08x\n", ua0, proc);
+        }
+        if (num == 0x418u) {   /* signal: signo + handler */
+            ip6hook_log("IP6SYS signal signo=%08x handler=%08x proc=%08x\n",
+                        ua0, ua1, proc);
+        }
+        if (num == 0x411u || num == 0x442u) {   /* dup / dup2 */
+            ip6hook_log("IP6SYS %s fd=%08x fd2=%08x proc=%08x\n",
+                        num == 0x411u ? "dup" : "dup2", ua0, ua1, proc);
         }
         if (num == 0x3ecu) {   /* write: log fd, count, and the bytes */
             char wbuf[48];
@@ -502,10 +529,11 @@ void helper_ip6_pchook(CPUMIPSState *env)
         ip6hook_log("IP6CON cnclose\n");
     }
     if ((uint32_t)env->active_tc.PC == 0x800173a0u) {
-        ip6hook_log("IP6SYS ret v0=%08x uinv0=%08x errcell=%08x\n",
+        ip6hook_log("IP6SYS ret n=%08x v0=%08x uinv0=%08x errcell=%08x "
+                    "proc=%08x\n", ip6_last_num,
                     (uint32_t)env->active_tc.gpr[2],
                     (uint32_t)cpu_ldl_data(env, 0xffffc114u),
-                    (uint32_t)cpu_ldl_data(env, 0xffffc304u));
+                    (uint32_t)cpu_ldl_data(env, 0xffffc304u), proc);
     }
 
     /* Semaphore lost-wakeup probe: dump the sema object at each psema/vsema. */
