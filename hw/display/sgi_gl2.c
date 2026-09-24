@@ -428,6 +428,7 @@ static void gl2_exec(SGIGL2State *s, unsigned cmd, uint16_t val)
 }
 
 static bool fbc_trace_on(void);
+static bool buf_trace_on(void);
 
 static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -663,6 +664,15 @@ static void gl2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
 }
 
+struct gl2_glyph_hist {
+    unsigned off;
+    int x, y, w, h;
+    uint16_t cfr, base, word0;
+    int wbuf, dbuf;
+};
+static struct gl2_glyph_hist gl2_gh[32];
+static int gl2_gh_n, gl2_gh_pos;
+
 static void gl2_gfx_update(void *opaque)
 {
     SGIGL2State *s = opaque;
@@ -674,6 +684,44 @@ static void gl2_gfx_update(void *opaque)
         return;
     }
     dest = (uint32_t *)surface_data(surface);
+    if (buf_trace_on()) {
+        static int n;
+        int k;
+
+        if (n < 4) {
+            fprintf(stderr, "GFXUPD cfr=%#x mdr=%#x wbuf=%d dbuf=%d\n",
+                    s->cfr, s->mdr, gl2_wbuf_idx(s), gl2_dbuf_idx(s));
+            n++;
+        }
+        if (gl2_gh_n > 0) {
+            int cnt = gl2_gh_n < 32 ? gl2_gh_n : 32;
+            fprintf(stderr, "GHIST last %d glyphs (dbuf=%d):\n", cnt,
+                    gl2_dbuf_idx(s));
+            for (k = 0; k < cnt; k++) {
+                int idx = (gl2_gh_pos - cnt + k + 32) % 32;
+                struct gl2_glyph_hist *g = &gl2_gh[idx];
+
+                fprintf(stderr, "  off=%#x x=%d y=%d w=%d h=%d cfr=%#x "
+                        "base=%#x wbuf=%d dbuf=%d word0=%04x\n", g->off,
+                        g->x, g->y, g->w, g->h, g->cfr, g->base, g->wbuf,
+                        g->dbuf, g->word0);
+            }
+            gl2_gh_n = 0;
+        }
+        {
+            static int fdumped;
+            int kk;
+
+            if (!fdumped) {
+                fdumped = 1;
+                fprintf(stderr, "FONTDUMP 800:");
+                for (kk = 0x800; kk < 0xc00; kk++) {
+                    fprintf(stderr, "%04x", s->font[kk]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     for (y = 0; y < GL2_YDIM; y++) {
         uint32_t *row = dest + (GL2_YDIM - 1 - y) * GL2_XDIM;
         for (x = 0; x < GL2_XDIM; x++) {
@@ -701,6 +749,16 @@ static bool fbc_trace_on(void)
 
     if (on < 0) {
         on = getenv("SGI_FBC_TRACE") != NULL;
+    }
+    return on;
+}
+
+static bool buf_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("SGI_GL2_BUF_TRACE") != NULL;
     }
     return on;
 }
@@ -807,6 +865,24 @@ static void gl2_draw_glyph(SGIGL2State *s, unsigned offset, int w, int h,
                 s->font[offset % GL2_FONT_WORDS], hit);
         dbg++;
     }
+    if (buf_trace_on()) {
+        struct gl2_glyph_hist *g = &gl2_gh[gl2_gh_pos];
+
+        g->off = offset;
+        g->x = s->char_x;
+        g->y = s->char_y;
+        g->w = w;
+        g->h = h;
+        g->cfr = s->cfr;
+        g->base = s->font_base;
+        g->word0 = s->font[(s->font_base + offset) % GL2_FONT_WORDS];
+        g->wbuf = gl2_wbuf_idx(s);
+        g->dbuf = gl2_dbuf_idx(s);
+        gl2_gh_pos = (gl2_gh_pos + 1) % 32;
+        if (gl2_gh_n < 32) {
+            gl2_gh_n++;
+        }
+    }
     s->dirty = true;
 }
 
@@ -881,8 +957,21 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
 
     case 0x17:                          /* FBCloadmasks: font RAM */
         if (nargs >= 1) {
-            unsigned addr = args[0];
+            /*
+             * FBCbaseaddress is "the offset the fbc will add to all fontram
+             * addresses" (kgl.c setfontbaseaddr), so it applies to the load
+             * path exactly as it does to the draw path.  The library reloads
+             * the raster font with the base still set, so loading at the raw
+             * address would strand the glyphs 0x800 words below where
+             * FBCdrawchars reads them.
+             */
+            unsigned addr = s->font_base + args[0];
 
+            if (buf_trace_on()) {
+                fprintf(stderr, "FBCLOAD addr=%#x nargs=%u base=%#x "
+                        "data0=%04x data1=%04x\n", args[0], nargs, s->font_base,
+                        nargs > 1 ? args[1] : 0, nargs > 2 ? args[2] : 0);
+            }
             for (i = 1; i < nargs; i++) {
                 s->font[addr++ % GL2_FONT_WORDS] = args[i];
             }
@@ -891,6 +980,9 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
 
     case 0x09:                          /* FBCbaseaddress: font RAM base */
         if (nargs >= 1) {
+            if (buf_trace_on()) {
+                fprintf(stderr, "FBCBASE %#x -> %#x\n", s->font_base, args[0]);
+            }
             s->font_base = args[0];
         }
         break;
@@ -903,6 +995,16 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
          * scans out; the MDR's UC_DOUBLE bit enables double buffering.
          */
         if (nargs >= 2) {
+            if (buf_trace_on()) {
+                fprintf(stderr, "FBCCONFIG oldcfr=%#x oldmdr=%#x "
+                        "(owbuf=%d odbuf=%d) -> mdr=%#x cfr=%#x "
+                        "(nwbuf=%d ndbuf=%d)\n", s->cfr, s->mdr,
+                        gl2_wbuf_idx(s), gl2_dbuf_idx(s), args[0], args[1],
+                        (args[1] & UC_CFR_UPDATEB) && !(args[1] & UC_CFR_UPDATEA)
+                            ? 1 : 0,
+                        (args[1] & UC_CFR_DISPLAYB) && !(args[1] & UC_CFR_DISPLAYA)
+                            ? 1 : 0);
+            }
             s->mdr = args[0];
             s->cfr = args[1];
         }
