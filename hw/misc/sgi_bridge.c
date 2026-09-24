@@ -124,6 +124,108 @@
 #define IOC3_SIO_IR_SB_TX_EXPLICIT  0x00010000u /* port B explicit TX intr */
 
 /*
+ * IOC3 keyboard/mouse (KM) controller.  Register offsets are the on-wire
+ * devio offsets (IRIX sys/PCI/ioc3.h IOC3_KM_CSR 0x09C .. IOC3_M_WD 0x0AC,
+ * plus the devio base).  The PROM's "Keyboard diagnostic" resets both ports
+ * and waits for the PS/2 BAT completion code (0xAA) after the ACK (0xFA);
+ * the wire format of K_RD/M_RD packs up to three received bytes with a valid
+ * bit each (KM_RD_DATA_0/1/2 + KM_RD_VALID_0/1/2).
+ */
+#define IOC3_KM_CSR_OFF       0x60009c
+#define IOC3_K_RD_OFF         0x6000a0
+#define IOC3_M_RD_OFF         0x6000a4
+#define IOC3_K_WD_OFF         0x6000a8
+#define IOC3_M_WD_OFF         0x6000ac
+
+#define KM_RD_DATA_0_SHIFT    16
+#define KM_RD_DATA_1_SHIFT    8
+#define KM_RD_DATA_2_SHIFT    0
+#define KM_RD_VALID_0         0x80000000u
+#define KM_RD_VALID_1         0x40000000u
+#define KM_RD_VALID_2         0x20000000u
+#define KM_RD_KBD_MSE         0x08000000u /* 0 = kbd, 1 = mouse */
+
+/* KM_CSR: idle lines read high; both state machines idle. */
+#define KM_CSR_IDLE           (0x00004000u | 0x00008000u | \
+                               0x0010u | 0x0020u | 0x0100u | 0x0200u)
+
+static void ioc3_km_push(SGIBRIDGEState *s, bool mouse, uint8_t byte)
+{
+    uint8_t *rx = mouse ? s->km_mouse_rx : s->km_kbd_rx;
+    uint8_t *len = mouse ? &s->km_mouse_rxlen : &s->km_kbd_rxlen;
+
+    if (*len < 3) {
+        rx[*len] = byte;
+        (*len)++;
+    }
+}
+
+/* Handle a command byte the host writes to K_WD/M_WD. */
+static void ioc3_km_command(SGIBRIDGEState *s, bool mouse, uint8_t cmd)
+{
+    bool *expect = mouse ? &s->km_mouse_expect_data : &s->km_kbd_expect_data;
+
+    /* A parameter byte after 0xED/0xF0/0xF3/0xE8 is ACKed, not decoded. */
+    if (*expect) {
+        *expect = false;
+        ioc3_km_push(s, mouse, 0xfa);
+        return;
+    }
+
+    switch (cmd) {
+    case 0xff:                      /* RESET: ACK then BAT complete        */
+        ioc3_km_push(s, mouse, 0xfa);
+        ioc3_km_push(s, mouse, 0xaa);
+        break;
+    case 0xf2:                      /* READ ID                             */
+        ioc3_km_push(s, mouse, 0xfa);
+        if (mouse) {
+            ioc3_km_push(s, mouse, 0x00);
+        } else {
+            ioc3_km_push(s, mouse, 0xab);
+            ioc3_km_push(s, mouse, 0x83);
+        }
+        break;
+    case 0xee:                      /* ECHO                                */
+        ioc3_km_push(s, mouse, 0xee);
+        break;
+    case 0xed:                      /* SET LEDs (one data byte follows)    */
+    case 0xf3:                      /* SET TYPEMATIC (one data byte)       */
+    case 0xf0:                      /* SET SCANCODE (one data byte)        */
+        *expect = true;
+        ioc3_km_push(s, mouse, 0xfa);
+        break;
+    case 0xe8:                      /* SET RESOLUTION (mouse, one data)    */
+        *expect = true;
+        ioc3_km_push(s, mouse, 0xfa);
+        break;
+    default:                        /* ENABLE/DISABLE/SETDEFAULT etc.      */
+        ioc3_km_push(s, mouse, 0xfa);
+        break;
+    }
+}
+
+/* Pack and consume the queued device->host bytes for K_RD/M_RD. */
+static uint32_t ioc3_km_read(SGIBRIDGEState *s, bool mouse)
+{
+    uint8_t *rx = mouse ? s->km_mouse_rx : s->km_kbd_rx;
+    uint8_t *len = mouse ? &s->km_mouse_rxlen : &s->km_kbd_rxlen;
+    uint32_t v = mouse ? KM_RD_KBD_MSE : 0;
+
+    if (*len > 0) {
+        v |= (uint32_t)rx[0] << KM_RD_DATA_0_SHIFT | KM_RD_VALID_0;
+    }
+    if (*len > 1) {
+        v |= (uint32_t)rx[1] << KM_RD_DATA_1_SHIFT | KM_RD_VALID_1;
+    }
+    if (*len > 2) {
+        v |= (uint32_t)rx[2] << KM_RD_DATA_2_SHIFT | KM_RD_VALID_2;
+    }
+    *len = 0;
+    return v;
+}
+
+/*
  * IOC3 serial RX ring (port A console input).  Same shape as the TX half but
  * the hardware is the producer: received bytes are written into 8-byte entries
  * (4 data + 4 status) at srpir and the guest consumes them via srcir
@@ -1633,6 +1735,14 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 
             sscr &= ~IOC3_SSCR_SELFCLR;
             val = sscr | ((sscr & IOC3_SSCR_DMA_PAUSE) ? IOC3_SSCR_PAUSE_STATE : 0);
+        } else if (offset == IOC3_KM_CSR_OFF) {
+            val = KM_CSR_IDLE;
+        } else if (offset == IOC3_K_RD_OFF) {
+            val = ioc3_km_read(s, false);
+        } else if (offset == IOC3_M_RD_OFF) {
+            val = ioc3_km_read(s, true);
+        } else if (offset == IOC3_K_WD_OFF || offset == IOC3_M_WD_OFF) {
+            val = s->ioc3_regs[IOC3_IDX(offset)];
         } else if (offset >= SGI_BRIDGE_ETH_OFF &&
                    offset < SGI_BRIDGE_ETH_OFF + SGI_BRIDGE_ETH_SIZE) {
             unsigned idx = (offset - SGI_BRIDGE_ETH_OFF) >> 2;
@@ -1881,6 +1991,15 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             /* Serial TX producer index: drain the ring to stcir. */
             s->ioc3_regs[IOC3_IDX(offset)] = val;
             sgi_bridge_ioc3_sio_tx_drain(s, offset == IOC3_PORT_B_STPIR_OFF);
+        } else if (offset == IOC3_K_WD_OFF) {
+            s->ioc3_regs[IOC3_IDX(offset)] = val;
+            ioc3_km_command(s, false, val & 0xff);
+        } else if (offset == IOC3_M_WD_OFF) {
+            s->ioc3_regs[IOC3_IDX(offset)] = val;
+            ioc3_km_command(s, true, val & 0xff);
+        } else if (offset == IOC3_KM_CSR_OFF ||
+                   offset == IOC3_K_RD_OFF || offset == IOC3_M_RD_OFF) {
+            s->ioc3_regs[IOC3_IDX(offset)] = val;
         } else if (offset != 0x600028) {
             if (offset >= SGI_BRIDGE_ETH_OFF &&
                 offset < SGI_BRIDGE_ETH_OFF + SGI_BRIDGE_ETH_SIZE) {

@@ -249,6 +249,21 @@ struct SGIBRIDGEState {
     uint32_t phy_write_data;
     uint32_t phy_read_data;
 
+    /*
+     * IOC3 PS/2 keyboard/mouse (KM) controller.  The two ports are
+     * host<-device only here: bytes the keyboard/mouse sends (ACK 0xFA, BAT
+     * 0xAA, IDs) queue in km_*_rx and are read back through K_RD/M_RD.  Each
+     * command that takes a parameter byte (0xED, 0xF0, 0xF3, 0xE8) sets the
+     * matching expect_data flag so the following data byte is ACKed without
+     * being treated as a new command.
+     */
+    uint8_t km_kbd_rx[3];
+    uint8_t km_mouse_rx[3];
+    uint8_t km_kbd_rxlen;
+    uint8_t km_mouse_rxlen;
+    bool km_kbd_expect_data;
+    bool km_mouse_expect_data;
+
     /* IP30 BaseIO on-board QLogic ISP1020 SCSI channels (PCI slots 0/1). */
     SGIQLispState isp[2];
 
