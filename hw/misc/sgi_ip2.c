@@ -297,6 +297,18 @@ int sgi_ip2_ext_tlb_fill(void *opaque, vaddr address, int size,
     }
     *physical = (hwaddr)(((pte & PAGE_PFNUM) << 12) | (offset & 0xfff));
     *prot = p;
+    if (address >= 0x1fffe000 && address < 0x1ffff000) {
+        static int on = -1;
+        static unsigned long n;
+        if (on < 0) {
+            on = getenv("SGI_MMUTR") != NULL;
+        }
+        if (on && (n++ < 60 || (n % 512) == 0)) {
+            fprintf(stderr, "MMUTR va=%08x -> phys=%08x seg=%d pn=%x "
+                    "pte=%08x\n", address, (unsigned)*physical, seg,
+                    page_number, pte);
+        }
+    }
     return 1;
 }
 
