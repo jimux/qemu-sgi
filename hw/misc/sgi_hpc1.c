@@ -366,6 +366,32 @@ static int sgi_hpc1_kbd_keycode(QKeyCode q)
     case Q_KEY_CODE_ALT: return 84;        case Q_KEY_CODE_ALT_R: return 85;
     case Q_KEY_CODE_META_L: return 84;     case Q_KEY_CODE_META_R: return 85;
     case Q_KEY_CODE_CAPS_LOCK: return 4;
+    /* Navigation, function and keypad keys.  Same rule, V = X keycode - 7,
+     * keycodes read from the guest's own keymap.  The keypad keys carry X's
+     * Num_Lock duality -- one physical key, two keysyms -- so both halves of a
+     * pair map to one V (KP_1 and KP_End are both keycode 65, hence V 58). */
+    case Q_KEY_CODE_INSERT: return 102;    case Q_KEY_CODE_DELETE: return 62;
+    case Q_KEY_CODE_HOME: return 103;      case Q_KEY_CODE_END: return 105;
+    case Q_KEY_CODE_PGUP: return 104;      case Q_KEY_CODE_PGDN: return 106;
+    case Q_KEY_CODE_LEFT: return 73;       case Q_KEY_CODE_RIGHT: return 80;
+    case Q_KEY_CODE_UP: return 81;         case Q_KEY_CODE_DOWN: return 74;
+    case Q_KEY_CODE_F1: return 87;         case Q_KEY_CODE_F2: return 88;
+    case Q_KEY_CODE_F3: return 89;         case Q_KEY_CODE_F4: return 90;
+    case Q_KEY_CODE_F5: return 91;         case Q_KEY_CODE_F6: return 92;
+    case Q_KEY_CODE_F7: return 93;         case Q_KEY_CODE_F8: return 94;
+    case Q_KEY_CODE_F9: return 95;         case Q_KEY_CODE_F10: return 96;
+    case Q_KEY_CODE_F11: return 97;        case Q_KEY_CODE_F12: return 98;
+    case Q_KEY_CODE_PRINT: return 99;      case Q_KEY_CODE_SYSRQ: return 99;
+    case Q_KEY_CODE_SCROLL_LOCK: return 100;
+    case Q_KEY_CODE_PAUSE: return 101;     case Q_KEY_CODE_NUM_LOCK: return 107;
+    case Q_KEY_CODE_KP_0: return 59;       case Q_KEY_CODE_KP_1: return 58;
+    case Q_KEY_CODE_KP_2: return 64;       case Q_KEY_CODE_KP_3: return 65;
+    case Q_KEY_CODE_KP_4: return 63;       case Q_KEY_CODE_KP_5: return 69;
+    case Q_KEY_CODE_KP_6: return 70;       case Q_KEY_CODE_KP_7: return 67;
+    case Q_KEY_CODE_KP_8: return 68;       case Q_KEY_CODE_KP_9: return 75;
+    case Q_KEY_CODE_KP_DECIMAL: return 66; case Q_KEY_CODE_KP_SUBTRACT: return 76;
+    case Q_KEY_CODE_KP_DIVIDE: return 108; case Q_KEY_CODE_KP_MULTIPLY: return 109;
+    case Q_KEY_CODE_KP_ADD: return 110;
     default: return -1;
     }
 }
@@ -1727,7 +1753,7 @@ static void sgi_hpc1_write(void *opaque, hwaddr addr, uint64_t value,
 #define HPC1_DMA_ADDR(x)        ((x) & 0x1fffffffu)
 #define HPC1_ENET_MAXPKT        1536
 /*
- * HPC_RSPACE, from the IP20 KERNEL header (tmp/kernbuild/kern/bsd/misc/seeq.h),
+ * HPC_RSPACE, from the IP20 KERNEL header (infra/kernbuild/kern/bsd/misc/seeq.h),
  * NOT the ARCS one (which says 3):
  *     #define HPC_RSPACE 8
  *     #define MAX_RPKT   (MAX_TPKT + HPC_RSPACE + 64)   == 1586
