@@ -1569,6 +1569,11 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     unsigned poly_zrej = 0; /* pixels the Z test threw away (item 4) */
     unsigned culled = 0;   /* triangles dropped by the back-face test */
     unsigned empty = 0;    /* triangles that covered no pixel */
+    unsigned degen = 0;    /* triangles with zero screen area (diagnostic) */
+    unsigned clipbox = 0;  /* triangles whose bbox the viewport clipped */
+    unsigned bboxempty = 0; /* triangles whose bbox clipped away entirely */
+    int bb_minx = 1 << 20, bb_miny = 1 << 20;
+    int bb_maxx = -(1 << 20), bb_maxy = -(1 << 20);
     unsigned px0;
     float zmin = 1e30f, zmax = -1e30f; /* NDC z range this call wrote */
     const float shininess = 8.0f;
@@ -1608,6 +1613,12 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
             sgi_gr2_ge7_shade(s, een, shininess, vcol[i]);
         }
     }
+    for (i = 0; i < s->ge_poly_n; i++) {
+        bb_minx = MIN(bb_minx, (int)floorf(sx[i]));
+        bb_miny = MIN(bb_miny, (int)floorf(sy[i]));
+        bb_maxx = MAX(bb_maxx, (int)ceilf(sx[i]));
+        bb_maxy = MAX(bb_maxy, (int)ceilf(sy[i]));
+    }
     for (i = 1; i + 1 < s->ge_poly_n; i++) {
         unsigned ia = s->ge_strip ? i - 1 : 0; /* fan apex, or strip prev-2 */
         float ax = sx[ia], ay = sy[ia], az = sz[ia];
@@ -1634,6 +1645,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         fy2 = (int64_t)lroundf(cy * 16.0f);
         area = (fx1 - fx0) * (fy2 - fy0) - (fy1 - fy0) * (fx2 - fx0);
         if (area == 0) {
+            degen++;
             continue;
         }
         /* Back-face culling (tokens 27/28).  This edge-function area is in
@@ -1676,15 +1688,24 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         /* Clip to the drawable: the GL viewport (plus its window origin) is the
          * only region a GL client may paint.  Without this the transformed
          * vertices spill over the window frame and neighbouring windows. */
-        minx = MAX(minx, vx);
-        miny = MAX(miny, vy);
-        maxx = MIN(maxx, vx + vw - 1);
-        maxy = MIN(maxy, vy + vh - 1);
-        minx = MAX(minx, 0);
-        miny = MAX(miny, 0);
-        maxx = MIN(maxx, SGI_GR2_SCREEN_W - 1);
-        maxy = MIN(maxy, SGI_GR2_SCREEN_H - 1);
+        {
+            int omnx = minx, omny = miny, omxx = maxx, omxy = maxy;
+
+            minx = MAX(minx, vx);
+            miny = MAX(miny, vy);
+            maxx = MIN(maxx, vx + vw - 1);
+            maxy = MIN(maxy, vy + vh - 1);
+            minx = MAX(minx, 0);
+            miny = MAX(miny, 0);
+            maxx = MIN(maxx, SGI_GR2_SCREEN_W - 1);
+            maxy = MIN(maxy, SGI_GR2_SCREEN_H - 1);
+            if (minx != omnx || miny != omny || maxx != omxx ||
+                maxy != omxy) {
+                clipbox++;
+            }
+        }
         if (minx > maxx || miny > maxy) {
+            bboxempty++;
             continue;
         }
         /* Top-left tie-break for the edges: a pixel whose centre lies exactly
@@ -1745,6 +1766,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     }
     trace_sgi_gr2_ge7_discard((int)s->ge_poly_n, 0, (int)culled,
                               (int)poly_zrej, (int)empty, (int)poly_px);
+    trace_sgi_gr2_ge7_tri((int)degen, (int)clipbox, (int)bboxempty,
+                          bb_minx, bb_miny, bb_maxx, bb_maxy);
     trace_sgi_gr2_ge7_poly(s->ge_poly_n, (int)poly_px,
                            (int)(vcol[0][0] * 255.0f + 0.5f),
                            (int)(vcol[0][1] * 255.0f + 0.5f),
