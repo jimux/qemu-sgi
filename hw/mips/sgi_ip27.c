@@ -1022,8 +1022,18 @@ static void sgi_ip27_init(MachineState *machine) {
 
   if (nnodes == 2) {
     /*
-     * One router linking the two hubs (ports 1 and 2).  Registers are reached
-     * only through the hubs' NI vector engine; there is no latency model.
+     * One router linking the two hubs, wired the way an Origin 2000 module
+     * actually wires its two node boards.  In the IP27 PROM (discover.c
+     * discover_module_indexes, nasid.c check_router/router_search_pcfg,
+     * main.c router_search_pcfg) a module's router carries its two hubs on
+     * ports 4 and 5 -- those are the "node" links; port 6 is PEER_PORT, the
+     * daisy link to the next module's router, and ports 1/2/3 are the
+     * router-to-router dimension links (the "star" variant puts hubs on
+     * 1/2/3/6 instead, which is why the old ports-1/2 wiring tripped
+     * star_rtr() and left router_search_pcfg() with an unconnected port 4/5/6
+     * -> "ERROR: unconnected router").  Both hubs here are the two node slots
+     * of module 0, so ports 4 and 5.  Registers are reached only through the
+     * hubs' NI vector engine; there is no latency model.
      */
     router = g_new0(SGIRouterState, 1);
     /*
@@ -1034,8 +1044,8 @@ static void sgi_ip27_init(MachineState *machine) {
      * router.
      */
     sgi_router_init(router, 0x00000000c0ffee01ULL, 0x8, 2);
-    sgi_router_connect(router, 1, hubs[0]);
-    sgi_router_connect(router, 2, hubs[1]);
+    sgi_router_connect(router, 4, hubs[0]);
+    sgi_router_connect(router, 5, hubs[1]);
     sgi_hub_set_router(hubs[0], router);
     sgi_hub_set_router(hubs[1], router);
   }
