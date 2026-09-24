@@ -682,7 +682,12 @@ static void sgi_heart_mlan_init(SGIDS2502BUS *bus)
         {0xc2, 0x21, 0x22, 0x23, 0x24, 0x25}, /* Front plane */
         {0xc3, 0x31, 0x32, 0x33, 0x34, 0x35}, /* Power supply */
     };
-    static const char *fru_name[4] = {"CPU", "SYS", "FP", "PS"};
+    /*
+     * The PROM's FRU diagnostics locate a part by searching the NIC memory
+     * for a literal "Name:xxx" key (see the strings at 0xbfc93860..0xbfc93920).
+     */
+    static const char *fru_name[4] = {"Name:PM10", "Name:IP30",
+                                      "Name:FP", "Name:PWR.SP"};
     int i;
 
     sgi_ds2502_bus_init(bus, "heart");
