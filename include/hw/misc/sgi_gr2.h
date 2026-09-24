@@ -139,6 +139,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
                                          /* light the state below belongs to */
 #define SGI_GR2_GE7_SPOTLIGHT   0x40200 /* token 128, gl_load_spotlight    */
 #define SGI_GR2_GE7_LMCOLOR     0x40204 /* token 129, lighting model       */
+#define SGI_GR2_GE7_DITHER      0x407e8 /* token 506, gl_d_dither(): 0 off */
 
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
 #define SGI_GR2_HQ_MYSTERY  0x6a07c /* presence magic, read by Gr2Probe */
@@ -537,6 +538,7 @@ struct SGIGr2State {
     bool ge_light_valid[SGI_GR2_GE7_MAX_LIGHTS];
     unsigned ge_light_cur;         /* light chosen by the last token 28      */
     unsigned ge_lpos_n;            /* words collected for the current light   */
+    bool ge_dither;                /* ordered dither before the 3-3-2 pack   */
     hwaddr ge_mat_tok;             /* last material token (run boundary)     */
     unsigned ge_mat_n;             /* components collected in the run        */
     bool ge_mat_valid;

@@ -974,37 +974,6 @@ static inline float sgi_gr2_u2f(uint32_t v)
     return x.f;
 }
 
-/* Map an intensity level (0..31) to a palette index.  The target is a neutral
- * grey of that intensity and the entry is chosen by nearest RGB distance, not
- * nearest luminance: a luminance match alone picks red or blue entries whose
- * brightness happens to coincide, which streaks a near-grey material.  RGB
- * distance keeps the mapping on the grey axis.  Rebuilt per polygon batch:
- * 32 x 256 comparisons. */
-static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[32])
-{
-    int g, i;
-
-    for (g = 0; g < 32; g++) {
-        int target = g * 255 / 31;
-        int best = 0, bestd = 1 << 30;
-
-        for (i = 0; i < 256; i++) {
-            uint32_t rgb = s->ramdac[i];
-            int r = (rgb >> 16) & 0xff;
-            int gg = (rgb >> 8) & 0xff;
-            int b = rgb & 0xff;
-            int dr = r - target, dg = gg - target, db = b - target;
-            int d = dr * dr + dg * dg + db * db;
-
-            if (d < bestd) {
-                bestd = d;
-                best = i;
-            }
-        }
-        lut[g] = (uint8_t)best;
-    }
-}
-
 /* gl_clear: fill a drawable rectangle with the palette's black and reset its
  * depth, so the window shows the GL client's background instead of the desktop
  * underneath.  powerflip's window is black, which is the palette entry nearest
@@ -1172,49 +1141,88 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
     }
 }
 
-static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
-                               float shininess)
+/* 4x4 ordered-dither matrix.  Same matrix as the Newport path (sgi_newport.c,
+ * itself from MAME's newport.cpp get_rgb_color) - the two boards share the SGI
+ * 8-bit raster convention and no separate GR2 matrix exists in the tree. */
+static const uint8_t sgi_gr2_ge7_bayer[4][4] = {
+    { 0, 12,  3, 15 },
+    { 8,  4, 11,  7 },
+    { 2, 14,  1, 13 },
+    { 10, 6,  9,  5 },
+};
+
+/* Pick the ramp level for a linear 0..255 channel value.  `thresh` >= 0 is a
+ * Bayer threshold: when the value lies between two ramp levels the matrix
+ * decides which one this pixel takes, so a gradient renders as a stipple of
+ * the two adjacent levels instead of a hard band.  `thresh` < 0 means plain
+ * nearest-level (dithering off).  The ramp levels are not evenly spaced
+ * (0,81,122,155,184,209,233,255), so the fraction is taken against the actual
+ * gap, not a uniform step. */
+static uint8_t sgi_gr2_ge7_lvl(const uint8_t *ramp, int n, int t, int thresh)
 {
-    float col[3];
+    int i, lo, hi, span, frac;
 
-    sgi_gr2_ge7_shade(s, n, shininess, col);
-    return MIN(MAX(0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2],
-                   0.0f), 1.0f);
-}
+    if (thresh < 0) {
+        int best = 0, bestd = 1 << 30;
 
-/* Nearest RAMDAC entry to a shaded RGB.  The 3D path stores a palette index,
- * and the guest's ink is a colour, not a grey level: an RGB distance keeps a
- * red curve red instead of collapsing it onto the grey axis. */
-static uint8_t sgi_gr2_ge7_rgbidx(const SGIGr2State *s, const float col[3])
-{
-    int r = (int)(MIN(MAX(col[0], 0.0f), 1.0f) * 255.0f + 0.5f);
-    int gr = (int)(MIN(MAX(col[1], 0.0f), 1.0f) * 255.0f + 0.5f);
-    int b = (int)(MIN(MAX(col[2], 0.0f), 1.0f) * 255.0f + 0.5f);
-    int best = 0, bestd = 1 << 30, i;
+        for (i = 0; i < n; i++) {
+            int d = (int)ramp[i] - t;
 
-    for (i = 0; i < 256; i++) {
-        uint32_t rgb = s->ramdac[i];
-        int dr = ((rgb >> 16) & 0xff) - r;
-        int dg = ((rgb >> 8) & 0xff) - gr;
-        int db = (rgb & 0xff) - b;
-        int d = dr * dr + dg * dg + db * db;
-
-        if (d < bestd) {
-            bestd = d;
-            best = i;
+            if (d < 0) {
+                d = -d;
+            }
+            if (d < bestd) {
+                bestd = d;
+                best = i;
+            }
+        }
+        return (uint8_t)best;
+    }
+    for (i = 0; i < n; i++) {
+        if (ramp[i] >= t) {
+            break;
         }
     }
-    return (uint8_t)best;
+    if (i <= 0) {
+        return 0;
+    }
+    if (i >= n) {
+        return (uint8_t)(n - 1);
+    }
+    lo = i - 1;
+    hi = i;
+    span = (int)ramp[hi] - (int)ramp[lo];
+    frac = span > 0 ? ((t - (int)ramp[lo]) * 16) / span : 0;
+    return (uint8_t)(frac > thresh ? hi : lo);
+}
+
+/* Quantise a shaded RGB to the 8-bit 3-3-2 direct-colour byte the GL window
+ * stores.  The screen is 8-bit PseudoColor (root 1280x1024x8, visual 0x25) and
+ * an RGBmode window does not go through the CLUT: it is the "24-bit" visual,
+ * an 8-bit 3-3-2 RGB triple the scanout expands through the direct-colour ramp
+ * (see sgi_gr2_re3_332).  This is the same representation the image path and
+ * the EZsetup cube use, so polygons and lines land in the same colour space.
+ * x/y drive the ordered dither. */
+static uint8_t sgi_gr2_ge7_332(const SGIGr2State *s, const float col[3],
+                               int x, int y)
+{
+    int r = (int)(MIN(MAX(col[0], 0.0f), 1.0f) * 255.0f + 0.5f);
+    int g = (int)(MIN(MAX(col[1], 0.0f), 1.0f) * 255.0f + 0.5f);
+    int b = (int)(MIN(MAX(col[2], 0.0f), 1.0f) * 255.0f + 0.5f);
+    int thresh = s->ge_dither ? sgi_gr2_ge7_bayer[x & 3][y & 3] : -1;
+
+    return (uint8_t)((sgi_gr2_ge7_lvl(sgi_gr2_ramp_rg, 8, r, thresh) << 5) |
+                     (sgi_gr2_ge7_lvl(sgi_gr2_ramp_b, 4, b, thresh) << 3) |
+                     sgi_gr2_ge7_lvl(sgi_gr2_ramp_rg, 8, g, thresh));
 }
 
 static void sgi_gr2_ge7_draw(SGIGr2State *s)
 {
     float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
     float sz[SGI_GR2_GE7_MAX_VERTS];
-    float iv[SGI_GR2_GE7_MAX_VERTS]; /* per-vertex light intensity          */
+    float vcol[SGI_GR2_GE7_MAX_VERTS][3]; /* per-vertex shaded RGB           */
     int vx, vy, vw, vh;
     unsigned i;
-    uint8_t lut[32];
     const float shininess = 8.0f;
 
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
@@ -1268,15 +1276,15 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                          s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
                          s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
             }
-            iv[i] = sgi_gr2_ge7_inten(s, een, shininess);
+            sgi_gr2_ge7_shade(s, een, shininess, vcol[i]);
         }
     }
-    sgi_gr2_ge7_greylut(s, lut);
     for (i = 1; i + 1 < s->ge_poly_n; i++) {
         unsigned ia = s->ge_strip ? i - 1 : 0; /* fan apex, or strip prev-2 */
-        float ax = sx[ia], ay = sy[ia], az = sz[ia], i0 = iv[ia];
-        float bx = sx[i], by = sy[i], bz = sz[i], i1 = iv[i];
-        float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1], i2 = iv[i + 1];
+        float ax = sx[ia], ay = sy[ia], az = sz[ia];
+        float bx = sx[i], by = sy[i], bz = sz[i];
+        float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1];
+        const float *c0 = vcol[ia], *c1 = vcol[i], *c2 = vcol[i + 1];
         int64_t fx0, fy0, fx1, fy1, fx2, fy2;
         int64_t area, e0, e1, e2;
         float w0, w1, w2, inv;
@@ -1306,7 +1314,9 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
             tf = bx; bx = cx; cx = tf;
             tf = by; by = cy; cy = tf;
             tf = bz; bz = cz; cz = tf;
-            tf = i1; i1 = i2; i2 = tf;
+            {
+                const float *tc = c1; c1 = c2; c2 = tc;
+            }
             fx1 = (int64_t)lroundf(bx * 16.0f);
             fy1 = (int64_t)lroundf(by * 16.0f);
             fx2 = (int64_t)lroundf(cx * 16.0f);
@@ -1341,9 +1351,9 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
             for (x = minx; x <= maxx; x++) {
                 int64_t px = (int64_t)x * 16 + 8;
                 int64_t py = (int64_t)y * 16 + 8;
-                float ig, z;
+                float col[3], z;
                 size_t o;
-                int li;
+                int c;
 
                 /* e0 for edge A->B, e1 for B->C, e2 for C->A. */
                 e0 = (fx1 - fx0) * (py - fy0) - (fy1 - fy0) * (px - fx0);
@@ -1369,14 +1379,14 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                 w0 = (float)e1 * inv;
                 w1 = (float)e2 * inv;
                 w2 = (float)e0 * inv;
-                ig = MIN(MAX(w0 * i0 + w1 * i1 + w2 * i2, 0.0f), 1.0f);
-                li = (int)(ig * 31.0f + 0.5f);
-                li = MIN(MAX(li, 0), 31);
+                for (c = 0; c < 3; c++) {
+                    col[c] = w0 * c0[c] + w1 * c1[c] + w2 * c2[c];
+                }
                 z = w0 * az + w1 * bz + w2 * cz;
                 o = (size_t)y * SGI_GR2_SCREEN_W + x;
                 if (z < s->ge_zbuf[o]) {
                     s->ge_zbuf[o] = z;
-                    sgi_gr2_put(s, x, y, lut[li]);
+                    sgi_gr2_put332(s, x, y, sgi_gr2_ge7_332(s, col, x, y));
                 }
             }
         }
@@ -1396,7 +1406,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
     unsigned i;
     const float shininess = 8.0f;
-    int idx;
+    float col[3];
 
     if (s->ge_line_n < 2 || !s->scanout || !s->ge_zbuf) {
         return;
@@ -1417,12 +1427,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     nx[0] = s->ge_normal[0];
     nx[1] = s->ge_normal[1];
     nx[2] = s->ge_normal[2];
-    {
-        float col[3];
-
-        sgi_gr2_ge7_shade(s, nx, shininess, col);
-        idx = sgi_gr2_ge7_rgbidx(s, col);
-    }
+    sgi_gr2_ge7_shade(s, nx, shininess, col);
     for (i = 0; i < s->ge_line_n; i++) {
         float p[3];
         float cx, cy, cz;
@@ -1468,7 +1473,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
             o = (size_t)y * SGI_GR2_SCREEN_W + x;
             if (z < s->ge_zbuf[o]) {
                 s->ge_zbuf[o] = z;
-                sgi_gr2_put(s, x, y, (uint8_t)idx);
+                sgi_gr2_put332(s, x, y, sgi_gr2_ge7_332(s, col, x, y));
             }
         }
     }
@@ -1668,6 +1673,12 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         break;
     case SGI_GR2_GE7_LMCOLOR:
         break; /* lighting-model selector: the material above is what we use */
+    case SGI_GR2_GE7_DITHER:
+        /* gl_d_dither(): 0 turns ordered dithering off.  libgl never sends it
+         * in any stream we have captured, so this only matters for a guest
+         * that calls dither() explicitly. */
+        s->ge_dither = (v != 0);
+        break;
     case SGI_GR2_GE7_NORMAL:
         switch (s->ge_n_n++) {
         case 0: s->ge_normal[0] = sgi_gr2_u2f(v); break;
@@ -2449,6 +2460,10 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->ramdac_index = 0;
     s->ramdac_ctl = 0;
     s->ramdac_stage_n = 0;
+    /* Ordered dithering defaults ON: IRIS GL's dither() is on initially and
+     * libgl never sends token 506, so the GE's power-up state is what the
+     * guest gets.  A guest that calls dither(0) clears it. */
+    s->ge_dither = true;
     /* Output ramps start as the identity until the guest programs them. */
     for (i = 0; i < 256; i++) {
         s->dac_ramp[0][i] = i;
