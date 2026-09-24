@@ -1009,8 +1009,8 @@ static NetClientInfo net_sgi_bridge_eth_info = {
  * Both the IP30 PROM (ARCS) and the installed IRIX kernel reach the timekeeper
  * through the IOC3 SuperIO index/data pair at BRIDGE+0x6A0000 (index) /
  * BRIDGE+0x6C0000 (data).  Octane_ip30prom.rev4.9 (0x1fc03ecc, the tod setter)
- * and the kernel's wtodc/rtodc helpers agree byte-for-byte on a BCD and
- * non-contiguous map:
+ * and the kernel's wtodc/rtodc helpers (ml/RACER/tod.c) agree byte-for-byte on
+ * the DS1687 register map:
  *   +0x00 sec  +0x02 min  +0x04 hour  +0x06 month  +0x07 wday
  *   +0x08 date +0x09 year%100  +0x48 century  +0x0b control B  +0x0d control D
  * The PROM reads reg D and treats bit 7 clear as "battery exhausted", then
@@ -1021,13 +1021,14 @@ static NetClientInfo net_sgi_bridge_eth_info = {
 #define RTC_SEC_OFF    0x00
 #define RTC_MIN_OFF    0x02
 #define RTC_HOUR_OFF   0x04
-#define RTC_MON_OFF    0x06
-#define RTC_WDAY_OFF   0x07
-#define RTC_MDAY_OFF   0x08
+#define RTC_WDAY_OFF   0x06   /* DS1687 DAY = day-of-week */
+#define RTC_MDAY_OFF   0x07   /* DS1687 DATE = day-of-month */
+#define RTC_MON_OFF    0x08
 #define RTC_YEAR_OFF   0x09   /* year % 100 */
+#define RTC_CTLA_OFF   0x0a
 #define RTC_CTLB_OFF   0x0b
 #define RTC_CTLD_OFF   0x0d
-#define RTC_CENT_OFF   0x48   /* century = year / 100 */
+#define RTC_CENT_OFF   0x48   /* century = year / 100 (bank 1) */
 
 static bool sgi_bridge_rtc_dbg(void)
 {
@@ -1039,14 +1040,20 @@ static bool sgi_bridge_rtc_dbg(void)
     return dbg;
 }
 
+/*
+ * The IP30 PROM and the kernel both run the DS1687 in binary data mode (the
+ * kernel's _clock_func writes CTRL_B RTC_BINARY_DATA_MODE and reads the fields
+ * as raw integers: ml/RACER/tod.c rtodc()), so the calendar bytes are binary,
+ * not BCD.
+ */
 static uint8_t sgi_bridge_bcd_enc(int v)
 {
-    return ((v / 10) << 4) | (v % 10);
+    return (uint8_t)v;
 }
 
 static int sgi_bridge_bcd_dec(uint8_t v)
 {
-    return ((v >> 4) & 0xf) * 10 + (v & 0xf);
+    return v;
 }
 
 static int64_t sgi_bridge_days_from_civil(int64_t y, unsigned m, unsigned d)
@@ -1808,10 +1815,12 @@ static void sgi_bridge_reset(DeviceState *dev)
     /*
      * Latch the host wall clock as the RTC epoch so the calendar the PROM and
      * kernel read is live from reset (ml/clksupport.c warns about a frozen
-     * clock otherwise).
+     * clock otherwise).  The epoch SECONDS come from the host wall clock
+     * (time(2)); QEMU_CLOCK_REALTIME is a monotonic counter, so it only
+     * supplies the elapsed-time tick.
      */
+    s->rtc_epoch_sec = time(NULL);
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    s->rtc_epoch_sec = s->rtc_epoch_ns / 1000000000LL;
     sgi_bridge_ds_board_init(&s->bridge_ds);
     sgi_bridge_ds_mac_init(&s->ioc3_ds);
     sgi_bridge_ds_reset(&s->bridge_ds);
