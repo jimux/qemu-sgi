@@ -59,6 +59,15 @@ static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
             (uint32_t)clock_ns_to_ticks(env->count_clock, now_ns);
 }
 
+/*
+ * IP30 (SGI Octane) sets this true (see sgi_octane.c).  IRIX there writes a
+ * CP0_Compare a few counts past-due on its lateness corrections, and without
+ * firing immediately the tick is deferred by a full 32-bit Count wrap, which
+ * freezes lbolt ("hasn't seen a scheduler clock interrupt").  Kept false for
+ * every other machine until each is verified independently.  See #3404.
+ */
+bool mips_cp0_fire_immediate;
+
 static int timer_dbg(void)
 {
     static int c = -1;
@@ -82,11 +91,16 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
      * If the deadline has already passed (Compare is at or behind the current
      * Count), the timer interrupt is pending *now*.  The unsigned subtraction
      * above would otherwise underflow to ~2^32 and defer the interrupt by a
-     * full 32-bit wrap.  IRIX writes a Compare that is a few counts past-due
-     * on its lateness corrections, so this must fire immediately (wait == 1)
-     * rather than wait a whole wrap for the Count to come back around.
+     * full 32-bit wrap.  IRIX on IP30 writes a Compare that is a few counts
+     * past-due on its lateness corrections, so there this must fire
+     * immediately (wait == 1) rather than wait a whole wrap for the Count to
+     * come back around.
+     *
+     * Gated: only the IP30 machine (sgi_octane) sets mips_cp0_fire_immediate.
+     * Other machines keep the stock behaviour until each is verified -- see
+     * #3404.
      */
-    if (wait == 0 || wait > 0x7fffffffu) {
+    if (mips_cp0_fire_immediate && (wait == 0 || wait > 0x7fffffffu)) {
         wait = 1;
     }
     next_ns = now_ns + clock_ticks_to_ns(env->count_clock, wait);

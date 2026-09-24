@@ -46,6 +46,7 @@
 #include "hw/misc/sgi_heart.h"
 #include "hw/misc/sgi_bridge.h"
 #include "hw/misc/sgi_sflash.h"
+#include "target/mips/internal.h"
 #include "hw/misc/sgi_pvaudio.h"
 #include "hw/misc/sgi_pvmem.h"
 #include "hw/misc/sgi_pvnet.h"
@@ -256,6 +257,13 @@ static void sgi_octane_init(MachineState *machine)
         error_report("RAM size more than 128GB is not supported");
         exit(EXIT_FAILURE);
     }
+
+    /*
+     * IP30 IRIX writes CP0_Compare a few counts past-due; the CP0 timer must
+     * then fire immediately rather than defer a full Count wrap, or lbolt
+     * freezes.  Opt this machine in (see #3404 / cpu_mips_timer_update()).
+     */
+    mips_cp0_fire_immediate = true;
 
     /* R10000 @ 300MHz default. */
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");

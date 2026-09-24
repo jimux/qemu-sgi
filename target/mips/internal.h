@@ -219,6 +219,13 @@ void cpu_mips_start_count(CPUMIPSState *env);
 void cpu_mips_stop_count(CPUMIPSState *env);
 void cpu_mips_timer_catchup(CPUMIPSState *env);
 
+/*
+ * Set by the IP30 (SGI Octane) machine: IRIX writes CP0_Compare a few counts
+ * past-due, and only there must the timer fire immediately rather than wait a
+ * full 32-bit wrap.  Default false; see cpu_mips_timer_update() and #3404.
+ */
+extern bool mips_cp0_fire_immediate;
+
 static inline void mips_env_set_pc(CPUMIPSState *env, target_ulong value)
 {
     env->active_tc.PC = value & ~(target_ulong)1;
