@@ -1077,6 +1077,24 @@ static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
 /* Rasterise the buffered polygon (a triangle fan) into `scanout`, Z-buffered.
  * The viewport maps NDC to pixels; if the guest has not yet sent one, fall
  * back to the whole screen. */
+/* The GE's specular is a table lookup, not an exponent computed on the fly:
+ * __glExpCreateSpecLUT builds 128 entries pow(t, shininess) and the guest
+ * uploads that table to token 116.  Index the guest's own curve so the
+ * shininess need not be guessed; fall back to the held exponent only until
+ * the table has arrived. */
+static float sgi_gr2_ge7_spec_term(const SGIGr2State *s, float ndh,
+                                   float shininess)
+{
+    int i;
+
+    if (s->ge_spec_lut_n < 128) {
+        return powf(ndh, shininess);
+    }
+    i = (int)(ndh * 127.0f + 0.5f);
+    i = MIN(MAX(i, 0), 127);
+    return s->ge_spec_lut[i];
+}
+
 /* Evaluate the guest's Phong model for one normal and return the shaded RGB.
  * Shared by the triangle and line rasterisers.
  *
@@ -1136,7 +1154,8 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
         for (c = 0; c < 3; c++) {
             col[c] += s->ge_light_color[li][c] * (s->ge_diffuse[c] * ndl +
                                                   s->ge_specular[c] *
-                                                  powf(ndh, shininess));
+                                                  sgi_gr2_ge7_spec_term(s, ndh,
+                                                              shininess));
         }
         any = true;
     }
@@ -1145,7 +1164,9 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
         ndl = MAX(nn[2], 0.0f);
         for (c = 0; c < 3; c++) {
             col[c] += s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
-                                         s->ge_specular[c] * powf(ndl, shininess));
+                                         s->ge_specular[c] *
+                                         sgi_gr2_ge7_spec_term(s, ndl,
+                                                             shininess));
         }
     }
     for (c = 0; c < 3; c++) {
@@ -1658,6 +1679,16 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         break;
     case SGI_GR2_GE7_EMISSION:
         sgi_gr2_ge7_mat_word(s, s->ge_emission, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_SPEC_LUT:
+        /* Token 116 is the specular table: __glExpCreateSpecLUT builds 128
+         * entries pow(t, shininess) and the guest uploads them here one word
+         * at a time, 128 in a row.  Keep the guest's own curve verbatim and
+         * cycle, so the latest upload wins. */
+        if (s->ge_spec_lut_n >= 128) {
+            s->ge_spec_lut_n = 0;
+        }
+        s->ge_spec_lut[s->ge_spec_lut_n++] = sgi_gr2_u2f(v);
         break;
     case SGI_GR2_GE7_CULL_FACE:
         /* Token 28 is __glExpEnableCullFace / __glExpPassCullFace in the

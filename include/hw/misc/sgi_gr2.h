@@ -138,6 +138,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_CULL_FACE   0x40070 /* token 28 = __glExpEnableCullFace/  */
                                          /* PassCullFace in the guest's own    */
                                          /* libGLcore (IP22GR2NG1), not a light */
+#define SGI_GR2_GE7_SPEC_LUT    0x401d0 /* token 116: the specular table the   */
+                                         /* guest uploads - __glExpCreateSpecLUT */
+                                         /* builds 128 entries pow(t,shininess)  */
+                                         /* and the GE indexes it with t, so the */
+                                         /* emulator uses the guest's own curve, */
+                                         /* never a guessed exponent.            */
 #define SGI_GR2_GE7_SPOTLIGHT   0x40200 /* token 128, gl_load_spotlight    */
 #define SGI_GR2_GE7_LMCOLOR     0x40204 /* token 129, lighting model       */
 #define SGI_GR2_GE7_DITHER      0x407e8 /* token 506, gl_d_dither(): 0 off */
@@ -543,6 +549,8 @@ struct SGIGr2State {
     bool ge_light_pend;            /* token-128 pair: index is the next word */
     unsigned ge_lpos_n;            /* words collected for the current light   */
     bool ge_dither;                /* ordered dither before the 3-3-2 pack   */
+    float ge_spec_lut[128];        /* token 116: the guest's specular table  */
+    int ge_spec_lut_n;             /* words collected into it                 */
     hwaddr ge_mat_tok;             /* last material token (run boundary)     */
     unsigned ge_mat_n;             /* components collected in the run        */
     bool ge_mat_valid;
