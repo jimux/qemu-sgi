@@ -424,6 +424,13 @@ void sgi_ds2502_bus_write_bit(SGIDS2502BUS *bus, int bit)
             }
             bus->s_bit++;
             if (bus->s_bit == 64) {
+                if (getenv("SGIDS_DBG")) {
+                    qemu_log("ds2502 SEARCH selects rom="
+                             "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                             bus->s_path[0], bus->s_path[1], bus->s_path[2],
+                             bus->s_path[3], bus->s_path[4], bus->s_path[5],
+                             bus->s_path[6], bus->s_path[7]);
+                }
                 bus->state = SGI_DS_CMD;
             }
         }
@@ -439,6 +446,10 @@ void sgi_ds2502_bus_write_bit(SGIDS2502BUS *bus, int bit)
             bus->state = SGI_DS_RMEM_DATA;
             bus->out_index = 0;
             bus->extra = (bus->sel >= 0) ? bus->dev[bus->sel].extra_bits : 0;
+            if (getenv("SGIDS_DBG")) {
+                qemu_log("ds2502 READMEM addr=0x%x sel=%d\n", bus->addr,
+                         bus->sel);
+            }
         }
         break;
     default:
