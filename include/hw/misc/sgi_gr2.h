@@ -383,6 +383,11 @@ struct SGIGr2State {
      * token 318 armed a pattern, flat when token 304 marked a solid rect. */
     bool re3_solid_seen;    /* token 304 seen in the current op              */
     bool re3_spans_seen;    /* token 305 seen in the current op              */
+    /* Token 321 (FIFO offset 0x40504): a six-word destination group at the END
+     * of an expTileRects payload, [org_x, x0, org_y, y0, x1, y1].  The DDX uses
+     * it for the 4Dwm menu item texture, where the destination comes from the
+     * token, not from the re3_clip list the root weave uses. */
+    bool re3_spanr_seen;
     bool re3_line_seen;     /* token 345 seen: the op is a segment list      */
     bool re3_spanstip_seen; /* token 347 seen: the op is a stippled span list */
     bool re3_poly_seen;     /* token 302 seen: the op is a filled polygon     */
