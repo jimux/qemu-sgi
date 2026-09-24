@@ -1538,6 +1538,24 @@ static void gl2_ge_raw_exec(SGIGL2State *s, uint16_t w,
     default:
         break;
     }
+
+    if (xlog_on() && (op == 0x00 || op == 0x01 || op == 0x04 ||
+                      (op >= 0x20 && op <= 0x2f))) {
+        unsigned q;
+
+        fprintf(stderr, "GEXLOG matrix op=%02x top=%d nargs=%u",
+                op, s->matrix_top, nargs);
+        if (op == 0x01 || (op >= 0x20 && op <= 0x2f)) {
+            for (q = 0; q < nargs && q < 10; q++) {
+                fprintf(stderr, " %04x", args[q]);
+            }
+        }
+        fprintf(stderr, " r0=[%.5g %.5g %.5g %.5g] r3=[%.5g %.5g %.5g %.5g]\n",
+                s->matrix[0][0], s->matrix[0][1],
+                s->matrix[0][2], s->matrix[0][3],
+                s->matrix[3][0], s->matrix[3][1],
+                s->matrix[3][2], s->matrix[3][3]);
+    }
 }
 
 /* Recognise a raw GE command word and set up its coordinate operands.
