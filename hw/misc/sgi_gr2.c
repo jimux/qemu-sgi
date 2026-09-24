@@ -2527,6 +2527,13 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
 
         trace_sgi_gr2_hqwrite(offset, value, pc);
     }
+    /* GR2 board-register writes (VC1 / XMAP / DAC / RE3 control) with the PC,
+     * so the writer can be classified: kernel driver (0x88...) vs DDX. */
+    if (offset >= 0x6c000 && offset < 0x6c200) {
+        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+
+        trace_sgi_gr2_board_write(offset, value, pc);
+    }
     /* GE7 instruction load/verify: store the window and load-register words
      * verbatim into the per-PC slot selected by the last gepc write.  No
      * masking or tidying — the driver compares against what it wrote. */
