@@ -181,6 +181,17 @@ struct SGIBRIDGEState {
     uint8_t sio_regs[256];
 
     /*
+     * IOC3 SuperIO byte-bus time-of-day calendar.  The PROM (ARCS) and the
+     * IRIX kernel both read/write it through the SuperIO index/data pair; the
+     * register map is BCD and non-contiguous (see rtc_read/rtc_write in
+     * sgi_bridge.c).  The current time is an epoch latched from the host wall
+     * clock (QEMU_CLOCK_REALTIME) so it genuinely ticks; a guest write re-bases
+     * the epoch so a guest set-time is reflected afterwards.
+     */
+    int64_t rtc_epoch_sec;
+    int64_t rtc_epoch_ns;
+
+    /*
      * IOC3 SuperIO UART A (serial console).
      *
      * In 16550-compatibility mode the IOC3 UART is byte-spaced: the register

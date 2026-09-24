@@ -50,6 +50,7 @@
 #include "system/dma.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 
 /*
  * BRIDGE covers widget 0xF: physical 0x1F000000-0x1FFFFFFF (16MB XIO widget).
@@ -1002,6 +1003,221 @@ static NetClientInfo net_sgi_bridge_eth_info = {
     .receive = sgi_bridge_eth_receive,
 };
 
+/*
+ * IOC3 SuperIO byte-bus time-of-day / NVRAM part (IP30).
+ *
+ * Both the IP30 PROM (ARCS) and the installed IRIX kernel reach the timekeeper
+ * through the IOC3 SuperIO index/data pair at BRIDGE+0x6A0000 (index) /
+ * BRIDGE+0x6C0000 (data).  Octane_ip30prom.rev4.9 (0x1fc03ecc, the tod setter)
+ * and the kernel's wtodc/rtodc helpers agree byte-for-byte on a BCD and
+ * non-contiguous map:
+ *   +0x00 sec  +0x02 min  +0x04 hour  +0x06 month  +0x07 wday
+ *   +0x08 date +0x09 year%100  +0x48 century  +0x0b control B  +0x0d control D
+ * The PROM reads reg D and treats bit 7 clear as "battery exhausted", then
+ * writes B=0x86 (24-hour BCD).  Reads present the HOST wall clock (project
+ * clock doctrine) so the calendar genuinely ticks; writes re-base it.  The
+ * remaining indices are battery-backed NVRAM.
+ */
+#define RTC_SEC_OFF    0x00
+#define RTC_MIN_OFF    0x02
+#define RTC_HOUR_OFF   0x04
+#define RTC_MON_OFF    0x06
+#define RTC_WDAY_OFF   0x07
+#define RTC_MDAY_OFF   0x08
+#define RTC_YEAR_OFF   0x09   /* year % 100 */
+#define RTC_CTLB_OFF   0x0b
+#define RTC_CTLD_OFF   0x0d
+#define RTC_CENT_OFF   0x48   /* century = year / 100 */
+
+static bool sgi_bridge_rtc_dbg(void)
+{
+    static int dbg = -1;
+
+    if (dbg < 0) {
+        dbg = getenv("SGIBRIDGE_RTC_DBG") != NULL;
+    }
+    return dbg;
+}
+
+static uint8_t sgi_bridge_bcd_enc(int v)
+{
+    return ((v / 10) << 4) | (v % 10);
+}
+
+static int sgi_bridge_bcd_dec(uint8_t v)
+{
+    return ((v >> 4) & 0xf) * 10 + (v & 0xf);
+}
+
+static int64_t sgi_bridge_days_from_civil(int64_t y, unsigned m, unsigned d)
+{
+    int64_t era;
+
+    y -= m <= 2;
+    era = (y >= 0 ? y : y - 399) / 400;
+    {
+        unsigned yoe = (unsigned)(y - era * 400);
+        unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+        unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+
+        return era * 146097 + (int64_t)doe - 719468;
+    }
+}
+
+static void sgi_bridge_civil_from_days(int64_t z, int *y, unsigned *m,
+                                       unsigned *d)
+{
+    int64_t era;
+    unsigned doe, yoe, doy, mp;
+    int64_t yy;
+
+    z += 719468;
+    era = (z >= 0 ? z : z - 146096) / 146097;
+    doe = (unsigned)(z - era * 146097);
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    yy = (int64_t)yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp + (mp < 10 ? 3 : -9);
+    *y = (int)(yy + (*m <= 2));
+}
+
+static void sgi_bridge_rtc_fields(SGIBRIDGEState *s, int *sec, int *min,
+                                  int *hour, int *wday, int *mday, int *mon,
+                                  int *year)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t t = s->rtc_epoch_sec + (now - s->rtc_epoch_ns) / 1000000000LL;
+    int64_t days = t / 86400;
+    int64_t rem = t % 86400;
+    unsigned m, d;
+
+    if (rem < 0) {
+        rem += 86400;
+        days--;
+    }
+    sgi_bridge_civil_from_days(days, year, &m, &d);
+    *sec = rem % 60;
+    *min = (rem / 60) % 60;
+    *hour = rem / 3600;
+    *mday = d;
+    *mon = m;
+    /* 1970-01-01 was a Thursday; DS wday is 1..7 = Sun..Sat. */
+    *wday = (int)(((days % 7) + 4 + 7) % 7) + 1;
+}
+
+static void sgi_bridge_rtc_rebase(SGIBRIDGEState *s, int sec, int min, int hour,
+                                  int mday, int mon, int year)
+{
+    int64_t days = sgi_bridge_days_from_civil(year, mon, mday);
+
+    s->rtc_epoch_sec = days * 86400 + hour * 3600 + min * 60 + sec;
+    s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+static uint64_t sgi_bridge_rtc_read(SGIBRIDGEState *s, unsigned idx)
+{
+    int sec, min, hour, wday, mday, mon, year;
+    uint64_t v;
+
+    switch (idx) {
+    case RTC_SEC_OFF:
+    case RTC_MIN_OFF:
+    case RTC_HOUR_OFF:
+    case RTC_MON_OFF:
+    case RTC_WDAY_OFF:
+    case RTC_MDAY_OFF:
+    case RTC_YEAR_OFF:
+    case RTC_CENT_OFF:
+        sgi_bridge_rtc_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
+        switch (idx) {
+        case RTC_SEC_OFF:  v = sgi_bridge_bcd_enc(sec); break;
+        case RTC_MIN_OFF:  v = sgi_bridge_bcd_enc(min); break;
+        case RTC_HOUR_OFF: v = sgi_bridge_bcd_enc(hour); break;
+        case RTC_MON_OFF:  v = sgi_bridge_bcd_enc(mon); break;
+        case RTC_WDAY_OFF: v = sgi_bridge_bcd_enc(wday); break;
+        case RTC_MDAY_OFF: v = sgi_bridge_bcd_enc(mday); break;
+        case RTC_YEAR_OFF: v = sgi_bridge_bcd_enc(year % 100); break;
+        default:           v = sgi_bridge_bcd_enc(year / 100); break;
+        }
+        break;
+    case RTC_CTLD_OFF:
+        v = 0x80;                 /* VRT: battery valid, clock running */
+        break;
+    default:
+        v = s->sio_regs[idx];
+        break;
+    }
+    if (sgi_bridge_rtc_dbg()) {
+        fprintf(stderr, "BRIDGE-RTC: R idx=0x%02x -> 0x%02" PRIx64 "\n",
+                idx, v);
+    }
+    return v;
+}
+
+static void sgi_bridge_rtc_write(SGIBRIDGEState *s, unsigned idx, uint8_t val)
+{
+    int sec, min, hour, wday, mday, mon, year;
+
+    if (sgi_bridge_rtc_dbg()) {
+        fprintf(stderr, "BRIDGE-RTC: W idx=0x%02x val=0x%02x\n", idx, val);
+    }
+    switch (idx) {
+    case RTC_SEC_OFF:
+    case RTC_MIN_OFF:
+    case RTC_HOUR_OFF:
+    case RTC_MON_OFF:
+    case RTC_WDAY_OFF:
+    case RTC_MDAY_OFF:
+    case RTC_YEAR_OFF:
+    case RTC_CENT_OFF:
+        sgi_bridge_rtc_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
+        switch (idx) {
+        case RTC_SEC_OFF:
+            sec = sgi_bridge_bcd_dec(val);
+            break;
+        case RTC_MIN_OFF:
+            min = sgi_bridge_bcd_dec(val);
+            break;
+        case RTC_HOUR_OFF:
+            hour = sgi_bridge_bcd_dec(val) % 24;
+            break;
+        case RTC_MON_OFF:
+            mon = sgi_bridge_bcd_dec(val);
+            if (mon < 1 || mon > 12) {
+                mon = 1;
+            }
+            break;
+        case RTC_WDAY_OFF:
+            wday = sgi_bridge_bcd_dec(val);
+            if (wday < 1 || wday > 7) {
+                wday = 1;
+            }
+            break;
+        case RTC_MDAY_OFF:
+            mday = sgi_bridge_bcd_dec(val);
+            if (mday < 1 || mday > 31) {
+                mday = 1;
+            }
+            break;
+        case RTC_YEAR_OFF:
+            year = (year / 100) * 100 + sgi_bridge_bcd_dec(val);
+            break;
+        default: /* RTC_CENT_OFF */
+            year = sgi_bridge_bcd_dec(val) * 100 + (year % 100);
+            break;
+        }
+        sgi_bridge_rtc_rebase(s, sec, min, hour, mday, mon, year);
+        return;
+    case RTC_CTLD_OFF:
+        return;                   /* status register: read-only here */
+    default:
+        s->sio_regs[idx] = val;
+        return;
+    }
+}
+
 static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
 {
     SGIBRIDGEState *s = opaque;
@@ -1234,7 +1450,7 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
      */
     case 0x620000 ... 0x6FFFFF:
         if (offset == 0x6C0000) {
-            val = s->sio_regs[s->sio_index];
+            val = sgi_bridge_rtc_read(s, s->sio_index);
         } else {
             val = 0;
         }
@@ -1518,7 +1734,7 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         if (offset == 0x6A0000) {
             s->sio_index = val & 0xff;
         } else if (offset == 0x6C0000) {
-            s->sio_regs[s->sio_index] = val & 0xff;
+            sgi_bridge_rtc_write(s, s->sio_index, val & 0xff);
         }
         break;
 
@@ -1589,6 +1805,13 @@ static void sgi_bridge_reset(DeviceState *dev)
     memset(s->ioc3_regs, 0, sizeof(s->ioc3_regs));
     memset(s->sio_regs, 0, sizeof(s->sio_regs));
     s->sio_index = 0;
+    /*
+     * Latch the host wall clock as the RTC epoch so the calendar the PROM and
+     * kernel read is live from reset (ml/clksupport.c warns about a frozen
+     * clock otherwise).
+     */
+    s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    s->rtc_epoch_sec = s->rtc_epoch_ns / 1000000000LL;
     sgi_bridge_ds_board_init(&s->bridge_ds);
     sgi_bridge_ds_mac_init(&s->ioc3_ds);
     sgi_bridge_ds_reset(&s->bridge_ds);
