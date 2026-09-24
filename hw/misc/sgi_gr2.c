@@ -1595,6 +1595,23 @@ static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
                    0.0f), 1.0f);
 }
 
+/* Depth test + store for one rasterised fragment.  When the board has no Z
+ * buffer installed (the shipped XS-24 configuration: zbuffer=off) the GE7
+ * raster runs in painter order -- every fragment passes and the most recently
+ * submitted primitive wins the pixel, which is what the real board displays.
+ * With a Z buffer present the usual nearest-depth test applies. */
+static bool sgi_gr2_ge7_zpass(SGIGr2State *s, size_t o, float z)
+{
+    if (!s->ge_zbuf) {
+        return true;
+    }
+    if (z < s->ge_zbuf[o]) {
+        s->ge_zbuf[o] = z;
+        return true;
+    }
+    return false;
+}
+
 static void sgi_gr2_ge7_draw(SGIGr2State *s)
 {
     float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
@@ -1611,7 +1628,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     float hx, hy, hz;
     const float shininess = 8.0f;
 
-    if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
+    if (s->ge_poly_n < 3 || !s->scanout) {
         return;
     }
     /* The light direction is the guest's, normalized; fall back to a headlight
@@ -1797,8 +1814,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                 li = MIN(MAX(li, 0), 31);
                 z = w0 * az + w1 * bz + w2 * cz;
                 o = (size_t)y * SGI_GR2_SCREEN_W + x;
-                if (z < s->ge_zbuf[o]) {
-                    s->ge_zbuf[o] = z;
+                if (sgi_gr2_ge7_zpass(s, o, z)) {
                     sgi_gr2_put(s, x, y, lut[li]);
                 }
             }
@@ -1823,7 +1839,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     const float shininess = 8.0f;
     int idx;
 
-    if (s->ge_line_n < 2 || !s->scanout || !s->ge_zbuf) {
+    if (s->ge_line_n < 2 || !s->scanout) {
         return;
     }
     if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
@@ -1899,8 +1915,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
                 continue;
             }
             o = (size_t)y * SGI_GR2_SCREEN_W + x;
-            if (z < s->ge_zbuf[o]) {
-                s->ge_zbuf[o] = z;
+            if (sgi_gr2_ge7_zpass(s, o, z)) {
                 sgi_gr2_put(s, x, y, (uint8_t)idx);
             }
         }
