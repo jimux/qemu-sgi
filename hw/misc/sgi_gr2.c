@@ -1096,16 +1096,21 @@ static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
 /* Rasterise the buffered polygon (a triangle fan) into `scanout`, Z-buffered.
  * The viewport maps NDC to pixels; if the guest has not yet sent one, fall
  * back to the whole screen. */
-/* Evaluate the guest's Phong model for one eye-space normal and return the
- * intensity (0..1).  Shared by the triangle and line rasterisers. */
+/* Evaluate the guest's Phong model for one normal and return the shaded RGB.
+ * Shared by the triangle and line rasterisers.
+ *
+ * The guest may bind several lights (ideas binds three and animates them), so
+ * every valid light is summed, each with its own half-vector against the eye
+ * at (0,0,1).  A guest with one light fills one slot and the sum is the old
+ * single-light result; if no light has been seen the eye-space fallback
+ * (0,0,1) is used so an unlit stream still draws. */
 static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
-                              float lx, float ly, float lz,
-                              float hx, float hy, float hz, float shininess,
-                              float col[3])
+                              float shininess, float col[3])
 {
-    float nn[3], ndl, ndh;
+    float nn[3], ndl, ndh, l[3], h[3], ll, hl;
     float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    int c;
+    int c, li;
+    bool any = false;
 
     if (nl > 1e-9f) {
         nn[0] = n[0] / nl;
@@ -1122,24 +1127,57 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
         nn[1] = -nn[1];
         nn[2] = -nn[2];
     }
-    ndl = MAX(nn[0] * lx + nn[1] * ly + nn[2] * lz, 0.0f);
-    ndh = MAX(nn[0] * hx + nn[1] * hy + nn[2] * hz, 0.0f);
     for (c = 0; c < 3; c++) {
         col[c] = s->ge_emission[c] +
-                 s->ge_ambient[c] * s->ge_ambient_sum[c] +
-                 s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
-                                    s->ge_specular[c] * powf(ndh, shininess));
+                 s->ge_ambient[c] * s->ge_ambient_sum[c];
+    }
+    for (li = 0; li < SGI_GR2_GE7_MAX_LIGHTS; li++) {
+        if (!s->ge_light_valid[li]) {
+            continue;
+        }
+        ll = s->ge_lights[li][0] * s->ge_lights[li][0] +
+             s->ge_lights[li][1] * s->ge_lights[li][1] +
+             s->ge_lights[li][2] * s->ge_lights[li][2];
+        if (ll <= 1e-6f) {
+            continue; /* a light at the origin is off */
+        }
+        ll = sqrtf(ll);
+        l[0] = s->ge_lights[li][0] / ll;
+        l[1] = s->ge_lights[li][1] / ll;
+        l[2] = s->ge_lights[li][2] / ll;
+        h[0] = l[0]; h[1] = l[1]; h[2] = l[2] + 1.0f;
+        hl = sqrtf(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+        if (hl > 1e-6f) {
+            h[0] /= hl; h[1] /= hl; h[2] /= hl;
+        }
+        ndl = MAX(nn[0] * l[0] + nn[1] * l[1] + nn[2] * l[2], 0.0f);
+        ndh = MAX(nn[0] * h[0] + nn[1] * h[1] + nn[2] * h[2], 0.0f);
+        for (c = 0; c < 3; c++) {
+            col[c] += s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
+                                         s->ge_specular[c] *
+                                         powf(ndh, shininess));
+        }
+        any = true;
+    }
+    if (!any) {
+        /* No light seen yet: a headlight at the eye so something draws. */
+        ndl = MAX(nn[2], 0.0f);
+        for (c = 0; c < 3; c++) {
+            col[c] += s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
+                                         s->ge_specular[c] * powf(ndl, shininess));
+        }
+    }
+    for (c = 0; c < 3; c++) {
         col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
     }
 }
 
 static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
-                               float lx, float ly, float lz,
-                               float hx, float hy, float hz, float shininess)
+                               float shininess)
 {
     float col[3];
 
-    sgi_gr2_ge7_shade(s, n, lx, ly, lz, hx, hy, hz, shininess, col);
+    sgi_gr2_ge7_shade(s, n, shininess, col);
     return MIN(MAX(0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2],
                    0.0f), 1.0f);
 }
@@ -1177,44 +1215,10 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     int vx, vy, vw, vh;
     unsigned i;
     uint8_t lut[32];
-    /* Eye-space light and half vectors.  The guest sets one light position
-     * (token 127, (0,0,1) for powerflip) and the eye is at the origin looking
-     * down -z, so both point along +z; a positional light at finite distance
-     * would need the vertex, which the stream does not carry per component. */
-    float lx, ly, lz;
-    float hx, hy, hz;
     const float shininess = 8.0f;
 
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
         return;
-    }
-    /* The light direction is the guest's, normalized; fall back to a headlight
-     * if no material/light has been seen yet. */
-    {
-        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
-                   s->ge_lpos[1] * s->ge_lpos[1] +
-                   s->ge_lpos[2] * s->ge_lpos[2];
-
-        if (s->ge_mat_valid && ll > 1e-6f) {
-            ll = sqrtf(ll);
-            lx = s->ge_lpos[0] / ll;
-            ly = s->ge_lpos[1] / ll;
-            lz = s->ge_lpos[2] / ll;
-        } else {
-            lx = 0.0f;
-            ly = 0.0f;
-            lz = 1.0f;
-        }
-        /* half vector between the (infinitely far) light and the eye */
-        hx = lx;
-        hy = ly;
-        hz = lz + 1.0f;
-        ll = sqrtf(hx * hx + hy * hy + hz * hz);
-        if (ll > 1e-6f) {
-            hx /= ll;
-            hy /= ll;
-            hz /= ll;
-        }
     }
     if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
         vx = s->vp_x;
@@ -1264,8 +1268,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                          s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
                          s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
             }
-            iv[i] = sgi_gr2_ge7_inten(s, een, lx, ly, lz, hx, hy, hz,
-                                      shininess);
+            iv[i] = sgi_gr2_ge7_inten(s, een, shininess);
         }
     }
     sgi_gr2_ge7_greylut(s, lut);
@@ -1389,7 +1392,6 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
 static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
 {
     int vx, vy, vw, vh;
-    float lx, ly, lz, hx, hy, hz;
     float nx[3];
     float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
     unsigned i;
@@ -1406,25 +1408,6 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     }
     vx += s->ge_win_x;
     vy += s->ge_win_y;
-    {
-        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
-                   s->ge_lpos[1] * s->ge_lpos[1] +
-                   s->ge_lpos[2] * s->ge_lpos[2];
-
-        if (s->ge_mat_valid && ll > 1e-6f) {
-            ll = sqrtf(ll);
-            lx = s->ge_lpos[0] / ll;
-            ly = s->ge_lpos[1] / ll;
-            lz = s->ge_lpos[2] / ll;
-        } else {
-            lx = 0.0f; ly = 0.0f; lz = 1.0f;
-        }
-        hx = lx; hy = ly; hz = lz + 1.0f;
-        ll = sqrtf(hx * hx + hy * hy + hz * hz);
-        if (ll > 1e-6f) {
-            hx /= ll; hy /= ll; hz /= ll;
-        }
-    }
     /* A 2D line has no normal of its own, so IRIS GL shades it with the
      * current normal (n3f).  The guest sets that immediately before the line
      * run: ideas' curves carry (1,0,0) or (0.766,0,-0.643), which face the
@@ -1437,7 +1420,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     {
         float col[3];
 
-        sgi_gr2_ge7_shade(s, nx, lx, ly, lz, hx, hy, hz, shininess, col);
+        sgi_gr2_ge7_shade(s, nx, shininess, col);
         idx = sgi_gr2_ge7_rgbidx(s, col);
     }
     for (i = 0; i < s->ge_line_n; i++) {
@@ -1512,6 +1495,24 @@ static void sgi_gr2_ge7_mat_word(SGIGr2State *s, float *dst, hwaddr tok,
     if (s->ge_mat_n >= 3) {
         s->ge_mat_valid = true;
     }
+}
+
+/* One component of a light position (token 127).  Each bind writes a complete
+ * 3-float run, so a finished run becomes the next light slot round-robin;
+ * that is how a guest binding several lights is represented. */
+static void sgi_gr2_ge7_light_word(SGIGr2State *s, float f)
+{
+    s->ge_lpos[s->ge_lpos_n++] = f;
+    if (s->ge_lpos_n < 3) {
+        return;
+    }
+    s->ge_lpos_n = 0;
+    s->ge_lights[s->ge_light_next][0] = s->ge_lpos[0];
+    s->ge_lights[s->ge_light_next][1] = s->ge_lpos[1];
+    s->ge_lights[s->ge_light_next][2] = s->ge_lpos[2];
+    s->ge_light_valid[s->ge_light_next] = true;
+    s->ge_light_next = (s->ge_light_next + 1) % SGI_GR2_GE7_MAX_LIGHTS;
+    s->ge_mat_valid = true;
 }
 
 static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
@@ -1639,7 +1640,7 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         sgi_gr2_ge7_mat_word(s, s->ge_lcolor, offset, sgi_gr2_u2f(v));
         break;
     case SGI_GR2_GE7_LPOS:
-        sgi_gr2_ge7_mat_word(s, s->ge_lpos, offset, sgi_gr2_u2f(v));
+        sgi_gr2_ge7_light_word(s, sgi_gr2_u2f(v));
         break;
     case SGI_GR2_GE7_AMBIENT_SUM:
         sgi_gr2_ge7_mat_word(s, s->ge_ambient_sum, offset, sgi_gr2_u2f(v));

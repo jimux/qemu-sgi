@@ -133,6 +133,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_DIFFUSE     0x401e8 /* token 122, RGBA                 */
 #define SGI_GR2_GE7_SPECULAR    0x401f0 /* token 124, RGB                  */
 #define SGI_GR2_GE7_LCOLOR      0x401f8 /* token 126, light colour RGB     */
+#define SGI_GR2_GE7_MAX_LIGHTS  3      /* light slots the shade sums       */
 #define SGI_GR2_GE7_LPOS        0x401fc /* token 127, light position XYZ   */
 #define SGI_GR2_GE7_LMCOLOR     0x40204 /* token 129, lighting model       */
 
@@ -524,6 +525,14 @@ struct SGIGr2State {
     float ge_lcolor[3];            /* token 126: light colour RGB            */
     float ge_lpos[3];              /* token 127: light position XYZ          */
     float ge_ambient_sum[3];       /* token 117: summed ambient RGB          */
+    /* The guest binds up to three lights and animates their positions; each
+     * bind writes a fresh 3-float lpos run.  A completed run replaces one slot
+     * round-robin and the shade sums the valid ones.  A single-light guest
+     * fills one slot; the others stay invalid and contribute nothing. */
+    float ge_lights[SGI_GR2_GE7_MAX_LIGHTS][3];
+    bool ge_light_valid[SGI_GR2_GE7_MAX_LIGHTS];
+    unsigned ge_light_next;
+    unsigned ge_lpos_n;            /* words collected for the current light   */
     hwaddr ge_mat_tok;             /* last material token (run boundary)     */
     unsigned ge_mat_n;             /* components collected in the run        */
     bool ge_mat_valid;
