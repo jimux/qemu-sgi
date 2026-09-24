@@ -415,6 +415,8 @@ static void gl2_exec(SGIGL2State *s, unsigned cmd, uint16_t val)
     }
 }
 
+static bool fbc_trace_on(void);
+
 static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIGL2State *s = opaque;
@@ -442,6 +444,10 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
             if (!s->prog_int_pending) {
                 v |= 0x10;
             }
+            if (fbc_trace_on()) {
+                fprintf(stderr, "FBCTRACE rdFLAGS v=%#x vert=%d prog=%d\n",
+                        v, s->vert_pending, s->prog_int_pending);
+            }
             if (s->vert_pending) {
                 s->vert_pending = false;
                 gl2_update_irq(s);
@@ -467,8 +473,11 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
                 s->readback_seq = 0;
                 return (1u << (s->nplanes < 16 ? s->nplanes : 16)) - 1; /* AB */
             default:
+                if (fbc_trace_on()) {
+                    fprintf(stderr, "FBCTRACE rdDATA -> %#x\n", s->fbc_out);
+                }
                 return s->fbc_out;
-            }
+        }
         }
         default:
             return 0;           /* GEflags reads as 0 when idle */
@@ -523,6 +532,9 @@ static void gl2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         switch (off & ~0x3ff) {
         case R_FBC_PIXEL & ~0x3ff:
             /* FBCclrint: dismiss a programmed interrupt. */
+            if (fbc_trace_on() && s->prog_int_pending) {
+                fprintf(stderr, "FBCTRACE clrint (was pending)\n");
+            }
             s->prog_int_pending = false;
             gl2_update_irq(s);
             break;
@@ -646,6 +658,16 @@ static void gl2_gfx_update(void *opaque)
 static const GraphicHwOps gl2_gfx_ops = {
     .gfx_update = gl2_gfx_update,
 };
+
+static bool fbc_trace_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("SGI_FBC_TRACE") != NULL;
+    }
+    return on;
+}
 
 /*
  * Diagnostic: log graphics-window MMIO reads made by USER mode (SR
@@ -906,6 +928,9 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         s->fbc_out = 9;                 /* _INTEOF */
         s->prog_int_pending = true;
         gl2_update_irq(s);
+        if (fbc_trace_on()) {
+            fprintf(stderr, "FBCTRACE eof -> _INTEOF pending\n");
+        }
         break;
 
     case 0x2f:                          /* FBCpixelsetup */

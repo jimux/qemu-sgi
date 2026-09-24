@@ -113,13 +113,67 @@ static QEMUTimer *sgi_pc_timer;
 static void sgi_pc_sample(void *opaque)
 {
     M68kCPU *cpu = opaque;
+    static int kern = -1;
+    static int interval = -1;
 
+    if (kern < 0) {
+        const char *iv = getenv("SGI_PC_SAMPLE_MS");
+        kern = getenv("SGI_PC_SAMPLE_KERN") != NULL;
+        interval = iv ? atoi(iv) : 100;
+    }
     if (!(cpu->env.sr & 0x2000)) {   /* user mode: supervisor bit clear */
         fprintf(stderr, "PCSAMPLE pc=%08x sr=%04x\n",
                 cpu->env.pc, cpu->env.sr);
+    } else if (kern) {
+        fprintf(stderr, "PCSAMPLEK pc=%08x sr=%04x\n",
+                cpu->env.pc, cpu->env.sr);
     }
     timer_mod(sgi_pc_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + interval);
+}
+
+static QEMUTimer *sgi_shmd_timer;
+
+static uint32_t sgi_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/*
+ * Diagnostic: dump the GL shared-memory handshake word as seen through the
+ * kernel's gl_shmemptr and through the client's fixed USER SHMEM address,
+ * so a mismatch (two different pages) is visible.  Off unless SGI_SHMD.
+ */
+static void sgi_shmd(void *opaque)
+{
+    M68kCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+    uint8_t b[4];
+    uint32_t shmptr = 0, shmpa = 0;
+    unsigned kw = 0, uw = 0;
+    int krc = -1, urc;
+
+    if (cpu_memory_rw_debug(cs, 0x2006f418, b, 4, 0) == 0) {
+        shmptr = sgi_be32(b);
+    }
+    if (cpu_memory_rw_debug(cs, 0x2006ef30, b, 4, 0) == 0) {
+        shmpa = sgi_be32(b);
+    }
+    if (shmptr) {
+        krc = cpu_memory_rw_debug(cs, shmptr, b, 2, 0);
+        if (krc == 0) {
+            kw = (b[0] << 8) | b[1];
+        }
+    }
+    urc = cpu_memory_rw_debug(cs, 0x1fffe000, b, 2, 0);
+    if (urc == 0) {
+        uw = (b[0] << 8) | b[1];
+    }
+    fprintf(stderr, "SHMD shmptr=%08x pa=%08x kernEOF=%u(rc%d) "
+            "userEOF=%u(rc%d)\n", shmptr, shmpa, kw, krc, uw, urc);
+    timer_mod(sgi_shmd_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 200);
 }
 
 static void iris3130_init(MachineState *machine)
@@ -179,6 +233,12 @@ static void iris3130_init(MachineState *machine)
                                     &s->cpu);
         timer_mod(sgi_pc_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+    }
+    if (getenv("SGI_SHMD")) {
+        sgi_shmd_timer = timer_new_ms(QEMU_CLOCK_REALTIME, sgi_shmd,
+                                      &s->cpu);
+        timer_mod(sgi_shmd_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 200);
     }
 
     /*
