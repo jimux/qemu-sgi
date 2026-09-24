@@ -357,6 +357,9 @@ void sgi_ds2502_bus_reset(SGIDS2502BUS *bus)
 
 static void sgi_ds_bus_decode(SGIDS2502BUS *bus)
 {
+    if (getenv("SGIDS_DBG")) {
+        qemu_log("ds2502 CMD %02x\n", bus->cmd);
+    }
     switch (bus->cmd) {
     case 0x33: /* READ ROM (single-drop) */
         bus->state = SGI_DS_READROM;
