@@ -1388,6 +1388,7 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
         if (s->ovr_ctrl != v) {
             s->ovr_ctrl = v;
             s->scan_dirty = true;
+            trace_sgi_gbe_ovr_ctrl(v);
         }
         return;
     case GBE_OVR_INHWCTRL:
@@ -1398,12 +1399,14 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
         if (s->frm_size_tile != v) {
             s->frm_size_tile = v;
             s->scan_dirty = true;
+            trace_sgi_gbe_frm_size(s->frm_size_tile, s->frm_size_pixel);
         }
         return;
     case GBE_FRM_SIZE_PIXEL:
         if (s->frm_size_pixel != v) {
             s->frm_size_pixel = v;
             s->scan_dirty = true;
+            trace_sgi_gbe_frm_size(s->frm_size_tile, s->frm_size_pixel);
         }
         return;
     case GBE_FRM_CTRL:
@@ -1420,6 +1423,7 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
         if (s->did_ctrl != v) {
             s->did_ctrl = v;
             s->scan_dirty = true;   /* window table remap */
+            trace_sgi_gbe_did_ctrl(v);
         }
         return;
     case GBE_DID_INHWCTRL:
@@ -1481,6 +1485,7 @@ static void sgi_gbe_write(void *opaque, hwaddr offset,
         if (s->mode_regs[mi] != v) {
             s->mode_regs[mi] = v;
             s->scan_dirty = true;   /* WID typ/cm change re-decodes pixels */
+            trace_sgi_gbe_mode_reg(mi, v);
         }
         return;
     }
