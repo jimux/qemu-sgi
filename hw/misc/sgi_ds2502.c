@@ -120,6 +120,39 @@ void sgi_ds2502_build_board(SGIDS2502 *ds, const char *serial,
     ds->rom[0] = 0x09;
     memcpy(&ds->rom[1], rom_serial, 6);
     ds->rom[7] = sgi_ds_crc8(ds->rom, 7);
+    ds->extra_bits = 8; /* DS2502 clocks a status byte before the data */
+}
+
+void sgi_ds2502_build_mac(SGIDS2502 *ds, const uint8_t mac[6],
+                          const uint8_t rom_serial[6])
+{
+    int a, b;
+
+    memset(ds->mem, 0xff, sizeof(ds->mem));
+    ds->mem[0] = 0x8d;
+    ds->mem[1] = 0x0a;
+    ds->mem[2] = ds->mem[3] = ds->mem[4] = ds->mem[5] = 0x00;
+    /* eaddr[i] = byte[11-i], so store MSB first at [6]. */
+    for (int i = 0; i < 6; i++) {
+        ds->mem[6 + i] = mac[5 - i];
+    }
+    ds->mem[12] = 0;
+    ds->mem[13] = 0;
+    for (a = 0; a < 256; a++) {
+        for (b = 0; b < 256; b++) {
+            ds->mem[12] = a;
+            ds->mem[13] = b;
+            if (sgi_ds_crc16(&ds->mem[1], 13) == 0xb001) {
+                goto done;
+            }
+        }
+    }
+done:;
+
+    ds->rom[0] = 0x09;
+    memcpy(&ds->rom[1], rom_serial, 6);
+    ds->rom[7] = sgi_ds_crc8(ds->rom, 7);
+    ds->extra_bits = 0; /* nic_eaddr reads the record from byte 0 */
 }
 
 void sgi_ds2502_reset(SGIDS2502 *ds)
@@ -195,7 +228,7 @@ void sgi_ds2502_write_bit(SGIDS2502 *ds, int bit)
         if (++ds->in_bits == 16) {
             ds->state = SGI_DS_RMEM_DATA;
             ds->out_index = 0;
-            ds->extra = (ds->rom[0] == 0x09) ? 8 : 0;
+            ds->extra = ds->extra_bits;
         }
         break;
     default:
@@ -398,7 +431,7 @@ void sgi_ds2502_bus_write_bit(SGIDS2502BUS *bus, int bit)
         if (++bus->in_bits == 16) {
             bus->state = SGI_DS_RMEM_DATA;
             bus->out_index = 0;
-            bus->extra = 8;  /* DS2502 family 0x09: status byte first */
+            bus->extra = (bus->sel >= 0) ? bus->dev[bus->sel].extra_bits : 0;
         }
         break;
     default:

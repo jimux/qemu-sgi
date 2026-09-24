@@ -32,6 +32,7 @@ typedef struct SGIDS2502 {
     int search_phase;
     int addr;
     int extra;
+    int extra_bits;      /* status bits clocked out before a memory page */
     int data_bit;        /* latched line state (MCR_DATA) */
 } SGIDS2502;
 
@@ -39,6 +40,15 @@ typedef struct SGIDS2502 {
 void sgi_ds2502_build_board(SGIDS2502 *ds, const char *serial,
                             const char *part, const char *name,
                             const uint8_t rom_serial[6]);
+
+/*
+ * Program the IOC3 MAC-address EEPROM record read by nic_eaddr()
+ * (libsk/ml/nic.c): family 0x09, [0]=0x8d, [1]=0x0a, [6..11] MAC LSB..MSB,
+ * [12..13] CRC16 solving crc16(bytes[1..13]) == 0xb001.  No status byte is
+ * clocked out before the record (extra_bits = 0).
+ */
+void sgi_ds2502_build_mac(SGIDS2502 *ds, const uint8_t mac[6],
+                          const uint8_t rom_serial[6]);
 
 /* Reset the part to the command state (a 1-wire reset pulse). */
 void sgi_ds2502_reset(SGIDS2502 *ds);
