@@ -27,6 +27,7 @@
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
+#include "trace.h"
 #include "qapi/error.h"
 #include "ui/input.h"
 #include "qemu/log.h"
@@ -136,6 +137,9 @@ static void scc_ctrl_write(SGIHPC1State *s, int d, int c, uint8_t val)
 {
     SGIHPC1Uart *u = &s->uart[d][c];
 
+    if (d == 0) {
+        trace_sgi_hpc1_duart_ctrl(d, c, u->reg_ptr, val);
+    }
     if (u->reg_ptr == 0) {
         uint8_t cmd = (val >> 3) & 0x07;
         uint8_t ptr = val & 0x07;
@@ -268,6 +272,7 @@ static uint8_t scc_data_read(SGIHPC1State *s, int d, int c)
         val = u->rx_fifo[u->rx_tail];
         u->rx_tail = (u->rx_tail + 1) % HPC1_RX_FIFO_SIZE;
         u->rx_count--;
+        trace_sgi_hpc1_duart_rx(d, c, val);
         qemu_chr_fe_accept_input(&s->serial);
         if (u->rx_count == 0) {
             u->rr3 &= ~(c == 0 ? SCC_RX_IP_A : SCC_RX_IP);
@@ -498,6 +503,14 @@ static void sgi_hpc1_mouse_event(DeviceState *dev, QemuConsole *src,
         return;
     }
 
+    if (getenv("SGI_MOUSE_DBG")) {
+        if (evt->type == INPUT_EVENT_KIND_BTN) {
+            trace_sgi_hpc1_mouse(1, btn->button, btn->down, s->mouse_buttons);
+        } else if (evt->type == INPUT_EVENT_KIND_REL) {
+            trace_sgi_hpc1_mouse(2, move->axis, (uint32_t)move->value,
+                                 s->mouse_buttons);
+        }
+    }
     sgi_hpc1_mouse_packet(s, s->mouse_dx, s->mouse_dy);
     s->mouse_dx = 0;
     s->mouse_dy = 0;
