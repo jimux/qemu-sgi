@@ -110,6 +110,65 @@ void wd33c93_set_transfer_count(WD33C93State *s, uint32_t count)
 }
 
 /*
+ * Selection timeout unit.  The Timeout Period register selects the period;
+ * the WD33C93A datasheet gives roughly 250 ms at its typical setting, and the
+ * IRIX driver programs 0x20, so model one register unit as ~8 ms (0x20 ->
+ * ~256 ms).  A register value of 0 uses a 250 ms default.
+ */
+#define WD33C93_TIMEOUT_UNIT_NS (8 * NANOSECONDS_PER_SECOND / 1000)
+
+static void wd33c93_complete_cmd(WD33C93State *s, uint8_t status);
+
+/*
+ * Selection of an absent target is a timed event: the chip holds BSY/CIP for
+ * the timeout period, then reports SELECTION_TIMEOUT with an interrupt.  A
+ * command written during the window is ignored with LCI set (the CIP check in
+ * wd33c93_execute_cmd covers that).  Completing inline instead made the
+ * timeout interrupt arrive before the IRIX driver had armed its follow-up
+ * command, so it never observed the ignored-command (LCI) condition.
+ */
+static void wd33c93_select_timeout(void *opaque)
+{
+    WD33C93State *s = opaque;
+
+    if (!s->select_pending) {
+        return;
+    }
+    /*
+     * A select that did not complete reports PH_NOSELECT (0) in the Command
+     * Phase register; the driver tells a genuine selection timeout apart from
+     * a hardware error on this value (IRIX wd93.c ST_TIMEOUT: phase !=
+     * PH_NOSELECT -> "Hardware error" abort).  do_select/do_select_xfer set
+     * the phase to PH_SELECT, so clear it here.
+     */
+    s->regs[WD_COMMAND_PHASE] = 0x00;
+    s->select_pending = false;
+    wd33c93_complete_cmd(s, SCSI_STATUS_SELECTION_TIMEOUT);
+}
+
+static void wd33c93_cancel_select(WD33C93State *s)
+{
+    if (s->select_timer) {
+        timer_del(s->select_timer);
+    }
+    s->select_pending = false;
+}
+
+static void wd33c93_arm_select_timeout(WD33C93State *s)
+{
+    uint8_t tpr = s->regs[WD_TIMEOUT_PERIOD];
+    uint64_t ns = (tpr ? tpr : 250u) * WD33C93_TIMEOUT_UNIT_NS;
+
+    s->select_pending = true;
+    /* The chip is busy for the whole timeout window. */
+    s->aux_status |= ASR_CIP | ASR_BSY;
+    if (s->select_timer) {
+        timer_mod(s->select_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+    }
+}
+
+/*
  * Complete a command with status and interrupt
  */
 static void wd33c93_complete_cmd(WD33C93State *s, uint8_t status)
@@ -265,8 +324,9 @@ static void wd33c93_do_select_xfer(WD33C93State *s, bool with_atn)
 
     /* Try to select target */
     if (wd33c93_select(s) < 0) {
-        /* Selection timeout */
-        wd33c93_complete_cmd(s, SCSI_STATUS_SELECTION_TIMEOUT);
+        /* No device: hold BSY/CIP and report SELECTION_TIMEOUT after the
+         * period programmed in the Timeout Period register. */
+        wd33c93_arm_select_timeout(s);
         return;
     }
 
@@ -363,7 +423,9 @@ static void wd33c93_do_select(WD33C93State *s, bool with_atn)
     s->aux_status |= ASR_CIP | ASR_BSY;
 
     if (wd33c93_select(s) < 0) {
-        wd33c93_complete_cmd(s, SCSI_STATUS_SELECTION_TIMEOUT);
+        /* No device: hold BSY/CIP and report SELECTION_TIMEOUT after the
+         * period programmed in the Timeout Period register. */
+        wd33c93_arm_select_timeout(s);
         return;
     }
 
@@ -410,10 +472,17 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
 
     /* Check if last command was ignored */
     if (s->aux_status & ASR_CIP) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "wd33c93: command 0x%02x while CIP set\n", cmd);
-        s->aux_status |= ASR_LCI;
-        return;
+        if (s->select_pending &&
+            (cmd_code == CMD_RESET || cmd_code == CMD_ABORT)) {
+            /* RESET/ABORT cancel a selection in progress (WD33C93A). */
+            wd33c93_cancel_select(s);
+            s->aux_status &= ~(ASR_CIP | ASR_BSY);
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "wd33c93: command 0x%02x while CIP set\n", cmd);
+            s->aux_status |= ASR_LCI;
+            return;
+        }
     }
 
     /*
@@ -945,6 +1014,7 @@ static void wd33c93_reset(DeviceState *dev)
     s->current_dev = NULL;
     s->current_req = NULL;
     s->drq_state = false;
+    wd33c93_cancel_select(s);
 
     fifo8_reset(&s->fifo);
 }
@@ -958,6 +1028,10 @@ static void wd33c93_realize(DeviceState *dev, Error **errp)
 
     /* Initialize FIFO */
     fifo8_create(&s->fifo, WD33C93_FIFO_SIZE);
+
+    /* Deferred selection timeout (see wd33c93_arm_select_timeout) */
+    s->select_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wd33c93_select_timeout,
+                                   s);
 
     /* Initialize SCSI bus */
     scsi_bus_init(&s->bus, sizeof(s->bus), dev, &wd33c93_scsi_info);

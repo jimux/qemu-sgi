@@ -175,6 +175,14 @@ struct WD33C93State {
     qemu_irq irq;                       /* Interrupt output */
     qemu_irq drq;                       /* DMA Request output */
     bool drq_state;                     /* Current DRQ state */
+
+    /* Selection of an absent target is a timed event on real hardware: the
+     * chip holds BSY/CIP for the period programmed in the Timeout Period
+     * register and only then reports SELECTION_TIMEOUT.  The IRIX driver
+     * programs a command during that window and expects it to be ignored
+     * with LCI set, so the timeout must be deferred, not completed inline. */
+    QEMUTimer *select_timer;
+    bool select_pending;
 };
 
 /*
