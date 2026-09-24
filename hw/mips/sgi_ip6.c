@@ -250,26 +250,8 @@ typedef struct SGIip6State {
     QEMUTimer *rtc_timer;
 
     bool lio_int;
-    /*
-     * IP6 PIT clocking.  Unlike a PC, only channel 2 sees the crystal
-     * (3.6864 MHz) and its output clocks channels 0 and 1 (MAME ip6.cpp
-     * set_clk<2>() + out_handler<2>()): channel 0 drives the clock interrupt
-     * and channel 1 the kg clock.  QEMU's i8254 clocks every channel at
-     * PIT_FREQ, and the PROM calibrates its delays off channel 2's rate, so
-     * we leave the i8254 alone for register state/channel-2 reads and pulse
-     * channels 0/1's interrupts from our own timers at the real rate.
-     */
+    bool pit0_level;
     bool pit0_programmed;
-    bool pit1_programmed;
-    QEMUTimer *pit_timer[2];
-    uint32_t pit_reload[2];
-    uint8_t pit_rw[2];
-    uint8_t pit_wstate[2];
-    uint8_t pit_wlatch[2];
-    uint32_t pit_in_freq;     /* channels 0/1 input = xtal / reload2 */
-    uint8_t pit2_rw;
-    uint8_t pit2_write_state;
-    uint8_t pit2_lsb;
 
     uint8_t memcfg;
     uint16_t cpucfg;
@@ -1363,110 +1345,24 @@ static void sgi_ip6_duart_irq(void *opaque, int n, int level)
 
 /* ---- 8254 PIT and timer interrupt acknowledge ------------------------- */
 
-/* Input crystal on PIT channel 2; its output clocks channels 0 and 1. */
-#define SGI_IP6_PIT_XTAL 3686400
-
-static void sgi_ip6_pit_rearm(SGIip6State *s, int ch)
-{
-    uint64_t period_ns;
-
-    if (!s->pit_timer[ch] || !s->pit_in_freq || !s->pit_reload[ch]) {
-        return;
-    }
-    period_ns = muldiv64(s->pit_reload[ch], NANOSECONDS_PER_SECOND,
-                         s->pit_in_freq);
-    timer_mod(s->pit_timer[ch],
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
-}
-
-/* One output pulse per period; the IRQ is a set-only latch cleared by the
- * timer ack register (see sgi_ip6_timer{0,1}_ack_read). */
-static void sgi_ip6_pit_tick0(void *opaque)
+static void sgi_ip6_pit_out0(void *opaque, int n, int level)
 {
     SGIip6State *s = opaque;
 
-    if (s->pit0_programmed && s->cpu) {
+    /* The PROM wires the PIT outputs as set-only latches: a rising edge
+     * asserts the CPU IRQ, and only the ack register clears it.  QEMU's PIT
+     * leaves channel 0 toggling out of reset, so wait until the PROM has
+     * actually programmed the chip before propagating edges. */
+    if (level && !s->pit0_level && s->pit0_programmed && s->cpu) {
         qemu_set_irq(s->cpu->env.irq[4], 1);
     }
-    sgi_ip6_pit_rearm(s, 0);
-}
-
-static void sgi_ip6_pit_write_reload(SGIip6State *s, int ch, uint64_t data)
-{
-    uint8_t byte = data & 0xff;
-
-    switch (s->pit_rw[ch]) {
-    case 1: /* LSB only */
-        s->pit_reload[ch] = byte;
-        break;
-    case 2: /* MSB only */
-        s->pit_reload[ch] = (uint32_t)byte << 8;
-        break;
-    case 3: /* LSB then MSB */
-        if (!s->pit_wstate[ch]) {
-            s->pit_wlatch[ch] = byte;
-            s->pit_wstate[ch] = 1;
-            return;
-        }
-        s->pit_reload[ch] = s->pit_wlatch[ch] | ((uint32_t)byte << 8);
-        s->pit_wstate[ch] = 0;
-        break;
-    default:
-        return;
-    }
-    if (s->pit_reload[ch] == 0) {
-        s->pit_reload[ch] = 0x10000;
-    }
-    if (ch == 0) {
-        s->pit0_programmed = true;
-    } else {
-        s->pit1_programmed = true;
-    }
-    sgi_ip6_pit_rearm(s, ch);
-}
-
-/* Channel 2 is the prescaler for channels 0 and 1 (IRIX uses reload 1024,
- * i.e. 3600 Hz). */
-static void sgi_ip6_pit_write_reload2(SGIip6State *s, uint64_t data)
-{
-    uint8_t byte = data & 0xff;
-    uint32_t reload;
-
-    switch (s->pit2_rw) {
-    case 1:
-        reload = byte;
-        break;
-    case 2:
-        reload = (uint32_t)byte << 8;
-        break;
-    case 3:
-        if (!s->pit2_write_state) {
-            s->pit2_lsb = byte;
-            s->pit2_write_state = 1;
-            return;
-        }
-        reload = s->pit2_lsb | ((uint32_t)byte << 8);
-        s->pit2_write_state = 0;
-        break;
-    default:
-        return;
-    }
-    if (reload == 0) {
-        reload = 0x10000;
-    }
-    s->pit_in_freq = (SGI_IP6_PIT_XTAL + reload / 2) / reload;
-    if (s->pit_in_freq == 0) {
-        s->pit_in_freq = 1;
-    }
-    sgi_ip6_pit_rearm(s, 0);
-    sgi_ip6_pit_rearm(s, 1);
+    s->pit0_level = level;
 }
 
 /*
  * The 8254 ports sit one per 32-bit bus word (+0/+4/+8/+12), not packed.
- * Forward each to the ISA PIT's byte ports (channel 2's readback is what
- * firmware calibrates against), and shadow the reloads so channels 0/1's
- * interrupt outputs run at the real chained rate.
+ * Forward each to the ISA PIT's byte ports, and note that software has
+ * begun programming the chip so its reset state stops driving IRQ2.
  */
 static uint64_t sgi_ip6_pit_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -1491,24 +1387,7 @@ static void sgi_ip6_pit_write(void *opaque, hwaddr addr, uint64_t data,
     if (addr & 3) {
         return;
     }
-
-    if (port == 3) {
-        unsigned sc = (data >> 6) & 3;
-        unsigned rw = (data >> 4) & 3;
-
-        if (sc == 2 && rw != 0) {
-            s->pit2_rw = rw;
-            s->pit2_write_state = 0;
-        } else if (sc != 3 && rw != 0) {
-            s->pit_rw[sc] = rw;
-            s->pit_wstate[sc] = 0;
-        }
-    } else if (port == 2) {
-        sgi_ip6_pit_write_reload2(s, data);
-    } else {
-        sgi_ip6_pit_write_reload(s, port, data);
-    }
-
+    s->pit0_programmed = true;
     memory_region_dispatch_write(&PIT_COMMON(s->pit)->ioports, port, data,
                                  size, MEMTXATTRS_UNSPECIFIED);
 }
@@ -2136,19 +2015,8 @@ static void sgi_ip6_init(MachineState *machine)
     s->isa = isa_bus_new(NULL, get_system_memory(), get_system_io(),
                          &error_fatal);
     s->pit = DEVICE(isa_create_simple(s->isa, TYPE_I8254));
-    /*
-     * Only channel 2 sees the crystal and its output clocks channels 0 and
-     * 1; until firmware programs the prescaler assume the IRIX boot value
-     * (reload 1024 -> 3600 Hz).  The i8254's own outputs are unused.
-     */
-    s->pit_in_freq = SGI_IP6_PIT_XTAL / 1024;
-    s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_ip6_pit_tick0, s);
-    /*
-     * The kg clock (channel 1 -> timer1) was not wired before and wiring it
-     * makes the second netboot transfer fail, so leave it unwired for now:
-     * only the clock interrupt rate is wrong in the boot path.
-     */
-    s->pit_timer[1] = NULL;
+    qdev_connect_gpio_out(s->pit, 0,
+                          qemu_allocate_irq(sgi_ip6_pit_out0, s, 0));
     memory_region_init_io(&s->pit_reg, OBJECT(machine), &sgi_ip6_pit_ops, s,
                           "sgi-ip6-pit", 0x10);
     memory_region_add_subregion(system_memory, SGI_IP6_PIT_BASE, &s->pit_reg);
@@ -2210,19 +2078,8 @@ static void sgi_ip6_init(MachineState *machine)
     timer_mod(s->rtc_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 100);
     s->lio_int = false;
+    s->pit0_level = true;   /* PIT output is high out of reset; see out0 */
     s->pit0_programmed = false;
-    s->pit1_programmed = false;
-    s->pit_in_freq = SGI_IP6_PIT_XTAL / 1024;
-    s->pit_reload[0] = s->pit_reload[1] = 0;
-    s->pit_rw[0] = s->pit_rw[1] = 0;
-    s->pit_wstate[0] = s->pit_wstate[1] = 0;
-    s->pit2_rw = s->pit2_write_state = s->pit2_lsb = 0;
-    if (s->pit_timer[0]) {
-        timer_del(s->pit_timer[0]);
-    }
-    if (s->pit_timer[1]) {
-        timer_del(s->pit_timer[1]);
-    }
     /*
      * LIO status bits are active low: set = idle, clear = asserted.  The GE
      * bit follows the GE5's own interrupt (the microcode's SET INT, cleared
