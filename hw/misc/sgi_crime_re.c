@@ -311,15 +311,56 @@ static uint32_t sgi_crime_re_get_pixel(SGICRIMEREState *s, uint32_t bufmode,
 {
     hwaddr phys;
     uint8_t b[4];
-    int bpp = 1 << ((bufmode >> BM_BUF_DEPTH_SHIFT) & 3);
+    uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
+    uint32_t buf_d = (bufmode >> BM_BUF_DEPTH_SHIFT) & 3;
+    uint32_t pix_d = (bufmode >> BM_PIX_DEPTH_SHIFT) & 3;
+    int px_bpp = 1 << pix_d;          /* PIXEL width (1/2/4) */
+    int word_bpp = 1 << buf_d;        /* WORD width (1/2/4) */
+    int bpp = word_bpp;
 
     if (!sgi_crime_re_fb_addr(s, bufmode, x, y, &phys)) {
         return 0;
     }
+
+    /*
+     * Mirror put_pixel()'s addressing: an 8-bit CI pixel in a 32-bit-word
+     * CI buffer lives in byte1, and a 16-bit pixel in a double-buffered
+     * word owns one half selected by doublePixSel.  Reading the whole
+     * 32-bit word at the un-offset address (the old behaviour) returned a
+     * different half's pixel for a 16-bit double-buffered destination, so
+     * a ROP read-modify-write or an X/GL read-back of the GL window read
+     * the wrong pixel.
+     */
+    if (pix_type == 0 && crim_ci_lane(bufmode)) {
+        phys += 1;
+    }
+    if (pix_type != 0 && ((bufmode >> 1) & 1) && px_bpp == 2 &&
+        px_bpp < word_bpp) {
+        phys += (bufmode & 1) ? (word_bpp - px_bpp) : 0;
+    }
+
+    /*
+     * 16-bit RGB(A) pixel in a wider word: A1_RGB5 (spec Figure 7-5,
+     * bits [15]=A [14:10]=R [9:5]=G [4:0]=B).  Unpack to the canonical
+     * RGBA fragment (R=31:24..A=7:0), expanding each 5-bit component to 8
+     * by bit replication exactly as the GBE scanout does.
+     */
+    if (pix_type != 0 && px_bpp == 2 && px_bpp < word_bpp) {
+        uint32_t v;
+        address_space_rw(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
+                         b, 2, false);
+        v = ((uint32_t)b[0] << 8) | b[1];
+        uint32_t r5 = (v >> 10) & 0x1f, g5 = (v >> 5) & 0x1f, b5 = v & 0x1f;
+        uint32_t a = (v >> 15) & 1;
+        return (((r5 << 3) | (r5 >> 2)) << 24)
+             | (((g5 << 3) | (g5 >> 2)) << 16)
+             | (((b5 << 3) | (b5 >> 2)) << 8)
+             | (a ? 0xff : 0);
+    }
+
     address_space_rw(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
                      b, bpp, false);
 
-    uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
     switch (pix_type) {
     case 0:                             /* color index (8/16-bit) */
         if (((bufmode >> BM_PIX_DEPTH_SHIFT) & 3) == 1) {
