@@ -23,6 +23,7 @@
 #include "internal.h"
 #include "exec/helper-proto.h"
 #include "exec/memop.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "fpu_helper.h"
 #include "qemu/crc32c.h"
 #include <zlib.h>
@@ -333,10 +334,80 @@ void mips_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
     MIPSCPUClass *mcc = MIPS_CPU_GET_CLASS(cs);
     CPUMIPSState *env = cpu_env(cs);
 
+    if (getenv("IP6ERR_DBG")) {
+        fprintf(stderr, "IP6DBE: phys=%08llx va=%08llx size=%u type=%d "
+                "pc=%08llx\n",
+                (unsigned long long)physaddr, (unsigned long long)addr, size,
+                access_type, (unsigned long long)env->active_tc.PC);
+    }
+
     if (access_type == MMU_INST_FETCH) {
         do_raise_exception(env, EXCP_IBE, retaddr);
     } else if (!mcc->no_data_aborts) {
         do_raise_exception(env, EXCP_DBE, retaddr);
+    }
+}
+
+/*
+ * IP6 bring-up probe: dump full machine state when the guest reaches one of
+ * the hooked PCs (0x80002838 mfc0 Cause, 0x8000ab58 idle_err entry,
+ * 0x8008fa60 gr1_retr_intr positive control).  Env-gated by IP6HOOK.
+ *
+ * Output goes to IP6HOOK_LOGFILE when set (else stderr) so a heavy hook does
+ * not back-pressure the vCPU's stderr pty.
+ */
+static void ip6hook_log(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+static void ip6hook_log(const char *fmt, ...)
+{
+    static FILE *f;
+    static bool tried;
+    va_list ap;
+
+    if (!tried) {
+        const char *p = getenv("IP6HOOK_LOGFILE");
+
+        tried = true;
+        if (p && *p) {
+            f = fopen(p, "a");
+            if (f) {
+                setvbuf(f, NULL, _IOLBF, 0);
+            }
+        }
+    }
+    if (f) {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        return;
+    }
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+void helper_ip6_pchook(CPUMIPSState *env)
+{
+    int i;
+
+    ip6hook_log("IP6HOOK: pc=%08x cause=%08x sr=%08x epc=%08x badv=%08x "
+            "ra=%08x\n", (uint32_t)env->active_tc.PC, env->CP0_Cause,
+            env->CP0_Status, (uint32_t)env->CP0_EPC,
+            (uint32_t)env->CP0_BadVAddr, (uint32_t)env->active_tc.gpr[31]);
+    ip6hook_log("IP6HOOK: entryhi=%08x entrylo0=%08x entrylo1=%08x "
+            "context=%08x index=%08x random=%08x\n",
+            (uint32_t)env->CP0_EntryHi, (uint32_t)env->CP0_EntryLo0,
+            (uint32_t)env->CP0_EntryLo1, (uint32_t)env->CP0_Context,
+            (uint32_t)env->CP0_Index, (uint32_t)env->CP0_Random);
+    ip6hook_log("IP6HOOK: rootdev=%08x masterpid=%08x "
+            "nprocs=%08x\n", (uint32_t)cpu_ldl_data(env, 0x800fc4c8),
+            (uint32_t)cpu_ldl_data(env, 0x800fdf20),
+            (uint32_t)cpu_ldl_data(env, 0x80045038));
+    for (i = 0; i < 32; i += 4) {
+        ip6hook_log("IP6HOOK: r%02d=%08x r%02d=%08x r%02d=%08x r%02d=%08x\n",
+                i, (uint32_t)env->active_tc.gpr[i],
+                i + 1, (uint32_t)env->active_tc.gpr[i + 1],
+                i + 2, (uint32_t)env->active_tc.gpr[i + 2],
+                i + 3, (uint32_t)env->active_tc.gpr[i + 3]);
     }
 }
 #endif /* !CONFIG_USER_ONLY */

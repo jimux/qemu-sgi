@@ -1188,6 +1188,15 @@ void helper_mtc0_status(CPUMIPSState *env, target_ulong arg1)
     cpu_mips_store_status(env, arg1);
     val = env->CP0_Status;
 
+    if (getenv("IP6ERR_DBG") &&
+        (((old ^ val) & (1 << 15)) || (env->CP0_Cause & 0x8000) ||
+         (env_cpu(env)->interrupt_request & CPU_INTERRUPT_HARD))) {
+        fprintf(stderr, "IP6SR: pc=%08llx sr %08x->%08x cause=%08x hard=%d\n",
+                (unsigned long long)env->active_tc.PC, old, val,
+                env->CP0_Cause,
+                !!(env_cpu(env)->interrupt_request & CPU_INTERRUPT_HARD));
+    }
+
     /*
      * R2000/R3000 cache control changes where a data access physically lands
      * (mips_cpu_tlb_fill), and the shadow TLB cannot distinguish the two

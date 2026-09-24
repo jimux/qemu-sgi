@@ -44,6 +44,12 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
         env->CP0_Cause &= ~(1 << (irq + CP0Ca_IP));
     }
 
+    if (getenv("IP6ERR_DBG") && irq == 7) {
+        fprintf(stderr, "IP6IRQ: irq=7 level=%d cause=%08x pc=%08llx\n",
+                level, env->CP0_Cause,
+                (unsigned long long)env->active_tc.PC);
+    }
+
     if (kvm_enabled() && (irq == 2 || irq == 3)) {
         kvm_mips_set_interrupt(cpu, irq, level);
     }

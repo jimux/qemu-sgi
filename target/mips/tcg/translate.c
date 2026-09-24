@@ -15195,6 +15195,29 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     int is_slot;
 
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
+
+    if (getenv("IP6HOOK")) {
+        uint32_t hookpc = (uint32_t)ctx->base.pc_next;
+        static const uint32_t ip6hook_pcs[] = {
+            0x8002c18cu, 0x8002c190u, 0x8000ecc0u, 0x8000edf8u, 0x8000ee60u,
+            0x80008a48u, 0x8000bee0u,
+            0x8000e8b0u, 0x8002a888u, 0x8002c188u, 0x8002c720u,
+            0x8000a5f8u, 0x8008fa60u, 0x80008a38u, 0x8001e8d0u, 0x8000bf78u, 0x80015228u,
+            0x80018798u, 0x8004f438u, 0x80003bc8u, 0x80021518u, 0x80021568u, 0x8000e918u,
+            0x8000e950u, 0x8000e978u, 0x8000e9a0u, 0x8000e9e0u, 0x8000e9f0u, 0x8000ea10u,
+            0x8000ea38u, 0x8000ea70u, 0x8000ea78u, 0x8000ea98u, 0x8000eac0u, 0x8000eae8u,
+            0x8000eb10u, 0x8000eb30u, 0x8000eb50u, 0x8000eb58u, 0x8000ecb8u, 0x800ad940u,
+            0x800af4a8u, 0x800b2640u, 0x800d7888u, 0x80066d90u, 0x80068358u, 0x80069608u,
+            0x8007d130u, 0x8007e5f0u, 0x8008e3c8u, 0x800957e0u, 0x800e5180u, 0x800981d0u,
+            0x80098520u,
+        };
+        for (size_t hi = 0; hi < ARRAY_SIZE(ip6hook_pcs); hi++) {
+            if (hookpc == ip6hook_pcs[hi]) {
+                gen_helper_ip6_pchook(tcg_env);
+                break;
+            }
+        }
+    }
     if (ctx->insn_flags & ISA_NANOMIPS32) {
         ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
         insn_bytes = decode_isa_nanomips(env, ctx);
