@@ -36,6 +36,10 @@
  * the menu window's geometry); main-plane fills carry 0 and the weave's
  * trailing black rect carries 0xf. */
 #define SGI_GR2_RE3_MODE_OVERLAY 3
+/* Token 321 (FIFO offset 0x40504): a six-word destination group at the end of
+ * an expTileRects payload, [org_x, x0, org_y, y0, x1, y1].  Measured on the
+ * 4Dwm menu item texture; see sgi_gr2_re3_tile_rects. */
+#define SGI_GR2_RE3_SPANR_TOKEN 0x40504
 
 /* The RAMDAC palette is not a static table: the guest's DDX programs it
  * through the XMAP_PAL_* registers at server start, and the model builds
@@ -221,6 +225,43 @@ static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
     sgi_gr2_update_display(s);
 }
 
+/* Bresenham over the OVERLAY plane (mode 309 == 3 strokes: the 4Dwm menu's
+ * glyph strokes and rules).  Same walk as sgi_gr2_re3_line, but the pixels are
+ * 2-bit overlay indices (the colour modulo 4). */
+static void sgi_gr2_ovl_line(SGIGr2State *s, uint8_t colour,
+                             int x0, int y0, int x1, int y1)
+{
+    int dx, dy, sx, sy, err, e2;
+
+    if (!s->overlay) {
+        return;
+    }
+    dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    sx = x0 < x1 ? 1 : -1;
+    sy = y0 < y1 ? 1 : -1;
+    err = dx - dy;
+    for (;;) {
+        sgi_gr2_ovl_put(s, x0, y0, colour & 3);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        if (x0 < -SGI_GR2_SCREEN_W || x0 > 2 * SGI_GR2_SCREEN_W ||
+            y0 < -SGI_GR2_SCREEN_H || y0 > 2 * SGI_GR2_SCREEN_H) {
+            break;
+        }
+        e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x0 += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
 /* RE3 stippled-rectangle fill: the DDX arms a 32-bit stipple pattern on token
  * 318 and a foreground colour index on token 314, then streams the rectangle.
  * Render one pixel per bit of the pattern, repeating every 32 columns — bit 31
@@ -258,36 +299,100 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
     sgi_gr2_update_display(s);
 }
 
-/* expTileRects repeats the tile across its destination.  The destination is the
- * clip rectangle list set by the preceding expValidateClip ops (one per exposed
- * rect, seen as a 304 with four coordinate words, no colour token, 490
- * terminated).  The list persists until a tile consumes it; the startup
- * clusters that precede any list are left alone rather than filled full-screen,
- * which is what keeps the toolchest. */
-static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
+/* Tile the current op's w x h 8bpp bitmap over one destination rectangle.
+ * `overlay` routes the pixels to the 2-bit overlay plane (mode 309 == 3).
+ * `sgi_gr2_re3_tile_rects` calls it once per destination; for the main plane
+ * the destination is the re3_clip list, and for the 4Dwm menu item texture (a
+ * token-321 group) it is a single rect. */
+static void sgi_gr2_re3_tile_rect(SGIGr2State *s, uint32_t w, uint32_t h,
+                                  uint32_t c0, uint32_t c1,
+                                  int rx1, int ry1, int rx2, int ry2,
+                                  bool overlay)
+{
+    int x, y;
+
+    if (rx1 < 0) {
+        rx1 = 0;
+    }
+    if (ry1 < 0) {
+        ry1 = 0;
+    }
+    if (rx2 > SGI_GR2_SCREEN_W) {
+        rx2 = SGI_GR2_SCREEN_W;
+    }
+    if (ry2 > SGI_GR2_SCREEN_H) {
+        ry2 = SGI_GR2_SCREEN_H;
+    }
+    for (y = ry1; y < ry2; y++) {
+        unsigned row = (unsigned)(y % h) * w;
+
+        for (x = rx1; x < rx2; x++) {
+            uint32_t word, p = row + (unsigned)(x % w);
+            uint8_t v, idx;
+
+            word = (p / 4 == 0) ? s->re3_tile_word0
+                                : s->re3_data[7 + (p / 4 - 1)];
+            v = (word >> (8 * (3 - (p % 4)))) & 0xff;
+            if (v == (s->re3_data[1] & 0xff)) {
+                idx = c1;
+            } else if (v == (s->re3_data[2] & 0xff)) {
+                idx = c0;
+            } else {
+                idx = v;
+            }
+            if (overlay) {
+                /* Overlay indices are 2-bit: take the tile's colour index modulo
+                 * 4, so index 0 stays transparent (the menu background shows
+                 * through) and only the label pixels land. */
+                sgi_gr2_ovl_put(s, x, y, idx & 3);
+            } else {
+                sgi_gr2_put(s, x, y, idx);
+            }
+        }
+    }
+}
+
+/* expTileRects repeats the tile across its destination.  The destination is
+ * normally the clip rectangle list set by the preceding expValidateClip ops
+ * (one per exposed rect, seen as a 304 with four coordinate words, no colour
+ * token, 490 terminated); the list persists until a tile consumes it, and the
+ * startup clusters that precede any list are left alone rather than filled
+ * full-screen, which is what keeps the toolchest.  The 4Dwm menu item texture
+ * instead carries a single destination as a token-321 six-word group at the END
+ * of the payload ([org_x, x0, org_y, y0, x1, y1], the menu origin repeated); for
+ * that shape the destination comes from the token, not from re3_clip. */
+static bool sgi_gr2_re3_tile_rects(SGIGr2State *s)
 {
     unsigned n = s->re3_data_n;
     uint32_t w, h, nwords, c0, c1;
+    /* Mode 3 alone is NOT the overlay selector: the root weave tiles under
+     * mode 3 too.  The overlay draw is the token-321 destination form.
+     * `mode3` also decides the fall-through (only mode-3 payloads may be a
+     * menu glyph list rather than a tile). */
+    bool mode3 = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
+    bool overlay = mode3 && s->re3_spanr_seen;
     unsigned r;
 
+    /* Returning false here means "not a tile op, let the other paths try":
+     * the 4Dwm menu's glyph ops arrive with 331 == 0x100b too, but their
+     * payload is a segment list, not a w*h tile, so the size checks below
+     * reject them and the dispatch must fall through to the line/mono paths
+     * (otherwise the glyphs are dropped as unmatched). */
     if (n < 7) {
-        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        return;
+        return false;
     }
     w = s->re3_data[3];
     h = s->re3_data[4];
     if (w == 0 || h == 0 || (w & 3) || w > SGI_GR2_SCREEN_W ||
         h > SGI_GR2_SCREEN_H) {
-        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        return;
+        return false;
     }
     nwords = (w * h) / 4;
     if (nwords == 0 || 7 + nwords - 1 > n) {
-        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        return;
+        return false;
     }
     if (!s->scanout) {
-        return;
+        return false;
     }
     /* The two tile colours are given by the op header, not by the tile pixels:
      * data[2] is the base and data[1] indexes the second colour.  The DDX forms
@@ -297,53 +402,31 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
      * paints in the exposed rects (the same grey/teal the control shows). */
     c0 = s->re3_data[2] << 3;
     c1 = c0 | (s->re3_data[1] << 1);
+    if (s->re3_spanr_seen) {
+        /* Menu item texture: token-321 destination at the end of the payload.
+         * (x0,y0) is inclusive, (x1,y1) exclusive, matching the clip list. */
+        int rx1 = (int)s->re3_data[n - 5];
+        int ry1 = (int)s->re3_data[n - 3];
+        int rx2 = (int)s->re3_data[n - 2];
+        int ry2 = (int)s->re3_data[n - 1];
+
+        sgi_gr2_re3_tile_rect(s, w, h, c0, c1, rx1, ry1, rx2, ry2, overlay);
+        trace_sgi_gr2_re3_tile(w, h, 1);
+        sgi_gr2_update_display(s);
+        return true;
+    }
     if (s->re3_nclip == 0) {
-        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        return;
+        return false;
     }
     for (r = 0; r < s->re3_nclip; r++) {
-        int rx1, ry1, rx2, ry2, x, y;
-
-        rx1 = s->re3_clip[r][0];
-        ry1 = s->re3_clip[r][1];
-        rx2 = s->re3_clip[r][2];
-        ry2 = s->re3_clip[r][3];
-        if (rx1 < 0) {
-            rx1 = 0;
-        }
-        if (ry1 < 0) {
-            ry1 = 0;
-        }
-        if (rx2 > SGI_GR2_SCREEN_W) {
-            rx2 = SGI_GR2_SCREEN_W;
-        }
-        if (ry2 > SGI_GR2_SCREEN_H) {
-            ry2 = SGI_GR2_SCREEN_H;
-        }
-        for (y = ry1; y < ry2; y++) {
-            unsigned row = (unsigned)(y % h) * w;
-
-            for (x = rx1; x < rx2; x++) {
-                uint32_t word, p = row + (unsigned)(x % w);
-                uint8_t v, idx;
-
-                word = (p / 4 == 0) ? s->re3_tile_word0
-                                    : s->re3_data[7 + (p / 4 - 1)];
-                v = (word >> (8 * (3 - (p % 4)))) & 0xff;
-                if (v == (s->re3_data[1] & 0xff)) {
-                    idx = c1;
-                } else if (v == (s->re3_data[2] & 0xff)) {
-                    idx = c0;
-                } else {
-                    idx = v;
-                }
-                sgi_gr2_put(s, x, y, idx);
-            }
-        }
+        sgi_gr2_re3_tile_rect(s, w, h, c0, c1,
+                              s->re3_clip[r][0], s->re3_clip[r][1],
+                              s->re3_clip[r][2], s->re3_clip[r][3], overlay);
     }
     trace_sgi_gr2_re3_tile(w, h, s->re3_nclip);
     s->re3_nclip = 0;
     sgi_gr2_update_display(s);
+    return true;
 }
 
 /* expOpStippledFillRects (token 331 == the stipple fill op) draws the WxH 8bpp
@@ -539,8 +622,23 @@ static unsigned sgi_gr2_re3_payload_start(SGIGr2State *s)
 static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
 {
     unsigned n = s->re3_data_n, i, start = sgi_gr2_re3_payload_start(s);
+    bool overlay = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
+    bool menu_form = false;
 
-    if (start >= n || (n - start) % 4 != 0) {
+    if (start >= n) {
+        /* The 4Dwm menu's stroke list carries header [0,3,1] then a three-word
+         * clip [x2,y1,y2], then (x0,y0,x1,y1) segments ended by a (1280,1024)
+         * sentinel: the menu's rules and glyph strokes.  Recognise that header
+         * so the geometry starts at the segments, not at the clip words. */
+        if (overlay && n >= 10 && s->re3_data[0] == 0 && s->re3_data[1] == 3 &&
+            s->re3_data[2] == 1) {
+            start = 6;
+            menu_form = true;
+        } else {
+            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+            return;
+        }
+    } else if ((n - start) % 4 != 0) {
         /* A payload that does not tile into (x0,y0,x1,y1) groups exactly is a
          * framing we do not understand — flag it rather than read a stray
          * diagonal out of it. */
@@ -555,10 +653,18 @@ static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
             x1 >= SGI_GR2_SCREEN_W || y1 >= SGI_GR2_SCREEN_H) {
             break;
         }
-        sgi_gr2_re3_line(s, s->re3_colour, x0, y0, x1, y1);
+        if (menu_form) {
+            /* Only the menu's [0,3,1] stroke list is an overlay draw; a
+             * main-plane segment op (header [0xff,3,0]) stays on the main
+             * plane even if its mode happens to be 3. */
+            sgi_gr2_ovl_line(s, s->re3_colour, x0, y0, x1, y1);
+        } else {
+            sgi_gr2_re3_line(s, s->re3_colour, x0, y0, x1, y1);
+        }
         trace_sgi_gr2_re3_seg(s->re3_colour, s->ramdac[s->re3_colour],
                               x0, y0, x1, y1);
     }
+    sgi_gr2_update_display(s);
 }
 
 /* Draw a stippled-span sub-op (expStippledSpans, token 347).  After the same
@@ -979,11 +1085,15 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         return;
     }
     if (s->re3_tile_seen) {
-        /* expTileRects: tile a bitmap across the screen (the root weave).  The
-         * op streams the tile via token 315 and PUC_DATA, so decide it here from
-         * the packet itself rather than from any rect heuristic. */
-        sgi_gr2_re3_tile_rects(s);
-        return;
+        /* expTileRects: tile a bitmap across the screen (the root weave, and the
+         * 4Dwm menu item texture).  The op streams the tile via token 315 and
+         * PUC_DATA, so decide it here from the packet itself rather than from any
+         * rect heuristic.  It returns false for a payload that is not a tile
+         * (the menu's glyph ops share the 331 == 0x100b type), so those fall
+         * through to the line/mono paths below instead of being dropped. */
+        if (sgi_gr2_re3_tile_rects(s)) {
+            return;
+        }
     }
     if (s->re3_image_seen) {
         /* expDrawImage24: a colour image, not a fill.  Checked first because its
@@ -1064,6 +1174,7 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
 {
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
+    s->re3_spanr_seen = false;
     s->re3_line_seen = false;
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
@@ -2132,6 +2243,10 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (size == 4 && offset == SGI_GR2_RE3_SPANS_TOKEN) {
         s->re3_spans_seen = true;
     }
+    if (size == 4 && offset == SGI_GR2_RE3_SPANR_TOKEN) {
+        /* Token 321: the expTileRects menu-item destination group. */
+        s->re3_spanr_seen = true;
+    }
     if (size == 4 && offset == SGI_GR2_RE3_TILE_TOKEN) {
         /* expTileRects streams its tile bitmap's first word on the tile data
          * port; the rest arrives as PUC_DATA.  Keep it so the tile can be
@@ -2564,6 +2679,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_colour_valid = false;
     s->re3_solid_seen = false;
     s->re3_spans_seen = false;
+    s->re3_spanr_seen = false;
     s->re3_line_seen = false;
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
