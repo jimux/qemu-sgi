@@ -541,6 +541,8 @@ struct SGIGr2State {
                                    /* follows a window move.  Token cell =   */
                                    /* x, then PUC_DATA y_bottom, w, h; y is  */
                                    /* bottom-origin, converted on latch.     */
+    int ge_win_w;                  /* and the window's w/h, so a resize is   */
+    int ge_win_h;                  /* observable and traceable (trace event) */
     int ge_clip_x, ge_clip_y;      /* token 485 words collected              */
     int ge_clip_w, ge_clip_h;
     unsigned ge_clip_n;
