@@ -198,22 +198,41 @@ static uint64_t sgi_ip27_be64(const uint8_t *p) {
 }
 
 /*
- * LBOOT flash backing store.  On real hardware the boot flash code region is
- * read-only and the PROM's log/env/NIC storage lives elsewhere; log writes
- * that hit the code region so we can catch anything corrupting the PROM
- * self-checksum.
+ * The boot flash is a single NOR device with two distinct views.  The CPU's
+ * LBOOT/RBOOT *windows* (HSPEC+0x10000000 / HSPEC+0x30000000) translate the
+ * device so the PROM *code* appears at offset 0: the PROM reads its
+ * self-checksum source at LBOOT+0 and IP27CONFIG lives at LBOOT+0x60 /
+ * RBOOT+0x60.  The raw device view -- reached by a user mmap, whose TO_PHYS
+ * physical is 0x10000000 (LBOOT) / 0x30000000 (RBOOT) -- holds the SN0
+ * container: the promhdr_t / segment table starts at 0 (magic "JFKSWCSM" at
+ * 0x40, image name "ip27prom" at 0x80) and the code begins at the header's
+ * code offset.
+ *
+ * The IRIX `flash` utility's flash_readprom/probe use the RAW view: it reads
+ * a promhdr_t at 0 and expects the container magic at 0x40.  Keeping code at
+ * offset 0 in the raw view (as we used to) made flash_readprom see code bytes
+ * -> "Invalid Header" -> an endless "[r]etry or [i]gnore" prompt loop that
+ * wedged inst's exit-commands and left /unix unbuilt.  So keep the code-at-0
+ * store for the windows and a separate container store for the raw view.
  */
-static uint8_t ip27_flash_mem[IP27_FLASH_SIZE];
-static uint64_t ip27_flash_protect;
+static uint8_t ip27_flash_code[IP27_FLASH_SIZE];   /* code-at-0 window store */
+static uint8_t ip27_rawflash[IP27_FLASH_SIZE];     /* raw SN0 container */
 
 /* AMD/Fujitsu flash command state (see libkl/ml/fprom.c do_probe/do_write). */
-static int ip27_flash_autoselect;
-static int ip27_flash_unlock;     /* 1 = AA@0x5555 seen, 2 = +55@0x2AAA */
-static int ip27_flash_program;    /* next write stores data */
-static int ip27_flash_erase;      /* 0x80 seen, awaiting 0x10 (chip) / 0x30 (sector) */
+typedef struct IP27FlashState {
+  uint8_t *mem;
+  int autoselect;
+  int unlock;      /* 1 = AA@0x5555 seen, 2 = +55@0x2AAA */
+  int program;     /* next write stores data */
+  int erase;       /* 0x80 seen, awaiting 0x10 (chip) / 0x30 (sector) */
+} IP27FlashState;
 
-static uint8_t ip27_flash_byte(uint64_t off) {
-  if (ip27_flash_autoselect) {
+static IP27FlashState ip27_flash_code_state = { .mem = ip27_flash_code };
+static IP27FlashState ip27_rawflash_state = { .mem = ip27_rawflash };
+static bool ip27_flash_dbg;
+
+static uint8_t ip27_flash_byte(IP27FlashState *s, uint64_t off) {
+  if (s->autoselect) {
     /* AMD29F080-style: manufacturer 0x01, device 0xd5 (accepted pair). */
     switch (off) {
     case 0:
@@ -229,16 +248,17 @@ static uint8_t ip27_flash_byte(uint64_t off) {
     }
   }
   if (off < IP27_FLASH_SIZE) {
-    return ip27_flash_mem[off];
+    return s->mem[off];
   }
   return 0xff;
 }
 
 static uint64_t ip27_flash_read(void *opaque, hwaddr off, unsigned size) {
+  IP27FlashState *s = opaque;
   uint64_t v = 0;
   unsigned i;
   for (i = 0; i < size; i++) {
-    v = (v << 8) | ip27_flash_byte(off + i);
+    v = (v << 8) | ip27_flash_byte(s, off + i);
   }
   return v;
 }
@@ -251,64 +271,79 @@ static void ip27_flash_write(void *opaque, hwaddr off, uint64_t val,
    * byte is val & 0xff.  Command words are not array data (this is what keeps
    * the PROM code region intact / the self-checksum valid).
    */
+  IP27FlashState *s = opaque;
   uint64_t faddr = off / 8;
   uint8_t b = val & 0xff;
 
+  if (ip27_flash_dbg) {
+    qemu_log_mask(LOG_GUEST_ERROR, "ip27flash[%s] WR off=0x%" PRIx64
+                  " size=%u val=0x%" PRIx64 "\n",
+                  s == &ip27_rawflash_state ? "raw" : "code", (uint64_t)off,
+                  size, val);
+  }
+
   if (faddr == 0 && b == 0xf0) {         /* reset to read mode */
-    ip27_flash_autoselect = 0;
-    ip27_flash_unlock = 0;
-    ip27_flash_program = 0;
-    ip27_flash_erase = 0;
+    s->autoselect = 0;
+    s->unlock = 0;
+    s->program = 0;
+    s->erase = 0;
     return;
   }
   if (faddr == 0x5555 && b == 0xaa) {
-    ip27_flash_unlock = 1;
+    s->unlock = 1;
     return;
   }
-  if (faddr == 0x2aaa && b == 0x55 && ip27_flash_unlock == 1) {
-    ip27_flash_unlock = 2;
+  if (faddr == 0x2aaa && b == 0x55 && s->unlock == 1) {
+    s->unlock = 2;
     return;
   }
-  if (faddr == 0x5555 && ip27_flash_unlock == 2 && b == 0x90) {
-    ip27_flash_autoselect = 1;
-    ip27_flash_unlock = 0;
+  if (faddr == 0x5555 && s->unlock == 2 && b == 0x90) {
+    s->autoselect = 1;
+    s->erase = 0;
+    s->unlock = 0;
     return;
   }
-  if (faddr == 0x5555 && ip27_flash_unlock == 2 && b == 0xa0) {
-    ip27_flash_program = 1;
-    ip27_flash_unlock = 0;
+  if (faddr == 0x5555 && s->unlock == 2 && b == 0xa0) {
+    s->program = 1;
+    s->erase = 0;
+    s->unlock = 0;
     return;
   }
-  if (faddr == 0x5555 && ip27_flash_unlock == 2 && b == 0x80) {
-    ip27_flash_erase = 1;
-    ip27_flash_unlock = 0;
+  if (faddr == 0x5555 && s->unlock == 2 && b == 0x80) {
+    s->erase = 1;
+    s->program = 0;
+    s->unlock = 0;
     return;
   }
-  if (ip27_flash_erase) {
-    /* Chip erase (0x10@0x5555) or sector erase (0x30@addr): set to 0xff. */
+  if (s->erase) {
+    /*
+     * Chip erase (0x10@0x5555) or sector erase (0x30@addr): set to 0xff.
+     * A single 0x80 setup is followed by one 0x30 per sector (the IRIX flasher
+     * queues all the code sectors this way), so s->erase stays set across the
+     * 0x30 commands and is only cleared by the chip-erase command or a reset.
+     */
     if (faddr == 0x5555 && b == 0x10) {
-      ip27_flash_erase = 0;
-      memset(ip27_flash_mem, 0xff, sizeof(ip27_flash_mem));
+      s->erase = 0;
+      memset(s->mem, 0xff, IP27_FLASH_SIZE);
     } else if (b == 0x30) {
-      uint64_t sec = (off / 8) & ~(uint64_t)0xffff; /* 64 KiB sector */
-      ip27_flash_erase = 0;
-      if (sec + 0x10000 <= sizeof(ip27_flash_mem)) {
-        memset(ip27_flash_mem + sec, 0xff, 0x10000);
+      uint64_t sec = faddr & ~(uint64_t)0xffff; /* 64 KiB sector */
+      if (sec + 0x10000 <= IP27_FLASH_SIZE) {
+        memset(s->mem + sec, 0xff, 0x10000);
       }
     }
     return;
   }
-  if (ip27_flash_program) {
+  if (s->program) {
     /* Program: the hub flash write address is the offset * 8, and only the
      * LSByte is used.  Flash can only clear bits, so AND the data in. */
     uint64_t fidx = off / 8;
     if (fidx < IP27_FLASH_SIZE) {
-      ip27_flash_mem[fidx] &= (val & 0xff);
+      s->mem[fidx] &= (val & 0xff);
     }
-    ip27_flash_program = 0;
+    s->program = 0;
     return;
   }
-  ip27_flash_unlock = 0;
+  s->unlock = 0;
 }
 
 static const MemoryRegionOps ip27_flash_ops = {
@@ -331,7 +366,9 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
   gchar *data = NULL;
   uint64_t load_addr, code_off, code_size, load_phys;
   uint8_t *dst = memory_region_get_ram_ptr(prom);
-  uint8_t *flash_dst = ip27_flash_mem;
+  uint8_t *flash_dst = ip27_flash_code;
+
+  ip27_flash_dbg = getenv("IP27_FLASH_DBG") != NULL;
 
   if (!g_file_get_contents(filename, &data, &len, &err)) {
     error_report("sgi-ip27: could not read PROM '%s': %s", filename,
@@ -371,7 +408,15 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
   /* Blank NOR flash reads 0xff, not zero. */
   memset(flash_dst, 0xff, IP27_FLASH_SIZE);
   memcpy(flash_dst, data + code_off, MIN((gsize)IP27_FLASH_SIZE, code_size));
-  ip27_flash_protect = MIN((uint64_t)IP27_FLASH_SIZE, code_size);
+
+  /*
+   * Raw device view (the `flash` utility's mmap of the hwgraph flash node)
+   * is the SN0 container exactly as shipped: promhdr_t / segment table at 0
+   * and the code at its container offset.  flash_readprom checks the magic at
+   * 0x40 here, so this view must not be code-at-0.
+   */
+  memset(ip27_rawflash, 0xff, IP27_FLASH_SIZE);
+  memcpy(ip27_rawflash, data, MIN((gsize)IP27_FLASH_SIZE, len));
 
   /*
    * Synthesize the flash-resident IP27CONFIG record.  It is embedded in the
@@ -1030,10 +1075,10 @@ static void sgi_ip27_init(MachineState *machine) {
                          &error_fatal);
   memory_region_add_subregion(system_memory, IP27_PROM_BASE, prom);
 
-  /* Boot flash in the LBOOT window (identity + the container image). */
+  /* Boot flash in the LBOOT window (identity + the code-at-0 image). */
   flash = g_new(MemoryRegion, 1);
-  memory_region_init_io(flash, NULL, &ip27_flash_ops, NULL, "sgi-ip27.flash",
-                        8 * IP27_FLASH_SIZE);
+  memory_region_init_io(flash, NULL, &ip27_flash_ops, &ip27_flash_code_state,
+                        "sgi-ip27.flash.code", 8 * IP27_FLASH_SIZE);
   memory_region_add_subregion(system_memory, ip27_phys(IP27_LBOOT_PHYS),
                               flash);
 
@@ -1060,19 +1105,19 @@ static void sgi_ip27_init(MachineState *machine) {
    * flash mapped only at the discriminator-preserving physical, that TLB
    * access was unbacked and raised a user Data Bus Error.  Measured on the
    * installer's exit-command `flash -p`: pc=0x1000c148, size=8 store,
-   * phys=0x30000000 (the RBOOT window).  Alias the same flash at both low
-   * physical windows, above the flat-RAM alias so a device window wins if RAM
-   * would otherwise cover it.
+   * phys=0x30000000 (the RBOOT window).  These low physical windows are the
+   * RAW device view (see the ops comment): the `flash` utility reads a
+   * promhdr_t at offset 0 and needs the SN0 container there, not the code.
    */
   {
-    MemoryRegion *lo = g_new(MemoryRegion, 1);
-    memory_region_init_alias(lo, NULL, "sgi-ip27.flash.lboot-lo", flash, 0,
-                             8 * IP27_FLASH_SIZE);
-    memory_region_add_subregion_overlap(system_memory, 0x10000000ULL, lo, 2);
-    lo = g_new(MemoryRegion, 1);
-    memory_region_init_alias(lo, NULL, "sgi-ip27.flash.rboot-lo", flash, 0,
-                             8 * IP27_FLASH_SIZE);
-    memory_region_add_subregion_overlap(system_memory, 0x30000000ULL, lo, 2);
+    MemoryRegion *raw = g_new(MemoryRegion, 1);
+    memory_region_init_io(raw, NULL, &ip27_flash_ops, &ip27_rawflash_state,
+                          "sgi-ip27.flash.raw", 8 * IP27_FLASH_SIZE);
+    memory_region_add_subregion_overlap(system_memory, 0x10000000ULL, raw, 2);
+    raw = g_new(MemoryRegion, 1);
+    memory_region_init_io(raw, NULL, &ip27_flash_ops, &ip27_rawflash_state,
+                          "sgi-ip27.flash.raw", 8 * IP27_FLASH_SIZE);
+    memory_region_add_subregion_overlap(system_memory, 0x30000000ULL, raw, 2);
   }
 
   if (machine->firmware) {
