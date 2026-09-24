@@ -865,10 +865,16 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         sgi_gr2_re3_draw_image(s);
         return;
     }
-    if (s->re3_stipple_valid) {
+    if (s->re3_stipple_valid && !(s->re3_mono_seen && s->re3_fg_valid)) {
         /* Stippled rect list: the root backdrop is one full-screen rect, but a
          * stippled sub-op with its own small rects (a cursor, a shade band) must
-         * paint only those — painting the whole screen here would wipe them. */
+         * paint only those — painting the whole screen here would wipe them.
+         * expStippledFillRects programs BOTH the MONO token (312) and the FG
+         * token (314) as part of its GC setup, so an op carrying both is an
+         * op-stippled GLYPH/image blit (IP20 draws the Console icon this way):
+         * its payload is an 8bpp bitmap, not a rect list, and painting it as
+         * rect stipples smears the bitmap across the screen.  Send it to the
+         * mono/image path instead.  A plain stipple op sets 318 alone. */
         sgi_gr2_re3_paint_rects(s, true);
         return;
     }
