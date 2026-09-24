@@ -607,21 +607,29 @@ static NetClientInfo net_sgi_baseio_eth_info = {
 };
 
 /*
- * IOC3 byte-bus time-of-day chip (Dallas DS1386).  Its register block is the
- * IOC3's SIO RTC: IOC3_SIO_RTC_BASE = IOC3_SIO_BASE(0x20000) + 0x168 (see
- * sys/PCI/ioc3.h), and the IOC3 sits at bridge+0x200000, so it lands here.
- * Offsets, the update-disable/enable protocol and the BCD encoding are from
- * IRIX ml/SN/klclock.{c,h}; the register map is non-contiguous
- * (SEC +0x1, MIN +0x2, HOUR +0x4, DAY +0x6, DATE +0x8, MONTH +0x9, YEAR +0xa).
- * rtodc() autodetects the part by writing 0xff to DAY and checking the
- * read-back: a DS1386 stores a BCD day and never returns 0xff, so modelling the
- * Dallas part with a live calendar keeps the autodetect on the Dallas branch.
+ * IOC3 byte-bus time-of-day / NVRAM part (Dallas DS1386-class timekeeping RAM).
  *
- * NOTE: bridge+0x280000 is NOT the RTC -- it is the IOC3 byte-bus SRAM window
- * (IOC3_BYTEBUS_DEV0 = 0x80000 within the IOC3, DEV0..3 spanning 512 KB), which
- * ARCS sizes and memory-tests; see the SGI_BASEIO_BR_SSRAM_* handling.
+ * The IP27 kernel reaches it through the IOC3 byte bus: ml/SN/klclock.h sets
+ * RTC_BASE_ADDR = IOC3_BYTEBUS_DEV0 + ioc3base, and ml/SN/nvram.c sets
+ * nvram_base = memory_base + IOC3_NVRAM_OFFSET, both = 0x80000 within the IOC3
+ * (sys/SN/SN0/klhwinit.h: IOC3_DEV_SEL_0 0x80000).  The IOC3 sits at
+ * bridge+0x200000, so the chip lands at bridge+0x280000 -- the low 0xe bytes
+ * are the clock registers, the bytes above are the battery-backed NVRAM
+ * (sys/SN/nvram.h: NVOFF_DALLAS_CLOCK 0, NVLEN_DALLAS_CLOCK 0xe,
+ * NVOFF_REVISION 0xe).  The register offsets, the update-disable/enable
+ * protocol and the BCD encoding are from ml/SN/klclock.{c,h}; the map is
+ * non-contiguous (SEC +0x1, MIN +0x2, HOUR +0x4, DAY +0x6, DATE +0x8,
+ * MONTH +0x9, YEAR +0xa, CONTROL +0xb).
+ *
+ * rtodc() autodetects the part by writing 0xff to DAY and checking the
+ * read-back: a DS1386 stores a BCD day and never returns 0xff, so present a
+ * live Dallas calendar and the autodetect stays on the Dallas branch (the SGS
+ * M48T35 alternative keeps its clock at the top of the region, +0x7ff8).
+ * Reads return the HOST wall clock (project clock doctrine); wtodc() writes
+ * re-base the calendar so a guest set-time is reflected afterwards.
  */
-#define SGI_BASEIO_RTC_OFF 0x220168ULL
+#define SGI_BASEIO_RTC_OFF 0x280000ULL
+#define SGI_BASEIO_RTC_LEN 0xe /* NVLEN_DALLAS_CLOCK: NVRAM starts at 0xe */
 #define RTC_DAL_SEC_OFF 0x1
 #define RTC_DAL_MIN_OFF 0x2
 #define RTC_DAL_HOUR_OFF 0x4
@@ -672,13 +680,13 @@ static void sgi_baseio_civil_from_days(int64_t z, int *y, int *m, int *d) {
 
 /*
  * Current calendar fields, derived from the Unix epoch latched at reset plus
- * elapsed virtual time (so the seconds field genuinely ticks).  `year` is the
- * full year; `wday` is 1..7 as the DS1386 expects.
+ * elapsed HOST wall-clock time (so the clock tracks real time and genuinely
+ * ticks).  `year` is the full year; `wday` is 1..7 as the DS1386 expects.
  */
 static void sgi_baseio_tod_fields(SGIBaseIOState *s, int *sec, int *min,
                                   int *hour, int *wday, int *mday, int *mon,
                                   int *year) {
-  int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+  int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
   int64_t t = s->tod_epoch_sec + (now - s->tod_epoch_ns) / 1000000000LL;
   int64_t days = t / 86400;
   int y, mo, d;
@@ -723,7 +731,12 @@ static uint64_t sgi_baseio_tod_read(SGIBaseIOState *s, hwaddr off) {
   case RTC_DAL_MONTH_OFF:
     return sgi_baseio_bcd_encode(mon);
   case RTC_DAL_YEAR_OFF:
-    return sgi_baseio_bcd_encode(year % 100);
+    /*
+     * IRIX's clock only holds years relative to YRREF (1970): rtodc() does
+     * `year += YRREF`, wtodc() does `year -= YRREF` (ml/SN/klclock.c).  So the
+     * chip field is YEAR-1970, not YEAR%100.
+     */
+    return sgi_baseio_bcd_encode((year - 1970) % 100);
   default:
     return 0;
   }
@@ -763,8 +776,13 @@ static void sgi_baseio_tod_write(SGIBaseIOState *s, hwaddr off, uint64_t val) {
     hour = sgi_baseio_bcd_decode(val) % 24;
     break;
   case RTC_DAL_DAY_OFF:
-    wday = sgi_baseio_bcd_decode(val); /* day-of-week is not part of the date */
-    break;  case RTC_DAL_DATE_OFF:
+    /* Clamp so the NVRAM autodetect (writes 0xff) reads back a valid day. */
+    wday = sgi_baseio_bcd_decode(val);
+    if (wday < 1 || wday > 7) {
+      wday = 1;
+    }
+    break;
+  case RTC_DAL_DATE_OFF:
     mday = sgi_baseio_bcd_decode(val);
     if (mday < 1 || mday > 31) {
       mday = 1;
@@ -777,8 +795,9 @@ static void sgi_baseio_tod_write(SGIBaseIOState *s, hwaddr off, uint64_t val) {
     }
     break;
   case RTC_DAL_YEAR_OFF: {
+    /* wtodc() writes year - YRREF (1970); see the read side. */
     int yy = sgi_baseio_bcd_decode(val);
-    year = (yy < 70) ? 2000 + yy : 1900 + yy;
+    year = 1970 + yy;
     break;
   }
   }
@@ -789,7 +808,7 @@ static void sgi_baseio_tod_write(SGIBaseIOState *s, hwaddr off, uint64_t val) {
   (void)wday;
   days = sgi_baseio_days_from_civil(year, mon, mday);
   s->tod_epoch_sec = days * 86400 + hour * 3600 + min * 60 + sec;
-  s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+  s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 }
 
 /*
@@ -1230,6 +1249,15 @@ static const MemoryRegionOps sgi_baseio_ioprom_ops = {
   .impl = { .min_access_size = 1, .max_access_size = 2 },
 };
 
+static bool sgi_baseio_rtcdbg(void) {
+  static int dbg = -1;
+
+  if (dbg < 0) {
+    dbg = getenv("IP27_RTC_DBG") != NULL;
+  }
+  return dbg;
+}
+
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
 
@@ -1535,23 +1563,28 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     return s->int_addr[(off - 0x134) >> 3];
   }
   /*
-   * Bridge external SSRAM / IOC3 byte-bus SRAM window at bridge+0x280000
-   * (IOC3_BYTEBUS_DEV0 = 0x80000 within the IOC3, DEV0..3 spanning 512 KB).  On
-   * IP27 ARCS size_bridge_ssram() writes a size marker at [0]/[64k]/[128k] and
-   * reads it back to pick the fitted size, then runs an alternating-pattern
-   * memory test over the array.  Back the window with storage so those accesses
-   * persist; without it they read back 0, the SSRAM looks absent, and the kernel
-   * loops forever.  It is pure SRAM -- the RTC is a different IOC3 register (see
-   * SGI_BASEIO_RTC_OFF).
+   * IOC3 byte-bus window at bridge+0x280000 (IOC3_BYTEBUS_DEV0 = 0x80000
+   * within the IOC3; DEV0..3 span 512 KB).  This is the DS1386-class
+   * timekeeping NVRAM: its low 0xe bytes are the clock registers (handled
+   * below) and the remainder is battery-backed NVRAM.  On IP27 ARCS
+   * size_bridge_ssram() writes a size marker at [0]/[64k]/[128k] and reads it
+   * back to pick the fitted size, then runs an alternating-pattern memory test
+   * over the array.  Back the NVRAM with storage so those accesses persist;
+   * without it they read back 0, the part looks absent, and the kernel loops
+   * forever.
    */
-  if (off >= SGI_BASEIO_BR_SSRAM_OFF &&
+  if (off >= SGI_BASEIO_BR_SSRAM_OFF + SGI_BASEIO_RTC_LEN &&
       off < SGI_BASEIO_BR_SSRAM_OFF + SGI_BASEIO_BR_SSRAM_SIZE) {
     hwaddr o = off - SGI_BASEIO_BR_SSRAM_OFF;
     unsigned n;
     uint64_t v = 0;
-
     for (n = 0; n < size; n++) {
       v |= (uint64_t)s->br_ssram[o + n] << (8 * n);
+    }
+    if (sgi_baseio_rtcdbg() && o < 0x20) {
+      fprintf(stderr, "BASEIO-RTC-DBG ssram R off=0x%" HWADDR_PRIx
+              " o=0x%" HWADDR_PRIx " size=%u -> 0x%" PRIx64 "\n",
+              off, o, size, v);
     }
     return v;
   }
@@ -1567,9 +1600,15 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
     }
     return v;
   }
-  /* IOC3 SIO RTC (Dallas DS1386) at IOC3_SIO_RTC_BASE. */
-  if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
-    return sgi_baseio_tod_read(s, off - SGI_BASEIO_RTC_OFF);
+  /* IOC3 byte-bus clock registers (Dallas DS1386) at bridge+0x280000. */
+  if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + SGI_BASEIO_RTC_LEN) {
+    uint64_t v = sgi_baseio_tod_read(s, off - SGI_BASEIO_RTC_OFF);
+
+    if (sgi_baseio_rtcdbg()) {
+      fprintf(stderr, "BASEIO-RTC-DBG sio R off=0x%" HWADDR_PRIx
+              " size=%u -> 0x%" PRIx64 "\n", off, size, v);
+    }
+    return v;
   }
   qemu_log_mask(LOG_UNIMP,
                 "sgi-baseio: unimplemented read @0x%" HWADDR_PRIx
@@ -1842,15 +1881,20 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   }
   /* IOC3 byte-bus time-of-day chip (Dallas DS1386). */
   /*
-   * Bridge external SSRAM / IOC3 byte-bus SRAM window (see the read side).
+   * IOC3 byte-bus NVRAM window (see the read side).
    * Writes land in the backing storage so the ARCS size probe and pattern test
-   * hold; the RTC is a separate IOC3 register (see SGI_BASEIO_RTC_OFF).
+   * hold.
    */
-  if (off >= SGI_BASEIO_BR_SSRAM_OFF &&
+  if (off >= SGI_BASEIO_BR_SSRAM_OFF + SGI_BASEIO_RTC_LEN &&
       off < SGI_BASEIO_BR_SSRAM_OFF + SGI_BASEIO_BR_SSRAM_SIZE) {
     hwaddr o = off - SGI_BASEIO_BR_SSRAM_OFF;
     unsigned n;
 
+    if (sgi_baseio_rtcdbg() && o < 0x20) {
+      fprintf(stderr, "BASEIO-RTC-DBG ssram W off=0x%" HWADDR_PRIx
+              " o=0x%" HWADDR_PRIx " size=%u val=0x%" PRIx64 "\n",
+              off, o, size, (uint64_t)val);
+    }
     for (n = 0; n < size; n++) {
       s->br_ssram[o + n] = (val >> (8 * n)) & 0xff;
     }
@@ -1872,8 +1916,12 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
     }
     return;
   }
-  /* IOC3 SIO RTC (Dallas DS1386) at IOC3_SIO_RTC_BASE. */
-  if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + 0x10) {
+  /* IOC3 byte-bus clock registers (Dallas DS1386) at bridge+0x280000. */
+  if (off >= SGI_BASEIO_RTC_OFF && off < SGI_BASEIO_RTC_OFF + SGI_BASEIO_RTC_LEN) {
+    if (sgi_baseio_rtcdbg()) {
+      fprintf(stderr, "BASEIO-RTC-DBG sio W off=0x%" HWADDR_PRIx
+              " size=%u val=0x%" PRIx64 "\n", off, size, (uint64_t)val);
+    }
     sgi_baseio_tod_write(s, off - SGI_BASEIO_RTC_OFF, val);
     return;
   }
@@ -2000,7 +2048,7 @@ static void sgi_baseio_reset(DeviceState *dev) {
    * advancing calendar from the first read (ml/clksupport.c warns otherwise).
    * CONTROL defaults to update-enable.
    */
-  s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+  s->tod_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
   s->tod_epoch_sec = (int64_t)time(NULL);
   s->tod_control = RTC_DAL_UPDATE_ENABLE;
   s->tod_user = 0;
