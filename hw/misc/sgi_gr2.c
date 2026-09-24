@@ -1518,8 +1518,12 @@ static void sgi_gr2_ge7_mat_word(SGIGr2State *s, float *dst, hwaddr tok,
 }
 
 /* One component of a light position (token 127).  Each bind writes a complete
- * 3-float run, and the run belongs to the light token 128 selected last, so
- * it lands in that light's own slot. */
+ * 3-float run.  The wire does not carry a light index next to the run: the
+ * guest's own libGLcore pushes every light's state in sequence to the SAME
+ * port (__glExpFreeLightLUT and __glExpUpdateLightingState write token 128
+ * repeatedly), so the identity is positional and we cannot yet tell the lights
+ * apart.  Until it is derived, keep one current light: the colour and the
+ * position runs pair by write order and "valid once it has a position" holds. */
 static void sgi_gr2_ge7_light_word(SGIGr2State *s, float f)
 {
     unsigned li = s->ge_light_cur;
@@ -1657,20 +1661,16 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
     case SGI_GR2_GE7_EMISSION:
         sgi_gr2_ge7_mat_word(s, s->ge_emission, offset, sgi_gr2_u2f(v));
         break;
-    case SGI_GR2_GE7_LMBIND_LIGHT:
-        /* lmbind(LIGHTn, ...) is a single word whose value is the light
-         * number.  It names the light the colour and position runs that follow
-         * belong to, and it ends any run in progress so the next light's
-         * vector starts clean.  (The emitter map names token 28; token 128 is
-         * gl_load_spotlight, a different parameter.) */
-        if (v < SGI_GR2_GE7_MAX_LIGHTS) {
-            s->ge_light_cur = v;
-        }
+    case SGI_GR2_GE7_CULL_FACE:
+        /* Token 28 is __glExpEnableCullFace / __glExpPassCullFace in the
+         * guest's own libGLcore.so (IP22GR2NG1), NOT a light bind: it is a
+         * cull-face on/off flag, which is why its values are only 0/1.  Phase 3
+         * keyed the light slots on it by mistake.  Do not model it here. */
         s->ge_mat_n = 0;
         s->ge_lpos_n = 0;
         break;
     case SGI_GR2_GE7_SPOTLIGHT:
-        break; /* spotlight parameters: not modelled */
+        break; /* token 128: see the light-word path (position update) */
 
     case SGI_GR2_GE7_LCOLOR:
         sgi_gr2_ge7_mat_word(s, s->ge_light_color[s->ge_light_cur], offset,
