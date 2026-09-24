@@ -1139,11 +1139,15 @@ static bool sgi_gr2_re3_draw_monostrip(SGIGr2State *s)
         }
         for (k = 0; k < H; k++) {
             uint32_t word = s->re3_data[i + 3 + k / 2];
-            uint32_t rowbits = ((k & 1) ? (word >> 4) : (word >> 20)) & 0xfff;
+            /* The terminal cell is up to 16 px wide, so a word carries TWO
+             * 16-bit rows (bits 31..16 then 15..0).  The 12-bit mask the smaller
+             * menu cells use dropped the outer 4 columns (seen as shel'ok1 and a
+             * gappy IRIS). */
+            uint32_t rowbits = ((k & 1) ? word : (word >> 16)) & 0xffff;
             int b;
 
-            for (b = 0; b < (int)W && b < 12; b++) {
-                if ((rowbits >> (11 - b)) & 1) {
+            for (b = 0; b < (int)W && b < 16; b++) {
+                if ((rowbits >> (15 - b)) & 1) {
                     if (overlay) {
                         sgi_gr2_ovl_put(s, x + b, (int)Y + k, fg & 3);
                     } else {
