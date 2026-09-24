@@ -20,6 +20,8 @@ enum {
     SGI_DS_F0_PENDING, /* 0xf0 seen: next op decides search vs read-memory */
     SGI_DS_RMEM_ADDR,  /* shifting in the 16-bit memory address */
     SGI_DS_RMEM_DATA,  /* shifting out memory bytes */
+    SGI_DS_RSTATUS_ADDR,/* shifting in the READ STATUS 16-bit address */
+    SGI_DS_RSTATUS_DATA,/* shifting out the 8x(8+2) status/redirection bytes */
 };
 
 /* Dallas/Maxim 1-wire CRC-8 (poly 0x8C, reflected). */
@@ -82,6 +84,42 @@ static void sgi_ds_put(uint8_t *dst, const char *s, int n)
     }
 }
 
+static void sgi_ds_build_rstat(uint8_t *out)
+{
+    int c, i, a, b;
+
+    for (c = 0; c < 8; c++) {
+        uint8_t *chunk = &out[c * 10];
+        uint16_t crc = 0;
+
+        if (c == 0) {   /* chunk 0 CRC is seeded with the 0xAA,0x00,0x01 command */
+            crc = sgi_ds_crc16_step(crc, 0xaa);
+            crc = sgi_ds_crc16_step(crc, 0x00);
+            crc = sgi_ds_crc16_step(crc, 0x01);
+        }
+        for (i = 0; i < 8; i++) {
+            chunk[i] = 0xff;            /* page not redirected */
+            crc = sgi_ds_crc16_step(crc, 0xff);
+        }
+        for (a = 0; a < 256; a++) {
+            uint16_t ca = sgi_ds_crc16_step(crc, a);
+            int found = 0;
+
+            for (b = 0; b < 256; b++) {
+                if (sgi_ds_crc16_step(ca, b) == 0xb001) {
+                    chunk[8] = a;
+                    chunk[9] = b;
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) {
+                break;
+            }
+        }
+    }
+}
+
 void sgi_ds2502_build_board(SGIDS2502 *ds, const char *serial,
                             const char *part, const char *name,
                             const uint8_t rom_serial[6])
@@ -118,10 +156,11 @@ void sgi_ds2502_build_board(SGIDS2502 *ds, const char *serial,
     done:;
     }
 
-    ds->rom[0] = 0x09;
+    ds->rom[0] = 0x0b;   /* DS2505: the IP30 PROM only reads family 0x0b */
     memcpy(&ds->rom[1], rom_serial, 6);
     ds->rom[7] = sgi_ds_crc8(ds->rom, 7);
-    ds->extra_bits = 8; /* DS2502 clocks a status byte before the data */
+    ds->extra_bits = 0;  /* DS2505 READ MEMORY has no leading status byte */
+    sgi_ds_build_rstat(ds->rstat);
 }
 
 void sgi_ds2502_build_mac(SGIDS2502 *ds, const uint8_t mac[6],
@@ -188,6 +227,11 @@ static void sgi_ds2502_decode(SGIDS2502 *ds)
     case 0xf0:
         ds->state = SGI_DS_F0_PENDING;
         break;
+    case 0xaa:   /* READ STATUS: 16-bit address then the redirection page */
+        ds->state = SGI_DS_RSTATUS_ADDR;
+        ds->in_bits = 0;
+        ds->addr = 0;
+        break;
     default:
         ds->state = SGI_DS_CMD;
         break;
@@ -232,6 +276,13 @@ void sgi_ds2502_write_bit(SGIDS2502 *ds, int bit)
             ds->extra = ds->extra_bits;
         }
         break;
+    case SGI_DS_RSTATUS_ADDR:
+        ds->addr |= (bit & 1) << ds->in_bits;
+        if (++ds->in_bits == 16) {
+            ds->state = SGI_DS_RSTATUS_DATA;
+            ds->out_index = 0;
+        }
+        break;
     default:
         break;
     }
@@ -270,6 +321,12 @@ int sgi_ds2502_read_bit(SGIDS2502 *ds)
         bit = (ds->mem[ds->addr + ds->out_index / 8] >>
                (ds->out_index % 8)) & 1;
         if (++ds->out_index == 32 * 8) {
+            ds->state = SGI_DS_CMD;
+        }
+        return bit;
+    case SGI_DS_RSTATUS_DATA:
+        bit = (ds->rstat[ds->out_index / 8] >> (ds->out_index % 8)) & 1;
+        if (++ds->out_index == 80 * 8) {
             ds->state = SGI_DS_CMD;
         }
         return bit;
@@ -332,6 +389,18 @@ int sgi_ds2502_bus_add(SGIDS2502BUS *bus, const char *serial, const char *part,
     return idx;
 }
 
+SGIDS2502 *sgi_ds2502_bus_add_raw(SGIDS2502BUS *bus)
+{
+    SGIDS2502 *dev;
+
+    if (bus->ndev >= SGIDS2502_MAX) {
+        return NULL;
+    }
+    dev = &bus->dev[bus->ndev++];
+    sgi_ds2502_reset(dev);
+    return dev;
+}
+
 void sgi_ds2502_bus_reset(SGIDS2502BUS *bus)
 {
     int i;
@@ -378,6 +447,11 @@ static void sgi_ds_bus_decode(SGIDS2502BUS *bus)
         break;
     case 0xf0: /* SEARCH ROM (read) or READ MEMORY (write) */
         bus->state = SGI_DS_F0_PENDING;
+        break;
+    case 0xaa: /* READ STATUS: 16-bit address then the selected part's page */
+        bus->state = SGI_DS_RSTATUS_ADDR;
+        bus->in_bits = 0;
+        bus->addr = 0;
         break;
     default:
         bus->state = SGI_DS_CMD;
@@ -455,6 +529,13 @@ void sgi_ds2502_bus_write_bit(SGIDS2502BUS *bus, int bit)
             }
         }
         break;
+    case SGI_DS_RSTATUS_ADDR:
+        bus->addr |= (bit & 1) << bus->in_bits;
+        if (++bus->in_bits == 16) {
+            bus->state = SGI_DS_RSTATUS_DATA;
+            bus->out_index = 0;
+        }
+        break;
     default:
         break;
     }
@@ -528,6 +609,17 @@ int sgi_ds2502_bus_read_bit(SGIDS2502BUS *bus)
             bit = (bus->dev[sel].mem[bus->addr + bus->out_index / 8] >>
                    (bus->out_index % 8)) & 1;
             if (++bus->out_index == 32 * 8) {
+                bus->state = SGI_DS_CMD;
+            }
+            return bit;
+        }
+    case SGI_DS_RSTATUS_DATA:
+        {
+            int sel = (bus->sel >= 0) ? bus->sel : 0;
+
+            bit = (bus->dev[sel].rstat[bus->out_index / 8] >>
+                   (bus->out_index % 8)) & 1;
+            if (++bus->out_index == 80 * 8) {
                 bus->state = SGI_DS_CMD;
             }
             return bit;

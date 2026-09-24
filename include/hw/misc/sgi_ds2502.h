@@ -23,6 +23,7 @@
 typedef struct SGIDS2502 {
     uint8_t rom[8];      /* family + 48-bit serial + Dallas CRC-8 */
     uint8_t mem[64];     /* two 32-byte pages, each with a trailing CRC-16 */
+    uint8_t rstat[80];   /* READ STATUS: 8 chunks of 8 redirection bytes + CRC-16 */
     int state;
     uint8_t cmd;
     int cmd_bits;
@@ -101,6 +102,7 @@ void sgi_ds2502_bus_init(SGIDS2502BUS *bus, const char *name);
 /* Add a part; program it with build_board(). Returns the index, or -1. */
 int sgi_ds2502_bus_add(SGIDS2502BUS *bus, const char *serial, const char *part,
                        const char *name, const uint8_t rom_serial[6]);
+SGIDS2502 *sgi_ds2502_bus_add_raw(SGIDS2502BUS *bus);
 void sgi_ds2502_bus_reset(SGIDS2502BUS *bus);
 void sgi_ds2502_bus_write_bit(SGIDS2502BUS *bus, int bit);
 int sgi_ds2502_bus_read_bit(SGIDS2502BUS *bus);

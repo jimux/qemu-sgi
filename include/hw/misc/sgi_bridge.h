@@ -102,7 +102,7 @@ struct SGIBRIDGEState {
     /* DS2502 board-config EEPROM on the bridge MicroLAN line (+0xb4). */
     SGIDS2502BUS bridge_ds;
     /* IOC3 MAC-address EEPROM on the IOC3 MicroLAN line (+0x600030). */
-    SGIDS2502 ioc3_ds;
+    SGIDS2502BUS ioc3_ds;
 
     /*
      * IOC3 PCI configuration (BRIDGE type-0 config, device 2 at +0x22000):

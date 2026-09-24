@@ -676,22 +676,16 @@ static const MemoryRegionOps sgi_heart_ops = {
 
 static void sgi_heart_mlan_init(SGIDS2502BUS *bus)
 {
-    static const uint8_t fru_rom[4][6] = {
+    static const uint8_t fru_rom[1][6] = {
         {0xc0, 0x01, 0x02, 0x03, 0x04, 0x05}, /* CPU module */
-        {0xc1, 0x11, 0x12, 0x13, 0x14, 0x15}, /* System board */
-        {0xc2, 0x21, 0x22, 0x23, 0x24, 0x25}, /* Front plane */
-        {0xc3, 0x31, 0x32, 0x33, 0x34, 0x35}, /* Power supply */
     };
-    /*
-     * The PROM's FRU diagnostics locate a part by searching the NIC memory
-     * for a literal "Name:xxx" key (see the strings at 0xbfc93860..0xbfc93920).
-     */
-    static const char *fru_name[4] = {"Name:PM10", "Name:IP30",
-                                      "Name:FP", "Name:PWR.SP"};
+    /* pon_nic.c requires the CPU module NIC name to contain "PM10"/"PM20";
+     * PM10 needs h_status PROC_ACTIVE == 0x1 (a single active CPU). */
+    static const char *fru_name[1] = {"PM10"};
     int i;
 
     sgi_ds2502_bus_init(bus, "heart");
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 1; i++) {
         sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", fru_name[i],
                            fru_rom[i]);
     }

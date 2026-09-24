@@ -309,12 +309,19 @@ static void sgi_bridge_ds_bus_init(SGIDS2502BUS *bus)
     sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", "IP30", board_rom);
 }
 
-static void sgi_bridge_ds_mac_init(SGIDS2502 *ds)
+static void sgi_bridge_ds_mac_init(SGIDS2502BUS *bus)
 {
     static const uint8_t mac[6] = {0x08, 0x00, 0x69, 0x12, 0x34, 0x56};
-    static const uint8_t rom[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    static const uint8_t mac_rom[6] = {0x70, 0x01, 0x02, 0x03, 0x04, 0x05};
+    static const uint8_t fp_rom[6] = {0x82, 0x31, 0x32, 0x33, 0x34, 0x35};
+    static const uint8_t ps_rom[6] = {0x83, 0x41, 0x42, 0x43, 0x44, 0x45};
+    SGIDS2502 *m;
 
-    sgi_ds2502_build_mac(ds, mac, rom);
+    sgi_ds2502_bus_init(bus, "ioc3");
+    m = sgi_ds2502_bus_add_raw(bus);
+    sgi_ds2502_build_mac(m, mac, mac_rom);           /* eaddr: family 0x09 */
+    sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", "FP", fp_rom);
+    sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", "PWR.SP", ps_rom);
 }
 
 /* MCR line state: returns DATA bit; DONE is always set for the host poll. */
@@ -328,14 +335,14 @@ static void sgi_bridge_ds_line_write(SGIDS2502BUS *bus, uint64_t val)
     sgi_ds2502_bus_mcr(bus, val);
 }
 
-static uint64_t sgi_bridge_ds_mac_line_read(SGIDS2502 *ds)
+static uint64_t sgi_bridge_ds_mac_line_read(SGIDS2502BUS *bus)
 {
-    return 0x2 | (ds->data_bit & 1);
+    return 0x2 | (bus->data_bit & 1);
 }
 
-static void sgi_bridge_ds_mac_line_write(SGIDS2502 *ds, uint64_t val)
+static void sgi_bridge_ds_mac_line_write(SGIDS2502BUS *bus, uint64_t val)
 {
-    sgi_ds2502_mcr(ds, val);
+    sgi_ds2502_bus_mcr(bus, val);
 }
 
 
