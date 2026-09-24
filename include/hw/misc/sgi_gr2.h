@@ -241,6 +241,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_XMAP_READY_BIT 0x2
 #define SGI_GR2_XMAP_CTL_OFF  0x6c1a0 /* control/data regs written at init */
 #define SGI_GR2_XMAP_CTL_END  0x6c1b8
+#define SGI_GR2_XMAP_MODE     0x6c1a4 /* per-entry MODE: PIXMD + PDMD (CI/RGB) */
 /* RAMDAC colour-map programming, inside the XMAP control window.  The DDX
  * writes each entry as: the INDEX to 0x6c1b0, a control byte to 0x6c1b4, then a
  * sliding byte stream on 0x6c1a8 whose bytes are R,G,B of the addressed entry
@@ -335,6 +336,14 @@ struct SGIGr2State {
      * GL-only client's output was written but only shown when some unrelated
      * 2D/VC1 op happened to refresh.  Presenting on retrace fixes that. */
     bool fb_dirty;
+    /* XMAP mode TABLE (xmapall): a MODE word (0x6c1a4) is written into the entry
+     * selected by the address registers addrlo (0x6c1b0) / addrhi (0x6c1b4).
+     * Each pixel's DID should index this table to pick CI vs RGB - the guest
+     * toggles entry 40 (CI <-> RGB) for a GL window while the desktop stays CI.
+     * NOTE: not yet consulted by the display; stored for the DID work. */
+    uint8_t xmap_addrlo;
+    uint8_t xmap_addrhi;
+    uint32_t xmap_mode[256];
     /* Overlay plane (2 bits/pixel; one byte per pixel here).  0 is TRANSPARENT
      * — the main plane shows through — and 1..3 index the 4-entry overlay
      * colormap.  4Dwm menus are depth-2 override-redirect windows: the DDX

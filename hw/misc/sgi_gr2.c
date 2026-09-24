@@ -2533,6 +2533,9 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset >= SGI_GR2_XMAP_CTL_OFF && offset < SGI_GR2_XMAP_CTL_END) {
         s->xmap_ready = true;
         trace_sgi_gr2_xmap_ctl((uint32_t)offset, (uint32_t)value);
+        if (offset == SGI_GR2_XMAP_MODE) {
+            s->xmap_mode[s->xmap_addrlo] = (uint32_t)value;
+        }
     }
     /* RAMDAC colour-map programming (XMAP_PAL_*): the DDX writes the entry
      * index to 0x6c1b0, a control byte to 0x6c1b4, and a sliding R,G,B byte
@@ -2542,6 +2545,7 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * Build the palette from those bytes; nothing is assumed about its values. */
     if (offset == SGI_GR2_XMAP_PAL_INDEX) {
         s->ramdac_index = value & 0xff;
+        s->xmap_addrlo = value & 0xff;
         /* Each entry's bytes start fresh after its index write; a 32-bit data
          * write carries a 4th byte (the next entry's R) which the following
          * index write therefore discards.  Validated against the `xwd` oracle:
@@ -2584,6 +2588,7 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         }
     } else if (offset == SGI_GR2_XMAP_PAL_CTL) {
         s->ramdac_ctl = value & 0xff;
+        s->xmap_addrhi = value & 0xff;
         trace_sgi_gr2_pal_ctl(s->ramdac_ctl);
     }
     /* BT457 DAC palette/gamma RAM (SGI_GR2_DAC0_OFF): the colour byte at +4 is
