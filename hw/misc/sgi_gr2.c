@@ -367,7 +367,12 @@ static bool sgi_gr2_re3_tile_rects(SGIGr2State *s)
 {
     unsigned n = s->re3_data_n;
     uint32_t w, h, nwords, c0, c1;
-    bool overlay = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
+    /* Mode 3 alone is NOT the overlay selector: the root weave tiles under
+     * mode 3 too.  The overlay draw is the token-321 destination form.
+     * `mode3` also decides the fall-through (only mode-3 payloads may be a
+     * menu glyph list rather than a tile). */
+    bool mode3 = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
+    bool overlay = mode3 && s->re3_spanr_seen;
     unsigned r;
 
     /* Returning false here means "not a tile op, let the other paths try":
@@ -376,29 +381,20 @@ static bool sgi_gr2_re3_tile_rects(SGIGr2State *s)
      * reject them and the dispatch must fall through to the line/mono paths
      * (otherwise the glyphs are dropped as unmatched). */
     if (n < 7) {
-        if (!overlay) {
-            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        }
-        return !overlay;
+        return false;
     }
     w = s->re3_data[3];
     h = s->re3_data[4];
     if (w == 0 || h == 0 || (w & 3) || w > SGI_GR2_SCREEN_W ||
         h > SGI_GR2_SCREEN_H) {
-        if (!overlay) {
-            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        }
-        return !overlay;
+        return false;
     }
     nwords = (w * h) / 4;
     if (nwords == 0 || 7 + nwords - 1 > n) {
-        if (!overlay) {
-            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        }
-        return !overlay;
+        return false;
     }
     if (!s->scanout) {
-        return !overlay;
+        return false;
     }
     /* The two tile colours are given by the op header, not by the tile pixels:
      * data[2] is the base and data[1] indexes the second colour.  The DDX forms
@@ -422,10 +418,7 @@ static bool sgi_gr2_re3_tile_rects(SGIGr2State *s)
         return true;
     }
     if (s->re3_nclip == 0) {
-        if (!overlay) {
-            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
-        }
-        return !overlay;
+        return false;
     }
     for (r = 0; r < s->re3_nclip; r++) {
         sgi_gr2_re3_tile_rect(s, w, h, c0, c1,
@@ -634,6 +627,7 @@ static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
 {
     unsigned n = s->re3_data_n, i, start = sgi_gr2_re3_payload_start(s);
     bool overlay = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
+    bool menu_form = false;
 
     if (start >= n) {
         /* The 4Dwm menu's stroke list carries header [0,3,1] then a three-word
@@ -643,6 +637,7 @@ static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
         if (overlay && n >= 10 && s->re3_data[0] == 0 && s->re3_data[1] == 3 &&
             s->re3_data[2] == 1) {
             start = 6;
+            menu_form = true;
         } else {
             trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
             return;
@@ -662,7 +657,10 @@ static void sgi_gr2_re3_draw_segments(SGIGr2State *s)
             x1 >= SGI_GR2_SCREEN_W || y1 >= SGI_GR2_SCREEN_H) {
             break;
         }
-        if (overlay) {
+        if (menu_form) {
+            /* Only the menu's [0,3,1] stroke list is an overlay draw; a
+             * main-plane segment op (header [0xff,3,0]) stays on the main
+             * plane even if its mode happens to be 3. */
             sgi_gr2_ovl_line(s, s->re3_colour, x0, y0, x1, y1);
         } else {
             sgi_gr2_re3_line(s, s->re3_colour, x0, y0, x1, y1);
