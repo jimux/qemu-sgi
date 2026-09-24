@@ -904,6 +904,7 @@ static void sgi_gr2_re3_draw_mono_pen(SGIGr2State *s, unsigned X, unsigned off)
 {
     uint8_t col = s->re3_monocol_valid ? (uint8_t)s->re3_monocol
                                        : s->re3_colour;
+    bool overlay = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
     int Y, W, H, k, r, run;
 
     if (off + 3 > s->re3_data_n) {
@@ -943,7 +944,11 @@ static void sgi_gr2_re3_draw_mono_pen(SGIGr2State *s, unsigned X, unsigned off)
             while (r + run < W && ((rowbits >> (11 - (r + run))) & 1)) {
                 run++;
             }
-            sgi_gr2_re3_fill(s, col, (int)X + r, Y + k, run, 1);
+            if (overlay) {
+                sgi_gr2_ovl_fill(s, col, (int)X + r, Y + k, run, 1);
+            } else {
+                sgi_gr2_re3_fill(s, col, (int)X + r, Y + k, run, 1);
+            }
             r += run;
         }
     }
@@ -953,6 +958,9 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
 {
     unsigned p;
     bool any = false;
+    /* Mode-3 glyphs belong to the overlay (the 4Dwm menu labels); the
+     * main-plane pen349 text is mode 0. */
+    bool overlay = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
 
     if (s->re3_monox_valid) {
         sgi_gr2_re3_draw_mono_pen(s, s->re3_monox, s->re3_mono_off);
@@ -991,11 +999,19 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
                     break;
                 }
                 if (r0 < SGI_GR2_SCREEN_H && ((w >> (31 - b)) & 1)) {
-                    sgi_gr2_put(s, xx, r0, s->re3_colour);
+                    if (overlay) {
+                        sgi_gr2_ovl_put(s, xx, r0, s->re3_colour & 3);
+                    } else {
+                        sgi_gr2_put(s, xx, r0, s->re3_colour);
+                    }
                 }
                 if (2 * k + 1 < h && r0 + 1 < SGI_GR2_SCREEN_H &&
                     ((w >> (15 - b)) & 1)) {
-                    sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
+                    if (overlay) {
+                        sgi_gr2_ovl_put(s, xx, r0 + 1, s->re3_colour & 3);
+                    } else {
+                        sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
+                    }
                 }
             }
         }
