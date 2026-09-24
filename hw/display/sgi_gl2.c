@@ -711,12 +711,13 @@ static void gl2_gfx_update(void *opaque)
         }
         {
             static int fdumped;
-            int kk;
 
-            if (!fdumped) {
+            if (!fdumped && s->font[0x1117] != 0) {
+                int kk;
+
                 fdumped = 1;
                 fprintf(stderr, "FONTDUMP 800:");
-                for (kk = 0x800; kk < 0xc00; kk++) {
+                for (kk = 0x800; kk < 0x1400; kk++) {
                     fprintf(stderr, "%04x", s->font[kk]);
                 }
                 fprintf(stderr, "\n");
