@@ -651,10 +651,72 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
  * word: row 2k is the high half (bits 31-16), row 2k+1 the low half (bits 15-0),
  * bit 15 the leftmost pixel.  The word count is ceil(h/2), so an odd h keeps its
  * last row in the high half.  Set bits take the current colour. */
+
+/* Draw ONE IP20 glyph.  Its pen x is X; its y, w, h and bitmap begin at
+ * re3_data[off].  Token 0x40510 is per-glyph — one 490-terminated region can
+ * carry several pens (the shell redraws the prompt as a run of them), and only
+ * keeping the last pen lost the earlier glyphs of such a run, so this is called
+ * both as each new pen arrives and once more for the final pen at the region
+ * terminator. */
+static void sgi_gr2_re3_draw_mono_pen(SGIGr2State *s, unsigned X, unsigned off)
+{
+    uint8_t col = s->re3_monocol_valid ? (uint8_t)s->re3_monocol
+                                       : s->re3_colour;
+    int Y, W, H, k, r, run;
+
+    if (off + 3 > s->re3_data_n) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    Y = (int)s->re3_data[off];
+    W = (int)s->re3_data[off + 1];
+    H = (int)s->re3_data[off + 2];
+    if (W <= 0 || W > 12) {
+        W = 12;
+    }
+    if (H <= 0 || H > 64) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+        return;
+    }
+    trace_sgi_gr2_re3_mono((int)X, Y, W, H, col);
+    for (k = 0; k < H; k++) {
+        unsigned wi = off + 3 + (unsigned)(k / 2);
+        uint32_t w = (wi < s->re3_data_n) ? s->re3_data[wi] : 0;
+        uint32_t rowbits;
+
+        /* Each 32-bit word carries TWO rows of 12 bits: bits 31..20 first,
+         * then bits 15..4.  Taking one row per word read only the low half and
+         * halved the glyph's height (the "squashed" render). */
+        rowbits = ((k & 1) ? (w >> 4) : (w >> 20)) & 0xfff;
+
+        /* Coalesce the row's set bits into runs and paint each through the
+         * rect fill helper, so clipping and the scanout update stay in one
+         * place rather than poking s->scanout here. */
+        for (r = 0; r < W; ) {
+            if (!((rowbits >> (11 - r)) & 1)) {
+                r++;
+                continue;
+            }
+            run = 1;
+            while (r + run < W && ((rowbits >> (11 - (r + run))) & 1)) {
+                run++;
+            }
+            sgi_gr2_re3_fill(s, col, (int)X + r, Y + k, run, 1);
+            r += run;
+        }
+    }
+}
+
 static void sgi_gr2_re3_draw_text(SGIGr2State *s)
 {
     unsigned p;
     bool any = false;
+
+    if (s->re3_monox_valid) {
+        sgi_gr2_re3_draw_mono_pen(s, s->re3_monox, s->re3_mono_off);
+        return;
+    }
+
 
     for (p = 0; p < s->re3_npens; p++) {
         unsigned off = s->re3_pen_off[p];
@@ -863,6 +925,8 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_mono_seen = false;
     s->re3_image_seen = false;
     s->re3_nimg = 0;
+    s->re3_monox_valid = false;
+    s->re3_monocol_valid = false;
     s->re3_npens = 0;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
@@ -1871,6 +1935,24 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->re3_poly_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_MONO_TOKEN) {
+        /* The MONO token's value is the glyph FOREGROUND colour.  A controlled
+         * -fg/-bg experiment showed it tracks -fg, while 0x404dc (== the RE3
+         * colour) tracks the cell background — so 0x404dc is the background, and
+         * reading it painted the glyphs in the background colour. */
+        s->re3_monocol = (uint32_t)value & 0xff;
+        s->re3_monocol_valid = true;
+        s->re3_mono_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_MONOX_TOKEN) {
+        /* IP20: the glyph piece's pen x; y/w/h follow in PUC_DATA.  A new pen
+         * means the previous one's data is complete, so draw it now — one
+         * region can carry several pens and the terminator only sees the last. */
+        if (s->re3_monox_valid) {
+            sgi_gr2_re3_draw_mono_pen(s, s->re3_monox, s->re3_mono_off);
+        }
+        s->re3_monox = (uint32_t)value & 0xffff;
+        s->re3_mono_off = s->re3_data_n;
+        s->re3_monox_valid = true;
         s->re3_mono_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_IMAGE_TOKEN) {
@@ -2318,6 +2400,9 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_mono_seen = false;
     s->re3_image_seen = false;
     s->re3_nimg = 0;
+    s->re3_monox_valid = false;
+    s->re3_monocol_valid = false;
+    s->re3_mono_off = 0;
     s->re3_npens = 0;
     s->re3_label_y = 0;
     s->re3_label_valid = false;

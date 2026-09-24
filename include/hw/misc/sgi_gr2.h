@@ -164,6 +164,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_RE3_MONO_TOKEN    0x404e0 /* token 312: expDrawMonoImage     */
 #define SGI_GR2_RE3_PEN_TOKEN     0x40574 /* token 349: glyph pen x          */
 #define SGI_GR2_RE3_PEN_MAX       64      /* pens recorded per sub-op        */
+/* IP20 Xsgi's expDrawMonoImage carries the origin ON the wire (the XZ DDX does
+ * not): token 0x40510 is the glyph pen x, the three PUC_DATA words that follow
+ * are y, w, h, and the MONO token (312) value is the glyph foreground colour.
+ * Token 0x404dc (== the running RE3 colour) is the cell BACKGROUND, not the
+ * glyph — a controlled -fg/-bg experiment proved which is which.  The bitmap is
+ * two rows per 32-bit word, 12 pixels each in bits 31..20 then 15..4 (bit 31 /
+ * bit 15 the leftmost of its row). */
+#define SGI_GR2_RE3_MONOCOL_TOKEN 0x404dc /* token 311: IP20 cell background */
+#define SGI_GR2_RE3_MONOX_TOKEN   0x40510 /* token 324: IP20 glyph pen x     */
 #define SGI_GR2_RE3_FG_TOKEN      0x404e8 /* token 314: stipple fg colour    */
 #define SGI_GR2_RE3_TILE_TOKEN    0x404ec /* token 315: tile/pattern data port */
 #define SGI_GR2_RE3_STIPPLE_TOKEN 0x404f8 /* token 318: stipple pattern      */
@@ -391,6 +400,15 @@ struct SGIGr2State {
      * for the glyph baseline. */
     int re3_label_y;
     bool re3_label_valid;
+    /* IP20 Xsgi's glyph piece, read straight from the stream (see the token
+     * defines above): pen x, foreground colour (from the MONO token), and the
+     * PUC_DATA index at which the piece's y/w/h begin.  Used in preference to
+     * the XZ label-bar link when present. */
+    uint32_t re3_monox;
+    uint32_t re3_monocol;
+    unsigned re3_mono_off;
+    bool re3_monox_valid;
+    bool re3_monocol_valid;
     bool re3_pair_seen;     /* a 1280-then-1024 pair appeared in the payload */
     bool re3_stipple_valid; /* token 318 written: next rect is stippled      */
     uint32_t re3_stipple;   /* 32-bit stipple pattern (token 318)            */
