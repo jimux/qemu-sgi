@@ -163,6 +163,49 @@ static void sgi_hub_reset_bh(void *opaque);
 #define NSRI_CHIPID_SHFT 0
 #define NSRI_LINKUP (1ULL << 29)
 
+/* NI routing tables (hubni.h): written by the PROM's distribute_tables(). */
+#define NI_META_TABLE0 0x638000
+#define NI_META_ENTRIES 32
+#define NI_LOCAL_TABLE0 0x638100
+#define NI_LOCAL_ENTRIES 16
+
+/*
+ * SN0 router register offsets (sys/SN/router.h) and field layout.  Routers are
+ * reached only through the hub NI vector PIO engine, so they are not memory
+ * mapped; the machine owns the SGIRouterState and both hubs point at it.
+ */
+#define RR_STATUS_REV_ID 0x00000
+#define RR_PORT_RESET 0x00008
+#define RR_PROT_CONF 0x00010
+#define RR_GLOBAL_PARMS 0x00018
+#define RR_SCRATCH_REG0 0x00020
+#define RR_SCRATCH_REG1 0x00028
+#define RR_DIAG_PARMS 0x00030
+#define RR_NIC_ULAN 0x00038
+#define RR_META_TABLE0 0x70000
+#define RR_LOCAL_TABLE0 0x70100
+#define RR_PORT_REG(_l, _o) (((_l) << 16) | (_o))
+#define RR_PORT_PARMS(_l) RR_PORT_REG(_l, 0x0000)
+#define RR_STATUS_ERROR(_l) RR_PORT_REG(_l, 0x0008)
+#define RR_HISTOGRAM(_l) RR_PORT_REG(_l, 0x0010)
+#define RR_RESET_MASK(_l) RR_PORT_REG(_l, 0x0018)
+
+/* RSRI field layout. */
+#define RSRI_INPORT_SHFT 46
+#define RSRI_LINKWORKING(_l) (1ULL << (26 + 3 * (_l)))
+#define RSRI_LINK8BIT(_l) (1ULL << (27 + 3 * (_l)))
+#define RSRI_CHIPIN_SHFT 8
+#define RSRI_CHIPREV_SHFT 4
+#define RSRI_CHIPID_SHFT 0
+#define RSRI_CHIPID_ROUTER 1
+
+#define RSCR0_NIC_MASK 0xffffffffffffULL
+#define RSCR0_BOOTED_MASK (1ULL << 60)
+#define RSCR0_LOCALID_SHFT 56
+#define RPCONF_METAIDVALID (1ULL << 11)
+#define RPCONF_METAID_SHFT 6
+#define RPCONF_FLOCAL_SHFT 12
+
 /*
  * Hub revision reported in NI_STATUS_REV_ID.  sys/SN/SN0/hub.h numbers these
  * HUB_REV_1_0=1, HUB_REV_2_0=2, HUB_REV_2_1=3, ...; ml/SN/klgraph.c warns
@@ -816,65 +859,216 @@ static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
 static uint64_t sgi_hub_read_off(SGIHubState *s, hwaddr off);
 static void sgi_hub_write_off(SGIHubState *s, hwaddr off, uint64_t val);
 
+/* ---- SN0 router register file (reached only through vectors) ---- */
+
+void sgi_router_init(SGIRouterState *r, uint32_t nic, uint32_t chipin,
+                     uint32_t revision) {
+  if (!r->regs) {
+    r->regs = g_new0(uint64_t, SGI_ROUTER_REG_WORDS);
+  }
+  r->nic = nic;
+  r->chipin = chipin;
+  r->revision = revision;
+  /*
+   * Cache the NIC in RR_SCRATCH_REG0.  The PROM's cache_router_nic() reads a
+   * zero SCR0 as "not cached" and falls back to bit-banging the router's
+   * 1-wire ULAN (RR_NIC_ULAN), which is not modelled; pre-populating SCR0 with
+   * the router's real identity lets discovery read the NIC directly.
+   */
+  r->regs[RR_SCRATCH_REG0 / 8] = nic & RSCR0_NIC_MASK;
+}
+
+void sgi_router_connect(SGIRouterState *r, int port, SGIHubState *hub) {
+  if (port >= 1 && port <= SGI_ROUTER_PORTS) {
+    r->port[port] = hub;
+  }
+}
+
+void sgi_hub_set_router(SGIHubState *s, SGIRouterState *r) { s->router = r; }
+
+/* Which router port this hub is plugged into (0 = not connected). */
+static int sgi_router_hub_port(SGIRouterState *r, SGIHubState *hub) {
+  int p;
+
+  for (p = 1; p <= SGI_ROUTER_PORTS; p++) {
+    if (r->port[p] == hub) {
+      return p;
+    }
+  }
+  return 0;
+}
+
+static uint64_t sgi_router_read(SGIRouterState *r, uint64_t off, int inport) {
+  uint64_t idx = off / 8;
+
+  if (idx >= SGI_ROUTER_REG_WORDS) {
+    return 0;
+  }
+  if (off == RR_STATUS_REV_ID) {
+    uint64_t v = ((uint64_t)(inport & 7) << RSRI_INPORT_SHFT) |
+                 ((uint64_t)(r->chipin & 0xf) << RSRI_CHIPIN_SHFT) |
+                 ((uint64_t)(r->revision & 0xf) << RSRI_CHIPREV_SHFT) |
+                 RSRI_CHIPID_ROUTER;
+    int p;
+
+    for (p = 1; p <= SGI_ROUTER_PORTS; p++) {
+      if (r->port[p]) {
+        v |= RSRI_LINKWORKING(p) | RSRI_LINK8BIT(p);
+      }
+    }
+    return v;
+  }
+  if (off == RR_SCRATCH_REG1) {
+    return r->regs[idx] & 0xffff;
+  }
+  /*
+   * RR_HISTOGRAM(_l): the high 16 bits are a free-running network-clock sample
+   * counter.  router_test() uses a nonzero value to detect the backplane type;
+   * model it from the host clock (1 microsecond granularity) rather than a
+   * fixed constant, since it is a measured rate, not an identity.
+   */
+  if ((off & 0xffff) == 0x0010 && off >= 0x10000) {
+    uint64_t c = (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1000) & 0xffff;
+
+    return c << 48;
+  }
+  return r->regs[idx];
+}
+
+static void sgi_router_write(SGIRouterState *r, uint64_t off, uint64_t val,
+                             int inport) {
+  uint64_t idx = off / 8;
+
+  if (idx >= SGI_ROUTER_REG_WORDS) {
+    return;
+  }
+  if (off == RR_SCRATCH_REG1) {
+    r->regs[idx] = val & 0xffff;
+    return;
+  }
+  r->regs[idx] = val;
+}
+
 /*
  * Execute a NI vector PIO operation (armed via NI_VECTOR/NI_VECTOR_PARMS).
- * Only the local node (vector path 0) is modelled; a remote vector has no
- * peer in a single-node system, so VALID is left clear and the caller times
- * out (the honest "no remote node" result).
+ *
+ * Single node (no router attached): only the local node answers, and a path-0
+ * NSRI read deliberately reports an unknown chip id so discover_object() leaves
+ * the sole hub unlinked and nasid_assign() keeps it at NASID 0.
+ *
+ * Router attached: the vector path is the source route the PROM/kernel builds
+ * with discover_route().  Path 0 addresses the hub's own link, i.e. the router;
+ * a nonzero path is the sequence of router exit ports to take (nibble 0 is the
+ * first hop), and the object reached by the last hop is the destination.  This
+ * is a pure register-level switch -- no latency, no coherence.
  */
 static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
   uint64_t pioid = (parms >> NVP_PIOID_SHFT) & 0x7ff;
   uint64_t wid = (parms >> NVP_WRITEID_SHFT) & 0xff;
   uint64_t addr = parms & NVP_ADDRESS_MASK;
   unsigned type = parms & NVP_TYPE_MASK;
+  uint64_t ret = 0;
   hwaddr reg;
 
-  /*
-   * Only the local node (vector path 0) is modelled; a remote vector has no
-   * peer in a single-node system, so VALID is left clear and the caller
-   * times out (the honest "no remote node" result).
-   */
-  if (s->ni_vector != 0) {
-    s->ni_vector_status = 0;
+  if (!s->router) {
+    if (s->ni_vector != 0) {
+      s->ni_vector_status = 0;
+      return;
+    }
+    reg = (addr < SGI_HUB_NI_BASE) ? SGI_HUB_NI_BASE + addr : addr;
+    switch (type) {
+    case PIOTYPE_READ:
+      if (reg == NI_STATUS_REV_ID) {
+        s->ni_vector_rd_data =
+            ((uint64_t)(s->nasid & 0x1ff) << NSRI_NODEID_SHFT) |
+            ((uint64_t)SGI_HUB_REV << NSRI_REV_SHFT) | 0x5;
+      } else {
+        s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
+      }
+      break;
+    case PIOTYPE_WRITE:
+      sgi_hub_write_off(s, reg, s->ni_vector_data);
+      break;
+    case PIOTYPE_XCHG:
+      s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
+      sgi_hub_write_off(s, reg, s->ni_vector_data);
+      break;
+    default:
+      s->ni_vector_status = 0;
+      return;
+    }
+    s->ni_vector_status = NVS_VALID | (pioid << NVS_PIOID_SHFT) |
+                          (wid << NVS_WRITEID_SHFT) |
+                          (addr & NVS_ADDRESS_MASK) | (type & NVS_TYPE_MASK);
     return;
   }
 
-  /*
-   * Register addresses in the vector parameter block are NI-block-relative
-   * for the low range (e.g. NI_SCRATCH_REG0 = 0x100); larger values are the
-   * full hub-window offset.
-   */
-  reg = (addr < SGI_HUB_NI_BASE) ? SGI_HUB_NI_BASE + addr : addr;
+  {
+    SGIRouterState *rtr = s->router;
+    SGIHubState *dest_hub = NULL;
+    SGIRouterState *dest_rtr = NULL;
+    int inport = sgi_router_hub_port(rtr, s);
+    uint64_t path = s->ni_vector;
 
-  switch (type) {
-  case PIOTYPE_READ:
-    if (reg == NI_STATUS_REV_ID) {
-      /*
-       * A vector/path-0 NSRI read is the PROM's discovery of the local
-       * node's "port 0": on a single node no peer answers there.  Report an
-       * unknown chip id (not HUB/ROUTER) so discover_object() takes its
-       * default branch and leaves the hub's port.index invalid; that makes
-       * nasid_assign() keep this sole node at NASID 0 (otherwise it treats
-       * the node as back-to-back with itself and assigns NASID 1, which the
-       * later config walk dereferences via NODE_RBOOT_BASE(1)).
-       */
-      s->ni_vector_rd_data =
-          ((uint64_t)(s->nasid & 0x1ff) << NSRI_NODEID_SHFT) |
-          ((uint64_t)SGI_HUB_REV << NSRI_REV_SHFT) | 0x5;
-      break;
+    if (path == 0) {
+      dest_rtr = rtr;
+    } else {
+      int len = 0, i;
+
+      while ((path >> (4 * len)) & 0xf) {
+        len++;
+      }
+      for (i = 0; i < len; i++) {
+        int port = (path >> (4 * i)) & 0xf;
+        SGIHubState *h = (port >= 1 && port <= SGI_ROUTER_PORTS)
+                             ? rtr->port[port]
+                             : NULL;
+
+        if (!h || i != len - 1) {
+          /* Only a single router is modelled. */
+          s->ni_vector_status = 0;
+          return;
+        }
+        dest_hub = h;
+        inport = port;
+      }
     }
-    s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
-    break;
-  case PIOTYPE_WRITE:
-    sgi_hub_write_off(s, reg, s->ni_vector_data);
-    break;
-  case PIOTYPE_XCHG:
-    s->ni_vector_rd_data = sgi_hub_read_off(s, reg);
-    sgi_hub_write_off(s, reg, s->ni_vector_data);
-    break;
-  default:
-    s->ni_vector_status = 0;
-    return;
+
+    if (dest_rtr) {
+      switch (type) {
+      case PIOTYPE_READ:
+        ret = sgi_router_read(dest_rtr, addr, inport);
+        break;
+      case PIOTYPE_WRITE:
+        sgi_router_write(dest_rtr, addr, s->ni_vector_data, inport);
+        break;
+      case PIOTYPE_XCHG:
+        ret = sgi_router_read(dest_rtr, addr, inport);
+        sgi_router_write(dest_rtr, addr, s->ni_vector_data, inport);
+        break;
+      default:
+        s->ni_vector_status = 0;
+        return;
+      }
+    } else {
+      reg = (addr < SGI_HUB_NI_BASE) ? SGI_HUB_NI_BASE + addr : addr;
+      switch (type) {
+      case PIOTYPE_READ:
+        ret = sgi_hub_read_off(dest_hub, reg);
+        break;
+      case PIOTYPE_WRITE:
+        sgi_hub_write_off(dest_hub, reg, s->ni_vector_data);
+        break;
+      case PIOTYPE_XCHG:
+        ret = sgi_hub_read_off(dest_hub, reg);
+        sgi_hub_write_off(dest_hub, reg, s->ni_vector_data);
+        break;
+      default:
+        s->ni_vector_status = 0;
+        return;
+      }
+    }
+    s->ni_vector_rd_data = ret;
   }
 
   s->ni_vector_status = NVS_VALID | (pioid << NVS_PIOID_SHFT) |
@@ -891,6 +1085,13 @@ static void sgi_hub_reset_bh(void *opaque) {
 }
 
 static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
+  /* Routing tables distributed by distribute_tables() (hubni.h). */
+  if (off >= NI_META_TABLE0 && off < NI_META_TABLE0 + NI_META_ENTRIES * 8) {
+    return s->ni_meta_table[(off - NI_META_TABLE0) / 8];
+  }
+  if (off >= NI_LOCAL_TABLE0 && off < NI_LOCAL_TABLE0 + NI_LOCAL_ENTRIES * 8) {
+    return s->ni_local_table[(off - NI_LOCAL_TABLE0) / 8];
+  }
   switch (off) {
   case NI_STATUS_REV_ID:
     return ((uint64_t)(s->nasid & 0x1ff) << NSRI_NODEID_SHFT) |
@@ -902,12 +1103,17 @@ static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
     return s->ni_scratch[0];
   case NI_SCRATCH_REG1:
     /*
-     * A single node is always NASID 0.  The PROM's discovery can leave the
-     * ADVERT_NASID field [15:0] as 1 (its port-0 self-probe makes
-     * nasid_assign() treat the node as back-to-back with itself), which then
-     * makes the PROM remap its window to a node-1 address.  Report the field
-     * as 0 so the node stays at NASID 0 (its true identity).
+     * Single node (no router): the PROM's port-0 self-probe can leave the
+     * ADVERT_NASID field [15:0] as 1, which makes the PROM remap its window to
+     * a node-1 address.  Report the field as 0 so the node stays at NASID 0.
+     *
+     * Two nodes: the same low 16 bits are ADVERT_OBJECTS_MASK, and the peer
+     * discovery handshake reads a remote hub's DISCDONE flag and object count
+     * from here, so the value must be returned intact.
      */
+    if (s->router) {
+      return s->ni_scratch[1];
+    }
     return s->ni_scratch[1] & ~0xffffULL;
   case NI_VECTOR:
   case NI_RETURN_VECTOR:
@@ -942,6 +1148,14 @@ static uint64_t sgi_hub_ni_read(SGIHubState *s, hwaddr off) {
 
 static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
                              unsigned size) {
+  if (off >= NI_META_TABLE0 && off < NI_META_TABLE0 + NI_META_ENTRIES * 8) {
+    s->ni_meta_table[(off - NI_META_TABLE0) / 8] = val;
+    return;
+  }
+  if (off >= NI_LOCAL_TABLE0 && off < NI_LOCAL_TABLE0 + NI_LOCAL_ENTRIES * 8) {
+    s->ni_local_table[(off - NI_LOCAL_TABLE0) / 8] = val;
+    return;
+  }
   switch (off) {
   case NI_PORT_RESET:
     /*
@@ -1092,6 +1306,15 @@ static void sgi_hub_write_off(SGIHubState *s, hwaddr off, uint64_t val) {
   }
 }
 
+/* Public register-file access, used by the router when it targets a hub. */
+uint64_t sgi_hub_reg_read(SGIHubState *s, uint64_t off) {
+  return sgi_hub_read_off(s, off);
+}
+
+void sgi_hub_reg_write(SGIHubState *s, uint64_t off, uint64_t val) {
+  sgi_hub_write_off(s, off, val);
+}
+
 static uint64_t sgi_hub_read(void *opaque, hwaddr addr, unsigned size) {
   SGIHubState *s = opaque;
   hwaddr off = addr & (SGI_HUB_WINDOW_SIZE - 1);
@@ -1156,8 +1379,8 @@ static void sgi_hub_reset(DeviceState *dev) {
     s->md_perf_cnt[i] = 0;
   }
 
-  s->cpu_present[0] = 1;
-  s->cpu_enable[0] = 1;
+  s->cpu_present[0] = (s->num_cpus >= 1) ? 1 : 0;
+  s->cpu_enable[0] = (s->num_cpus >= 1) ? 1 : 0;
   s->cpu_present[1] = (s->num_cpus > 1) ? 1 : 0;
   s->cpu_enable[1] = (s->num_cpus > 1) ? 1 : 0;
 
@@ -1175,6 +1398,13 @@ static void sgi_hub_reset(DeviceState *dev) {
    */
   s->pi_err_stack[0] = 0;
   s->pi_err_stack[1] = PI_ERR_STACK_RST0;
+
+  for (i = 0; i < NI_META_ENTRIES; i++) {
+    s->ni_meta_table[i] = 0;
+  }
+  for (i = 0; i < NI_LOCAL_ENTRIES; i++) {
+    s->ni_local_table[i] = 0;
+  }
 
   /*
    * MD_SLOTID_USTAT: bit 4 = FPGA/flash ready; bits [2:0] are the node board's

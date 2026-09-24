@@ -137,7 +137,50 @@ struct SGIHubState {
 
   /* Polls the free-running RTC against each slice's armed COMPARE. */
   QEMUTimer *rt_timer;
+
+  /*
+   * SN0 network fabric: this hub's NI link is the router it is plugged into
+   * (NULL on a single-node machine).  When a router is attached a vector PIO
+   * with path 0 addresses the router itself, and a nonzero path names the
+   * router exit ports to traverse (see sgi_hub_ni_vector_go).  The router's
+   * register file and port graph live in the machine, not in the hub.
+   */
+  struct SGIRouterState *router;
+
+  /* NI routing tables written by distribute_tables(): 32 meta + 16 local. */
+  uint64_t ni_meta_table[32];
+  uint64_t ni_local_table[16];
 };
+
+/*
+ * SN0 router (the R-brick crossbar linking hubs).  Only the register file and
+ * the port graph are modelled; there is no latency or coherence.
+ *
+ * Router registers are accessed exclusively through the hubs' NI vector PIO
+ * engine, not by memory mapping, so this is a plain structure the machine
+ * owns and both hubs reference.  `regs` is indexed by register offset / 8.
+ */
+#define SGI_ROUTER_PORTS 6
+#define SGI_ROUTER_REG_WORDS (0x80000 / 8)
+
+typedef struct SGIRouterState {
+  uint64_t *regs;
+  uint32_t nic;
+  uint32_t chipin;
+  uint32_t revision;
+  struct SGIHubState *port[SGI_ROUTER_PORTS + 1]; /* ports 1..6 */
+} SGIRouterState;
+
+void sgi_router_init(SGIRouterState *r, uint32_t nic, uint32_t chipin,
+                     uint32_t revision);
+void sgi_router_connect(SGIRouterState *r, int port, SGIHubState *hub);
+
+/* Attach a router as this hub's NI link (NULL = single-node, no peer). */
+void sgi_hub_set_router(SGIHubState *s, SGIRouterState *r);
+
+/* Register-file access used by the router when it targets a hub. */
+uint64_t sgi_hub_reg_read(SGIHubState *s, uint64_t off);
+void sgi_hub_reg_write(SGIHubState *s, uint64_t off, uint64_t val);
 
 /*
  * Raise or clear one interrupt vector in the hub's INT_PEND0/1 sets.

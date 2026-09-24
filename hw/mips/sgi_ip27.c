@@ -91,6 +91,13 @@
 /* PROM window: file code (0x1fc00000) is mapped here. */
 #define IP27_PROM_BASE 0x1fc00000ULL
 #define IP27_PROM_SIZE (1 * MiB)
+/*
+ * Two-node mode gives the PROM a larger RAM region: its pcfg/klconfig
+ * structures push the BSS/stack past the 1 MB single-node window (measured
+ * stack at ~0x1fdef6b0).  Kept separate so the single-node machine is
+ * byte-for-byte unchanged.
+ */
+#define IP27_PROM_SIZE_TWO (8 * MiB)
 
 /*
  * LBOOT window: the local hub's boot flash (and other directory-bus devices).
@@ -754,6 +761,31 @@ static void sgi_ip27_init(MachineState *machine) {
   SGIHubState *hub_state;
   int ncpus = machine->smp.cpus;
   int i;
+  /*
+   * Node count for the two-node Origin 2000 leg.  Default 1 keeps the
+   * single-node machine byte-for-byte unchanged (gate c).  IP27_NODES=2 models
+   * a second hub reachable through a single router, with its own RAM; only
+   * node 0 executes code (node 1 is a memory/CPU brick whose PROM does not
+   * run), so -m is split evenly between the two nodes.
+   */
+  int nnodes = 1;
+  uint64_t node_ram = machine->ram_size;
+  SGIRouterState *router = NULL;
+  SGIHubState *hubs[2] = { NULL, NULL };
+  MemoryRegion *ram1 = NULL;
+
+  if (getenv("IP27_NODES")) {
+    nnodes = atoi(getenv("IP27_NODES"));
+  }
+  if (nnodes < 1) {
+    nnodes = 1;
+  }
+  if (nnodes > 2) {
+    nnodes = 2;
+  }
+  if (nnodes == 2) {
+    node_ram = machine->ram_size / 2;
+  }
 
   if (ncpus < 1) {
     ncpus = 1;
@@ -829,57 +861,75 @@ static void sgi_ip27_init(MachineState *machine) {
   mips_cpu_pin_kernel_mapping(IP27_K2_BASE, 0, IP27_K2_PAGEMASK,
                               IP27_K2_FLAGS);
 
-  /* Node-local memory at physical 0, aliased uncached (UNCAC/MSPEC spaces). */
-  {
-    uint64_t banksz = MIN(machine->ram_size, (uint64_t)0x8000000);
-    memory_region_add_subregion(system_memory, 0, ram);
-    ip27_add_ram_banks(system_memory, IP27_UNCAC_BASE, ram,
-                       machine->ram_size, banksz, "sgi-ip27.ram.uncac");
-    ip27_add_ram_banks(system_memory, IP27_MSPEC_BASE, ram,
-                       machine->ram_size, banksz, "sgi-ip27.ram.mspec");
-    ip27_add_ram_banks(system_memory, IP27_CAC_BASE, ram,
-                       machine->ram_size, banksz, "sgi-ip27.ram.cac");
-    /*
-     * HSPEC is another access-mode alias of node memory: TO_HSPEC(x) =
-     * HSPEC_BASE | (x & TO_PHYS_MASK), so HSPEC+off reads/writes local RAM at
-     * off (addrs.h).  The LBOOT flash and the bdoor directory are added later,
-     * so they overlay this alias.  Without it the kernel's fill of its BSS/
-     * heap via HSPEC (e.g. 0x9000000001bdf818) hits unmapped space -> DBE.
-     */
-    ip27_add_ram_banks(system_memory, IP27_HSPEC_BASE, ram,
-                       machine->ram_size, banksz, "sgi-ip27.ram.hspec");
-  }
-
   /*
-   * B1: node-tagged physical alias.  On IP27 a physical address carries a
-   * node/brick tag above the local RAM offset (NODE_OFFSET(n) = n <<
-   * NODE_SIZE_BITS; M-mode shift 32).  The IRIX kernel builds its wired PDA
-   * physical address from fpage (CAC-tagged); by the time it reaches EntryLo
-   * it is e.g. 0x1c0004a4000 -- tag 0x1c<<32 with local offset 0x4a4000, which
-   * is valid node-0 RAM.  A single-node machine has no other nodes, so alias
-   * every node-tagged window (k<<32) back to node-0 RAM at the same low
-   * offset.  Untagged low RAM, the CAC/UNCAC/HSPEC containers (phys 0x08../
-   * 0x10../0x12..) and the IO windows are all far outside this range and
-   * unaffected, and the power-on memory test uses untagged low RAM.
+   * Node-local memory at physical 0, aliased uncached (UNCAC/MSPEC spaces).
+   * Single node: node 0 owns all of machine->ram.  Two nodes: -m is split
+   * evenly, node 0 uses the low half of machine->ram, node 1 gets its own RAM
+   * block, and every XKPHYS space carries node 1's memory at NODE_OFFSET(1) =
+   * 1<<32 (NODE_SIZE_BITS = 32 in M-mode) so the master PROM/kernel can write
+   * node 1's KLDIR/KLCONFIG and read its memory over the fabric.
    *
-   * DIVERGENCE: a real multi-node machine would route these to other nodes'
-   * memory; here they all resolve to node 0.
+   * HSPEC is another access-mode alias of node memory: TO_HSPEC(x) =
+   * HSPEC_BASE | (x & TO_PHYS_MASK), so HSPEC+off reads/writes local RAM at off
+   * (addrs.h).  The LBOOT flash and the bdoor directory are added later, so
+   * they overlay this alias.  Without it the kernel's fill of its BSS/heap via
+   * HSPEC (e.g. 0x9000000001bdf818) hits unmapped space -> DBE.
    */
-  for (i = 1; i <= IP27_NODE_TAG_MAX; i++) {
-    /*
-     * Reproduce the memory controller's BANK-SLOT layout (bank b at b << 29),
-     * not a flat 256 MB window.  The PROM DIMM probe sizes a 256 MB node as
-     * two 128 MB banks, so a page in the second DIMM carries the physical
-     * address tag | 0x20000000 (MD_BANK_SHFT = 29, i.e. 512 MB slots).  A flat
-     * alias of machine->ram_size stops at 256 MB, so the first bank-1 page the
-     * kernel allocates (measured: 0x1c020002298, bank1 @ 512 MB) landed in a
-     * hole and raised a user Data Bus Error.  ip27_add_ram_banks() maps each
-     * bank slot onto ram[] exactly as the CAC/HSPEC containers already do.
-     */
-    uint64_t banksz = MIN(machine->ram_size, (uint64_t)0x8000000);
+  {
+    uint64_t banksz = MIN(node_ram, (uint64_t)0x8000000);
+    MemoryRegion *ram0 = ram;
 
-    ip27_add_ram_banks(system_memory, (uint64_t)i << 32, ram,
-                       machine->ram_size, banksz, "sgi-ip27.ram.nodetag");
+    if (nnodes == 2) {
+      ram0 = g_new(MemoryRegion, 1);
+      memory_region_init_alias(ram0, NULL, "sgi-ip27.ram.node0", ram, 0,
+                               node_ram);
+    }
+    memory_region_add_subregion(system_memory, 0, ram0);
+    ip27_add_ram_banks(system_memory, IP27_UNCAC_BASE, ram0, node_ram, banksz,
+                       "sgi-ip27.ram.uncac");
+    ip27_add_ram_banks(system_memory, IP27_MSPEC_BASE, ram0, node_ram, banksz,
+                       "sgi-ip27.ram.mspec");
+    ip27_add_ram_banks(system_memory, IP27_CAC_BASE, ram0, node_ram, banksz,
+                       "sgi-ip27.ram.cac");
+    ip27_add_ram_banks(system_memory, IP27_HSPEC_BASE, ram0, node_ram, banksz,
+                       "sgi-ip27.ram.hspec");
+    if (nnodes == 2) {
+      ram1 = g_new(MemoryRegion, 1);
+
+      memory_region_init_ram(ram1, NULL, "sgi-ip27.ram.node1", node_ram,
+                             &error_fatal);
+      ip27_add_ram_banks(system_memory, IP27_UNCAC_BASE | (1ULL << 32), ram1,
+                         node_ram, banksz, "sgi-ip27.ram1.uncac");
+      ip27_add_ram_banks(system_memory, IP27_MSPEC_BASE | (1ULL << 32), ram1,
+                         node_ram, banksz, "sgi-ip27.ram1.mspec");
+      ip27_add_ram_banks(system_memory, IP27_CAC_BASE | (1ULL << 32), ram1,
+                         node_ram, banksz, "sgi-ip27.ram1.cac");
+      ip27_add_ram_banks(system_memory, IP27_HSPEC_BASE | (1ULL << 32), ram1,
+                         node_ram, banksz, "sgi-ip27.ram1.hspec");
+    }
+
+    /*
+     * B1: node-tagged physical alias.  On IP27 a physical address carries a
+     * node/brick tag above the local RAM offset (NODE_OFFSET(n) = n << 32 in
+     * M-mode).  The IRIX kernel builds its wired PDA physical address from
+     * fpage (CAC-tagged); by the time it reaches EntryLo it is e.g.
+     * 0x1c0004a4000 -- tag 0x1c<<32 with local offset 0x4a4000, valid node-0
+     * RAM.  In single-node mode every tag k resolves to node 0.  In two-node
+     * mode tag 1 is the real second node and tags 2..MAX still fall through to
+     * node 0 (the kernel's node-0 aliases such as the 0x1c0 PDA tag).
+     *
+     * Reproduce the memory controller's BANK-SLOT layout (bank b at b << 29),
+     * not a flat window: a page in the second DIMM carries tag | 0x20000000
+     * (MD_BANK_SHFT = 29).
+     */
+    for (i = 1; i <= IP27_NODE_TAG_MAX; i++) {
+      MemoryRegion *tag_ram = (nnodes == 2 && i == 1) ? ram1 : ram0;
+      const char *name = (nnodes == 2 && i == 1) ? "sgi-ip27.ram.nodetag1"
+                                                 : "sgi-ip27.ram.nodetag";
+
+      ip27_add_ram_banks(system_memory, (uint64_t)i << 32, tag_ram, node_ram,
+                         banksz, name);
+    }
   }
 
   /*
@@ -929,15 +979,66 @@ static void sgi_ip27_init(MachineState *machine) {
   }
 
 
-  /* Hub ASIC in the node's widget-1 small window. */
-  hub = qdev_new(TYPE_SGI_HUB);
-  qdev_prop_set_uint32(hub, "nasid", 0);
-  qdev_prop_set_uint32(hub, "num-cpus", ncpus);
-  qdev_prop_set_uint64(hub, "mem-config",
-                       sgi_ip27_mem_config(machine->ram_size));
-  sysbus_realize_and_unref(SYS_BUS_DEVICE(hub), &error_fatal);
-  sysbus_mmio_map(SYS_BUS_DEVICE(hub), 0, ip27_swin_phys(0, IP27_HUB_WIDGET));
-  hub_state = SGI_HUB(hub);
+  /*
+   * Hub ASIC in each node's widget-1 small window.  Node 0 runs the CPUs;
+   * node 1 (two-node leg) is a CPU-less memory brick whose PROM does not run,
+   * so its NI identity is seeded here and it is only discovered/configured
+   * through the fabric.
+   */
+  for (i = 0; i < nnodes; i++) {
+    DeviceState *h = qdev_new(TYPE_SGI_HUB);
+
+    qdev_prop_set_uint32(h, "nasid", i);
+    qdev_prop_set_uint32(h, "num-cpus", (i == 0) ? ncpus : 0);
+    qdev_prop_set_uint64(h, "mem-config", sgi_ip27_mem_config(node_ram));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(h), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(h), 0, ip27_swin_phys(i, IP27_HUB_WIDGET));
+    hubs[i] = SGI_HUB(h);
+    if (i == 1) {
+      /*
+       * Node 1's PROM never executes here, so seed the two identity registers
+       * its PROM would have written before the master discovers it:
+       *   NI_SCRATCH_REG0 = the hub NIC (discovery identity/dedup).
+       *   NI_SCRATCH_REG1 = the advertisement.  The peer-completion handshake
+       *   (robust_discover, main.c) reads ADVERT_DISCDONE and
+       *   ADVERT_OBJECTS_MASK; node 1 would have discovered the same 3 objects
+       *   (2 hubs + 1 router), so advertise DISCDONE|3 plus module 1 / node
+       *   slot 1 / PROM version 6.  ADVERT_NASID (same low bits) is irrelevant
+       *   because the NASID is assigned by the master.
+       */
+      hubs[i]->ni_scratch[0] = 0x000000000002ab01ULL;
+      /*
+       * ADVERT_CPUMASK (bits 47:44) = 0xc marks node 1's CPUs unusable, which
+       * is the honest state for a node whose PROM never runs: the PROM's
+       * global barriers and the kernel's CPU start-up then skip it, while its
+       * memory is still configured (a CPU-dead memory brick).
+       */
+      hubs[i]->ni_scratch[1] = 3ULL | (1ULL << 22) | (0xcULL << 44) |
+                               (1ULL << 40) | (1ULL << 56) | (6ULL << 24);
+    }
+  }
+  hub = DEVICE(hubs[0]);
+  hub_state = hubs[0];
+
+  if (nnodes == 2) {
+    /*
+     * One router linking the two hubs (ports 1 and 2).  Registers are reached
+     * only through the hubs' NI vector engine; there is no latency model.
+     */
+    router = g_new0(SGIRouterState, 1);
+    /*
+     * RSRI_CHIPIN (bits 11:8): bit 3 clear means a META router, and a normal
+     * R-brick has it set -- discover_router() sets PCFG_ROUTER_META on
+     * ~CHIPIN & 8, and a meta router makes nasid_assign() reject the topology
+     * ("nodes attached to meta router").  Report chipin 0x8 for a normal
+     * router.
+     */
+    sgi_router_init(router, 0x00000000c0ffee01ULL, 0x8, 2);
+    sgi_router_connect(router, 1, hubs[0]);
+    sgi_router_connect(router, 2, hubs[1]);
+    sgi_hub_set_router(hubs[0], router);
+    sgi_hub_set_router(hubs[1], router);
+  }
 
   /*
    * BaseIO board as XIO widget 0 (Bridge part 0xc002 + IOC3).  The PROM
@@ -1023,10 +1124,10 @@ static void sgi_ip27_init(MachineState *machine) {
     {
       uint64_t period;
       uint64_t store;
-      ip27_bdoor_bank0_size = MIN(machine->ram_size, (uint64_t)0x8000000);
+      ip27_bdoor_bank0_size = MIN(node_ram, (uint64_t)0x8000000);
       period = ip27_bdoor_bank0_size >> 2;
       ip27_bdoor_num_banks =
-          (machine->ram_size + ip27_bdoor_bank0_size - 1) / ip27_bdoor_bank0_size;
+          (node_ram + ip27_bdoor_bank0_size - 1) / ip27_bdoor_bank0_size;
       store = MAX(IP27_BDDIR_STORE, ip27_bdoor_num_banks * period);
       ip27_bdoor_dir = g_malloc0(store);
       ip27_bdecc_dir = g_malloc0(store);
@@ -1036,6 +1137,20 @@ static void sgi_ip27_init(MachineState *machine) {
     memory_region_add_subregion(system_memory,
                                 ip27_phys(IP27_HSPEC_BASE + 0x80000000ULL),
                                 bdoor);
+    if (nnodes == 2) {
+      /*
+       * Node 1's back-door window.  Both nodes have the same DIMM geometry, so
+       * they share the storage arrays (the PROM only sizes/tests each node's
+       * own RAM; the register-level fabric means no cross-node aliasing).
+       */
+      MemoryRegion *bdoor1 = g_new(MemoryRegion, 1);
+
+      memory_region_init_io(bdoor1, NULL, &ip27_bdoor_ops, NULL,
+                            "sgi-ip27.bdoor1", 0x80000000ULL);
+      memory_region_add_subregion(
+          system_memory,
+          ip27_phys(IP27_HSPEC_BASE | (1ULL << 32)) + 0x80000000ULL, bdoor1);
+    }
   }
 
   hub_state = SGI_HUB(hub);
@@ -1071,7 +1186,8 @@ static void sgi_ip27_init(MachineState *machine) {
    * copied in), so it must be writable.
    */
   prom = g_new(MemoryRegion, 1);
-  memory_region_init_ram(prom, NULL, "sgi-ip27.prom", IP27_PROM_SIZE,
+  memory_region_init_ram(prom, NULL, "sgi-ip27.prom",
+                         (nnodes == 2) ? IP27_PROM_SIZE_TWO : IP27_PROM_SIZE,
                          &error_fatal);
   memory_region_add_subregion(system_memory, IP27_PROM_BASE, prom);
 
@@ -1094,6 +1210,27 @@ static void sgi_ip27_init(MachineState *machine) {
     memory_region_add_subregion(system_memory,
                                 ip27_phys(IP27_HSPEC_BASE + 0x30000000ULL),
                                 rboot);
+    if (nnodes == 2) {
+      /*
+       * Node 1's LBOOT/RBOOT windows.  The kernel reads each node's IP27CONFIG
+       * via IP27CONFIG_ADDR_NODE(nasid) = RBOOT(nasid)+0x60 and probes its
+       * LBOOT flash, so alias node 1's windows onto the same synthesized flash.
+       * (Node 1's PROM does not run; the config is common.)
+       */
+      MemoryRegion *l1 = g_new(MemoryRegion, 1);
+      MemoryRegion *r1 = g_new(MemoryRegion, 1);
+
+      memory_region_init_alias(l1, NULL, "sgi-ip27.lboot1", flash, 0,
+                               8 * IP27_FLASH_SIZE);
+      memory_region_add_subregion(
+          system_memory,
+          ip27_phys(IP27_HSPEC_BASE | (1ULL << 32)) + 0x10000000ULL, l1);
+      memory_region_init_alias(r1, NULL, "sgi-ip27.rboot1", flash, 0,
+                               8 * IP27_FLASH_SIZE);
+      memory_region_add_subregion(
+          system_memory,
+          ip27_phys(IP27_HSPEC_BASE | (1ULL << 32)) + 0x30000000ULL, r1);
+    }
   }
 
   /*
