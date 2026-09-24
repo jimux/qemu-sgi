@@ -2,18 +2,14 @@
  * ============================ DIRTY / KNOWN-WRONG ============================
  * DO NOT TRUST THIS FILE AS A CLEAN OCTANE (IP30) REFERENCE.
  *
- * Besides the real "octane" machine, this file also hosts a bogus "sgi-ip55"
- * machine (description "SGI IP54 Paravirtual Workstation") and instantiates
- * IP54 paravirtual devices (SGI_SMP, SGI_PVMEM, SGI_PVNET, SGI_GLACCEL) that do
- * not exist on real Octane hardware. The "sgi-ip55" type is stale and collides
- * with the project's invented IP55/virtuix machine name.
+ * This file instantiates paravirtual devices (SGI_SMP, SGI_PVMEM, SGI_PVNET,
+ * SGI_GLACCEL) left over from an earlier paravirtual machine; they do not
+ * exist on real Octane hardware. Treat that residue as suspect.
+ * Authoritative real-Octane facts live in the wiki / resolved-notes
+ * (platform/ip30-octane).
  *
- * Treat the IP54/paravirtual residue here as suspect, and verify how much of it
- * bleeds into the "octane" machine init vs. the bogus sgi-ip55 one. Authoritative
- * real-Octane facts live in the wiki / resolved-notes (platform/ip30-octane).
- *
- * TODO (separate cleanup, intentionally NOT done here): remove the sgi-ip55
- * type and the IP54 paravirtual residue; keep the octane machine faithful.
+ * TODO (separate cleanup): remove the paravirtual residue; keep the octane
+ * machine faithful.
  * ===========================================================================
  *
  * QEMU SGI Octane (IP30) machine emulation
@@ -284,36 +280,14 @@ static void sgi_octane_class_init(ObjectClass *oc, const void *data) {
     mc->no_cdrom = 1;
 }
 
-static void sgi_ip54_class_init(ObjectClass *oc, const void *data) {
-    MachineClass *mc = MACHINE_CLASS(oc);
-
-    mc->desc = "SGI IP54 Paravirtual Workstation";
-    mc->init = sgi_octane_init;
-    mc->block_default_type = IF_SCSI;
-    mc->default_ram_size = 64 * MiB;
-    mc->default_ram_id = "sgi.ram";
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R10000");
-    mc->default_cpus = 1;
-    mc->max_cpus = 128;
-    mc->no_floppy = 1;
-    mc->no_cdrom = 1;
-}
-
 static const TypeInfo sgi_octane_type = {
     .name = MACHINE_TYPE_NAME("octane"),
     .parent = TYPE_MACHINE,
     .class_init = sgi_octane_class_init,
 };
 
-static const TypeInfo sgi_ip55_type = {
-    .name = MACHINE_TYPE_NAME("sgi-ip55"),
-    .parent = TYPE_MACHINE,
-    .class_init = sgi_ip54_class_init,
-};
-
 static void sgi_octane_machine_init(void) {
     type_register_static(&sgi_octane_type);
-    type_register_static(&sgi_ip55_type);
 }
 
 type_init(sgi_octane_machine_init)

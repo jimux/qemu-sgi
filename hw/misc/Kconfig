@@ -171,9 +171,6 @@ config SGI_MACE_VIDEO
     bool
     select I2C
 
-config SGI_BOOTDISK
-    bool
-
 config SGI_SMP
     bool
 
@@ -194,14 +191,6 @@ config SGI_HEART
 
 config SGI_BRIDGE
     bool
-
-config SGI_PVTIMER
-    bool
-
-config SGI_IOC2_KBD
-    bool
-    select PS2
-    select SGI_HPC3
 
 config RISCV_MIPS_CMGCR
     bool

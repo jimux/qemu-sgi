@@ -162,5 +162,3 @@ config SGI_GBE
 config SGI_GLACCEL
     bool
 
-config SGI_PVREX3
-    bool

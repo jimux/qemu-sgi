@@ -29,7 +29,7 @@
 /*
  * On real R4000-class hardware CP0_Count advances at a fixed hardware rate
  * regardless of how busy the CPU is.  QEMU's QEMU_CLOCK_VIRTUAL is fine for
- * a CPU keeping up with its modeled frequency, but on sgi-ip54 (and any host
+ * a CPU keeping up with its modeled frequency, but on any host
  * where icount sleep=off is needed for UI smoothness) virtual time races
  * ahead of wall time and dilates everything the kernel reads — networking
  * timeouts, lbolt-derived gettimeofday(), animations.

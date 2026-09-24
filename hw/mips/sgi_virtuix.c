@@ -1769,7 +1769,7 @@ static void sgi_virtuix_init(MachineState *machine) {
    * uniprocessor boots remain byte-identical. IPIs are delivered on CP0 IP6
    * (env.irq[6]) -- a hardware interrupt line nothing else drives on the
    * emulated Indy -- avoiding the CP0_Cause cross-thread race that a
-   * software-interrupt bit would reintroduce (an IP54 lesson).
+   * software-interrupt bit would reintroduce (a lesson from a previous effort).
    */
   /*
    * Always instantiate the sgi-smp block, even at -smp 1. The IP55 kernel reads

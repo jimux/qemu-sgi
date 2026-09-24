@@ -1,7 +1,7 @@
 /*
  * SGI Paravirtual Audio Device
  *
- * Simple ring-buffer PCM audio device for the IP30/IP54 machine.
+ * Simple ring-buffer PCM audio device for the paravirtual machines.
  * Guest fills a ring buffer with PCM samples; QEMU drains it via
  * the host audio backend at the configured sample rate.
  *

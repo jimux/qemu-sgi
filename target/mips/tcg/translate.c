@@ -15119,9 +15119,9 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
         ctx->mem_idx = hflags_mmu_index(ctx->hflags);
 #endif
     /*
-     * sgi-ip54 IRIX userland (IRIS malloc, csh, xkbcomp, iaf/scheme) intermittently
+     * IRIX userland (IRIS malloc, csh, xkbcomp, iaf/scheme) intermittently
      * does unaligned lw on heap pointers. On real MIPS-III the kernel's AdEL
-     * handler would emulate the unaligned access; the IP54 emulated kernel
+     * handler would emulate the unaligned access; an emulated kernel without it
      * SIGBUSes which kills login helpers. Default unaligned loads to silently
      * succeed, so userspace survives. Doesn't affect lwl/lwr (explicit unaligned
      * opcodes). MIPS-R6/nanoMIPS native-strict-align ISA keeps MO_ALIGN.
@@ -15130,7 +15130,7 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
      * segfault during compile under MO_UNALN if its front-end relies on
      * AdEL-trap side effects.  Setting QEMU_MIPS_FORCE_ALIGN=1 reverts to
      * the upstream MO_ALIGN default so Indy-machine kernel builds succeed
-     * while sgi-ip54 boots stay on MO_UNALN.
+     * while other boots stay on MO_UNALN.
      */
     {
         static int force_align = -1;

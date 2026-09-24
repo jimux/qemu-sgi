@@ -1,8 +1,8 @@
 /*
  * SGI Paravirtual GL Accelerator — Dumb Framebuffer Mode
  *
- * This device provides a simple DMA-based framebuffer for the IP30/IP54
- * machine. The guest writes pixel data into a physically contiguous
+ * This device provides a simple DMA-based framebuffer for the paravirtual
+ * machines. The guest writes pixel data into a physically contiguous
  * buffer and programs FB_BASE/WIDTH/HEIGHT/FORMAT. The device DMAs
  * the guest framebuffer into the QEMU console surface at 60Hz.
  *

@@ -1,10 +1,9 @@
 /*
  * memwatch - trap guest CPU writes (or reads) to a physical address range and
  * log the writing instruction's PC + the value.  This is the durable
- * replacement for gdb hardware watchpoints, which do not fire on the sgi-ip54
- * build (kernel data lives in MIPS KSEG0/KSEG1 unmapped segments that this
- * QEMU's TCG watchpoint check does not cover).  See
- * progress_notes/ip54/replay_debugging.md.
+ * replacement for gdb hardware watchpoints, which do not fire on IRIX kernel
+ * data (it lives in MIPS KSEG0/KSEG1 unmapped segments that this QEMU's TCG
+ * watchpoint check does not cover).
  *
  * Catches the "wild write" class: e.g. who is clobbering cause_ip5_count.
  * NOTE: it sees GUEST-CPU accesses only (translated instructions).  A write

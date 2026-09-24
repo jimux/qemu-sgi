@@ -1,7 +1,6 @@
 /*
  * SGI O2 (IP32, "Moosehead") — authentic CRIME/MACE/GBE model (disentangled
- * from the IP54 paravirtual machine 2026-09; IP54 now lives in
- * hw/mips/sgi_ip54pv.c, machine "sgi-ip54").
+ * from an earlier paravirtual machine, 2026-09).
  *
  * Uniprocessor (max_cpus=1), UMA SDRAM (1 GB cap, 8 × 128 MB CRIME banks).
  * Real IP32 PROM is loaded via -bios (e.g.
@@ -94,13 +93,13 @@
 /*
  * High-RAM alias base: physical 0x40000000.
  *
- * RAM above 256MB is mapped here as a flat alias so the IP54 PROM and
+ * RAM above 256MB is mapped here as a flat alias so the PROM and
  * IRIX kernel can access it via XKPHYS (>4GB) or TLB (256MB–4GB).
  * PVMEM reports this address as high_base so the PROM passes correct ARCS
  * FreeMemory descriptors to the kernel.
  *
  * Note: the real O2 PROM's SizeMEM() expected CRIME bank mirrors here.
- * IP54 uses PVMEM instead and does not require that mirroring scheme.
+ * Paravirtual machines use PVMEM instead and do not need that mirroring.
  */
 #define O2_HIGH_RAM_BASE 0x40000000ULL
 
@@ -1110,7 +1109,7 @@ static void sgi_o2_init(MachineState *machine) {
   /* CRIME at 0x14000000 */
   crime_dev = qdev_new(TYPE_SGI_CRIME);
   /* CRIME supports at most 8 × 128MB = 1GB. Cap here to avoid uint32
-   * overflow when IP54 is configured with >1GB. PVMEM handles the rest. */
+   * overflow when configured with >1GB. PVMEM handles the rest. */
   {
     uint64_t crime_ram = MIN(machine->ram_size, (uint64_t)(8 * 128 * MiB));
     qdev_prop_set_uint32(crime_dev, "ram-size", (uint32_t)crime_ram);

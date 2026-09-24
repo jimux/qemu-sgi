@@ -131,7 +131,6 @@ config SGI_O2
     select SGI_VICE
     select SGI_MACE_VIDEO
     select SGI_AIC7880
-    select SGI_BOOTDISK
     select SERIAL_MM
     select UNIMP
     select SGI_PVMEM
@@ -146,7 +145,6 @@ config SGI_OCTANE
     select SGI_HEART
     select SGI_BRIDGE
     select SGI_GBE
-    select SGI_BOOTDISK
     select SGI_ARCS
     select SERIAL_MM
     select UNIMP
@@ -156,18 +154,3 @@ config SGI_OCTANE
     select SGI_GLACCEL
     select SGI_PVAUDIO
 
-config SGI_IP54PV
-    bool
-    default y
-    depends on MIPS64 && TCG
-    select SGI_PVTIMER
-    select SGI_PVUART
-    select SGI_BOOTDISK
-    select SGI_SMP
-    select SGI_PVMEM
-    select SGI_PVNET
-    select SGI_GLACCEL
-    select SGI_PVAUDIO
-    select SGI_PVREX3
-    select SGI_IOC2_KBD
-    select UNIMP
