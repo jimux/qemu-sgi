@@ -3017,12 +3017,16 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
          * menu (or any other mode-3 draw) lands in it. */
         s->overlay = g_new0(uint8_t,
                             (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
-        /* GE7 Z-buffer.  Allocated up front and cleared to "far" (0x7f7f7f7f
-         * ~ +3.4e38) so the first frame draws. */
-        s->ge_zbuf = g_new(float,
-                           (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
-        memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
-               SGI_GR2_SCREEN_H * sizeof(float));
+        /* GE7 Z-buffer, allocated only when this board variant has one: the
+         * shipped XS-24 runs with zbuffer=off, and its raster must then run in
+         * painter order (see sgi_gr2_ge7_zpass) rather than depth-tested.
+         * Cleared to "far" (0x7f7f7f7f ~ +3.4e38) so the first frame draws. */
+        if (s->zbuffer) {
+            s->ge_zbuf = g_new(float,
+                               (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+            memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+                   SGI_GR2_SCREEN_H * sizeof(float));
+        }
         s->con = graphic_console_init(dev, 0, &sgi_gr2_gfx_ops, s);
         qemu_console_resize(s->con, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
     }
