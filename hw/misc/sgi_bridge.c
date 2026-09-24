@@ -461,6 +461,8 @@ static void sgi_bridge_eth_irq_update(SGIBRIDGEState *s)
  * TX ISR wakes the output queue -- so without this the first kernel printf
  * after the console switches to interrupt-driven output stalls every thread.
  */
+static bool sgi_bridge_sio_async(void);
+
 static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
 {
     uint32_t pending = s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] & s->ioc3_sio_ienb;
@@ -488,7 +490,7 @@ static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
      * then the guest's polled path is what it actually uses.  Set
      * SGIBRIDGE_SIO_IRQ=1 to deliver it anyway (investigation only).
      */
-    if (!getenv("SGIBRIDGE_SIO_IRQ")) {
+    if (!getenv("SGIBRIDGE_SIO_IRQ") && !sgi_bridge_sio_async()) {
         pending &= ~(IOC3_SIO_IR_SA_TX_MT | IOC3_SIO_IR_SA_TX_EXPLICIT |
                      IOC3_SIO_IR_SB_TX_MT | IOC3_SIO_IR_SB_TX_EXPLICIT);
     }
@@ -513,8 +515,73 @@ static void sgi_bridge_ioc3_sio_irq_update(SGIBRIDGEState *s)
     }
 }
 
+static bool sgi_bridge_sio_async(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("SGIBRIDGE_SIO_ASYNC") != NULL;
+    }
+    return v;
+}
+
+/* Console per-byte time at the configured console baud (9600). */
+#define SIO_TX_BYTE_NS (1000000000ULL / 9600)
+
+static void sgi_bridge_ioc3_sio_tx_tick(void *opaque)
+{
+    SGIBRIDGEState *s = opaque;
+    int port = s->sio_tx_port;
+    uint32_t stpir_off = port ? IOC3_PORT_B_STPIR_OFF : IOC3_PORT_A_STPIR_OFF;
+    uint32_t stcir_off = port ? IOC3_PORT_B_STCIR_OFF : IOC3_PORT_A_STCIR_OFF;
+    uint32_t sscr_off = port ? IOC3_PORT_B_SSCR_OFF : IOC3_PORT_A_SSCR_OFF;
+    uint32_t prod = s->ioc3_regs[IOC3_IDX(stpir_off)] & IOC3_SIO_RING_MASK;
+    uint32_t cons = s->ioc3_regs[IOC3_IDX(stcir_off)] & IOC3_SIO_RING_MASK;
+    uint64_t base = ioc3_sio_ring_phys(s->ioc3_regs[IOC3_IDX(IOC3_SBBR_H_OFF)],
+                                       s->ioc3_regs[IOC3_IDX(IOC3_SBBR_L_OFF)]);
+
+    if (port) {
+        base += IOC3_SIO_PORT_B_RING;
+    }
+    if (cons != prod) {
+        uint8_t entry[8];
+        int x;
+
+        if (dma_memory_read(&address_space_memory, base + cons, entry,
+                            sizeof(entry), MEMTXATTRS_UNSPECIFIED) == MEMTX_OK) {
+            for (x = 0; x < 4; x++) {
+                if (entry[4 + x] & IOC3_TXCB_VALID) {
+                    serial_io_ops.write(&s->ioc3_uart, 0, entry[x], 1);
+                }
+            }
+            cons = (cons + sizeof(entry)) & IOC3_SIO_RING_MASK;
+            s->ioc3_regs[IOC3_IDX(stcir_off)] = cons;
+        } else {
+            prod = cons; /* give up on the entry */
+        }
+    }
+    if (cons == prod) {
+        /* Real idle transition: latch TX-empty, disable DMA, deliver TX irq. */
+        s->ioc3_regs[IOC3_IDX(sscr_off)] &= ~IOC3_SSCR_DMA_EN;
+        s->ioc3_regs[IOC3_IDX(IOC3_SIO_IR_OFF)] |=
+            port ? IOC3_SIO_IR_SB_TX_MT : IOC3_SIO_IR_SA_TX_MT;
+        sgi_bridge_ioc3_sio_irq_update(s);
+        return;
+    }
+    timer_mod(s->sio_tx_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SIO_TX_BYTE_NS);
+}
+
 static void sgi_bridge_ioc3_sio_tx_drain(SGIBRIDGEState *s, int port)
 {
+    if (sgi_bridge_sio_async()) {
+        s->sio_tx_port = port;
+        if (!timer_pending(s->sio_tx_timer)) {
+            timer_mod(s->sio_tx_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SIO_TX_BYTE_NS);
+        }
+        return;
+    }
+
     uint32_t stpir_off = port ? IOC3_PORT_B_STPIR_OFF : IOC3_PORT_A_STPIR_OFF;
     uint32_t stcir_off = port ? IOC3_PORT_B_STCIR_OFF : IOC3_PORT_A_STCIR_OFF;
     uint32_t prod = s->ioc3_regs[IOC3_IDX(stpir_off)] & IOC3_SIO_RING_MASK;
@@ -2110,6 +2177,11 @@ static void sgi_bridge_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &sgi_bridge_ops, s,
                           "sgi-bridge", BRIDGE_REG_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+
+    /* Faithful async console TX drain timer (SGIBRIDGE_SIO_ASYNC). */
+    s->sio_tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   sgi_bridge_ioc3_sio_tx_tick, s);
+    s->sio_tx_port = 0;
 
     /*
      * IOC3 UART A (serial console).

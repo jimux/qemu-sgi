@@ -146,6 +146,9 @@ struct SGIBRIDGEState {
      * the bvec is raised/relaxed on transitions.
      */
     uint32_t ioc3_sio_ienb;
+    /* Faithful async TX drain (SGIBRIDGE_SIO_ASYNC): one ring entry/tick. */
+    QEMUTimer *sio_tx_timer;
+    int sio_tx_port;
     int ioc3_sio_irq_level;
 
     /*
