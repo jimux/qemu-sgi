@@ -1445,6 +1445,30 @@ static void sgi_ip6_pit_tick0(void *opaque)
     }
 }
 
+/*
+ * Channel 1 output: the "kilogram" clock.  MAME's ip6.cpp wires PIT
+ * out_handler<1> to CPU IRQ4, which on this board is QEMU irq[6]
+ * (Cause bit 14) and is acknowledged by the 0x1fa00000 timer1 register.
+ */
+static void sgi_ip6_pit_tick1(void *opaque)
+{
+    SGIip6State *s = opaque;
+
+    if (sgi_ip6_pit_dbg()) {
+        sgi_ip6_pit_log(
+                "IP6PIT tick1 t=%lld pc=%08x rl1=%u mode1=%u in_freq=%u\n",
+                (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                sgi_ip6_pit_pc(s), s->pit_reload[1], s->pit_mode[1],
+                s->pit_in_freq);
+    }
+    if (s->cpu) {
+        qemu_set_irq(s->cpu->env.irq[6], 1);
+    }
+    if (s->pit_mode[1] == 2 || s->pit_mode[1] == 3) {
+        sgi_ip6_pit_rearm(s, 1);
+    }
+}
+
 static int sgi_ip6_pit_dbg(void)
 {
     static int v = -1;
@@ -2282,7 +2306,7 @@ static void sgi_ip6_init(MachineState *machine)
      */
     s->pit_in_freq = SGI_IP6_PIT_XTAL / 0x10000;
     s->pit_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_ip6_pit_tick0, s);
-    s->pit_timer[1] = NULL;
+    s->pit_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL, sgi_ip6_pit_tick1, s);
     memory_region_init_io(&s->pit_reg, OBJECT(machine), &sgi_ip6_pit_ops, s,
                           "sgi-ip6-pit", 0x10);
     memory_region_add_subregion(system_memory, SGI_IP6_PIT_BASE, &s->pit_reg);
