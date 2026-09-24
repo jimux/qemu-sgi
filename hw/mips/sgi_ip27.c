@@ -773,6 +773,14 @@ static void sgi_ip27_init(MachineState *machine) {
   SGIRouterState *router = NULL;
   SGIHubState *hubs[2] = { NULL, NULL };
   MemoryRegion *ram1 = NULL;
+  /*
+   * The module's ELSC (entry-level system controller).  Its I2C NVRAM holds
+   * the module number the PROM reads over the hub's PCF8584 (libkl/io/elsc.c,
+   * ml/i2c.c); one ELSC serves a whole module, so both node boards point at
+   * it.  Number 1 is the first module (module 0 means "not yet assigned", and
+   * router_search_pcfg() only accepts a module > 0).
+   */
+  SGIElscState *elsc = g_new0(SGIElscState, 1);
 
   if (getenv("IP27_NODES")) {
     nnodes = atoi(getenv("IP27_NODES"));
@@ -783,6 +791,8 @@ static void sgi_ip27_init(MachineState *machine) {
   if (nnodes > 2) {
     nnodes = 2;
   }
+
+  sgi_elsc_init(elsc, 1, 0);
   if (nnodes == 2) {
     node_ram = machine->ram_size / 2;
   }
@@ -994,6 +1004,7 @@ static void sgi_ip27_init(MachineState *machine) {
     sysbus_realize_and_unref(SYS_BUS_DEVICE(h), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(h), 0, ip27_swin_phys(i, IP27_HUB_WIDGET));
     hubs[i] = SGI_HUB(h);
+    sgi_hub_set_elsc(hubs[i], elsc);
     if (i == 1) {
       /*
        * Node 1's PROM never executes here, so seed the two identity registers

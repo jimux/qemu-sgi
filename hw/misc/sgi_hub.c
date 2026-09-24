@@ -94,6 +94,34 @@ static void sgi_hub_reset_bh(void *opaque);
 #define MD_UREG1_0 0x220080
 #define MD_UREG1_15 0x2200f8
 
+/*
+ * PCF8584 I2C bus controller (libkl/ml/i2c.c).  A0 (data register, S0) is at
+ * KL_I2C_REG = MD_UREG0_0; A1 (control/status, S1) is at MD_UREG0_0 + 8.
+ */
+#define I2C_A0_OFF 0x220000
+#define I2C_A1_OFF 0x220008
+
+/* Control register write-only bits. */
+#define I2C_CTL_PIN 0x80
+#define I2C_CTL_ESO 0x40
+#define I2C_CTL_ES1 0x20
+#define I2C_CTL_ES2 0x10
+#define I2C_CTL_STA 0x04
+#define I2C_CTL_STO 0x02
+#define I2C_CTL_ACK 0x01
+
+/* Status register read-only bits. */
+#define I2C_STA_PIN 0x80
+#define I2C_STA_BER 0x10
+#define I2C_STA_LRB 0x08 /* last received (ACK) bit */
+#define I2C_STA_AAS 0x04
+#define I2C_STA_LAB 0x02
+#define I2C_STA_BNB 0x01
+
+/* ELSC NVRAM slave addresses (I2C_ADDR_RAM | page) and the arb address. */
+#define I2C_ADDR_RAM 0x50
+#define I2C_ARB_ADDR 0x70
+
 /* --- Hub NI (network interface) offsets --- */
 #define NI_STATUS_REV_ID 0x600000
 #define NI_PORT_RESET 0x600008
@@ -767,7 +795,186 @@ static void sgi_hub_mlan_write(SGIHubState *s, uint64_t val) {
   }
 }
 
+/* ---- PCF8584 I2C controller + ELSC NVRAM (libkl/ml/i2c.c, elsc.c) ---- */
+
+/* Does this hub port an ELSC NVRAM page?  The supervisor EEPROM answers at
+ * I2C_ADDR_RAM..I2C_ADDR_RAM+7 (pages 0..7); everything else NAKs. */
+static int sgi_hub_i2c_slave_present(const SGIHubState *s) {
+  return s->elsc && s->i2c_slave >= I2C_ADDR_RAM &&
+         s->i2c_slave <= (I2C_ADDR_RAM + 7);
+}
+
+/*
+ * The ELSC is the I2C super-master: rather than one master owning the bus it
+ * writes a token (I2C_ARB_ADDR * 2 + I2C_CPU_CODE, optionally + the message
+ * indication bit) into every PCF8584's data register to hand out a time slice.
+ * i2c_arb() first waits for the token to drop, then for one to appear and be
+ * held for I2C_SIGNAL_TIME (250 us).  Present it for 1 ms in every 2 ms so both
+ * edges are observable; the local master is slot n1 / CPU 0, so cpu_code is 0.
+ */
+static uint8_t sgi_hub_i2c_sig(void) { return (uint8_t)(I2C_ARB_ADDR * 2); }
+
+static uint64_t sgi_hub_i2c_token(void) {
+  uint64_t t_us = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) / 1000;
+
+  return ((t_us % 2000) < 1000) ? (uint64_t)sgi_hub_i2c_sig() : 0;
+}
+
+static bool sgi_hub_i2c_trace(void) {
+  static int enabled = -1;
+
+  if (enabled < 0) {
+    enabled = getenv("IP27_I2C_TRACE") ? 1 : 0;
+  }
+  return enabled;
+}
+
+/* Latch a slave address/direction byte (S0) as the transaction address. */
+static void sgi_hub_i2c_address(SGIHubState *s, uint8_t v) {
+  s->i2c_slave = (v >> 1) & 0x7f;
+  s->i2c_rw = v & 1;
+  s->i2c_phase = 0;
+  s->i2c_rx_count = 0;
+  s->i2c_active = 1;
+  if (sgi_hub_i2c_trace()) {
+    fprintf(stderr, "sgi-hub i2c addr n%d: slave=0x%02x rw=%d (byte 0x%02x)\n",
+            s->nasid, s->i2c_slave, s->i2c_rw, v);
+  }
+}
+
+static uint64_t sgi_hub_i2c_a0_read(SGIHubState *s) {
+  uint64_t ret;
+
+  if (s->i2c_ctl & I2C_CTL_ESO) {
+    /* Data register (S0). */
+    if (s->i2c_active && s->i2c_rw) {
+      if (s->i2c_rx_count == 0) {
+        /* The slave address byte is read (and discarded) first. */
+        s->i2c_rx_count = 1;
+        ret = (uint8_t)((s->i2c_slave << 1) | 1);
+      } else if (sgi_hub_i2c_slave_present(s)) {
+        ret = s->elsc->nvram[s->i2c_memaddr];
+        if (sgi_hub_i2c_trace() && s->i2c_rx_count <= 1) {
+          fprintf(stderr, "sgi-elsc n%d read 0x%03x = 0x%02x\n", s->nasid,
+                  s->i2c_memaddr, (unsigned)ret);
+        }
+        s->i2c_memaddr = (s->i2c_memaddr + 1) & (SGI_ELSC_NVRAM_SIZE - 1);
+        s->i2c_rx_count++;
+      } else {
+        ret = 0xff;
+      }
+    } else {
+      /* Idle: the super-master's token lives in the data register. */
+      ret = sgi_hub_i2c_token();
+    }
+  } else if (s->i2c_ctl & I2C_CTL_ES1) {
+    ret = s->i2c_clock;
+  } else if (s->i2c_ctl & I2C_CTL_ES2) {
+    ret = 0; /* interrupt vector, unused */
+  } else {
+    ret = s->i2c_own;
+  }
+
+  return ret;
+}
+
+static void sgi_hub_i2c_a0_write(SGIHubState *s, uint8_t v) {
+  if (s->i2c_ctl & I2C_CTL_ESO) {
+    /* Data register (S0).  The driver echoes the super-master's token into S0
+     * (and reads it back) before every address/data byte; the token is never a
+     * real payload byte here, so drop it and keep waiting for the real one. */
+    s->i2c_data = v;
+    if (v == sgi_hub_i2c_sig()) {
+      return;
+    }
+    if (!s->i2c_active) {
+      /* Before the start the driver writes the arbitration token and then the
+       * real address; the PCF8584 transmits only the last byte written, so
+       * remember it and turn it into the address when the start arrives. */
+      s->i2c_have_addr = 1;
+    } else if (s->i2c_need_addr) {
+      /* A repeated start was issued; this byte is the new address. */
+      s->i2c_need_addr = 0;
+      sgi_hub_i2c_address(s, v);
+    } else if (s->i2c_rw == 0) {
+      if (s->i2c_phase == 0) {
+        /* Master transmit: first byte after the address is the NVRAM offset. */
+        s->i2c_memaddr =
+            (((s->i2c_slave & 7) << 8) | v) & (SGI_ELSC_NVRAM_SIZE - 1);
+        s->i2c_phase = 1;
+        if (sgi_hub_i2c_trace()) {
+          fprintf(stderr, "sgi-elsc n%d offset 0x%03x\n", s->nasid,
+                  s->i2c_memaddr);
+        }
+      } else if (sgi_hub_i2c_slave_present(s)) {
+        if (sgi_hub_i2c_trace()) {
+          fprintf(stderr, "sgi-elsc n%d write 0x%03x = 0x%02x\n", s->nasid,
+                  s->i2c_memaddr, v);
+        }
+        s->elsc->nvram[s->i2c_memaddr] = v;
+        s->i2c_memaddr = (s->i2c_memaddr + 1) & (SGI_ELSC_NVRAM_SIZE - 1);
+      }
+    }
+  } else if (s->i2c_ctl & I2C_CTL_ES1) {
+    s->i2c_clock = v;
+  } else if (s->i2c_ctl & I2C_CTL_ES2) {
+    /* interrupt vector, unused */
+  } else {
+    s->i2c_own = v;
+  }
+}
+
+static uint64_t sgi_hub_i2c_a1_read(SGIHubState *s) {
+  /* Bus free, no error/arbitration-loss/addressed-as-slave; operations
+   * complete instantly so PIN is never pending.  A transaction to a slave
+   * that does not answer NAKs (LRB set) so the driver bails immediately. */
+  uint64_t status = I2C_STA_BNB;
+
+  if (s->i2c_active && !sgi_hub_i2c_slave_present(s)) {
+    status |= I2C_STA_LRB;
+  }
+  return status;
+}
+
+static void sgi_hub_i2c_a1_write(SGIHubState *s, uint8_t v) {
+  if (sgi_hub_i2c_trace()) {
+    fprintf(stderr, "sgi-hub i2c A1w n%d: ctl=0x%02x\n", s->nasid, v);
+  }
+  s->i2c_ctl = v;
+  if (v & I2C_CTL_STA) {
+    if (s->i2c_active) {
+      /* A repeated start: the address byte follows the start. */
+      s->i2c_need_addr = 1;
+    } else if (s->i2c_have_addr) {
+      /* The address was written before its start (last byte wins). */
+      sgi_hub_i2c_address(s, s->i2c_data);
+      s->i2c_have_addr = 0;
+    }
+  }
+  if (v & I2C_CTL_STO) {
+    s->i2c_active = 0;
+    s->i2c_rw = 0;
+    s->i2c_have_addr = 0;
+    s->i2c_need_addr = 0;
+  }
+}
+
+void sgi_elsc_init(SGIElscState *e, uint8_t module, uint8_t partition) {
+  memset(e->nvram, 0, sizeof(e->nvram));
+  e->nvram[SGI_ELSC_MAGIC_AD] = SGI_ELSC_MAGIC_NO;
+  e->nvram[SGI_ELSC_MODULE_AD] = module;
+  e->nvram[SGI_ELSC_PARTITION_AD] = partition;
+}
+
+void sgi_hub_set_elsc(SGIHubState *s, SGIElscState *e) { s->elsc = e; }
+
 static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
+  if (off == I2C_A0_OFF) {
+    return sgi_hub_i2c_a0_read(s);
+  }
+  if (off == I2C_A1_OFF) {
+    return sgi_hub_i2c_a1_read(s);
+  }
   if (off == MD_MEMORY_CONFIG) {
     return s->mem_config;
   }
@@ -819,6 +1026,14 @@ static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
 
 static void sgi_hub_md_write(SGIHubState *s, hwaddr off, uint64_t val,
                              unsigned size) {
+  if (off == I2C_A0_OFF) {
+    sgi_hub_i2c_a0_write(s, val & 0xff);
+    return;
+  }
+  if (off == I2C_A1_OFF) {
+    sgi_hub_i2c_a1_write(s, val & 0xff);
+    return;
+  }
   if (off == MD_MEMORY_CONFIG) {
     s->mem_config = val;
     return;
@@ -1174,6 +1389,9 @@ static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
     s->ni_scratch[0] = val;
     break;
   case NI_SCRATCH_REG1:
+    if (sgi_hub_i2c_trace()) {
+      fprintf(stderr, "sgi-hub n%d SR1 = 0x%" PRIx64 "\n", s->nasid, val);
+    }
     s->ni_scratch[1] = val;
     break;
   case NI_VECTOR:
@@ -1416,6 +1634,20 @@ static void sgi_hub_reset(DeviceState *dev) {
    * SLOTNUM_NODE_CLASS|1).
    */
   s->slotid_ustat = 0x10 | 0x7;
+
+  /* PCF8584 I2C controller: powered up idle (no transaction, no own address). */
+  s->i2c_ctl = 0;
+  s->i2c_own = 0;
+  s->i2c_clock = 0;
+  s->i2c_data = 0;
+  s->i2c_have_addr = 0;
+  s->i2c_need_addr = 0;
+  s->i2c_active = 0;
+  s->i2c_rw = 0;
+  s->i2c_slave = 0;
+  s->i2c_phase = 0;
+  s->i2c_memaddr = 0;
+  s->i2c_rx_count = 0;
 
   /* II: hub widget id, working XIO link, all widgets accessible. */
   s->ii_wcr = HUB_XIO_WIDGET_ID;

@@ -150,7 +150,53 @@ struct SGIHubState {
   /* NI routing tables written by distribute_tables(): 32 meta + 16 local. */
   uint64_t ni_meta_table[32];
   uint64_t ni_local_table[16];
+
+  /*
+   * PCF8584 I2C bus controller at MD_UREG0_0 (A0, data) and MD_UREG0_0+8
+   * (A1, control/status).  The hub drives the module's I2C bus, on which the
+   * ELSC (entry-level system controller) sits; the PROM reads its module
+   * number and partition out of the ELSC's NVRAM through this chip.  `elsc`
+   * points at the module-owned NVRAM (NULL before the machine wires it).
+   */
+  struct SGIElscState *elsc;
+  uint8_t i2c_ctl;       /* last control byte written to A1 */
+  uint8_t i2c_own;       /* own-address register (S0') */
+  uint8_t i2c_clock;     /* clock-control register (S2) */
+  uint8_t i2c_data;      /* last byte written to the data register (S0) */
+  int i2c_have_addr;     /* a pre-start data write is waiting to be the address */
+  int i2c_need_addr;     /* a repeated start was issued: next A0 write is addr */
+  int i2c_active;        /* a start condition has begun a transaction */
+  int i2c_rw;            /* 0 = master transmit, 1 = master receive */
+  int i2c_slave;         /* latched 7-bit slave address */
+  int i2c_phase;         /* transmit: 0 = memory offset, 1 = data stream */
+  uint16_t i2c_memaddr;  /* 11-bit ELSC NVRAM address */
+  int i2c_rx_count;      /* bytes returned since the read address phase */
 };
+
+/*
+ * ELSC NVRAM (the module's system controller).  The PROM reads it over I2C
+ * (libkl/io/elsc.c): a 2 KB serial EEPROM addressed in pages of 256 bytes,
+ * where page 7 (NVRAM address 0x700..0x70f) holds the magic, module number,
+ * partition and DIP-switch bytes.  One ELSC serves a whole module (its two
+ * node boards share it), so the machine owns this and both hubs point at it.
+ */
+#define SGI_ELSC_NVRAM_SIZE 2048
+#define SGI_ELSC_MAGIC_AD 0x700
+#define SGI_ELSC_MAGIC_NO 0x37
+/* The RUNNER ip27prom.img reads the module number at NVRAM 0x70a (observed:
+ * the SR1 ADVERT_MODULE field tracks the byte at 0x70a, not 0x708).  The
+ * partition sits at 0x708 in that build. */
+#define SGI_ELSC_MODULE_AD 0x70a
+#define SGI_ELSC_PARTITION_AD 0x708
+
+typedef struct SGIElscState {
+  uint8_t nvram[SGI_ELSC_NVRAM_SIZE];
+} SGIElscState;
+
+/* Seed the ELSC NVRAM with a magic number, module number and partition. */
+void sgi_elsc_init(SGIElscState *e, uint8_t module, uint8_t partition);
+/* Attach the module's ELSC to a hub's I2C controller. */
+void sgi_hub_set_elsc(SGIHubState *s, SGIElscState *e);
 
 /*
  * SN0 router (the R-brick crossbar linking hubs).  Only the register file and
