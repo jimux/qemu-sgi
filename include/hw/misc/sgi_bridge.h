@@ -199,6 +199,14 @@ struct SGIBRIDGEState {
      */
     uint8_t rtc_xram[128];
     uint8_t rtc_xram_addr;
+    /*
+     * DS1687 bank select: RTC_CTRL_A (0x0a) bit 4 (RTC_SELECT_BANK_1) OR bit 7
+     * of the register index selects bank 1.  Bank 0 holds the clock and the
+     * user RAM the kernel checksums (0x0e..0x7f); bank 1 holds the century
+     * (reg 0x48) and the X_RAM ports (0x50/0x53).
+     */
+    uint8_t rtc_bank;
+    uint8_t rtc_bank1[64];
     char *nvram_file;
 
     /*

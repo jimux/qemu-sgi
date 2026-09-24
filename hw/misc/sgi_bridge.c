@@ -1130,41 +1130,55 @@ static void sgi_bridge_rtc_rebase(SGIBRIDGEState *s, int sec, int min, int hour,
  * sio_regs plus the bank-1 extended RAM) and checksums it, so both are
  * file-backed when a path is set, mirroring the Indy NVRAM file.
  */
+/* Persisted image: bank-0 RAM, bank-1 regs, X_RAM, then the two bank ports. */
 static void sgi_bridge_nvram_load(SGIBRIDGEState *s)
 {
     gchar *data = NULL;
     gsize len = 0;
-    size_t base = sizeof(s->sio_regs);
+    const uint8_t *p;
+    size_t expected = sizeof(s->sio_regs) + sizeof(s->rtc_bank1) +
+                      sizeof(s->rtc_xram) + 2;
 
-    if (s->nvram_file &&
-        g_file_get_contents(s->nvram_file, &data, &len, NULL) && len > 0) {
-        memcpy(s->sio_regs, data, MIN(len, base));
-        if (len > base) {
-            memcpy(s->rtc_xram, data + base,
-                   MIN(len - base, sizeof(s->rtc_xram)));
-        }
+    if (!s->nvram_file ||
+        !g_file_get_contents(s->nvram_file, &data, &len, NULL) ||
+        len != expected) {
+        g_free(data);
+        return;
     }
+    p = (const uint8_t *)data;
+    memcpy(s->sio_regs, p, sizeof(s->sio_regs));    p += sizeof(s->sio_regs);
+    memcpy(s->rtc_bank1, p, sizeof(s->rtc_bank1));  p += sizeof(s->rtc_bank1);
+    memcpy(s->rtc_xram, p, sizeof(s->rtc_xram));    p += sizeof(s->rtc_xram);
+    s->rtc_bank = *p++;
+    s->rtc_xram_addr = *p++;
     g_free(data);
 }
 
 static void sgi_bridge_nvram_save(SGIBRIDGEState *s)
 {
-    uint8_t buf[sizeof(s->sio_regs) + sizeof(s->rtc_xram)];
+    uint8_t buf[sizeof(s->sio_regs) + sizeof(s->rtc_bank1) +
+                sizeof(s->rtc_xram) + 2];
+    uint8_t *p = buf;
 
     if (!s->nvram_file) {
         return;
     }
-    memcpy(buf, s->sio_regs, sizeof(s->sio_regs));
-    memcpy(buf + sizeof(s->sio_regs), s->rtc_xram, sizeof(s->rtc_xram));
+    memcpy(p, s->sio_regs, sizeof(s->sio_regs));    p += sizeof(s->sio_regs);
+    memcpy(p, s->rtc_bank1, sizeof(s->rtc_bank1));  p += sizeof(s->rtc_bank1);
+    memcpy(p, s->rtc_xram, sizeof(s->rtc_xram));    p += sizeof(s->rtc_xram);
+    *p++ = s->rtc_bank;
+    *p++ = s->rtc_xram_addr;
     g_file_set_contents(s->nvram_file, (const gchar *)buf, sizeof(buf), NULL);
 }
 
 static uint64_t sgi_bridge_rtc_read(SGIBRIDGEState *s, unsigned idx)
 {
     int sec, min, hour, wday, mday, mon, year;
+    unsigned reg = idx & 0x7f;
+    bool bank1 = s->rtc_bank || (idx & 0x80);
     uint64_t v;
 
-    switch (idx) {
+    switch (reg) {
     case RTC_SEC_OFF:
     case RTC_MIN_OFF:
     case RTC_HOUR_OFF:
@@ -1172,35 +1186,45 @@ static uint64_t sgi_bridge_rtc_read(SGIBRIDGEState *s, unsigned idx)
     case RTC_WDAY_OFF:
     case RTC_MDAY_OFF:
     case RTC_YEAR_OFF:
-    case RTC_CENT_OFF:
+        /* The clock registers 0x00..0x0d are shared across both banks. */
         sgi_bridge_rtc_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
-        switch (idx) {
+        switch (reg) {
         case RTC_SEC_OFF:  v = sgi_bridge_bcd_enc(sec); break;
         case RTC_MIN_OFF:  v = sgi_bridge_bcd_enc(min); break;
         case RTC_HOUR_OFF: v = sgi_bridge_bcd_enc(hour); break;
         case RTC_MON_OFF:  v = sgi_bridge_bcd_enc(mon); break;
         case RTC_WDAY_OFF: v = sgi_bridge_bcd_enc(wday); break;
         case RTC_MDAY_OFF: v = sgi_bridge_bcd_enc(mday); break;
-        case RTC_YEAR_OFF: v = sgi_bridge_bcd_enc(year % 100); break;
-        default:           v = sgi_bridge_bcd_enc(year / 100); break;
+        default:           v = sgi_bridge_bcd_enc(year % 100); break;
         }
         break;
+    case RTC_CTLD_OFF:
+        v = bank1 ? s->sio_regs[reg] : 0x80;  /* bank 0: VRT set */
+        break;
+    case RTC_CENT_OFF:
+        if (!bank1) {
+            v = s->sio_regs[reg];     /* bank 0: plain user RAM */
+            break;
+        }
+        sgi_bridge_rtc_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
+        v = sgi_bridge_bcd_enc(year / 100);
+        break;
     case RTC_XRAM_ADDR:
-        v = s->rtc_xram_addr;
+        v = bank1 ? s->rtc_xram_addr : s->sio_regs[reg];
         break;
     case RTC_XRAM_DATA:
-        v = s->rtc_xram[s->rtc_xram_addr & 0x7f];
-        break;
-    case RTC_CTLD_OFF:
-        v = 0x80;                 /* VRT: battery valid, clock running */
+        v = bank1 ? s->rtc_xram[s->rtc_xram_addr & 0x7f] : s->sio_regs[reg];
         break;
     default:
-        v = s->sio_regs[idx];
+        /* Registers 0x00..0x3f are shared between banks; only 0x40..0x7f
+         * are bank-1-only extended registers (RTC_IS_SHARED_REG). */
+        v = (bank1 && reg >= 0x40) ? s->rtc_bank1[reg - 0x40]
+                                   : s->sio_regs[reg];
         break;
     }
     if (sgi_bridge_rtc_dbg()) {
-        fprintf(stderr, "BRIDGE-RTC: R idx=0x%02x -> 0x%02" PRIx64 "\n",
-                idx, v);
+        fprintf(stderr, "BRIDGE-RTC: R idx=0x%02x bank=%d -> 0x%02" PRIx64 "\n",
+                idx, bank1, v);
     }
     return v;
 }
@@ -1208,11 +1232,14 @@ static uint64_t sgi_bridge_rtc_read(SGIBRIDGEState *s, unsigned idx)
 static void sgi_bridge_rtc_write(SGIBRIDGEState *s, unsigned idx, uint8_t val)
 {
     int sec, min, hour, wday, mday, mon, year;
+    unsigned reg = idx & 0x7f;
+    bool bank1 = s->rtc_bank || (idx & 0x80);
 
     if (sgi_bridge_rtc_dbg()) {
-        fprintf(stderr, "BRIDGE-RTC: W idx=0x%02x val=0x%02x\n", idx, val);
+        fprintf(stderr, "BRIDGE-RTC: W idx=0x%02x bank=%d val=0x%02x\n",
+                idx, bank1, val);
     }
-    switch (idx) {
+    switch (reg) {
     case RTC_SEC_OFF:
     case RTC_MIN_OFF:
     case RTC_HOUR_OFF:
@@ -1220,9 +1247,8 @@ static void sgi_bridge_rtc_write(SGIBRIDGEState *s, unsigned idx, uint8_t val)
     case RTC_WDAY_OFF:
     case RTC_MDAY_OFF:
     case RTC_YEAR_OFF:
-    case RTC_CENT_OFF:
         sgi_bridge_rtc_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
-        switch (idx) {
+        switch (reg) {
         case RTC_SEC_OFF:
             sec = sgi_bridge_bcd_dec(val);
             break;
@@ -1253,23 +1279,51 @@ static void sgi_bridge_rtc_write(SGIBRIDGEState *s, unsigned idx, uint8_t val)
         case RTC_YEAR_OFF:
             year = (year / 100) * 100 + sgi_bridge_bcd_dec(val);
             break;
-        default: /* RTC_CENT_OFF */
-            year = sgi_bridge_bcd_dec(val) * 100 + (year % 100);
-            break;
         }
         sgi_bridge_rtc_rebase(s, sec, min, hour, mday, mon, year);
         return;
+    case RTC_CENT_OFF:
+        if (!bank1) {
+            s->sio_regs[reg] = val;   /* bank 0: plain user RAM */
+            sgi_bridge_nvram_save(s);
+            return;
+        }
+        sgi_bridge_rtc_fields(s, &sec, &min, &hour, &wday, &mday, &mon, &year);
+        year = sgi_bridge_bcd_dec(val) * 100 + (year % 100);
+        sgi_bridge_rtc_rebase(s, sec, min, hour, mday, mon, year);
+        return;
+    case RTC_CTLA_OFF:
+        /* Register A bit 4 (DV0) selects bank 1 (datasheet). */
+        s->rtc_bank = (val & 0x10) ? 1 : 0;
+        s->sio_regs[reg] = val;
+        sgi_bridge_nvram_save(s);
+        return;
     case RTC_XRAM_ADDR:
+        if (!bank1) {
+            s->sio_regs[reg] = val;
+            sgi_bridge_nvram_save(s);
+            return;
+        }
         s->rtc_xram_addr = val;
+        sgi_bridge_nvram_save(s);
         return;
     case RTC_XRAM_DATA:
+        if (!bank1) {
+            s->sio_regs[reg] = val;
+            sgi_bridge_nvram_save(s);
+            return;
+        }
         s->rtc_xram[s->rtc_xram_addr & 0x7f] = val;
         sgi_bridge_nvram_save(s);
         return;
     case RTC_CTLD_OFF:
         return;                   /* status register: read-only here */
     default:
-        s->sio_regs[idx] = val;
+        if (bank1 && reg >= 0x40) {
+            s->rtc_bank1[reg - 0x40] = val;
+        } else {
+            s->sio_regs[reg] = val;
+        }
         sgi_bridge_nvram_save(s);
         return;
     }
@@ -1861,8 +1915,10 @@ static void sgi_bridge_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ioc3_regs, 0, sizeof(s->ioc3_regs));
     memset(s->sio_regs, 0, sizeof(s->sio_regs));
+    memset(s->rtc_bank1, 0, sizeof(s->rtc_bank1));
     memset(s->rtc_xram, 0, sizeof(s->rtc_xram));
     s->sio_index = 0;
+    s->rtc_bank = 0;
     s->rtc_xram_addr = 0;
     sgi_bridge_nvram_load(s);
     /*
