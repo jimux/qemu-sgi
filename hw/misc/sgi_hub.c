@@ -1258,8 +1258,20 @@ static void sgi_hub_ni_vector_go(SGIHubState *s, uint64_t parms) {
         sgi_router_write(dest_rtr, addr, s->ni_vector_data, inport);
         break;
       case PIOTYPE_XCHG:
+        /*
+         * A vector PIO exchange is a conditional swap, not a write: the
+         * SN0 PROM builds the router lock on it (libkl/ml/vector.c,
+         * vector_exch_node): it is defined to write the supplied value
+         * "provided that the current content of the register is zero", and
+         * to return the prior content.  router_lock() (router.c) reads a
+         * zero back as "lock acquired" and spins while it reads nonzero, so
+         * honouring the zero-only write is what makes RR_SCRATCH_REG1 lock
+         * and unlock like the hardware the PROM expects.
+         */
         ret = sgi_router_read(dest_rtr, addr, inport);
-        sgi_router_write(dest_rtr, addr, s->ni_vector_data, inport);
+        if (ret == 0) {
+          sgi_router_write(dest_rtr, addr, s->ni_vector_data, inport);
+        }
         break;
       default:
         s->ni_vector_status = 0;
