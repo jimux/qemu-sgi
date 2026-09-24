@@ -443,6 +443,15 @@ static uint64_t ioc3_sio_ring_phys(uint32_t h, uint32_t l)
 
 static void sgi_bridge_dev_irq(void *opaque, int n, int level);
 
+/* IOC3 Ethernet asserts its PCI interrupt (BRIDGE bvec 2) while EISR & EIER. */
+#define BRIDGE_BVEC_IOC3_ETH 2
+static void sgi_bridge_eth_irq_update(SGIBRIDGEState *s)
+{
+    int level = (s->eth_regs[IOC3_EISR] & s->eth_regs[IOC3_EIER]) != 0;
+
+    sgi_bridge_dev_irq(s, BRIDGE_BVEC_IOC3_ETH, level);
+}
+
 /*
  * IOC3 serial DMA, TX half.  do_ioc3_write() packs console bytes into a ring
  * in guest RAM (8-byte entries: 4 data + 4 status/control) and stores the new
@@ -787,7 +796,24 @@ static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
 
     s->eth_rxprod = (s->eth_rxprod + IOC3_RXDSZ) % IOC3_RX_RING_BYTES;
     s->eth_regs[IOC3_ERPIR] = s->eth_rxprod;
-    s->eth_regs[IOC3_EISR] |= IOC3_EISR_RXTHRESHINT;
+    /*
+     * RX threshold interrupt: fires only when the unconsumed RX descriptor
+     * count reaches the ERCSR threshold (ERCSR[8:0]).  The POST loopback
+     * diag sets the threshold to its maximum (511) and then asserts that
+     * EISR holds TX_EMPTY and nothing else, so an unconditional raise here
+     * would fail it.
+     */
+    {
+        unsigned thresh = s->eth_regs[IOC3_ERCSR] & 0x1ff;
+        unsigned pending =
+            ((s->eth_rxprod - (unsigned)s->eth_regs[IOC3_ERCIR]) &
+             (IOC3_RX_RING_BYTES - 1)) / IOC3_RXDSZ;
+
+        if (thresh == 0 || pending >= thresh) {
+            s->eth_regs[IOC3_EISR] |= IOC3_EISR_RXTHRESHINT;
+        }
+    }
+    sgi_bridge_eth_irq_update(s);
 }
 
 /*
@@ -1781,9 +1807,17 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                     s->eth_regs[idx] = val & ~(IOC3_EMCR_RST |
                                                IOC3_EMCR_ARB_DIAG_IDLE);
                     if (val & IOC3_EMCR_RST) {
+                        /*
+                         * EMCR_RST resets the MAC engine, not the ring-base,
+                         * barrier or MAC-address registers: the POST loopback
+                         * diag programs ERBR/ETBR/EMAR *before* asserting RST
+                         * and expects them to survive.  Clear only the MAC
+                         * status/config state and the DMA indices.
+                         */
                         s->eth_rxprod = 0;
                         s->eth_txcons = 0;
-                        memset(s->eth_regs, 0, sizeof(s->eth_regs));
+                        s->eth_regs[IOC3_EISR] = 0;
+                        s->eth_regs[IOC3_EIER] = 0;
                     }
                     /*
                      * While RX is disabled, can_receive() makes the net layer
@@ -1882,6 +1916,7 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
     }
 
     /* b_int_enable (or any write) can change whether an IRQ is asserted. */
+    sgi_bridge_eth_irq_update(s);
     sgi_bridge_update_irq(s);
 }
 
