@@ -400,6 +400,13 @@ struct SGIGr2State {
     uint32_t re3_pen_val[SGI_GR2_RE3_PEN_MAX];
     unsigned re3_pen_off[SGI_GR2_RE3_PEN_MAX];
     unsigned re3_npens;
+    /* Token-321 destination groups of the current op.  One expTileRects payload
+     * can carry many of them (up to ~20): for the 4Dwm menu items the MONO path
+     * does not cover, each six-word group is one glyph pixel run, and the runs
+     * together spell the label.  Their PUC_DATA offsets are recorded at write
+     * time, exactly like the pens above. */
+    unsigned re3_spanr_off[SGI_GR2_RE3_PEN_MAX];
+    unsigned re3_nspanr;
     /* Colour images (expDrawImage24).  Token 342 starts one run: the value is the
      * run's x, and the PUC_DATA that follows is (y, width, 1, nwords, 2, 0) then
      * nwords 32-bit words of 4 8-bit palette indices each (MSB byte first).

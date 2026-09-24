@@ -403,15 +403,37 @@ static bool sgi_gr2_re3_tile_rects(SGIGr2State *s)
     c0 = s->re3_data[2] << 3;
     c1 = c0 | (s->re3_data[1] << 1);
     if (s->re3_spanr_seen) {
-        /* Menu item texture: token-321 destination at the end of the payload.
-         * (x0,y0) is inclusive, (x1,y1) exclusive, matching the clip list. */
-        int rx1 = (int)s->re3_data[n - 5];
-        int ry1 = (int)s->re3_data[n - 3];
-        int rx2 = (int)s->re3_data[n - 2];
-        int ry2 = (int)s->re3_data[n - 1];
+        /* Menu item texture: each token-321 six-word group is a destination
+         * rectangle [org_x, x0, org_y, y0, x1, y1], (x0,y0) inclusive and
+         * (x1,y1) exclusive like the clip list.  A payload holds many of them
+         * (the label's glyph pixel runs), so draw them all.  In the overlay the
+         * run is painted solid with the tile's foreground colour -- the 16x16
+         * checkerboard is the item's dithered texture, not the glyph -- so the
+         * label comes out legible instead of dashed. */
+        unsigned g;
 
-        sgi_gr2_re3_tile_rect(s, w, h, c0, c1, rx1, ry1, rx2, ry2, overlay);
-        trace_sgi_gr2_re3_tile(w, h, 1);
+        for (g = 0; g < s->re3_nspanr; g++) {
+            unsigned o = s->re3_spanr_off[g];
+            int rx1, ry1, rx2, ry2;
+
+            if (o + 6 > n) {
+                continue;
+            }
+            rx1 = (int)s->re3_data[o + 1];
+            ry1 = (int)s->re3_data[o + 3];
+            rx2 = (int)s->re3_data[o + 4];
+            ry2 = (int)s->re3_data[o + 5];
+            if (rx2 <= rx1 || ry2 < ry1) {
+                continue;
+            }
+            if (overlay) {
+                sgi_gr2_ovl_fill(s, (uint8_t)(c1 & 3), rx1, ry1,
+                                 rx2 - rx1, ry2 - ry1 + 1);
+            } else {
+                sgi_gr2_re3_tile_rect(s, w, h, c0, c1, rx1, ry1, rx2, ry2, false);
+            }
+        }
+        trace_sgi_gr2_re3_tile(w, h, s->re3_nspanr);
         sgi_gr2_update_display(s);
         return true;
     }
@@ -1202,6 +1224,7 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_monox_valid = false;
     s->re3_monocol_valid = false;
     s->re3_npens = 0;
+    s->re3_nspanr = 0;
     s->re3_pair_seen = false;
     s->re3_stipple_valid = false;
     s->re3_fg_valid = false;
@@ -2451,8 +2474,12 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->re3_spans_seen = true;
     }
     if (size == 4 && offset == SGI_GR2_RE3_SPANR_TOKEN) {
-        /* Token 321: the expTileRects menu-item destination group. */
+        /* Token 321: one expTileRects menu-item destination group.  A single
+         * payload can carry many (each glyph pixel run), so record them all. */
         s->re3_spanr_seen = true;
+        if (s->re3_nspanr < SGI_GR2_RE3_PEN_MAX) {
+            s->re3_spanr_off[s->re3_nspanr++] = s->re3_data_n;
+        }
     }
     if (size == 4 && offset == SGI_GR2_RE3_TILE_TOKEN) {
         /* expTileRects streams its tile bitmap's first word on the tile data
@@ -2900,6 +2927,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_monox_valid = false;
     s->re3_monocol_valid = false;
     s->re3_mono_off = 0;
+    s->re3_nspanr = 0;
     s->re3_npens = 0;
     s->re3_label_y = 0;
     s->re3_label_valid = false;
