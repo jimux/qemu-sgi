@@ -891,17 +891,33 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          * point.  Without dropping the previous (ARCS/kernel) queue state a
          * stale ring is replayed -- observed as channel-1 status entries with
          * handles from the earlier channel-0 ARCS ring, which the driver
-         * panics on ("Bogus response handle", io/ql.c:2155).  The firmware
-         * itself keeps running across the PCI soft reset (the driver downloads
-         * it before ql_reset_interface), so firmware_running is left set.
+         * panics on ("Bogus response handle", io/ql.c:2155).
+         *
+         * The soft reset also stops the RISC engine and clears the mailbox
+         * registers: the ARCS standalone driver issues
+         * ICR_ENABLE_RISC_INT|ICR_SOFT_RESET and then waits for mailbox0 to
+         * read 0 (and runs a mbox1..6 register compare), and the IRIX kernel
+         * re-downloads/re-executes the firmware after the reset (ql_download_fw
+         * / ql_reset_interface both end with MBOX_CMD_EXECUTE_FIRMWARE).  If the
+         * request engine stays armed across the reset it can post a stale status
+         * into mailbox5, which makes the PROM's post-init-0 mailbox register test
+         * fail its compare (this was the IP30 init-0 panic; ported from octane
+         * f264582207).
          */
         if (val & BUS_ICR_SOFT_RESET) {
+            int n;
+            s->firmware_running = false;
+            s->cmd_pending = false;
             memset(&s->req, 0, sizeof(s->req));
             memset(&s->rsp, 0, sizeof(s->rsp));
+            for (n = 0; n < 8; n++) {
+                ql_mbox_put(s, n, 0);
+            }
+            ql_reg_put(s, QL_HCCR, 0);
             if (qlisp_dbg()) {
                 qemu_log_mask(LOG_UNIMP,
-                              "sgi-qlisp: SOFT-RESET inst=%u queues dropped\n",
-                              s->busnr);
+                              "sgi-qlisp: SOFT-RESET inst=%u queues/mbox "
+                              "dropped\n", s->busnr);
             }
         }
         break;
