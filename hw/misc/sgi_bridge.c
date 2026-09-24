@@ -288,310 +288,60 @@ static const MemoryRegionOps ioc3_uart_ops = {
 /* --- DS2502 1-wire board-config EEPROM (bridge NIC line) ------------- */
 
 /* Dallas/Maxim 1-wire CRC-8 (poly 0x8C, reflected). */
-static uint8_t sgi_bridge_crc8(const uint8_t *p, int n)
+/*
+ * Bridge MicroLAN: the IP30 board record plus the FRU ID chips the PROM's
+ * power-on "NIC diagnostic" enumerates by ROM search.  Every part is a DS2502
+ * (family 0x09) with a valid ROM CRC-8 and crc16(page) == 0xb001 memory pages.
+ */
+static void sgi_bridge_ds_bus_init(SGIDS2502BUS *bus)
 {
-    uint8_t crc = 0;
-    int i, j;
-
-    for (i = 0; i < n; i++) {
-        uint8_t c = p[i];
-        for (j = 0; j < 8; j++) {
-            if ((crc ^ c) & 1) {
-                crc = (crc >> 1) ^ 0x8C;
-            } else {
-                crc >>= 1;
-            }
-            c >>= 1;
-        }
-    }
-    return crc;
-}
-
-/* NIC 16-bit CRC (poly 0xC001), from libsk/ml/nic.c. */
-static const int sgi_bridge_oddparity[16] = {0, 1, 1, 0, 1, 0, 0, 1,
-                                             1, 0, 0, 1, 0, 1, 1, 0};
-
-static uint16_t sgi_bridge_crc16_step(uint16_t crc, uint8_t in)
-{
-    uint16_t data = in;
-
-    data = (data ^ (crc & 0xff)) & 0xff;
-    crc >>= 8;
-    if (sgi_bridge_oddparity[data & 0xf] ^ sgi_bridge_oddparity[data >> 4]) {
-        crc ^= 0xc001;
-    }
-    data <<= 6;
-    crc ^= data;
-    data <<= 1;
-    crc ^= data;
-    return crc;
-}
-
-static uint16_t sgi_bridge_crc16(const uint8_t *p, int n)
-{
-    uint16_t crc = 0;
+    static const uint8_t board_rom[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    static const uint8_t fru_rom[4][6] = {
+        {0x10, 0x11, 0x12, 0x13, 0x14, 0x15}, /* CPU board NIC */
+        {0x20, 0x21, 0x22, 0x23, 0x24, 0x25}, /* System board NIC */
+        {0x30, 0x31, 0x32, 0x33, 0x34, 0x35}, /* Front plane NIC */
+        {0x40, 0x41, 0x42, 0x43, 0x44, 0x45}, /* Power supply NIC */
+    };
+    static const char *fru_name[4] = {"CPU", "SYS", "FP", "PS"};
     int i;
 
-    for (i = 0; i < n; i++) {
-        crc = sgi_bridge_crc16_step(crc, p[i]);
-    }
-    return crc;
-}
-
-static void sgi_bridge_put(uint8_t *dst, const char *s, int n)
-{
-    int i;
-
-    for (i = 0; i < n; i++) {
-        dst[i] = s[i] ? (uint8_t)s[i] : ' ';
+    sgi_ds2502_bus_init(bus, "bridge");
+    sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", "IP30", board_rom);
+    for (i = 0; i < 4; i++) {
+        sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", fru_name[i],
+                           fru_rom[i]);
     }
 }
 
-/*
- * Build the DS2502 board-config EEPROM image: an IP30 board manufacturing
- * record. Page 0 holds the serial and part number, page 1 the
- * revision/group/name; each 32-byte page carries a trailing 16-bit CRC so
- * crc16(page) == 0xb001.
- */
-static void sgi_bridge_ds_board_init(SGIDS *ds)
-{
-    static const char part[] = "030-1457-001"; /* IP30 system board */
-    static const char name[] = "IP30";
-    int a, b;
-
-    memset(ds->mem, 0xff, sizeof(ds->mem));
-
-    ds->mem[0] = 0x01;
-    sgi_bridge_put(&ds->mem[1], "1234567890", 10);
-    sgi_bridge_put(&ds->mem[11], part, 19);
-
-    sgi_bridge_put(&ds->mem[32 + 0], "", 6);
-    sgi_bridge_put(&ds->mem[32 + 6], "0001", 4);
-    ds->mem[32 + 10] = 0x00;
-    memset(&ds->mem[32 + 11], 0x00, 4);
-    ds->mem[32 + 15] = 0x00;
-    sgi_bridge_put(&ds->mem[32 + 16], name, 14);
-
-    for (int page = 0; page < 2; page++) {
-        uint8_t *pg = &ds->mem[page * 32];
-
-        pg[30] = 0;
-        pg[31] = 0;
-        for (a = 0; a < 256; a++) {
-            for (b = 0; b < 256; b++) {
-                pg[30] = a;
-                pg[31] = b;
-                if (sgi_bridge_crc16(pg, 32) == 0xb001) {
-                    goto done;
-                }
-            }
-        }
-    done:;
-    }
-
-    ds->rom[0] = 0x09;
-    ds->rom[1] = 0x01;
-    ds->rom[2] = 0x02;
-    ds->rom[3] = 0x03;
-    ds->rom[4] = 0x04;
-    ds->rom[5] = 0x05;
-    ds->rom[6] = 0x06;
-    ds->rom[7] = sgi_bridge_crc8(ds->rom, 7);
-    ds->extra_bits = 8; /* DS1982 returns a status byte before the data */
-}
-
-/*
- * Build the IOC3 MAC-address EEPROM image.  Format read by nic_eaddr()
- * (libsk/ml/nic.c): family 0x09; 14 bytes from address 0:
- *   [0]=0x8d command CRC, [1]=0x0a length, [6..11] = MAC (LSB..MSB),
- *   [12..13] = CRC16 solving crc16(bytes[1..13]) == 0xb001.
- */
-static void sgi_bridge_ds_mac_init(SGIDS *ds)
+static void sgi_bridge_ds_mac_init(SGIDS2502 *ds)
 {
     static const uint8_t mac[6] = {0x08, 0x00, 0x69, 0x12, 0x34, 0x56};
-    int a, b;
+    static const uint8_t rom[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
 
-    memset(ds->mem, 0xff, sizeof(ds->mem));
-    ds->mem[0] = 0x8d;
-    ds->mem[1] = 0x0a;
-    ds->mem[2] = ds->mem[3] = ds->mem[4] = ds->mem[5] = 0x00;
-    /* eaddr[i] = byte[11-i], so store MSB first at [6]. */
-    for (int i = 0; i < 6; i++) {
-        ds->mem[6 + i] = mac[5 - i];
-    }
-    ds->mem[12] = 0;
-    ds->mem[13] = 0;
-    for (a = 0; a < 256; a++) {
-        for (b = 0; b < 256; b++) {
-            ds->mem[12] = a;
-            ds->mem[13] = b;
-            if (sgi_bridge_crc16(&ds->mem[1], 13) == 0xb001) {
-                goto done;
-            }
-        }
-    }
-done:;
-
-    ds->rom[0] = 0x09;
-    ds->rom[1] = 0x01;
-    ds->rom[2] = 0x02;
-    ds->rom[3] = 0x03;
-    ds->rom[4] = 0x04;
-    ds->rom[5] = 0x05;
-    ds->rom[6] = 0x06;
-    ds->rom[7] = sgi_bridge_crc8(ds->rom, 7);
-    ds->extra_bits = 0; /* nic_eaddr reads the record from byte 0 */
-}
-
-static void sgi_bridge_ds_reset(SGIDS *ds)
-{
-    ds->state = 1; /* CMD */
-    ds->cmd = 0;
-    ds->cmd_bits = 0;
-    ds->in = 0;
-    ds->in_bits = 0;
-    ds->out_index = 0;
-    ds->search_phase = 0;
-    ds->addr = 0;
-    ds->extra = 0;
-    ds->data_bit = 0;
-}
-
-static void sgi_bridge_ds_decode(SGIDS *ds)
-{
-    switch (ds->cmd) {
-    case 0x33: /* READ ROM */
-        ds->state = 2;
-        ds->out_index = 0;
-        break;
-    case 0x55: /* MATCH ROM */
-        ds->state = 3;
-        ds->in = 0;
-        ds->in_bits = 0;
-        break;
-    case 0xcc: /* SKIP ROM */
-        ds->state = 1;
-        break;
-    case 0xf0: /* read-memory (or search-ROM) */
-        ds->state = 5;
-        break;
-    default:
-        ds->state = 1;
-        break;
-    }
-    ds->cmd = 0;
-    ds->cmd_bits = 0;
-}
-
-static void sgi_bridge_ds_write_bit(SGIDS *ds, int bit)
-{
-    switch (ds->state) {
-    case 1: /* CMD */
-        ds->cmd |= (bit & 1) << ds->cmd_bits;
-        if (++ds->cmd_bits == 8) {
-            sgi_bridge_ds_decode(ds);
-        }
-        break;
-    case 3: /* MATCHROM */
-        ds->in |= (bit & 1) << ds->in_bits;
-        if (++ds->in_bits == 64) {
-            ds->state = 1;
-        }
-        break;
-    case 4: /* SEARCH */
-        if (ds->search_phase == 2) {
-            ds->search_phase = 0;
-            if (++ds->out_index == 64) {
-                ds->state = 1;
-            }
-        }
-        break;
-    case 5: /* F0_PENDING: a write means the 16-bit address follows */
-        ds->state = 6;
-        ds->addr = 0;
-        ds->in_bits = 0;
-        /* fall through */
-    case 6: /* RMEM_ADDR */
-        ds->addr |= (bit & 1) << ds->in_bits;
-        if (++ds->in_bits == 16) {
-            ds->state = 7;
-            ds->out_index = 0;
-            ds->extra = ds->extra_bits;
-        }
-        break;
-    default:
-        break;
-    }
-}
-
-static int sgi_bridge_ds_read_bit(SGIDS *ds)
-{
-    int bit;
-
-    switch (ds->state) {
-    case 2: /* READROM */
-        bit = (ds->rom[ds->out_index / 8] >> (ds->out_index % 8)) & 1;
-        if (++ds->out_index == 64) {
-            ds->state = 1;
-        }
-        return bit;
-    case 4: /* SEARCH */
-        bit = (ds->rom[ds->out_index / 8] >> (ds->out_index % 8)) & 1;
-        if (ds->search_phase == 0) {
-            ds->search_phase = 1;
-            return bit;
-        }
-        ds->search_phase = 2;
-        return bit ^ 1;
-    case 5: /* F0_PENDING: a read starts a ROM search */
-        ds->state = 4;
-        ds->out_index = 0;
-        ds->search_phase = 0;
-        return sgi_bridge_ds_read_bit(ds);
-    case 7: /* RMEM_DATA */
-        if (ds->extra > 0) {
-            bit = (0xff >> (8 - ds->extra)) & 1;
-            ds->extra--;
-            return bit;
-        }
-        bit = (ds->mem[ds->addr + ds->out_index / 8] >>
-               (ds->out_index % 8)) & 1;
-        if (++ds->out_index == 32 * 8) {
-            ds->state = 1;
-        }
-        return bit;
-    default:
-        return 0;
-    }
+    sgi_ds2502_build_mac(ds, mac, rom);
 }
 
 /* MCR line state: returns DATA bit; DONE is always set for the host poll. */
-static uint64_t sgi_bridge_ds_line_read(SGIDS *ds)
+static uint64_t sgi_bridge_ds_line_read(SGIDS2502BUS *bus)
+{
+    return 0x2 | (bus->data_bit & 1);
+}
+
+static void sgi_bridge_ds_line_write(SGIDS2502BUS *bus, uint64_t val)
+{
+    sgi_ds2502_bus_mcr(bus, val);
+}
+
+static uint64_t sgi_bridge_ds_mac_line_read(SGIDS2502 *ds)
 {
     return 0x2 | (ds->data_bit & 1);
 }
 
-static void sgi_bridge_ds_line_write(SGIDS *ds, uint64_t val)
+static void sgi_bridge_ds_mac_line_write(SGIDS2502 *ds, uint64_t val)
 {
-    unsigned pulse = (val >> 10) & 0x3ff;
-    unsigned sample = (val >> 2) & 0xff;
-
-    if (pulse >= 480) {
-        /* reset/presence pulse; single device => presence bit 0 */
-        sgi_bridge_ds_reset(ds);
-        ds->data_bit = 0;
-    } else if (sample == 30) {
-        sgi_bridge_ds_write_bit(ds, 0);
-        ds->data_bit = 0;
-    } else if (sample == 110) {
-        sgi_bridge_ds_write_bit(ds, 1);
-        ds->data_bit = 0;
-    } else if (sample == 13) {
-        ds->data_bit = sgi_bridge_ds_read_bit(ds);
-    } else {
-        ds->data_bit = 0;
-    }
+    sgi_ds2502_mcr(ds, val);
 }
+
 
 /*
  * IOC3 Ethernet (10/100 MAC) register and DMA model.
@@ -1617,6 +1367,9 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
      */
     case 0x00b4:
         val = sgi_bridge_ds_line_read(&s->bridge_ds);
+        if (getenv("SGIDS_DBG")) {
+            qemu_log("BR_MCR rd -> 0x%x\n", (unsigned)val);
+        }
         break;
 
     case 0x0008 ... 0x000b:
@@ -1722,7 +1475,10 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
             val = 0x00400000; /* SIO_CR_ARB_DIAG_IDLE */
         } else if (offset == 0x600030) {
             /* IOC3 MCR: 1-wire line to the MAC-address EEPROM. */
-            val = sgi_bridge_ds_line_read(&s->ioc3_ds);
+            val = sgi_bridge_ds_mac_line_read(&s->ioc3_ds);
+            if (getenv("SGIDS_DBG")) {
+                qemu_log("IO_MCR rd -> 0x%x\n", (unsigned)val);
+            }
         } else if (offset == IOC3_PORT_A_SSCR_OFF || offset == IOC3_PORT_B_SSCR_OFF) {
             /*
              * IOC3 serial DMA control (SSCR).  SSCR_PAUSE_STATE reflects
@@ -1866,6 +1622,9 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
         break;
 
     case 0x00b4:
+        if (getenv("SGIDS_DBG")) {
+            qemu_log("BR_MCR wr 0x%x\n", (unsigned)val);
+        }
         sgi_bridge_ds_line_write(&s->bridge_ds, val);
         break;
 
@@ -1940,7 +1699,10 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
     case 0x600000 ... 0x61FFFF:
         if (offset == 0x600030) {
             /* IOC3 MCR: 1-wire line to the MAC-address EEPROM. */
-            sgi_bridge_ds_line_write(&s->ioc3_ds, val);
+            if (getenv("SGIDS_DBG")) {
+                qemu_log("IO_MCR wr 0x%x\n", (unsigned)val);
+            }
+            sgi_bridge_ds_mac_line_write(&s->ioc3_ds, val);
         } else if (offset == IOC3_SIO_IR_OFF) {
             /* SIO_IR is 1-to-clear: the ISR acks its source bits by writing. */
             s->ioc3_regs[IOC3_IDX(offset)] &= ~val;
@@ -2155,10 +1917,8 @@ static void sgi_bridge_reset(DeviceState *dev)
      */
     s->rtc_epoch_sec = time(NULL);
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    sgi_bridge_ds_board_init(&s->bridge_ds);
+    sgi_bridge_ds_bus_init(&s->bridge_ds);
     sgi_bridge_ds_mac_init(&s->ioc3_ds);
-    sgi_bridge_ds_reset(&s->bridge_ds);
-    sgi_bridge_ds_reset(&s->ioc3_ds);
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
     s->eth_rxprod = 0;
     s->eth_txcons = 0;
