@@ -223,6 +223,22 @@ struct SGIGL2State {
     bool charpos_pending;         /* a charposnabs expects the next GEpoint */
     uint16_t font_base;           /* FBCbaseaddress: added to glyph offsets */
 
+    /*
+     * GE transformation matrix and stack.  The GE carries a 4x4 float
+     * matrix (row-vector convention: p' = p * M, so row 3 holds the
+     * translation) that scales/rotates/translates every coordinate the GE
+     * consumes.  GEloadmm replaces it wholesale; the first/mid/last/
+     * complete-mm commands multiply the current matrix by a row-supplied
+     * matrix; push/pop save and restore it.
+     */
+    float matrix[4][4];
+    float matrix_stack[64][4][4];
+    int matrix_top;
+    float mm_tmp[4][4];           /* matrix being assembled by the mm commands */
+    bool mm_active;
+    bool ge_cmd_is_raw;           /* current in-flight command is a raw GE op */
+    bool ge_reconfig;             /* collecting a variable-length GEreconfigure */
+
     bool testpattern;
     bool trace;
     bool dirty;
@@ -1232,6 +1248,211 @@ static void gl2_fill_poly(SGIGL2State *s)
     s->dirty = true;
 }
 
+/* Number of operand words a GEPA-tagged coordinate command carries. */
+static int gl2_ge_coord_words(unsigned flags)
+{
+    int ncoord = (flags & 0x2) ? 3 : (flags & 0x1) ? 2 : 4;
+    int cw = (flags & 0x8) ? 1 : 2;
+
+    return ncoord * cw;
+}
+
+/*
+ * Operand count for every raw GE command, from the GE rev2 opcode list in
+ * gl2cmds.h and the macros that emit them (gl2/gl2/include/imdraw.h,
+ * immatrix.h).  The count must be exact even for commands this model does
+ * not otherwise implement: a float operand like 50.0 (0x42480000) splits
+ * into the words 0x4248 and 0x0000, and 0x4248's low byte 0x08 makes the
+ * assembler mistake it for an FBC passthru header whose 7-bit count then
+ * swallows the rest of the packet.  Consuming the operands here is what
+ * keeps the FBC stream aligned.  Returns -1 if w is not a GE opcode.
+ */
+static int gl2_ge_operand_words(uint16_t w)
+{
+    unsigned op = w & 0x3f;
+    unsigned flags = (w >> 8) & 0xf;
+
+    switch (op) {
+    case 0x01:                          /* GEloadmm: 16 floats */
+        return 32;
+    case 0x05:                          /* GEloadviewport: 8 longs */
+        return 16;
+    case 0x00:                          /* GEpopmm */
+    case 0x03:                          /* GEstoremm */
+    case 0x04:                          /* GEpushmm */
+    case 0x06:                          /* GEsethitmode */
+    case 0x07:                          /* GEclearhitmode */
+    case 0x09: case 0x0a: case 0x0b:    /* viewport stack */
+    case 0x0d:                          /* GEswitchpipes */
+    case 0x0f:                          /* GEnoop */
+    case 0x33:                          /* GEclosepoly */
+        return 0;
+    case 0x10: case 0x11: case 0x12: case 0x13:
+    case 0x14: case 0x15: case 0x16:             /* move/draw/point/curve */
+    case 0x20: case 0x21: case 0x22: case 0x23:  /* GEmidmm0-3 */
+    case 0x24: case 0x25: case 0x26: case 0x27:  /* GEfirstmm0-3 */
+    case 0x28: case 0x29: case 0x2a: case 0x2b:  /* GElastmm0-3 */
+    case 0x2c: case 0x2d: case 0x2e: case 0x2f:  /* GEcompletemm0-3 */
+    case 0x30: case 0x31: case 0x34: case 0x35:  /* poly / polyrel */
+    case 0x37: case 0x38:                        /* curvepoly, xformpt */
+        return gl2_ge_coord_words(flags);
+    default:
+        return -1;
+    }
+}
+
+static void gl2_mm_identity(float m[4][4])
+{
+    int r, c;
+
+    for (r = 0; r < 4; r++) {
+        for (c = 0; c < 4; c++) {
+            m[r][c] = (r == c) ? 1.0f : 0.0f;
+        }
+    }
+}
+
+/* dst = dst * b (row-vector convention). */
+static void gl2_mm_mul(float dst[4][4], const float b[4][4])
+{
+    float r[4][4];
+    int i, j, k;
+
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 4; j++) {
+            float acc = 0.0f;
+            for (k = 0; k < 4; k++) {
+                acc += dst[i][k] * b[k][j];
+            }
+            r[i][j] = acc;
+        }
+    }
+    memcpy(dst, r, sizeof(r));
+}
+
+/* Decode the idx-th coordinate from a GEPA-tagged operand stream. */
+static float gl2_ge_arg_value(const uint16_t *args, unsigned idx,
+                              unsigned flags)
+{
+    if (flags & 0x8) {                  /* GEPA_S: one short word */
+        return (float)(int16_t)args[idx];
+    } else {
+        uint32_t u = ((uint32_t)args[2 * idx] << 16) | args[2 * idx + 1];
+
+        if (flags & 0x4) {              /* GEPA_I: integer */
+            return (float)(int32_t)u;
+        } else {                        /* GEPA_F: float bits */
+            float f;
+            memcpy(&f, &u, 4);
+            return f;
+        }
+    }
+}
+
+/* Fill one row of a matrix from the operands of a first/mid/last/complete-mm. */
+static void gl2_mm_set_row(float m[4][4], int row, const uint16_t *args,
+                           unsigned flags)
+{
+    int ncoord = (flags & 0x2) ? 3 : (flags & 0x1) ? 2 : 4;
+    int c;
+
+    for (c = 0; c < ncoord && c < 4; c++) {
+        m[row][c] = gl2_ge_arg_value(args, c, flags);
+    }
+}
+
+/*
+ * Execute a raw GE command.  The transforms the text demo relies on are
+ * tracked here (GEloadmm, GEpushmm/geoppopmm and the first/mid/last/
+ * complete-mm family); the remaining operands are consumed and discarded
+ * so the FBC passthru stream stays aligned.
+ */
+static void gl2_ge_raw_exec(SGIGL2State *s, uint16_t w,
+                            const uint16_t *args, unsigned nargs)
+{
+    unsigned op = w & 0x3f;
+    unsigned flags = (w >> 8) & 0xf;
+
+    if (s->trace) {
+        unsigned i;
+        fprintf(stderr, "gl2: GE raw cmd=0x%02x flags=%#x nargs=%u",
+                op, flags, nargs);
+        for (i = 0; i < nargs && i < 6; i++) {
+            fprintf(stderr, " %04x", args[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    switch (op) {
+    case 0x00:                          /* GEpopmm */
+        if (s->matrix_top > 0) {
+            s->matrix_top--;
+            memcpy(s->matrix, s->matrix_stack[s->matrix_top],
+                   sizeof(s->matrix));
+        }
+        break;
+
+    case 0x01:                          /* GEloadmm: 16 floats, col-major */
+        if (nargs >= 32) {
+            unsigned k;
+
+            for (k = 0; k < 16; k++) {
+                s->matrix[k % 4][k / 4] = gl2_ge_arg_value(args, k, 0);
+            }
+        }
+        break;
+
+    case 0x03:                          /* GEstoremm (feedback): tracked */
+        break;
+
+    case 0x04:                          /* GEpushmm */
+        if (s->matrix_top < (int)ARRAY_SIZE(s->matrix_stack)) {
+            memcpy(s->matrix_stack[s->matrix_top], s->matrix,
+                   sizeof(s->matrix));
+            s->matrix_top++;
+        }
+        break;
+
+    case 0x05:                          /* GEloadviewport */
+    case 0x06:                          /* GEsethitmode */
+    case 0x09: case 0x0a: case 0x0b:    /* viewport stack */
+    case 0x0c:                          /* GEreconfigure */
+    case 0x0d:                          /* GEswitchpipes */
+    case 0x0f:                          /* GEnoop */
+        break;
+
+    case 0x20: case 0x21: case 0x22: case 0x23:
+    case 0x24: case 0x25: case 0x26: case 0x27:
+    case 0x28: case 0x29: case 0x2a: case 0x2b:
+    case 0x2c: case 0x2d: case 0x2e: case 0x2f: {
+        int row = op & 3;
+        bool first = op >= 0x24 && op <= 0x27;
+        bool last = op >= 0x28 && op <= 0x2b;
+        bool complete = op >= 0x2c;
+
+        /*
+         * "first" and "complete" start a fresh multiply matrix (the
+         * unspecified rows default to identity, which is how a bare
+         * GEcompletemm3 becomes a pure translation); "last" and "complete"
+         * finish it and multiply the current matrix by it.
+         */
+        if (first || complete || !s->mm_active) {
+            gl2_mm_identity(s->mm_tmp);
+            s->mm_active = true;
+        }
+        gl2_mm_set_row(s->mm_tmp, row, args, flags);
+        if (last || complete) {
+            gl2_mm_mul(s->matrix, s->mm_tmp);
+            s->mm_active = false;
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
 /* Recognise a raw GE command word and set up its coordinate operands.
  * Returns true if w was consumed as a GE command. */
 static bool gl2_ge_raw(SGIGL2State *s, uint16_t w)
@@ -1239,7 +1460,7 @@ static bool gl2_ge_raw(SGIGL2State *s, uint16_t w)
     unsigned op = w & 0x3f;
     unsigned flags = (w >> 8) & 0xf;
     int isd = (flags & 0x8) ? 1 : 0;        /* GEPA_S: short coords */
-    int ncoord = (flags & 0x2) ? 3 : 2;     /* GEPA_3D: 3 coords */
+    int ncoord = (flags & 0x2) ? 3 : (flags & 0x1) ? 2 : 4;
     int cw = isd ? 1 : 2;                   /* words per coordinate */
 
     switch (op) {
@@ -1259,20 +1480,80 @@ static bool gl2_ge_raw(SGIGL2State *s, uint16_t w)
         gl2_fill_poly(s);
         s->poly_n = 0;
         return true;
-    default:
-        return false;
+    default: {
+        /*
+         * Every other GE opcode still consumes its operands, whether or
+         * not it does anything with them.  Without this the coordinates of
+         * an unimplemented command are re-examined as passthru headers.
+         */
+        int need;
+
+        if (op == 0x0c) {               /* GEreconfigure: variable length */
+            s->ge_cmd = w;
+            s->ge_cmd_is_raw = true;
+            s->ge_nargs = 1;
+            s->ge_reconfig = true;
+            return true;
+        }
+
+        need = gl2_ge_operand_words(w);
+
+        if (need < 0) {
+            if (s->trace && w != 0 && w != 0xff08) {
+                fprintf(stderr, "gl2: GE raw UNKNOWN w=%04x (dropped)\n", w);
+            }
+            return false;
+        }
+        s->ge_cmd = w;
+        s->ge_cmd_is_raw = true;
+        s->ge_nargs = 1;
+        s->ge_need = need;
+        if (need == 0) {
+            gl2_ge_raw_exec(s, w, NULL, 0);
+        } else {
+            s->ge_in_cmd = true;
+        }
+        return true;
+    }
     }
 }
 
 static void gl2_ge_word(SGIGL2State *s, uint16_t w)
 {
+    if (s->ge_reconfig) {
+        /*
+         * GEreconfigure's operand count is not fixed: each word packs a
+         * found-chip index in its high byte, counting down and ending on
+         * 0xff, so it depends on how many GE chips the machine has (12 on
+         * a 10-chip GL2, 14 on a 12-chip one).  Consume operands until
+         * that 0xff terminator; the im_passthru(0) that follows in
+         * gl_justconfigure() is the header of the next FBC command, not a
+         * reconfigure operand, and eating it stalls the client's
+         * feedback wait.
+         */
+        if (s->ge_nargs - 1 < ARRAY_SIZE(s->ge_args)) {
+            s->ge_args[s->ge_nargs - 1] = w;
+        }
+        s->ge_nargs++;
+        if (((w >> 8) & 0xff) == 0xff ||
+            s->ge_nargs - 1 >= ARRAY_SIZE(s->ge_args)) {
+            gl2_ge_raw_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
+            s->ge_reconfig = false;
+        }
+        return;
+    }
+
     if (s->ge_in_cmd) {
         if (s->ge_nargs - 1 < ARRAY_SIZE(s->ge_args)) {
             s->ge_args[s->ge_nargs - 1] = w;
         }
         s->ge_nargs++;
         if (--s->ge_need == 0) {
-            gl2_ge_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
+            if (s->ge_cmd_is_raw) {
+                gl2_ge_raw_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
+            } else {
+                gl2_ge_exec(s, s->ge_cmd, s->ge_args, s->ge_nargs - 1);
+            }
             s->ge_in_cmd = false;
         }
         return;
@@ -1324,6 +1605,7 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
         s->ge_pending = false;
         if (gl2_fbc_known(w)) {
             s->ge_cmd = w;
+            s->ge_cmd_is_raw = false;
             s->ge_nargs = 1;
             s->ge_need = s->ge_pending_need - 1;
             if (s->ge_need == 0) {
@@ -1559,6 +1841,11 @@ static void gl2_reset(DeviceState *dev)
     s->char_x = s->char_y = 0;
     s->charpos_pending = false;
     s->font_base = 0;
+    gl2_mm_identity(s->matrix);
+    s->matrix_top = 0;
+    s->mm_active = false;
+    s->ge_cmd_is_raw = false;
+    s->ge_reconfig = false;
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
     s->rgb_color = s->rgb_we = 0;
