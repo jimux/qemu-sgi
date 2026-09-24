@@ -123,6 +123,22 @@
 #define IP2190_C_READNOCACHE 0x94
 #define IP2190_SECTOR       512
 
+/*
+ * The 2190 completion interrupt is a level (Multibus 5) that the kernel's
+ * ipintr() must accept by reading R0 and writing IP_CLEAR.  If the model
+ * asserts the line in a state the driver does not accept, level5() counts a
+ * stray and panics after MAX_LEVEL5_STRAYS.  SGI_IP2190_TRACE records every
+ * line raise/clear and every R0 access so that mismatch is visible.
+ */
+static bool ip2190_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("SGI_IP2190_TRACE") != NULL;
+    }
+    return on;
+}
+
 struct SGIIP2State {
     SysBusDevice parent_obj;
 
@@ -752,6 +768,11 @@ static void ip2190_go(SGIIP2State *s)
      * The 2190 raises its Multibus interrupt on completion; NOWAIT commands
      * rely on it (ipintr -> iodone), only the probe's WAIT commands poll.
      */
+    if (ip2190_trace_on()) {
+        fprintf(stderr, "IP2190 completion cmd=%#x cyl=%u head=%u sec=%u "
+                "cnt=%u status=%#x error=%#x iopb=%#x -> R0 DONE, irq=1\n",
+                cmd, cyl, head, sec, cnt, status, error, iopb_mb);
+    }
     qemu_set_irq(s->ip_irq_out, 1);
 }
 
@@ -770,6 +791,10 @@ static MemTxResult ip2_mbio_read(void *opaque, hwaddr addr, uint64_t *data,
 
     if (addr == IP2190_R0) {
         *data = s->ip_done ? IP2190_DONE : 0;
+        if (ip2190_trace_on()) {
+            fprintf(stderr, "IP2190 rd R0 -> %#x (done=%d, irq=%d)\n",
+                    (unsigned)*data, s->ip_done, s->ip_done);
+        }
         return MEMTX_OK;
     }
     return MEMTX_DECODE_ERROR;
@@ -782,6 +807,10 @@ static MemTxResult ip2_mbio_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case IP2190_R0:
+        if (ip2190_trace_on()) {
+            fprintf(stderr, "IP2190 wr R0 <- %#x (GO=%#x CLEAR=%#x)\n",
+                    (unsigned)val, IP2190_GO, IP2190_CLEAR);
+        }
         if (val == IP2190_CLEAR) {
             s->ip_done = false;
             qemu_set_irq(s->ip_irq_out, 0);
