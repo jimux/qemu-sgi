@@ -126,8 +126,7 @@ static void sgi_heart_set_irq(void *opaque, int n, int level)
 static void sgi_heart_update_irq(SGIHEARTState *s)
 {
     uint64_t isr = s->isr;
-    uint64_t imr = s->imr[0];  /* CPU 0 mask for now */
-    uint64_t masked = isr & imr;
+    int c;
 
     /*
      * HEART level -> CPU IP map (from IRIX ffintrctbl/c0vec_tbl):
@@ -138,30 +137,34 @@ static void sgi_heart_update_irq(SGIHEARTState *s)
      *   level4 (vec 51-63) -> IP6  (heart_intr_err)
      * The machine wires cpu_irq[i] -> the matching env.irq (see sgi_octane.c).
      */
-    if (masked & HEART_INT_LEVEL4) {
-        qemu_irq_raise(s->cpu_irq[0]);
-    } else {
-        qemu_irq_lower(s->cpu_irq[0]);
-    }
-    if (masked & HEART_INT_LEVEL3) {
-        qemu_irq_raise(s->cpu_irq[1]);
-    } else {
-        qemu_irq_lower(s->cpu_irq[1]);
-    }
-    if (masked & HEART_INT_LEVEL2) {
-        qemu_irq_raise(s->cpu_irq[2]);
-    } else {
-        qemu_irq_lower(s->cpu_irq[2]);
-    }
-    if (masked & HEART_INT_LEVEL1) {
-        qemu_irq_raise(s->cpu_irq[3]);
-    } else {
-        qemu_irq_lower(s->cpu_irq[3]);
-    }
-    if (masked & HEART_INT_LEVEL0) {
-        qemu_irq_raise(s->cpu_irq[4]);
-    } else {
-        qemu_irq_lower(s->cpu_irq[4]);
+    for (c = 0; c < 2; c++) {
+        uint64_t masked = isr & s->imr[c];
+
+        if (masked & HEART_INT_LEVEL4) {
+            qemu_irq_raise(s->cpu_irq[c][0]);
+        } else {
+            qemu_irq_lower(s->cpu_irq[c][0]);
+        }
+        if (masked & HEART_INT_LEVEL3) {
+            qemu_irq_raise(s->cpu_irq[c][1]);
+        } else {
+            qemu_irq_lower(s->cpu_irq[c][1]);
+        }
+        if (masked & HEART_INT_LEVEL2) {
+            qemu_irq_raise(s->cpu_irq[c][2]);
+        } else {
+            qemu_irq_lower(s->cpu_irq[c][2]);
+        }
+        if (masked & HEART_INT_LEVEL1) {
+            qemu_irq_raise(s->cpu_irq[c][3]);
+        } else {
+            qemu_irq_lower(s->cpu_irq[c][3]);
+        }
+        if (masked & HEART_INT_LEVEL0) {
+            qemu_irq_raise(s->cpu_irq[c][4]);
+        } else {
+            qemu_irq_lower(s->cpu_irq[c][4]);
+        }
     }
 }
 
@@ -442,11 +445,14 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
          * which vector fired; returning a stale/zero field makes it see no
          * vector even though IP7 is asserted.
          */
-        val = (size == 4) ? ((s->isr & s->imr[0]) >> 32)
-                          : (s->isr & s->imr[0]);
+        val = (size == 4) ?
+              ((s->isr & s->imr[current_cpu ? current_cpu->cpu_index & 3 : 0])
+               >> 32) :
+              (s->isr & s->imr[current_cpu ? current_cpu->cpu_index & 3 : 0]);
         break;
     case HEART_IMSR + 4:
-        val = (s->isr & s->imr[0]) & 0xffffffffu;
+        val = (s->isr & s->imr[current_cpu ? current_cpu->cpu_index & 3 : 0])
+              & 0xffffffffu;
         break;
     case HEART_CAUSE:
         val = s->cause;
@@ -768,9 +774,11 @@ static void sgi_heart_realize(DeviceState *dev, Error **errp)
                           s, "sgi-heart-probe", HEART_PROBE_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->probe_iomem);
 
-    /* Output IRQs to CPU (IP7, IP6, IP5, IP4, IP3) */
-    for (int i = 0; i < 5; i++) {
-        sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cpu_irq[i]);
+    /* Per-CPU output IRQs (level 4..0 -> IP7, IP6, IP5, IP4, IP3). */
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 5; j++) {
+            sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cpu_irq[i][j]);
+        }
     }
 
     /* Input IRQ lines from devices → HEART ISR bits */

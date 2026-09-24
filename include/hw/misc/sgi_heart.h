@@ -194,7 +194,8 @@ struct SGIHEARTState {
     MemoryRegion *ram;
 
     /* CPU interrupt output (HEART -> CPU IP7/IP6/IP5/IP4/IP3) */
-    qemu_irq cpu_irq[5];
+    /* Per-CPU interrupt lines: [cpu][level], level 4..0 -> IP7..IP3. */
+    qemu_irq cpu_irq[2][5];
 
     /* COMPARE timer */
     QEMUTimer *compare_timer;

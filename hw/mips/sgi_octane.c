@@ -304,11 +304,23 @@ static void sgi_octane_init(MachineState *machine)
      * HEART interrupt outputs -> CPU IP3-IP7. Level 4 (errors/widget) -> IP7,
      * level 3 (timer) -> IP6, level 2 -> IP5, level 1 -> IP4, level 0 -> IP3.
      */
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 0, cpu->env.irq[6]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 1, cpu->env.irq[5]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 2, cpu->env.irq[4]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 3, cpu->env.irq[3]);
-    sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), 4, cpu->env.irq[2]);
+    /*
+     * HEART per-CPU interrupt outputs: [cpu][level] -> IP7/IP6/IP5/IP4/IP3.
+     * Both CPUs get their own lines so vectors the kernel enables in imr[i]
+     * are delivered on CPU i.
+     */
+    for (int c = 0; c < (int)machine->smp.cpus; c++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), c * 5 + 0,
+                           octane_cpus[c]->env.irq[6]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), c * 5 + 1,
+                           octane_cpus[c]->env.irq[5]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), c * 5 + 2,
+                           octane_cpus[c]->env.irq[4]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), c * 5 + 3,
+                           octane_cpus[c]->env.irq[3]);
+        sysbus_connect_irq(SYS_BUS_DEVICE(heart_dev), c * 5 + 4,
+                           octane_cpus[c]->env.irq[2]);
+    }
 
     /* BRIDGE (widget 0xF) at 0x1F000000, 12MB covering PCI/IOC3/devio. */
     bridge_dev = qdev_new(TYPE_SGI_BRIDGE);
