@@ -6,6 +6,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "hw/misc/sgi_ds2502.h"
 
 /* --- One DS250x part (from origin's sgi_hub.c af842ce7a2) -------------- */
@@ -322,6 +323,12 @@ int sgi_ds2502_bus_add(SGIDS2502BUS *bus, const char *serial, const char *part,
     }
     idx = bus->ndev++;
     sgi_ds2502_build_board(&bus->dev[idx], serial, part, name, rom_serial);
+    if (getenv("SGIDS_DBG")) {
+        qemu_log("ds2502 bus_add idx=%d ndev=%d rom=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                 idx, bus->ndev, bus->dev[idx].rom[0], bus->dev[idx].rom[1],
+                 bus->dev[idx].rom[2], bus->dev[idx].rom[3], bus->dev[idx].rom[4],
+                 bus->dev[idx].rom[5], bus->dev[idx].rom[6], bus->dev[idx].rom[7]);
+    }
     return idx;
 }
 
@@ -492,20 +499,25 @@ int sgi_ds2502_bus_read_bit(SGIDS2502BUS *bus)
         }
         return sgi_ds2502_bus_read_bit(bus);
     case SGI_DS_RMEM_DATA:
-        if (bus->sel < 0) {
-            return 1;
-        }
-        if (bus->extra > 0) {
-            bit = (0xff >> (8 - bus->extra)) & 1;
-            bus->extra--;
+        {
+            /*
+             * A read-memory with no preceding MATCH/SKIP ROM (the PROM's
+             * board-EEPROM reads do exactly that) addresses the default part.
+             */
+            int sel = (bus->sel >= 0) ? bus->sel : 0;
+
+            if (bus->extra > 0) {
+                bit = (0xff >> (8 - bus->extra)) & 1;
+                bus->extra--;
+                return bit;
+            }
+            bit = (bus->dev[sel].mem[bus->addr + bus->out_index / 8] >>
+                   (bus->out_index % 8)) & 1;
+            if (++bus->out_index == 32 * 8) {
+                bus->state = SGI_DS_CMD;
+            }
             return bit;
         }
-        bit = (bus->dev[bus->sel].mem[bus->addr + bus->out_index / 8] >>
-               (bus->out_index % 8)) & 1;
-        if (++bus->out_index == 32 * 8) {
-            bus->state = SGI_DS_CMD;
-        }
-        return bit;
     default:
         return 1;
     }
