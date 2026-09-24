@@ -27,6 +27,7 @@
 #include "hw/char/mc68681.h"
 #include "hw/misc/sgi_ip2.h"
 #include "hw/display/sgi_gl2.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 
 #define TYPE_IRIS3130_MACHINE MACHINE_TYPE_NAME("iris3130")
@@ -94,6 +95,33 @@ static void iris3130_ip2_irq(void *opaque, int n, int level)
     }
 }
 
+bool sgi_gl2_user_read(uint32_t *pc_out)
+{
+    M68kCPU *cpu = (M68kCPU *)current_cpu;
+
+    if (!cpu || (cpu->env.sr & 0x2000)) {
+        return false;
+    }
+    if (pc_out) {
+        *pc_out = cpu->env.pc;
+    }
+    return true;
+}
+
+static QEMUTimer *sgi_pc_timer;
+
+static void sgi_pc_sample(void *opaque)
+{
+    M68kCPU *cpu = opaque;
+
+    if (!(cpu->env.sr & 0x2000)) {   /* user mode: supervisor bit clear */
+        fprintf(stderr, "PCSAMPLE pc=%08x sr=%04x\n",
+                cpu->env.pc, cpu->env.sr);
+    }
+    timer_mod(sgi_pc_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+}
+
 static void iris3130_init(MachineState *machine)
 {
     IRIS3130MachineState *s = IRIS3130_MACHINE(machine);
@@ -139,6 +167,19 @@ static void iris3130_init(MachineState *machine)
     s->cpu.env.ext_tlb_fill = sgi_ip2_ext_tlb_fill;
     s->cpu.env.ext_tlb_opaque = SGI_IP2(board);
     sgi_ip2_set_cpu(board, CPU(&s->cpu));
+
+    /*
+     * Diagnostic: sample the CPU program counter on a wall-clock timer so a
+     * guest that spins in user mode (making no syscalls) still reveals its
+     * hot loop.  A guest in supervisor mode is skipped.  Off unless
+     * SGI_PC_SAMPLE is set in the environment.
+     */
+    if (getenv("SGI_PC_SAMPLE")) {
+        sgi_pc_timer = timer_new_ms(QEMU_CLOCK_REALTIME, sgi_pc_sample,
+                                    &s->cpu);
+        timer_mod(sgi_pc_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+    }
 
     /*
      * tty0 is DUART0 channel A (keyboard), tty1 DUART0 channel B (the

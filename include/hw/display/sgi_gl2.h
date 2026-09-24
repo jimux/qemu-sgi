@@ -25,4 +25,11 @@ MemoryRegion *sgi_gl2_mmio_region(DeviceState *dev);
  */
 MemoryRegion *sgi_gl2_ge_region(DeviceState *dev);
 
+/*
+ * Diagnostic hook implemented by the machine (which can see the target CPU):
+ * report whether the currently executing guest is in user mode, and if so
+ * return its PC.  Used only for the SGI_MMIO_LOG read tracing.
+ */
+bool sgi_gl2_user_read(uint32_t *pc_out);
+
 #endif

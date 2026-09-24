@@ -647,8 +647,39 @@ static const GraphicHwOps gl2_gfx_ops = {
     .gfx_update = gl2_gfx_update,
 };
 
+/*
+ * Diagnostic: log graphics-window MMIO reads made by USER mode (SR
+ * supervisor bit clear) when SGI_MMIO_LOG is set.  A guest spinning on a
+ * GE/GF2 status bit (waiting for ready/token/retrace) shows up as the same
+ * address read thousands of times with an unchanging value, and the PC names
+ * the waiting call -- which points straight at the model fix.
+ */
+static void gl2_log_uread(const char *tag, hwaddr addr, uint64_t val,
+                          unsigned size)
+{
+    static int on = -1;
+    uint32_t pc;
+
+    if (on < 0) {
+        on = getenv("SGI_MMIO_LOG") != NULL;
+    }
+    if (!on || !sgi_gl2_user_read(&pc)) {
+        return;
+    }
+    fprintf(stderr, "MMIOUR %s off=%#x pc=%08x val=%#llx size=%u\n",
+            tag, (unsigned)addr, pc, (unsigned long long)val, size);
+}
+
+static uint64_t gl2_read_log(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t v = gl2_read(opaque, addr, size);
+
+    gl2_log_uread("FBC", addr, v, size);
+    return v;
+}
+
 static const MemoryRegionOps gl2_ops = {
-    .read = gl2_read,
+    .read = gl2_read_log,
     .write = gl2_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
@@ -1163,8 +1194,16 @@ static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
 }
 
+static uint64_t gl2_ge_read_log(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t v = gl2_ge_read(opaque, addr, size);
+
+    gl2_log_uread("GE", addr, v, size);
+    return v;
+}
+
 static const MemoryRegionOps gl2_ge_ops = {
-    .read = gl2_ge_read,
+    .read = gl2_ge_read_log,
     .write = gl2_ge_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
