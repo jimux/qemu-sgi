@@ -1108,8 +1108,136 @@ static void sgi_baseio_eth_irq_sync(SGIBaseIOState *s) {
   sgi_baseio_int_sync(s);
 }
 
+/*
+ * IO6 boot flash (AMD Am29F080-class NOR) at bridge DevIO +0xC00000.
+ *
+ * The IRIX flash(1M) tool (cmd/flashio/fprom_sn0.c, FPROM_DEV_IO6_P1) drives
+ * the same AMD command protocol as the hub flash, but with the IO6 P1 access
+ * pattern: commands are 16-bit stores at WORD-indexed offsets (SHCMD_IO6_P1
+ * writes `*(ushort_t *)base + offset`, so word 0x5555 lands at byte 0xAAAA and
+ * word 0x2AAA at byte 0x5554), autoselect is read back with 16-bit loads at raw
+ * byte offsets 0 (manufacturer) and 2 (device), and data/erase/status use raw
+ * byte offsets (LB_IO6_P1).  do_probe accepts the Am29F080 pair (manu 0x01,
+ * dev 0xd5); without it fprom_probe returns FPROM_ERROR_DEVICE and
+ * flash_writeprom sets EINVAL (flashio_sn0.c:1372) -- the "errno: 22" that
+ * wedged the install's flash exitop.  Measured: the tool's accesses land
+ * exactly here (window offs 0xC0AAAA/0xC05554/0xC00000).
+ */
+static uint8_t sgi_baseio_ioprom_byte(SGIBaseIOState *s, uint64_t off) {
+  if (s->ioprom_autoselect) {
+    /* 16-bit BE reads: LH(0)=manu, LH(2)=dev.  0x0001/0x00d5 is accepted. */
+    switch (off) {
+    case 0: return 0x00;
+    case 1: return 0x01;
+    case 2: return 0x00;
+    case 3: return 0xd5;
+    default: return 0xff;
+    }
+  }
+  return off < SGI_BASEIO_IOPROM_SIZE ? s->ioprom[off] : 0xff;
+}
+
+static uint64_t sgi_baseio_ioprom_read(void *opaque, hwaddr off, unsigned size) {
+  SGIBaseIOState *s = opaque;
+  uint64_t v = 0;
+  unsigned i;
+  for (i = 0; i < size; i++) {
+    v = (v << 8) | sgi_baseio_ioprom_byte(s, off + i);
+  }
+  if (s->ioprom_dbg) {
+    qemu_log_mask(LOG_GUEST_ERROR, "ioprom[%u] R off=0x%" PRIx64 " size=%u -> "
+                  "0x%" PRIx64 "\n", (unsigned)s->widget, (uint64_t)off, size, v);
+  }
+  return v;
+}
+
+static void sgi_baseio_ioprom_write(void *opaque, hwaddr off, uint64_t val,
+                                    unsigned size) {
+  SGIBaseIOState *s = opaque;
+  uint8_t b = val & 0xff; /* command macros store the byte zero-extended */
+
+  if (s->ioprom_dbg) {
+    qemu_log_mask(LOG_GUEST_ERROR, "ioprom[%u] W off=0x%" PRIx64 " size=%u "
+                  "val=0x%" PRIx64 "\n", (unsigned)s->widget, (uint64_t)off, size, val);
+  }
+
+  /* SHDATA_IO6_P1: after 0xa0 the next 16-bit store is program data at the
+   * raw byte offset; the flash can only clear bits, so AND it in (BE order). */
+  if (s->ioprom_program) {
+    if (off + 1 < SGI_BASEIO_IOPROM_SIZE) {
+      s->ioprom[off] &= (val >> 8) & 0xff;
+      s->ioprom[off + 1] &= val & 0xff;
+    } else if (off < SGI_BASEIO_IOPROM_SIZE) {
+      s->ioprom[off] &= b;
+    }
+    s->ioprom_program = 0;
+    return;
+  }
+  if (off == 0 && b == 0xf0) { /* reset to read mode */
+    s->ioprom_autoselect = 0;
+    s->ioprom_unlock = 0;
+    s->ioprom_program = 0;
+    s->ioprom_erase = 0;
+    return;
+  }
+  if (off == 0xaaaa && b == 0xaa) {
+    s->ioprom_unlock = 1;
+    return;
+  }
+  if (off == 0x5554 && b == 0x55 && s->ioprom_unlock == 1) {
+    s->ioprom_unlock = 2;
+    return;
+  }
+  if (off == 0xaaaa && s->ioprom_unlock == 2 && b == 0x90) {
+    s->ioprom_autoselect = 1;
+    s->ioprom_erase = 0;
+    s->ioprom_unlock = 0;
+    return;
+  }
+  if (off == 0xaaaa && s->ioprom_unlock == 2 && b == 0xa0) {
+    s->ioprom_program = 1;
+    s->ioprom_erase = 0;
+    s->ioprom_unlock = 0;
+    return;
+  }
+  if (off == 0xaaaa && s->ioprom_unlock == 2 && b == 0x80) {
+    s->ioprom_erase = 1;
+    s->ioprom_program = 0;
+    s->ioprom_unlock = 0;
+    return;
+  }
+  if (s->ioprom_erase) {
+    if (b == 0x30) {
+      /* Erase the 64 KiB block containing the target byte (the flasher also
+       * issues sub-block addresses in the top block; over-erasing to 0xff is
+       * harmless -- the tool programs the file immediately after). */
+      uint64_t sec = off & ~(uint64_t)0xffff;
+      if (sec < SGI_BASEIO_IOPROM_SIZE) {
+        memset(s->ioprom + sec, 0xff,
+               MIN((uint64_t)0x10000, SGI_BASEIO_IOPROM_SIZE - sec));
+      }
+    }
+    return;
+  }
+  s->ioprom_unlock = 0;
+}
+
+static const MemoryRegionOps sgi_baseio_ioprom_ops = {
+  .read = sgi_baseio_ioprom_read,
+  .write = sgi_baseio_ioprom_write,
+  .endianness = DEVICE_BIG_ENDIAN,
+  .valid = { .min_access_size = 1, .max_access_size = 2 },
+  .impl = { .min_access_size = 1, .max_access_size = 2 },
+};
+
 static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   SGIBaseIOState *s = opaque;
+
+  if (s->win_dbg && off >= 0x400000ULL) {
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "baseio-win[%u] R off=0x%" HWADDR_PRIx " size=%u\n",
+                  (unsigned)s->widget, off, size);
+  }
 
   /*
    * XIO widget identification, low word (offset 4): bits [27:12] are the
@@ -1453,6 +1581,16 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
 static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
                              unsigned size) {
   SGIBaseIOState *s = opaque;
+
+  if (s->win_dbg &&
+      (off >= 0x400000ULL /* high window incl. flash/QLISP */
+       || (size <= 2 && ((val & 0xff) == 0xaa || (val & 0xff) == 0x55 ||
+                         (val & 0xff) == 0x90 || (val & 0xff) == 0xf0 ||
+                         (val & 0xff) == 0xa0 || (val & 0xff) == 0x80)))) {
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "baseio-win[%u] W off=0x%" HWADDR_PRIx " size=%u val=0x%"
+                  PRIx64 "\n", (unsigned)s->widget, off, size, (uint64_t)val);
+  }
 
   if (off == 0xb4) {
     sgi_baseio_mcr_write(&s->ds_board, val);
@@ -1924,6 +2062,8 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
   Chardev *chr;
   int i;
 
+  s->win_dbg = getenv("IP27_BASEIO_WINDBG") != NULL;
+
   /*
    * Bridge PCI-interrupt aggregation: eight device-line inputs (BaseIO
    * devices assert them) and one aggregate output the machine may route.  The
@@ -1972,6 +2112,21 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
                         "sgi-baseio-ssram", SGI_BASEIO_IOC3_SSRAM_LEN);
   memory_region_add_subregion(&s->iomem, SGI_BASEIO_IOC3_SSRAM_OFF,
                               &s->ssram_mr);
+
+  /*
+   * IO6 boot flash.  Exposed on every BaseIO instance (the kernel's mmap of
+   * the xtalk/pci/controller vertex can be backed by either the discovery
+   * alias or the real IO widget).  Blank NOR reads 0xff.  See the
+   * access-pattern notes above sgi_baseio_ioprom_read.
+   */
+  {
+    memset(s->ioprom, 0xff, SGI_BASEIO_IOPROM_SIZE);
+    s->ioprom_dbg = getenv("SGIBASEIO_IOPROM_DBG") != NULL;
+    memory_region_init_io(&s->ioprom_mr, OBJECT(s), &sgi_baseio_ioprom_ops, s,
+                          "sgi-baseio-ioprom", SGI_BASEIO_IOPROM_SIZE);
+    memory_region_add_subregion(&s->iomem, SGI_BASEIO_IOPROM_OFF,
+                                &s->ioprom_mr);
+  }
 
   /*
    * On-board QLogic ISP1020 SCSI channels.  The children must always be

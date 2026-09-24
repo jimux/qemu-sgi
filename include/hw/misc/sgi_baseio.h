@@ -132,6 +132,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIBaseIOState, SGI_BASEIO)
  */
 #define SGI_BASEIO_BR_ATE_OFF 0x10000ULL
 
+/*
+ * BaseIO IO6 boot flash (AMD Am29F080-class NOR) at bridge DevIO +0xC00000.
+ *
+ * The IRIX `flash` utility (cmd/flashio/flashio_sn0.c, IOPROM_OFFSET) reaches
+ * it by mmapping the xtalk/pci/controller hwgraph vertex.  Measured (widget-8
+ * window access trace): the tool's AMD command sequence lands at window
+ * offsets 0xC0AAAA (unlock 0xAA), 0xC05554 (unlock 0x55), 0xC0AAAA (0x90
+ * autoselect) with reset 0xF0 at 0xC00000 and 16-bit autoselect reads at
+ * 0xC00000/0xC00002 -- i.e. exactly DevIO +0xC00000, which is where the
+ * install exitop's EINVAL (flashio_sn0.c:1372, fprom_probe returned
+ * FPROM_ERROR_DEVICE because nothing decoded these reads -> 0x0000) was seen.
+ * Model the am29f080 pair (0x01,0xd5) here.
+ */
+#define SGI_BASEIO_IOPROM_OFF 0xC00000ULL
+#define SGI_BASEIO_IOPROM_SIZE 0x100000ULL
+
 /* Register word indices (from IOC3 offset 0x0F0). */
 #define SGI_IOC3_EMCR 0
 #define SGI_IOC3_EISR 1
@@ -206,6 +222,23 @@ struct SGIBaseIOState {
 
   uint32_t nasid;
   uint32_t widget;
+
+  /*
+   * Debug: log every BaseIO window access (IP27_BASEIO_WINDBG=1).  Used to
+   * locate which offset the flash(1M) tool's mmap of its hwgraph vertex
+   * actually reaches; off by default.
+   */
+  bool win_dbg;
+
+  /* IO6 boot flash (AMD Am29F080-class), bridge DevIO +0xC00000; see
+   * SGI_BASEIO_IOPROM_OFF.  Widget-8 instance only. */
+  MemoryRegion ioprom_mr;
+  uint8_t ioprom[SGI_BASEIO_IOPROM_SIZE];
+  int ioprom_autoselect;
+  int ioprom_unlock;  /* 1 = AA@0xAAAA seen, 2 = +55@0x5554 */
+  int ioprom_program; /* next write stores data */
+  int ioprom_erase;   /* 0x80 seen, awaiting 0x30 (sector) */
+  bool ioprom_dbg;
 
   /*
    * XIO widget id reported in WIDGET_CONTROL (bridge+0x24) -- the id the
