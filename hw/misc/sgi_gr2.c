@@ -319,7 +319,7 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
  * prefix length, walk back from the end while each group is a sane rectangle:
  * the longest valid suffix is the list, and the prefix is left alone.  This is
  * the layout read off the DDX store sequences (note 31), not a guessed tail. */
-static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
+static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s, bool stippled)
 {
     unsigned n = s->re3_data_n, groups = 0;
 
@@ -333,6 +333,18 @@ static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
             y2 > SGI_GR2_SCREEN_H) {
             break;
         }
+        /* A stippled fill carries a stipple pattern/mask header ahead of its
+         * rect list.  That header can end in words that, together with the
+         * run of zeros before them, look like one more rectangle starting at
+         * the screen origin - the backward walk reads it as a spurious
+         * (0,0,40,210) rect.  The DDX keeps the real rect count in a register
+         * and writes only four words per rect, with no count in the FIFO
+         * payload (expStippledFillRects), so the count cannot be recovered
+         * from the stream; a further origin-anchored group after the first is
+         * a parse artifact, not geometry.  Stop there. */
+        if (stippled && groups > 0 && x1 == 0 && y1 == 0) {
+            break;
+        }
         groups++;
     }
     return groups;
@@ -343,7 +355,7 @@ static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
 static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
 {
     unsigned n = s->re3_data_n;
-    unsigned groups = sgi_gr2_re3_rect_groups(s), g;
+    unsigned groups = sgi_gr2_re3_rect_groups(s, stippled), g;
     uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
 
     if (groups == 0) {
