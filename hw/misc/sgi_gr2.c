@@ -2532,6 +2532,7 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * for the driver's poll. */
     if (offset >= SGI_GR2_XMAP_CTL_OFF && offset < SGI_GR2_XMAP_CTL_END) {
         s->xmap_ready = true;
+        trace_sgi_gr2_xmap_ctl((uint32_t)offset, (uint32_t)value);
     }
     /* RAMDAC colour-map programming (XMAP_PAL_*): the DDX writes the entry
      * index to 0x6c1b0, a control byte to 0x6c1b4, and a sliding R,G,B byte
