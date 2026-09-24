@@ -101,6 +101,29 @@ static void sgi_sflash_cmd_write(void *opaque, hwaddr off, uint64_t value,
 
 /* --- PDS segment (segment 15) ---------------------------------------- */
 
+/* Reload the PDS image from its backing file (or erase it if unbacked). */
+static void sgi_sflash_pds_load(SGISflashState *s)
+{
+    gchar *data = NULL;
+    gsize len = 0;
+
+    memset(s->pds, 0xff, sizeof(s->pds));
+    if (s->pds_file &&
+        g_file_get_contents(s->pds_file, &data, &len, NULL) && len > 0) {
+        memcpy(s->pds, data, MIN(len, sizeof(s->pds)));
+    }
+    g_free(data);
+}
+
+/* Persist the PDS image to its backing file, if any. */
+static void sgi_sflash_pds_save(SGISflashState *s)
+{
+    if (s->pds_file) {
+        g_file_set_contents(s->pds_file, (const gchar *)s->pds,
+                            sizeof(s->pds), NULL);
+    }
+}
+
 static uint64_t sgi_sflash_pds_read(void *opaque, hwaddr off, unsigned size)
 {
     SGISflashState *s = opaque;
@@ -126,12 +149,14 @@ static void sgi_sflash_pds_write(void *opaque, hwaddr off, uint64_t value,
             s->pds[o + 1] = v & 0xff;
         }
         s->write_pending = false;
+        sgi_sflash_pds_save(s);
         return;
     }
     if (s->erase_pending && v == SFLASH_CMD_ERASE_CONFIRM) {
         memset(s->pds, 0xff, sizeof(s->pds));
         s->erase_pending = false;
         s->cmd = 0;
+        sgi_sflash_pds_save(s);
         return;
     }
 
@@ -157,6 +182,7 @@ static void sgi_sflash_pds_write(void *opaque, hwaddr off, uint64_t value,
         if (o + 1 < SGI_SFLASH_SEG_SIZE) {
             s->pds[o + 1] = v & 0xff;
         }
+        sgi_sflash_pds_save(s);
         break;
     }
 }
@@ -181,7 +207,7 @@ static void sgi_sflash_reset(DeviceState *dev)
 {
     SGISflashState *s = SGI_SFLASH(dev);
 
-    memset(s->pds, 0xff, sizeof(s->pds)); /* erased */
+    sgi_sflash_pds_load(s);
     s->cmd = 0;
     s->cmd_off = 0;
     s->write_pending = false;
@@ -206,6 +232,7 @@ static void sgi_sflash_realize(DeviceState *dev, Error **errp)
 static const Property sgi_sflash_properties[] = {
     DEFINE_PROP_LINK("rom", SGISflashState, rom, TYPE_MEMORY_REGION,
                      MemoryRegion *),
+    DEFINE_PROP_STRING("pds", SGISflashState, pds_file),
 };
 
 static void sgi_sflash_class_init(ObjectClass *klass, const void *data)

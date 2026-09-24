@@ -333,6 +333,20 @@ static void sgi_octane_init(MachineState *machine)
 
         object_property_set_link(OBJECT(sflash), "rom", OBJECT(prom),
                                  &error_abort);
+        /*
+         * Back the flash PDS (NVRAM) segment with a file so the PROM's
+         * environment (OSLoadFilename, SystemPartition, ...) and its
+         * initialized time-of-day clock persist across runs.  Without it the
+         * segment starts erased and the PROM reinitializes both on every boot.
+         * Honour OCTANE_PDS for tests; default to the Indy-style filename.
+         */
+        {
+            const char *pds = getenv("OCTANE_PDS");
+
+            object_property_set_str(OBJECT(sflash), "pds",
+                                    pds ? pds : "sgi_octane_nvram.bin",
+                                    &error_abort);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sflash), &error_fatal);
         /* Alternate-base command window + PDS segment (segment 15). */
         sysbus_mmio_map(SYS_BUS_DEVICE(sflash), 0, OCTANE_FLASH_ALT_BASE);

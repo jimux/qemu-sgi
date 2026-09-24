@@ -39,6 +39,14 @@ struct SGISflashState {
     /* Backing PROM image, for reads of the code segments. */
     MemoryRegion *rom;
 
+    /*
+     * Optional file backing the PDS (NVRAM) segment, so PROM environment
+     * variables (OSLoadFilename, SystemPartition, ...) persist across runs --
+     * otherwise the segment starts erased and the PROM reinitializes its env
+     * and the time-of-day clock on every boot.  Unset means volatile.
+     */
+    char *pds_file;
+
     uint8_t pds[SGI_SFLASH_SEG_SIZE];
 
     uint32_t cmd;
