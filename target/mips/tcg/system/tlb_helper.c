@@ -549,9 +549,21 @@ static int r3k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
 {
     int ret = r4k_map_address(env, physical, prot, address, access_type);
 
-    if (ret == TLBRET_INVALID) {
-        return TLBRET_NOMATCH;
-    }
+    /*
+     * MIPS-I distinguishes a TLB miss (no entry matches the VPN/ASID) from a
+     * matching entry whose Valid bit is clear.  r4k_map_address already
+     * reports the former as TLBRET_NOMATCH and the latter as TLBRET_INVALID,
+     * and raise_mmu_exception selects the UTLB-refill vector only for a
+     * no-match (it is the one that sets EXCP_TLB_NOMATCH); TLBRET_INVALID
+     * takes the general vector, which is the R3000 rule.
+     *
+     * Do NOT fold TLBRET_INVALID into TLBRET_NOMATCH: the software refill
+     * handler installs the invalid entry it has just built and returns, so
+     * folding it would send the very next access back to the refill vector
+     * for the same VPN and loop forever.  IRIX 4.0.5 on the IP6 does exactly
+     * that on user VA 0x10000000 (its refill stores V=0 because the page is
+     * not present), which wedged the boot before init could run.
+     */
     return ret;
 }
 
