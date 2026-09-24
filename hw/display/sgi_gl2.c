@@ -972,6 +972,17 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
     if (cmd != 0x25) {
         s->fb_active = false;
     }
+    /*
+     * Likewise disarm the plane-mask readback.  gl_getplaneinfo() issues
+     * FBCpixelsetup and reads its three words immediately, but gr_init's
+     * self-test issues the same packet and never reads, leaving the arm
+     * set; a later ordinary FBCdata read (the console's, or another
+     * client's) would then get the readback words instead of what it
+     * asked for.  A stale arm must not survive to the next command.
+     */
+    if (cmd != 0x2f) {
+        s->readback_seq = 0;
+    }
 
     if (s->trace) {
         fprintf(stderr, "gl2: GE cmd=0x%02x nargs=%u", cmd, nargs);
