@@ -1153,16 +1153,17 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
     }
 }
 
-/* 4x4 ordered-dither matrix.  [ASSUMPTION] Borrowed from the Newport path
- * (sgi_newport.c, itself from MAME's newport.cpp get_rgb_color) on the grounds
- * that the two boards share the SGI 8-bit raster convention: no dither matrix
- * exists in gr2.h/gr2hw.h or the DDX, and we have no GR2 reference showing the
- * stipple pattern.  Replace with the real matrix if one is recovered. */
+/* 4x4 ordered-dither matrix, read from __glDitherTable in the guest's own
+ * libGLcore.so (the IP22GR2NG1 library the ideas/atlantis/powerflip binaries
+ * link: /usr/gfx/arch/IP22GR2NG1/libGLcore.so).  Its first 16 bytes are this
+ * matrix; the 48 that follow are per-channel threshold tables.  It is a
+ * rotation/transpose of the Newport matrix, not the same table - which is why
+ * the Newport one must not be reused.  Row-major as stored. */
 static const uint8_t sgi_gr2_ge7_bayer[4][4] = {
-    { 0, 12,  3, 15 },
-    { 8,  4, 11,  7 },
-    { 2, 14,  1, 13 },
-    { 10, 6,  9,  5 },
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 },
 };
 
 /* Pick the ramp level for a linear 0..255 channel value.  `thresh` >= 0 is a
