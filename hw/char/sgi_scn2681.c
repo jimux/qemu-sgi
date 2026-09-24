@@ -42,7 +42,18 @@
 
 static void scn2681_update_irq(SCN2681State *s)
 {
-    qemu_set_irq(s->irq, (s->isr & s->imr) != 0);
+    bool level = (s->isr & s->imr) != 0;
+    const char *p = getenv("SCN2681_LOGFILE");
+
+    if (p && level) {
+        FILE *f = fopen(p, "a");
+        if (f) {
+            fprintf(f, "SCN IRQ isr=%02x imr=%02x lvl=%d\n", s->isr, s->imr,
+                    level);
+            fclose(f);
+        }
+    }
+    qemu_set_irq(s->irq, level);
 }
 
 /* One character time for the transmit-busy model.  Fixed default: the exact
@@ -219,12 +230,28 @@ static void scn2681_ct_cb(void *opaque)
     }
 }
 
+/* Temporary file-backed probe (SCN2681_LOGFILE): trace console register I/O. */
+static void scn2681_probe(const char *dir, int reg, unsigned val)
+{
+    const char *p = getenv("SCN2681_LOGFILE");
+    FILE *f;
+
+    if (!p) {
+        return;
+    }
+    f = fopen(p, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "SCN %s reg=%x val=%02x\n", dir, reg & 0xf, val & 0xff);
+    fclose(f);
+}
+
 uint8_t scn2681_read(SCN2681State *s, int reg)
 {
     uint8_t ret = 0;
 
-    switch (reg & 0xf) {
-    case SCN2681_REG_MR1A:
+    switch (reg & 0xf) {    case SCN2681_REG_MR1A:
         if (!s->ch[0].mr_ptr) {
             s->ch[0].mr_ptr = true;
             ret = s->ch[0].mr1;
@@ -301,11 +328,13 @@ uint8_t scn2681_read(SCN2681State *s, int reg)
         break;
     }
 
+    scn2681_probe("R", reg, ret);
     return ret;
 }
 
 void scn2681_write(SCN2681State *s, int reg, uint8_t val)
 {
+    scn2681_probe("W", reg, val);
     switch (reg & 0xf) {
     case SCN2681_REG_MR1A:
         if (!s->ch[0].mr_ptr) {

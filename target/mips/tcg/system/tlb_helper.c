@@ -49,6 +49,78 @@ static inline uint64_t get_tlb_pfn_from_entrylo(uint64_t entrylo)
 #endif
 }
 
+/*
+ * R3000 TLB debugging probes (temporary): file-backed so they never touch the
+ * guest pty.  Set IP6TLB_LOGFILE and they trace the refill writes and the
+ * lookup misses for the page named by IP6TLB_ADDR (default the IRIX kseg2
+ * page 0xff880000 that the IP6 kernel faults on forever).
+ */
+static uint32_t r3k_probe_addr(void)
+{
+    const char *a = getenv("IP6TLB_ADDR");
+    return a ? (uint32_t)strtoul(a, NULL, 0) : 0xff880000u;
+}
+
+static void r3k_probe_write(CPUMIPSState *env, int idx, const char *op)
+{
+    uint32_t want = r3k_probe_addr();
+    const char *p = getenv("IP6TLB_LOGFILE");
+    r4k_tlb_t *tlb;
+    FILE *f;
+
+    if (!p || env->cpu_model->mmu_type != MMU_TYPE_R3000) {
+        return;
+    }
+    tlb = &env->tlb->mmu.r4k.tlb[idx];
+    if ((tlb->VPN & TARGET_PAGE_MASK) != (want & TARGET_PAGE_MASK)) {
+        return;
+    }
+    f = fopen(p, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "TLBW %s idx=%d EH=%08x EL0=%08x EL1=%08x ASIDmask=%03x | "
+            "VPN=%08x ASID=%03x G=%d V0=%d D0=%d PFN0=%08x EHINV=%d\n",
+            op, idx, (unsigned)env->CP0_EntryHi, (unsigned)env->CP0_EntryLo0,
+            (unsigned)env->CP0_EntryLo1, (unsigned)env->CP0_EntryHi_ASID_mask,
+            (unsigned)tlb->VPN, tlb->ASID, tlb->G, tlb->V0, tlb->D0,
+            (unsigned)tlb->PFN[0], tlb->EHINV);
+    fclose(f);
+}
+
+static void r3k_probe_miss(CPUMIPSState *env, target_ulong address)
+{
+    uint32_t want = r3k_probe_addr();
+    const char *p = getenv("IP6TLB_LOGFILE");
+    FILE *f;
+    int i;
+
+    if (!p || env->cpu_model->mmu_type != MMU_TYPE_R3000) {
+        return;
+    }
+    if ((address & TARGET_PAGE_MASK) != (want & TARGET_PAGE_MASK)) {
+        return;
+    }
+    f = fopen(p, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "TLBMISS addr=%08x EH=%08x ASIDmask=%03x G_via_EL0=%d | ",
+            (unsigned)address, (unsigned)env->CP0_EntryHi,
+            (unsigned)env->CP0_EntryHi_ASID_mask,
+            (env->CP0_EntryLo0 & 0x100) != 0);
+    for (i = 0; i < env->tlb->tlb_in_use; i++) {
+        r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
+        if ((tlb->VPN & TARGET_PAGE_MASK) == (want & TARGET_PAGE_MASK)) {
+            fprintf(f, "[i=%d VPN=%08x ASID=%03x G=%d V0=%d D0=%d PFN0=%08x "
+                    "EHINV=%d] ", i, (unsigned)tlb->VPN, tlb->ASID, tlb->G,
+                    tlb->V0, tlb->D0, (unsigned)tlb->PFN[0], tlb->EHINV);
+        }
+    }
+    fprintf(f, "\n");
+    fclose(f);
+}
+
 static void r4k_fill_tlb(CPUMIPSState *env, int idx)
 {
     r4k_tlb_t *tlb;
@@ -224,6 +296,7 @@ static void r4k_helper_tlbwi(CPUMIPSState *env)
 
     r4k_invalidate_tlb(env, idx, 0);
     r4k_fill_tlb(env, idx);
+    r3k_probe_write(env, idx, "tlbwi");
 }
 
 static void r4k_helper_tlbwr(CPUMIPSState *env)
@@ -232,6 +305,7 @@ static void r4k_helper_tlbwr(CPUMIPSState *env)
 
     r4k_invalidate_tlb(env, r, 1);
     r4k_fill_tlb(env, r);
+    r3k_probe_write(env, r, "tlbwr");
 }
 
 static void r4k_helper_tlbp(CPUMIPSState *env)
@@ -549,20 +623,20 @@ static int r3k_map_address(CPUMIPSState *env, hwaddr *physical, int *prot,
 {
     int ret = r4k_map_address(env, physical, prot, address, access_type);
 
+    if (ret != TLBRET_MATCH) {
+        r3k_probe_miss(env, address);
+    }
     /*
-     * MIPS-I distinguishes a TLB miss (no entry matches the VPN/ASID) from a
-     * matching entry whose Valid bit is clear.  r4k_map_address already
-     * reports the former as TLBRET_NOMATCH and the latter as TLBRET_INVALID,
-     * and raise_mmu_exception selects the UTLB-refill vector only for a
-     * no-match (it is the one that sets EXCP_TLB_NOMATCH); TLBRET_INVALID
-     * takes the general vector, which is the R3000 rule.
-     *
-     * Do NOT fold TLBRET_INVALID into TLBRET_NOMATCH: the software refill
-     * handler installs the invalid entry it has just built and returns, so
-     * folding it would send the very next access back to the refill vector
-     * for the same VPN and loop forever.  IRIX 4.0.5 on the IP6 does exactly
-     * that on user VA 0x10000000 (its refill stores V=0 because the page is
-     * not present), which wedged the boot before init could run.
+     * MIPS-I distinguishes a TLB miss (no entry matches the VPN/ASID) from an
+     * entry that matches but has V=0.  r4k_map_address already reports the
+     * former as TLBRET_NOMATCH and the latter as TLBRET_INVALID, and
+     * raise_mmu_exception maps only TLBRET_NOMATCH (through EXCP_TLB_NOMATCH)
+     * to the UTLB-refill vector; TLBRET_INVALID takes the general vector
+     * (0x080 on the R3000).  Do NOT fold TLBRET_INVALID into TLBRET_NOMATCH:
+     * the refill handler installs the invalid entry it just built and returns,
+     * so folding makes a V=0 match re-enter the refill vector forever - which
+     * is exactly the 0x10000000 loop the IP6 kernel hits after the refill
+     * stores an entry with V=0.
      */
     return ret;
 }
@@ -749,6 +823,24 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
         (extract64(address, 62, 2) << (env->SEGBITS - 9)) |     /* R       */
         (extract64(address, 13, env->SEGBITS - 13) << 4);       /* BadVPN2 */
 #endif
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        const char *lt = getenv("IP6TLB_LOGFILE");
+        if (lt) {
+            FILE *lf = fopen(lt, "a");
+            if (lf) {
+                fprintf(lf, "MMUFAULT addr=%08x pc=%08x exc=%d EntryHi=%08x "
+                        "a0=%08x a1=%08x a2=%08x ra=%08x tlbret=%d\n",
+                        (unsigned)address,
+                        (unsigned)env->active_tc.PC, exception,
+                        (unsigned)env->CP0_EntryHi,
+                        (unsigned)env->active_tc.gpr[4],
+                        (unsigned)env->active_tc.gpr[5],
+                        (unsigned)env->active_tc.gpr[6],
+                        (unsigned)env->active_tc.gpr[31], tlb_error);
+                fclose(lf);
+            }
+        }
+    }
     cs->exception_index = exception;
     env->error_code = error_code;
 

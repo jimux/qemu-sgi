@@ -608,6 +608,8 @@ static const MemoryRegionOps sgi_ip6_dmahi_ops = {
 
 /* ---- LIO interrupt block --------------------------------------------- */
 
+static void sgi_ip6_scsi_log(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+
 static uint64_t sgi_ip6_lio_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
@@ -624,6 +626,10 @@ static uint64_t sgi_ip6_lio_read(void *opaque, hwaddr addr, unsigned size)
     }
     if (off >= 8 && off < 0xc) {
         /* 8-bit interrupt mask register */
+        if (getenv("IP6SCSI_LOGFILE")) {
+            sgi_ip6_scsi_log("IP6LIO imr_read %02x isr=%03x\n",
+                             s->lio_imr, s->lio_isr);
+        }
         return s->lio_imr;
     }
     return 0;
@@ -636,6 +642,10 @@ static void sgi_ip6_lio_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t off = addr & 0xf;
 
     if (off >= 8 && off < 0xc) {
+        if (getenv("IP6SCSI_LOGFILE")) {
+            sgi_ip6_scsi_log("IP6LIO imr_write %02x old=%02x isr=%03x\n",
+                             (unsigned)(data & 0xff), s->lio_imr, s->lio_isr);
+        }
         s->lio_imr = data & 0xff;
         /* fifo interrupt status follows line state if not enabled */
         if (!(s->lio_imr & (1u << LIO_FIFO))) {
@@ -1104,21 +1114,103 @@ static void sgi_ip6_lio_update(SGIip6State *s)
 
     if (level != s->lio_int && s->cpu) {
         s->lio_int = level;
+        if (getenv("IP6SCSI_LOGFILE")) {
+            sgi_ip6_scsi_log("IP6LIO update isr=%03x imr=%02x -> irq3=%d\n",
+                             s->lio_isr, s->lio_imr, level);
+        }
         qemu_set_irq(s->cpu->env.irq[3], level);
     }
 }
 
 /* ---- WD33C93 SCSI ----------------------------------------------------- */
 
+/*
+ * SCSI bring-up trace.  Like the PIT trace this goes to a file when
+ * IP6SCSI_LOGFILE is set (else stderr with IP6SCSI_DBG), so a heavy probe
+ * cannot back-pressure the guest's stderr pty.
+ */
+static void sgi_ip6_scsi_log(const char *fmt, ...)
+{
+    static FILE *f;
+    static bool tried;
+    va_list ap;
+
+    if (!tried) {
+        const char *p = getenv("IP6SCSI_LOGFILE");
+
+        tried = true;
+        if (p && *p) {
+            f = fopen(p, "a");
+            if (f) {
+                setvbuf(f, NULL, _IOLBF, 0);
+            }
+        }
+    }
+    if (f) {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        return;
+    }
+    if (getenv("IP6SCSI_DBG")) {
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+}
+
+static bool sgi_ip6_scsi_dbg(void)
+{
+    return getenv("IP6SCSI_DBG") || getenv("IP6SCSI_LOGFILE");
+}
+
 static uint64_t sgi_ip6_scsi_read(void *opaque, hwaddr addr, unsigned size)
 {
     SGIip6State *s = opaque;
     uint32_t off = addr & (SGI_IP6_SCSI_SIZE - 1);
+    uint64_t v;
 
-    if (off < 0x100) {
-        return wd33c93_addr_read(s->scsi);   /* address port: ASR */
+    if (sgi_ip6_scsi_dbg()) {
+        sgi_ip6_scsi_log("IP6SCSI raw R addr=%08x off=%03x size=%u lane=%u\n",
+                         (unsigned)addr, off, size, (unsigned)(addr & 3));
     }
-    return wd33c93_data_read(s->scsi);       /* data port */
+    if (off < 0x100) {
+        v = wd33c93_addr_read(s->scsi);   /* address port: ASR */
+        if (sgi_ip6_scsi_dbg()) {
+            unsigned pc = s->cpu ? (unsigned)(s->cpu->env.active_tc.PC & 0xffffffffu) : 0;
+            uint32_t chan = 0, cnt = 0xffffffffu, flag = 0xffffffffu;
+            if (s->cpu) {
+                chan = (uint32_t)s->cpu->env.active_tc.gpr[9];   /* t1 */
+            }
+            if ((chan & 0xe0000000u) == 0x80000000u) {
+                uint32_t w;
+                cpu_physical_memory_read((chan & 0x1fffffffu) + 0x10, &w, 4);
+                cnt = be32_to_cpu(w);
+                cpu_physical_memory_read((chan & 0x1fffffffu) + 0x18, &w, 4);
+                flag = be32_to_cpu(w);
+            }
+            sgi_ip6_scsi_log("IP6SCSI asr_read %02x aux=%02x pc=%08x chan=%08x "
+                             "cnt=%u flag=%u t=%lld\n",
+                             (unsigned)v, s->scsi->aux_status, pc, chan,
+                             cnt, flag,
+                             (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
+        return v;
+    }
+    {
+        unsigned r = s->scsi->addr_reg;
+
+        v = wd33c93_data_read(s->scsi);   /* data port */
+        if (sgi_ip6_scsi_dbg()) {
+            sgi_ip6_scsi_log("IP6SCSI data_read reg=%02x val=%02x aux=%02x "
+                             "tc=%u alen=%u pc=%08x t=%lld\n", r, (unsigned)v,
+                             s->scsi->aux_status, s->scsi->transfer_count,
+                             s->scsi->async_len,
+                             s->cpu ? (unsigned)(s->cpu->env.active_tc.PC & 0xffffffffu) : 0,
+                             (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
+    }
+    return v;
 }
 
 static void sgi_ip6_scsi_write(void *opaque, hwaddr addr, uint64_t data,
@@ -1127,9 +1219,28 @@ static void sgi_ip6_scsi_write(void *opaque, hwaddr addr, uint64_t data,
     SGIip6State *s = opaque;
     uint32_t off = addr & (SGI_IP6_SCSI_SIZE - 1);
 
+    if (sgi_ip6_scsi_dbg()) {
+        sgi_ip6_scsi_log("IP6SCSI raw W addr=%08x off=%03x size=%u lane=%u "
+                         "data=%02x\n", (unsigned)addr, off, size,
+                         (unsigned)(addr & 3), (unsigned)(data & 0xff));
+    }
     if (off < 0x100) {
         wd33c93_addr_write(s->scsi, data & 0xff);
+        if (sgi_ip6_scsi_dbg()) {
+            sgi_ip6_scsi_log("IP6SCSI addr_write reg=%02x\n",
+                             (unsigned)(data & 0xff));
+        }
     } else {
+        if (sgi_ip6_scsi_dbg()) {
+            sgi_ip6_scsi_log("IP6SCSI data_write reg=%02x val=%02x "
+                             "tc=%u aux=%02x status=%02x pc=%08x t=%lld%s\n",
+                             s->scsi->addr_reg,
+                             (unsigned)(data & 0xff), s->scsi->transfer_count,
+                             s->scsi->aux_status, s->scsi->scsi_status,
+                             s->cpu ? (unsigned)(s->cpu->env.active_tc.PC & 0xffffffffu) : 0,
+                             (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                             s->scsi->addr_reg == 0x18 ? " CMDWR" : "");
+        }
         wd33c93_data_write(s->scsi, data & 0xff);
     }
 }
@@ -1182,6 +1293,11 @@ static void sgi_ip6_scsi_irq(void *opaque, int n, int level)
 {
     SGIip6State *s = opaque;
 
+    if (sgi_ip6_scsi_dbg()) {
+        sgi_ip6_scsi_log("IP6SCSI irq level=%d aux=%02x status=%02x "
+                         "isr=%03x imr=%03x\n", level, s->scsi->aux_status,
+                         s->scsi->scsi_status, s->lio_isr, s->lio_imr);
+    }
     /* LIO status bits are active low: set = idle, clear = pending. */
     if (level) {
         s->lio_isr &= ~(1u << LIO_SCSI);
@@ -1205,6 +1321,12 @@ static void sgi_ip6_scsi_drq(void *opaque, int n, int level)
 
     if (!level || !wdc) {
         return;
+    }
+
+    if (sgi_ip6_scsi_dbg()) {
+        sgi_ip6_scsi_log("IP6SCSI drq enter alen=%u tc=%u dmalo=%08x "
+                         "mapindex=%u\n", wdc->async_len,
+                         wdc->transfer_count, s->dmalo, s->mapindex);
     }
 
     while (wdc->async_len > 0) {
