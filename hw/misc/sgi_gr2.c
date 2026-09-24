@@ -1539,6 +1539,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
     float nx[3];
     float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
     unsigned i;
+    unsigned ink_px = 0; /* pixels this run paints (trace diagnostic) */
     const float shininess = 8.0f;
     float col[3];
 
@@ -1608,9 +1609,14 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
             if (z < s->ge_zbuf[o]) {
                 s->ge_zbuf[o] = z;
                 sgi_gr2_put332(s, x, y, sgi_gr2_ge7_332(s, col, x, y));
+                ink_px++;
             }
         }
     }
+    trace_sgi_gr2_ge7_ink(s->ge_line_n, (int)ink_px,
+                          (int)(col[0] * 255.0f + 0.5f),
+                          (int)(col[1] * 255.0f + 0.5f),
+                          (int)(col[2] * 255.0f + 0.5f));
     s->ge_3d_seen = true;
 }
 
