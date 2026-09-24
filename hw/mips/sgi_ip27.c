@@ -1000,6 +1000,13 @@ static void sgi_ip27_init(MachineState *machine) {
 
     qdev_prop_set_uint32(h, "nasid", i);
     qdev_prop_set_uint32(h, "num-cpus", (i == 0) ? ncpus : 0);
+    /*
+     * The two node boards of a module occupy distinct node slots so their
+     * hwgraph paths (module/<m>/slot/n1 and /n2) differ.  Reporting n1 for
+     * both made klhwg_connect_hubs() add the same hub->router edge twice
+     * (GRAPH_DUP panic).  nodeslot_table[7] = n1, [6] = n2.
+     */
+    qdev_prop_set_uint32(h, "slot-id", (i == 0) ? 7 : 6);
     qdev_prop_set_uint64(h, "mem-config", sgi_ip27_mem_config(node_ram));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(h), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(h), 0, ip27_swin_phys(i, IP27_HUB_WIDGET));
@@ -1058,13 +1065,17 @@ static void sgi_ip27_init(MachineState *machine) {
      */
     router = g_new0(SGIRouterState, 1);
     /*
-     * RSRI_CHIPIN (bits 11:8): bit 3 clear means a META router, and a normal
-     * R-brick has it set -- discover_router() sets PCFG_ROUTER_META on
-     * ~CHIPIN & 8, and a meta router makes nasid_assign() reject the topology
-     * ("nodes attached to meta router").  Report chipin 0x8 for a normal
-     * router.
+     * RSRI_CHIPIN (bits 11:8) is the router's slot strap: bit 3 clear means a
+     * META router (discover_router() sets PCFG_ROUTER_META on ~CHIPIN & 8, and
+     * nasid_assign() rejects "nodes attached to meta router"), so a normal
+     * R-brick has it set.  The same 4-bit field indexes routerslot_table
+     * (libkl/ml/slots.c): only straps 14/15 are valid, mapping to r2/r1 -- all
+     * other values are SLOTNUM_INVALID_CLASS, which later makes the kernel's
+     * klhwg_connect_hubs() panic with "Can't find board: .../slot/Invalid0/
+     * router".  A single R-brick in a two-node module is r1, so report 0xf
+     * (bit 3 set => not META; routerslot_table[15] = ROUTER_CLASS|1 = r1).
      */
-    sgi_router_init(router, 0x00000000c0ffee01ULL, 0x8, 2);
+    sgi_router_init(router, 0x00000000c0ffee01ULL, 0xf, 2);
     sgi_router_connect(router, 4, hubs[1]);
     sgi_router_connect(router, 5, hubs[0]);
     sgi_hub_set_router(hubs[0], router);
