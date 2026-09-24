@@ -347,7 +347,7 @@ static int sgi_hpc1_kbd_keycode(QKeyCode q)
     case Q_KEY_CODE_5: return 23;  case Q_KEY_CODE_6: return 30;
     case Q_KEY_CODE_7: return 31;  case Q_KEY_CODE_8: return 38;
     case Q_KEY_CODE_9: return 39;  case Q_KEY_CODE_0: return 46;
-    case Q_KEY_CODE_RET: return 60;        case Q_KEY_CODE_KP_ENTER: return 51;
+    case Q_KEY_CODE_RET: return 51;        case Q_KEY_CODE_KP_ENTER: return 82;
     case Q_KEY_CODE_SPC: return 83;
     case Q_KEY_CODE_BACKSPACE: return 61;  case Q_KEY_CODE_ESC: return 7;
     case Q_KEY_CODE_TAB: return 9;
