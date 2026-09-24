@@ -1792,6 +1792,42 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
 
     if (!is_copy) {
         /*
+         * @@SEMANTICS@@ — MTE CLEAR into the depth buffer.  TLB C
+         * (CRM_DEPTH_TLB_SEL) is the SZ/depth buffer and its pixel is a
+         * 32-bit big-endian word (byte0 = stencil, bytes1..3 = 24-bit Z;
+         * spec §7.3.4.4 Fig 7-6).  The MTE fill value is that whole SZ
+         * word, NOT a colour: routing a depth clear through the *colour*
+         * BufMode packs fgValue into the destination pixel format, so a
+         * GL zclear() to far (fg=0x00ffffff) was stored as a 16-bit
+         * A1_RGB5 (0x83ff) — the depth buffer came up near instead of
+         * far, and since depth func LEQUAL compares z <= zd, every
+         * depth-tested fragment was rejected.  Measured on demograph:
+         * every map fragment died at the depth test (clipped=0 depth=N),
+         * the window stayed at the clear colour, while only the
+         * un-depth-tested background triangles drew.  The clear must land
+         * as the raw 32-bit SZ value for any MTE fill targetting the
+         * depth TLB.  (A fill of fg=0, e.g. powerflip's, is unchanged.)
+         */
+        if (dst_tlb == CRM_DEPTH_TLB_SEL) {
+            uint8_t w[4];
+            w[0] = (fg >> 24) & 0xff;      /* stencil   */
+            w[1] = (fg >> 16) & 0xff;      /* Z[23:16]  */
+            w[2] = (fg >> 8) & 0xff;       /* Z[15:8]   */
+            w[3] = fg & 0xff;              /* Z[7:0]    */
+            for (int y = y1; y != y2 + dy; y += dy) {
+                for (int x = x1; x != x2 + dx; x += dx) {
+                    hwaddr phys;
+                    if (!sgi_crime_re_tiled_addr(s, CRM_DEPTH_TLB_SEL,
+                                                 x, y, 4, &phys)) {
+                        continue;
+                    }
+                    address_space_rw(&address_space_memory, phys,
+                                     MEMTXATTRS_UNSPECIFIED, w, 4, true);
+                }
+            }
+            return;
+        }
+        /*
          * Tiled fill: same walk as M7 (mte_zero / PROM textport), but
          * honor MTE.enStipple — the spec (CRIME 1.5 §7.3.2.1) calls bit
          * 10 "enStipple: enable/disable stipple pixel mask application
