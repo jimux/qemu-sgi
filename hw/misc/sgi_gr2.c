@@ -1617,6 +1617,13 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
                           (int)(col[0] * 255.0f + 0.5f),
                           (int)(col[1] * 255.0f + 0.5f),
                           (int)(col[2] * 255.0f + 0.5f));
+    trace_sgi_gr2_ge7_inkstate((int)(s->ge_normal[0] * 100.0f),
+                               (int)(s->ge_normal[1] * 100.0f),
+                               (int)(s->ge_normal[2] * 100.0f),
+                               (int)(s->ge_diffuse[0] * 255.0f + 0.5f),
+                               (int)(s->ge_diffuse[1] * 255.0f + 0.5f),
+                               (int)(s->ge_diffuse[2] * 255.0f + 0.5f),
+                               (int)s->puc_colour, (int)s->re3_colour);
     s->ge_3d_seen = true;
 }
 
