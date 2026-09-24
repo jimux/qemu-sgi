@@ -6122,37 +6122,6 @@ static const TranslatorOps m68k_tr_ops = {
     .tb_stop            = m68k_tr_tb_stop,
 };
 
-void sgi_kprobe(CPUState *cpu, vaddr pc)
-{
-    static int on = -1;
-    const char *nm = NULL;
-    CPUM68KState *env;
-
-    if (on < 0) {
-        on = getenv("SGI_KPROBE") != NULL;
-    }
-    if (!on) {
-        return;
-    }
-    switch ((uint32_t)pc) {
-    case 0x2004c17e: nm = "kb_translate"; break;
-    case 0x2001924a: nm = "putq"; break;
-    case 0x200198c4: nm = "qenable"; break;
-    case 0x200280b4: nm = "wakeup"; break;
-    case 0x2004bf5e: nm = "gl_softintr"; break;
-    case 0x2001665a: nm = "du_rx"; break;
-    case 0x20008af2: nm = "wn_softintr"; break;
-    case 0x2004ed78: nm = "retrace_softintr"; break;
-    case 0x20008786: nm = "wn_rsrv"; break;
-    default:
-        return;
-    }
-    env = cpu_env(cpu);
-    fprintf(stderr, "KPROBE %-16s d0=%08x d1=%08x a0=%08x a1=%08x a7=%08x\n",
-            nm, env->dregs[0], env->dregs[1], env->aregs[0], env->aregs[1],
-            env->aregs[7]);
-}
-
 void m68k_translate_code(CPUState *cpu, TranslationBlock *tb,
                          int *max_insns, vaddr pc, void *host_pc)
 {
