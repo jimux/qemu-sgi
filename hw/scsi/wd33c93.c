@@ -244,6 +244,7 @@ static void wd33c93_do_abort(WD33C93State *s)
     wd33c93_set_drq(s, false);
 
     /* For now, complete with disconnect status */
+    s->regs[WD_COMMAND_PHASE] = 0x43;   /* PH_DISCONNECT */
     wd33c93_complete_cmd(s, SCSI_STATUS_DISCONNECT);
 }
 
@@ -530,6 +531,9 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
             scsi_req_unref(s->current_req);
             s->current_req = NULL;
         }
+        /* ST_DISCONNECT is reported with the Command Phase register holding
+         * PH_DISCONNECT (0x43); the driver distinguishes it there. */
+        s->regs[WD_COMMAND_PHASE] = 0x43;   /* PH_DISCONNECT */
         wd33c93_complete_cmd(s, SCSI_STATUS_DISCONNECT);
         break;
 
