@@ -136,6 +136,18 @@ struct SGIGL2State {
     bool rgb_valid;               /* rgb registers in force (else A/B/C/D) */
     unsigned nplanes;             /* installed BP3 planes (device property) */
     int readback_seq;             /* FBCpixelsetup plane-mask readback */
+
+    /*
+     * FBCfeedback matrix-save readback (saveeverything()/getgpos()).
+     * The kernel drives the GE to store one matrix per GEstoremm, then reads
+     * the FBC output: _INTFEEDBACK, then (storemm_count*33 + 3), then that
+     * many matrix words.  It panics if the count token does not match, so the
+     * count has to be reconstructed from the GEstoremm commands.
+     */
+    bool fb_active;
+    int fb_storemm;
+    int fb_phase;                 /* 0=intcode 1=count 2=payload */
+    int fb_left;                  /* payload words remaining */
     uint16_t ucr;
     uint16_t scrmaskx, scrmasky;
     uint16_t fmaddr;              /* current FM (font/pattern) address */
@@ -461,23 +473,44 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
             if (s->micro_access) {
                 return idx < 4096 ? s->microram[s->micro_slice][idx] : 0;
             }
-            switch (s->readback_seq) {
-            case 1:
-                s->readback_seq = 2;
-                return 10;              /* _INTPIXEL32 */
-            case 2:
-                s->readback_seq = 3;
-                return (s->nplanes > 16)
-                       ? ((1u << (s->nplanes - 16)) - 1) : 0;   /* CD */
-            case 3:
-                s->readback_seq = 0;
-                return (1u << (s->nplanes < 16 ? s->nplanes : 16)) - 1; /* AB */
-            default:
-                if (fbc_trace_on()) {
-                    fprintf(stderr, "FBCTRACE rdDATA -> %#x\n", s->fbc_out);
+            if (s->readback_seq) {
+                switch (s->readback_seq) {
+                case 1:
+                    s->readback_seq = 2;
+                    if (fbc_trace_on()) {
+                        fprintf(stderr, "FBCTRACE rdDATA readback -> 10\n");
+                    }
+                    return 10;          /* _INTPIXEL32 */
+                case 2:
+                    s->readback_seq = 3;
+                    return (s->nplanes > 16)
+                           ? ((1u << (s->nplanes - 16)) - 1) : 0;   /* CD */
+                default:
+                    s->readback_seq = 0;
+                    return (1u << (s->nplanes < 16 ? s->nplanes : 16)) - 1; /* AB */
                 }
-                return s->fbc_out;
-        }
+            }
+            if (s->fb_active) {
+                switch (s->fb_phase) {
+                case 0:                 /* interrupt code */
+                    return 20;          /* _INTFEEDBACK */
+                case 1:                 /* matrix count token */
+                    s->fb_left = s->fb_storemm * 33;
+                    s->fb_phase = 2;
+                    return (uint16_t)(s->fb_left + 3);
+                default:                /* matrix payload: the kernel reads
+                                         * only what it needs, so never latch
+                                         * on the modelled count */
+                    if (s->fb_left > 0) {
+                        s->fb_left--;
+                    }
+                    return 0;
+                }
+            }
+            if (fbc_trace_on()) {
+                fprintf(stderr, "FBCTRACE rdDATA -> %#x\n", s->fbc_out);
+            }
+            return s->fbc_out;
         }
         default:
             return 0;           /* GEflags reads as 0 when idle */
@@ -536,6 +569,9 @@ static void gl2_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 fprintf(stderr, "FBCTRACE clrint (was pending)\n");
             }
             s->prog_int_pending = false;
+            if (s->fb_active && s->fb_phase == 0) {
+                s->fb_phase = 1;        /* next FBCdata read: count token */
+            }
             gl2_update_irq(s);
             break;
         case R_FBC_FLAGS & ~0x3ff:
@@ -780,6 +816,15 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
 {
     unsigned i;
 
+    /*
+     * The FBCfeedback transaction ends as soon as any other FBC command is
+     * executed (the kernel reads its payload before moving on), so a stale
+     * transaction can never bleed into a later FBCdata read.
+     */
+    if (cmd != 0x25) {
+        s->fb_active = false;
+    }
+
     if (s->trace) {
         fprintf(stderr, "gl2: GE cmd=0x%02x nargs=%u", cmd, nargs);
         for (i = 0; i < nargs; i++) {
@@ -892,13 +937,15 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
 
     case 0x25:                          /* FBCfeedback: matrix feedback */
         /*
-         * saveeverything() issues FBCfeedback then spins on
-         * `while (FBCflags & INTERRUPT_BIT_)`, expecting the FBC to raise a
-         * programmed interrupt with code _INTFEEDBACK in FBCdata.  Without it
-         * the kernel textport wedges TX_BUSY (and saveeverything's wait never
-         * ends).  The matrix payload itself is not modelled; raising the
-         * interrupt is what releases the wait.
+         * saveeverything() and getgpos() issue FBCfeedback, then one
+         * GEstoremm per matrix level, then FBCEOF1/2/3, then read FBCdata:
+         * _INTFEEDBACK (20), (fbcount+3), and fbcount matrix words.  Begin
+         * the transaction and let the FBCdata reads below drive it.
          */
+        s->fb_active = true;
+        s->fb_storemm = 0;
+        s->fb_phase = 0;
+        s->fb_left = 0;
         s->fbc_out = 20;                /* _INTFEEDBACK */
         s->prog_int_pending = true;
         gl2_update_irq(s);
@@ -946,8 +993,19 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
                 s->readback_seq = 1;    /* next FBCdata reads: intcode, CD, AB */
                 s->prog_int_pending = true;
                 gl2_update_irq(s);
+                if (fbc_trace_on()) {
+                    fprintf(stderr, "PIXSETUP match nargs=%d\n", nargs);
+                }
                 break;
             }
+        }
+        if (i + 1 >= nargs && fbc_trace_on()) {
+            int k;
+            fprintf(stderr, "PIXSETUP NO match nargs=%d:", nargs);
+            for (k = 0; k < nargs; k++) {
+                fprintf(stderr, " %#x", args[k]);
+            }
+            fprintf(stderr, "\n");
         }
         break;
 
@@ -1150,6 +1208,10 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
         return;
     }
 
+    if (s->fb_active && w == 0x0003) {
+        s->fb_storemm++;                /* GEstoremm: one matrix per command */
+    }
+
     if ((w & 0xff) == 0x08 && !(w & 0x8000)) {
         s->ge_pending = true;
         s->ge_pending_need = ((w >> 8) & 0x7f) + 1;
@@ -1201,7 +1263,14 @@ static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                 fprintf(stderr, "gl2: HOSTFLAG dispatch -> _INTCURSOR\n");
             }
         }
-        if (addr == 0x800) {
+        /*
+         * The kernel's `im_last_outlong` macro (GETOKEN/LASTGE slot) is
+         * emitted as a store to 0x60000000, not 0x60000800, so commands
+         * arrive at offset 0.  Process both the LASTGE offset and offset 0
+         * through the assembler; the 0x000f token write is still answered by
+         * the hostflag path above and 0xff08 assembles to a harmless no-op.
+         */
+        if (addr == 0x800 || addr == 0) {
             if (size == 4) {
                 gl2_ge_word(s, (val >> 16) & 0xffff);
                 gl2_ge_word(s, val & 0xffff);
@@ -1353,6 +1422,10 @@ static void gl2_reset(DeviceState *dev)
     s->rgb_color = s->rgb_we = 0;
     s->rgb_valid = false;
     s->readback_seq = 0;
+    s->fb_active = false;
+    s->fb_storemm = 0;
+    s->fb_phase = 0;
+    s->fb_left = 0;
     s->vert_pending = false;
     s->prog_int_pending = false;
     if (s->retrace_timer) {
