@@ -389,6 +389,9 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
         val = s->piur_acc_err;
         break;
     case HEART_MLAN_CLK_DIV:
+        if (getenv("NICDBG")) {
+            fprintf(stderr, "HEART MLAN_CLK_DIV rd\n");
+        }
         val = s->mlan_clk_div;
         break;
     case HEART_MLAN_CTL:
@@ -396,8 +399,8 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
         val = s->mlan_ctl | HEART_MLAN_DONE;
         break;
     case HEART_MLAN_CTL + 4:
-        /* Low 32-bit half (the PROM polls done bit 1 here at 0x0FF000BC). */
-        val = (s->mlan_ctl & 0xffffffffULL) | HEART_MLAN_DONE;
+        /* Low 32-bit half: HEART MicroLAN 1-wire line (done bit 1, data bit 0). */
+        val = 0x2 | (s->mlan.data_bit & 1);
         break;
 
     case HEART_REALTIME_CTR:
@@ -487,6 +490,7 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
 static void sgi_heart_write(void *opaque, hwaddr offset, uint64_t val,
                             unsigned size)
 {
+
     SGIHEARTState *s = opaque;
 
     HEART_DPRINTF("write offset 0x%05" HWADDR_PRIx " <- 0x%016" PRIx64 "\n",
@@ -581,8 +585,7 @@ static void sgi_heart_write(void *opaque, hwaddr offset, uint64_t val,
         s->mlan_ctl = val;
         break;
     case HEART_MLAN_CTL + 4:
-        s->mlan_ctl = (s->mlan_ctl & 0xffffffff00000000ULL)
-                      | (val & 0xffffffffULL);
+        sgi_ds2502_bus_mcr(&s->mlan, val);
         break;
 
     case HEART_REALTIME_CTR:
@@ -671,6 +674,25 @@ static const MemoryRegionOps sgi_heart_ops = {
     },
 };
 
+static void sgi_heart_mlan_init(SGIDS2502BUS *bus)
+{
+    static const uint8_t fru_rom[4][6] = {
+        {0xc0, 0x01, 0x02, 0x03, 0x04, 0x05}, /* CPU module */
+        {0xc1, 0x11, 0x12, 0x13, 0x14, 0x15}, /* System board */
+        {0xc2, 0x21, 0x22, 0x23, 0x24, 0x25}, /* Front plane */
+        {0xc3, 0x31, 0x32, 0x33, 0x34, 0x35}, /* Power supply */
+    };
+    static const char *fru_name[4] = {"CPU", "SYS", "FP", "PS"};
+    int i;
+
+    sgi_ds2502_bus_init(bus, "heart");
+    for (i = 0; i < 4; i++) {
+        sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", fru_name[i],
+                           fru_rom[i]);
+    }
+    sgi_ds2502_bus_reset(bus);
+}
+
 static void sgi_heart_reset(DeviceState *dev)
 {
     SGIHEARTState *s = SGI_HEART(dev);
@@ -701,6 +723,7 @@ static void sgi_heart_reset(DeviceState *dev)
     s->piur_acc_err = 0;
     s->mlan_clk_div = 0;
     s->mlan_ctl = 0;
+    sgi_heart_mlan_init(&s->mlan);
 
     memset(s->imr, 0, sizeof(s->imr));
     s->set_isr = 0;

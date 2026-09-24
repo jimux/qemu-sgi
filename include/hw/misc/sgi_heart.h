@@ -20,6 +20,7 @@
 #define HW_MISC_SGI_HEART_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/sgi_ds2502.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "qom/object.h"
@@ -221,6 +222,8 @@ struct SGIHEARTState {
     uint64_t piur_acc_err;
     uint64_t mlan_clk_div;
     uint64_t mlan_ctl;
+    /* HEART MicroLAN (0x0ff000bc): CPU-module FRU ID chip(s). */
+    SGIDS2502BUS mlan;
 
     /* Interrupt state */
     uint64_t imr[4];      /* Per-CPU interrupt masks */

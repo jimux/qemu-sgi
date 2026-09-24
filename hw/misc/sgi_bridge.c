@@ -307,10 +307,6 @@ static void sgi_bridge_ds_bus_init(SGIDS2502BUS *bus)
 
     sgi_ds2502_bus_init(bus, "bridge");
     sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", "IP30", board_rom);
-    for (i = 0; i < 4; i++) {
-        sgi_ds2502_bus_add(bus, "1234567890", "030-1457-001", fru_name[i],
-                           fru_rom[i]);
-    }
 }
 
 static void sgi_bridge_ds_mac_init(SGIDS2502 *ds)
