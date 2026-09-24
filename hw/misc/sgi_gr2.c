@@ -137,6 +137,25 @@ static void sgi_gr2_ovl_fill(SGIGr2State *s, uint8_t colour,
     if (y < 0) { h += y; y = 0; }
     if (x + w > SGI_GR2_SCREEN_W) { w = SGI_GR2_SCREEN_W - x; }
     if (y + h > SGI_GR2_SCREEN_H) { h = SGI_GR2_SCREEN_H - y; }
+    /* Track the menu's box: a colour-0 fill is the menu's overlay clear and
+     * retires it; any other fill is menu content (its background, its labels)
+     * and grows the box.  See ovl_clip_valid in the header. */
+    if (colour == 0) {
+        s->ovl_clip_valid = false;
+    } else if (w > 0 && h > 0) {
+        if (!s->ovl_clip_valid) {
+            s->ovl_clip_x1 = x;
+            s->ovl_clip_y1 = y;
+            s->ovl_clip_x2 = x + w;
+            s->ovl_clip_y2 = y + h;
+            s->ovl_clip_valid = true;
+        } else {
+            s->ovl_clip_x1 = MIN(s->ovl_clip_x1, x);
+            s->ovl_clip_y1 = MIN(s->ovl_clip_y1, y);
+            s->ovl_clip_x2 = MAX(s->ovl_clip_x2, x + w);
+            s->ovl_clip_y2 = MAX(s->ovl_clip_y2, y + h);
+        }
+    }
     for (yy = y; yy < y + h; yy++) {
         for (xx = x; xx < x + w; xx++) {
             sgi_gr2_ovl_put(s, xx, yy, colour);
@@ -244,7 +263,14 @@ static void sgi_gr2_ovl_line(SGIGr2State *s, uint8_t colour,
     sy = y0 < y1 ? 1 : -1;
     err = dx - dy;
     for (;;) {
-        sgi_gr2_ovl_put(s, x0, y0, colour & 3);
+        /* An overlay stroke is only erasable inside the current menu box (its
+         * clear).  Outside it the pixel would survive every clear -- a stray
+         * rectangle after the menu is dismissed -- so drop those pixels. */
+        if (!s->ovl_clip_valid ||
+            (x0 >= s->ovl_clip_x1 && x0 < s->ovl_clip_x2 &&
+             y0 >= s->ovl_clip_y1 && y0 < s->ovl_clip_y2)) {
+            sgi_gr2_ovl_put(s, x0, y0, colour & 3);
+        }
         if (x0 == x1 && y0 == y1) {
             break;
         }
@@ -3112,6 +3138,7 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_fg_valid = false;
     s->re3_rop = 0;
     s->re3_rop_valid = false;
+    s->ovl_clip_valid = false;
     s->re3_data_n = 0;
     s->re3_data_overflow = false;
     s->last_puc = 0;
