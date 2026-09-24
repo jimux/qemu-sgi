@@ -559,7 +559,6 @@ struct SGIGr2State {
     int ge_clip_w, ge_clip_h;
     unsigned ge_clip_n;
     bool ge_clip_armed;
-    bool ge_need_clear;            /* a fresh frame: clear the drawable first */
     float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
     float ge_vnormal[SGI_GR2_GE7_MAX_VERTS][3]; /* its per-vertex normals     */
     unsigned ge_poly_n;

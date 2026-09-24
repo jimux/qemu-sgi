@@ -1300,12 +1300,31 @@ static void sgi_gr2_ge7_clear_rect(SGIGr2State *s, int vx, int vy, int vw,
     for (y = MAX(vy, 0); y < MIN(vy + vh, SGI_GR2_SCREEN_H); y++) {
         for (x = MAX(vx, 0); x < MIN(vx + vw, SGI_GR2_SCREEN_W); x++) {
             sgi_gr2_put(s, x, y, idx);
-            if (s->ge_zbuf) {
-                s->ge_zbuf[(size_t)y * SGI_GR2_SCREEN_W + x] = 0x7f7f7f7f;
-            }
         }
     }
     s->ge_3d_seen = true;
+}
+
+/* The drawable rectangle a GE7 clear or draw applies to: the viewport if one is
+ * armed, else the whole screen, offset by the window origin (the client writes
+ * window-relative coordinates - see note 78).  Shared so the clear and the
+ * polygon path cover the same pixels. */
+static void sgi_gr2_ge7_draw_rect(const SGIGr2State *s, int *x, int *y,
+                                  int *w, int *h)
+{
+    if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
+        *x = s->vp_x;
+        *y = s->vp_y;
+        *w = s->vp_w;
+        *h = s->vp_h;
+    } else {
+        *x = 0;
+        *y = 0;
+        *w = SGI_GR2_SCREEN_W;
+        *h = SGI_GR2_SCREEN_H;
+    }
+    *x += s->ge_win_x;
+    *y += s->ge_win_y;
 }
 
 /* True when the MSINGLE combined matrix (token 54) is the current transform,
@@ -1557,30 +1576,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
         return;
     }
-    if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
-        vx = s->vp_x;
-        vy = s->vp_y;
-        vw = s->vp_w;
-        vh = s->vp_h;
-    } else {
-        vx = 0;
-        vy = 0;
-        vw = SGI_GR2_SCREEN_W;
-        vh = SGI_GR2_SCREEN_H;
-    }
-    /* The client writes window-relative coordinates; the window's origin on
-     * screen is the X server's state (the client never emits winposition into
-     * the FIFO and the GE has no window-origin register - see note 78).  With
-     * no origin source the drawable sits at the screen origin. */
-    vx += s->ge_win_x;
-    vy += s->ge_win_y;
-    if (s->ge_need_clear && !sgi_gr2_ge7_single_active(s)) {
-        /* Only the 3D modelview/projection path clears per frame; a MSINGLE
-         * app (ideas) writes 55 per object, so clearing there would wipe its
-         * line art mid-frame. */
-        sgi_gr2_ge7_clear_rect(s, vx, vy, vw, vh);
-        s->ge_need_clear = false;
-    }
+    sgi_gr2_ge7_draw_rect(s, &vx, &vy, &vw, &vh);
     for (i = 0; i < s->ge_poly_n; i++) {
         float cx, cy, cz;
         float px, py;
@@ -1988,16 +1984,12 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
             s->ge_mv_n = 0;
             s->ge_mv_valid = true;
             s->ge_seq55 = ++s->ge_seq;
-            /* A fresh modelview begins a frame: clear the Z-buffer to "far"
-             * (0x7f7f7f7f ~ +3.4e38) so the previous frame does not occlude
-             * it, and mark the drawable for a colour clear.  The FIFO stream
-             * carries gl_clear (token 158) only once at start-up, so the
-             * per-frame double-buffer clear is stood in for here. */
-            if (s->ge_zbuf) {
-                memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
-                       SGI_GR2_SCREEN_H * sizeof(float));
-            }
-            s->ge_need_clear = true;
+            /* A modelview write is per-OBJECT for most clients (atlantis sends
+             * one per polygon), so it is NOT a frame boundary: it must neither
+             * clear the drawable nor reset Z here.  The app's own gl_clear
+             * (token 158) and z clear (token 159) delimit frames; see those
+             * cases.  Resetting Z per MV would also stop objects in one frame
+             * depth-testing against each other. */
         }
         break;
     case SGI_GR2_GE7_SINGLE:
@@ -2173,6 +2165,16 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         s->ge_poly_n = 0;
         s->ge_strip = false;
         break;
+    case SGI_GR2_GE7_CLEAR: {
+        /* gl_clear (token 158): the app's own per-frame colour clear - the REAL
+         * frame boundary, not a modelview write.  The app emits the z clear
+         * separately as token 159 (ZCLEAR), so this clears colour only. */
+        int cx, cy, cw, ch;
+
+        sgi_gr2_ge7_draw_rect(s, &cx, &cy, &cw, &ch);
+        sgi_gr2_ge7_clear_rect(s, cx, cy, cw, ch);
+        break;
+    }
     case SGI_GR2_GE7_ZCLEAR:
         if (s->ge_zbuf) {
             memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
