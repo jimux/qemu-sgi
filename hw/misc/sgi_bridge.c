@@ -1537,6 +1537,11 @@ static uint64_t sgi_bridge_read(void *opaque, hwaddr offset, unsigned size)
     case 0x620000 ... 0x6FFFFF:
         if (offset == 0x6C0000) {
             val = sgi_bridge_rtc_read(s, s->sio_index);
+        } else if (offset >= 0x640000 && offset < 0x680000) {
+            /* IOC3 Ethernet SSRAM: 17-bit entries, bit17 = odd-parity error. */
+            uint32_t w = s->ioc3_ssram[(offset - 0x640000) >> 2] & 0x1ffff;
+
+            val = __builtin_parity(w) ? (w | 0x20000) : w;
         } else {
             val = 0;
         }
@@ -1836,6 +1841,8 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
             s->sio_index = val & 0xff;
         } else if (offset == 0x6C0000) {
             sgi_bridge_rtc_write(s, s->sio_index, val & 0xff);
+        } else if (offset >= 0x640000 && offset < 0x680000) {
+            s->ioc3_ssram[(offset - 0x640000) >> 2] = val & 0x1ffff;
         }
         break;
 

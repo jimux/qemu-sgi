@@ -123,6 +123,12 @@ struct SGIBRIDGEState {
      */
     uint8_t ate_ram[0x400];
     uint8_t ext_ssram[0x80000];
+    /*
+     * IOC3 Ethernet SSRAM (IOC3 devio +0x40000, 256KB): 17-bit entries
+     * (16 data + parity).  The POST diag_enet_ssram() writes/reads it and
+     * expects bit17 to read back as the odd-parity error flag, not stored.
+     */
+    uint32_t ioc3_ssram[0x10000];
 
     /*
      * IOC3 devio register block (BRIDGE+0x600000-0x61FFFF). The PROM's
