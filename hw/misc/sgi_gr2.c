@@ -1153,9 +1153,11 @@ static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
     }
 }
 
-/* 4x4 ordered-dither matrix.  Same matrix as the Newport path (sgi_newport.c,
- * itself from MAME's newport.cpp get_rgb_color) - the two boards share the SGI
- * 8-bit raster convention and no separate GR2 matrix exists in the tree. */
+/* 4x4 ordered-dither matrix.  [ASSUMPTION] Borrowed from the Newport path
+ * (sgi_newport.c, itself from MAME's newport.cpp get_rgb_color) on the grounds
+ * that the two boards share the SGI 8-bit raster convention: no dither matrix
+ * exists in gr2.h/gr2hw.h or the DDX, and we have no GR2 reference showing the
+ * stipple pattern.  Replace with the real matrix if one is recovered. */
 static const uint8_t sgi_gr2_ge7_bayer[4][4] = {
     { 0, 12,  3, 15 },
     { 8,  4, 11,  7 },
