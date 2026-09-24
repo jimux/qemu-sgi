@@ -37,6 +37,53 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIHubState, SGI_HUB)
 
 #define SGI_HUB_MAX_CPUS 2
 
+/*
+ * Dallas DS2502 1-wire slave (family 0x09): a minimal add-only memory part.
+ * The master bit-bangs an MCR_PACK(pulse, sample) command onto the line; the
+ * part answers reset/presence, READ ROM (0x33), MATCH ROM (0x55), SKIP ROM
+ * (0xcc) and READ MEMORY (0xf0, 16-bit address).  Two lines carry one in this
+ * machine: the hub's MD_MLAN_CTL and the SN0 router's RR_NIC_ULAN.  Both share
+ * this state machine; the record contents (rom serial, memory pages) are
+ * owner-specific, built with sgi_ds2502_build_board().
+ *
+ * Protocol/CRC from libsk/ml/nic.c (and the matching octane DS2502 model);
+ * MCR_PACK/MCR_DONE/MCR_DATA from sys/nic.h.
+ */
+typedef struct SGIDS2502 {
+  uint8_t rom[8];      /* family + 48-bit serial + Dallas CRC-8 */
+  uint8_t mem[64];     /* two 32-byte pages, each with a trailing CRC-16 */
+  int state;
+  uint8_t cmd;
+  int cmd_bits;
+  uint8_t in;
+  int in_bits;
+  int out_index;
+  int search_phase;
+  int addr;
+  int extra;
+  int data_bit;        /* latched line state (MCR_DATA) */
+} SGIDS2502;
+
+/* Fill rom[]/mem[] with a board record: a 10-char serial string, part and
+ * name go in the two memory pages, and rom_serial[6] becomes the 48-bit ROM
+ * serial.  All CRCs are computed so the PROM's nic_next()/page check passes. */
+void sgi_ds2502_build_board(SGIDS2502 *ds, const char *serial,
+                            const char *part, const char *name,
+                            const uint8_t rom_serial[6]);
+/* Reset the part to the command state (a 1-wire reset pulse). */
+void sgi_ds2502_reset(SGIDS2502 *ds);
+/* Clock one master bit into the part. */
+void sgi_ds2502_write_bit(SGIDS2502 *ds, int bit);
+/* Clock one bit out of the part. */
+int sgi_ds2502_read_bit(SGIDS2502 *ds);
+/*
+ * Decode one MCR_PACK(pulse, sample) access and return the latched line data
+ * bit.  pulse >= 480 is reset/presence; sample 30/110 is a write 0/1; sample
+ * 13 is a read (nic.c nic_presence 520/65, nic_write 80/30 or 6/110,
+ * nic_read 6/13).  The caller supplies MCR_DONE and the MCR_DATA bit.
+ */
+int sgi_ds2502_mcr(SGIDS2502 *ds, uint64_t val);
+
 struct SGIHubState {
   SysBusDevice parent_obj;
 
@@ -104,18 +151,7 @@ struct SGIHubState {
   uint64_t ni_age[4];
 
   /* NI: hub NIC DS2502 1-wire EEPROM, bit-banged via MD_MLAN_CTL. */
-  uint8_t ds_rom[8];
-  uint8_t ds_mem[64];
-  int ds_state;
-  uint8_t ds_cmd;
-  int ds_cmd_bits;
-  uint8_t ds_in;
-  int ds_in_bits;
-  int ds_out_index;
-  int ds_search_phase;
-  int ds_addr;
-  int ds_extra;
-  int ds_data_bit;
+  SGIDS2502 ds;
 
   /* II: I/O interface (widget identity/link/access). */
   uint64_t ii_wcr;
@@ -215,6 +251,8 @@ typedef struct SGIRouterState {
   uint32_t chipin;
   uint32_t revision;
   struct SGIHubState *port[SGI_ROUTER_PORTS + 1]; /* ports 1..6 */
+  /* Router NIC DS2502 1-wire EEPROM, bit-banged via RR_NIC_ULAN. */
+  SGIDS2502 ds;
 } SGIRouterState;
 
 void sgi_router_init(SGIRouterState *r, uint32_t nic, uint32_t chipin,
