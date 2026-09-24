@@ -81,6 +81,10 @@ throwaway:
         }
     }
     env->aregs[7] = sp;
+    if (getenv("SGI_SYSCALL_LOG") && !(sr & SR_S)) {
+        fprintf(stderr, "SYSRET pc=%08x d0=%08x d1=%08x\n",
+                env->pc, env->dregs[0], env->dregs[1]);
+    }
     cpu_m68k_set_sr(env, sr);
 }
 
