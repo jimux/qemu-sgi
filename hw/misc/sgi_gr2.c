@@ -659,12 +659,14 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
     for (p = 0; p < s->re3_npens; p++) {
         unsigned off = s->re3_pen_off[p];
         uint32_t pen = s->re3_pen_val[p];
-        uint32_t f0, h, k, nwords;
+        uint32_t f0, f1, h, k, nwords;
+        unsigned gw;
 
         if (off + 3 > s->re3_data_n) {
             continue;
         }
         f0 = s->re3_data[off];       /* destination y */
+        f1 = s->re3_data[off + 1];   /* glyph width in pixels */
         h = s->re3_data[off + 2];
         nwords = (h + 1) / 2;
         if (f0 >= SGI_GR2_SCREEN_H || pen >= SGI_GR2_SCREEN_W ||
@@ -672,12 +674,13 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
             off + 3 + nwords > s->re3_data_n) {
             continue;
         }
+        gw = (f1 >= 1 && f1 <= 16) ? f1 : 8;
         for (k = 0; k < nwords; k++) {
             uint32_t w = s->re3_data[off + 3 + k];
             int r0 = (int)f0 + 2 * (int)k;
             int b;
 
-            for (b = 0; b < 16; b++) {
+            for (b = 0; b < (int)gw; b++) {
                 int xx = (int)pen + b;
 
                 if (xx >= SGI_GR2_SCREEN_W) {
