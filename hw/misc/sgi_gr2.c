@@ -1098,11 +1098,12 @@ static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
  * back to the whole screen. */
 /* Evaluate the guest's Phong model for one eye-space normal and return the
  * intensity (0..1).  Shared by the triangle and line rasterisers. */
-static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
-                               float lx, float ly, float lz,
-                               float hx, float hy, float hz, float shininess)
+static void sgi_gr2_ge7_shade(const SGIGr2State *s, const float n[3],
+                              float lx, float ly, float lz,
+                              float hx, float hy, float hz, float shininess,
+                              float col[3])
 {
-    float nn[3], ndl, ndh, col[3];
+    float nn[3], ndl, ndh;
     float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     int c;
 
@@ -1130,8 +1131,42 @@ static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
                                     s->ge_specular[c] * powf(ndh, shininess));
         col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
     }
+}
+
+static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
+                               float lx, float ly, float lz,
+                               float hx, float hy, float hz, float shininess)
+{
+    float col[3];
+
+    sgi_gr2_ge7_shade(s, n, lx, ly, lz, hx, hy, hz, shininess, col);
     return MIN(MAX(0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2],
                    0.0f), 1.0f);
+}
+
+/* Nearest RAMDAC entry to a shaded RGB.  The 3D path stores a palette index,
+ * and the guest's ink is a colour, not a grey level: an RGB distance keeps a
+ * red curve red instead of collapsing it onto the grey axis. */
+static uint8_t sgi_gr2_ge7_rgbidx(const SGIGr2State *s, const float col[3])
+{
+    int r = (int)(MIN(MAX(col[0], 0.0f), 1.0f) * 255.0f + 0.5f);
+    int gr = (int)(MIN(MAX(col[1], 0.0f), 1.0f) * 255.0f + 0.5f);
+    int b = (int)(MIN(MAX(col[2], 0.0f), 1.0f) * 255.0f + 0.5f);
+    int best = 0, bestd = 1 << 30, i;
+
+    for (i = 0; i < 256; i++) {
+        uint32_t rgb = s->ramdac[i];
+        int dr = ((rgb >> 16) & 0xff) - r;
+        int dg = ((rgb >> 8) & 0xff) - gr;
+        int db = (rgb & 0xff) - b;
+        int d = dr * dr + dg * dg + db * db;
+
+        if (d < bestd) {
+            bestd = d;
+            best = i;
+        }
+    }
+    return (uint8_t)best;
 }
 
 static void sgi_gr2_ge7_draw(SGIGr2State *s)
@@ -1354,9 +1389,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
 static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
 {
     int vx, vy, vw, vh;
-    uint8_t pl[32];
     float lx, ly, lz, hx, hy, hz;
-    float nx[3] = { 0.0f, 0.0f, 1.0f };
+    float nx[3];
     float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
     unsigned i;
     const float shininess = 8.0f;
@@ -1391,10 +1425,21 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
             hx /= ll; hy /= ll; hz /= ll;
         }
     }
-    sgi_gr2_ge7_greylut(s, pl);
-    idx = pl[MIN(MAX((int)(sgi_gr2_ge7_inten(s, nx, lx, ly, lz, hx, hy, hz,
-                                             shininess) * 31.0f + 0.5f),
-                     0), 31)];
+    /* A 2D line has no normal of its own, so IRIS GL shades it with the
+     * current normal (n3f).  The guest sets that immediately before the line
+     * run: ideas' curves carry (1,0,0) or (0.766,0,-0.643), which face the
+     * lights it sends (all in the xy plane).  A hard-coded (0,0,1) normal is
+     * perpendicular to every one of those lights, so the curves shaded to
+     * black. */
+    nx[0] = s->ge_normal[0];
+    nx[1] = s->ge_normal[1];
+    nx[2] = s->ge_normal[2];
+    {
+        float col[3];
+
+        sgi_gr2_ge7_shade(s, nx, lx, ly, lz, hx, hy, hz, shininess, col);
+        idx = sgi_gr2_ge7_rgbidx(s, col);
+    }
     for (i = 0; i < s->ge_line_n; i++) {
         float p[3];
         float cx, cy, cz;
