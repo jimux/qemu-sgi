@@ -441,6 +441,12 @@ struct SGIGr2State {
      * bar colour (222).  The DDX does not put the text y on the wire, and the
      * label bar is drawn just before its glyphs, so this is the structural link
      * for the glyph baseline. */
+    /* The last solid rect painted.  The DDX clears a terminal's text area with
+     * a bg rect immediately before its glyph strip, and that rect's x1 is the
+     * text origin -- the strip carries only the row y, never an x. */
+    int re3_last_rect_x;
+    int re3_last_rect_y;
+    bool re3_last_rect_valid;
     int re3_label_y;
     bool re3_label_valid;
     /* IP20 Xsgi's glyph piece, read straight from the stream (see the token
