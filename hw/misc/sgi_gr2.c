@@ -2533,9 +2533,6 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset >= SGI_GR2_XMAP_CTL_OFF && offset < SGI_GR2_XMAP_CTL_END) {
         s->xmap_ready = true;
         trace_sgi_gr2_xmap_ctl((uint32_t)offset, (uint32_t)value);
-        if (offset == SGI_GR2_XMAP_MODE) {
-            s->xmap_mode = (uint32_t)value;
-        }
     }
     /* RAMDAC colour-map programming (XMAP_PAL_*): the DDX writes the entry
      * index to 0x6c1b0, a control byte to 0x6c1b4, and a sliding R,G,B byte
@@ -2797,12 +2794,7 @@ static void sgi_gr2_update_display(void *opaque)
                 uint8_t b = s->dac_ramp[2][rgb & 0xff];
 
                 row[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-            } else if ((s->xmap_mode & SGI_GR2_XMAP_MODE_RGB) ||
-                       (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x])) {
-                /* xmapall MODE PDMD = RGB (bit 24) makes the whole display
-                 * direct-colour 3-3-2, the way the hardware does when the guest
-                 * switches the mode generator; the per-pixel flag covers the
-                 * mixed case. */
+            } else if (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x]) {
                 row[x] = sgi_gr2_re3_332(idx);
             } else {
                 /* The CLUT byte is pre-gamma: run each channel through the
