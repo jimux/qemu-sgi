@@ -1847,14 +1847,23 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
          * and writes pairs (5.0, index) and (6.0, index) to this port: the
          * first word is a parameter id, the second is the LIGHT INDEX.  That
          * is the index the wire carries; use it to select the slot the colour
-         * and position runs that follow belong to. */
-        if (s->ge_light_pend) {
-            if (v < SGI_GR2_GE7_MAX_LIGHTS) {
-                s->ge_light_cur = v;
+         * and position runs that follow belong to.
+         *
+         * The port words are FLOATS: decode before comparing.  Comparing the
+         * raw bit pattern against MAX_LIGHTS silently matched only index 0
+         * (whose bits are zero), so every light but light 0 was dropped and a
+         * two-light client rendered with one, near-black. */
+        {
+            float fv = sgi_gr2_u2f(v);
+
+            if (s->ge_light_pend) {
+                if (fv >= 0.0f && fv < (float)SGI_GR2_GE7_MAX_LIGHTS) {
+                    s->ge_light_cur = (unsigned)fv;
+                }
+                s->ge_light_pend = false;
+            } else if (fv == 5.0f) {
+                s->ge_light_pend = true;
             }
-            s->ge_light_pend = false;
-        } else if (v == 0x40a00000u) { /* 5.0 */
-            s->ge_light_pend = true;
         }
         break;
 
