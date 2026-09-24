@@ -129,11 +129,18 @@ static uint64_t sgi_sflash_pds_read(void *opaque, hwaddr off, unsigned size)
     SGISflashState *s = opaque;
     hwaddr o = off & (SGI_SFLASH_SEG_SIZE - 1);
 
+    uint64_t v;
+
     if (size <= 2 &&
         (s->cmd == SFLASH_CMD_STATUS_READ || s->cmd == SFLASH_CMD_ESR_READ)) {
         return sflash_read16(SFLASH_STATUS_READY, off, size);
     }
-    return sflash_read_bytes(&s->pds[o], size < 8 ? size : 8);
+    v = sflash_read_bytes(&s->pds[o], size < 8 ? size : 8);
+    if (getenv("SGISFLASH_PDS_DBG")) {
+        fprintf(stderr, "SFLASH-PDS: R o=0x%04" HWADDR_PRIx " size=%u -> 0x%"
+                PRIx64 "\n", o, size, v);
+    }
+    return v;
 }
 
 static void sgi_sflash_pds_write(void *opaque, hwaddr off, uint64_t value,

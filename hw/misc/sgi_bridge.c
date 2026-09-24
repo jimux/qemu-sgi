@@ -1029,6 +1029,8 @@ static NetClientInfo net_sgi_bridge_eth_info = {
 #define RTC_CTLB_OFF   0x0b
 #define RTC_CTLD_OFF   0x0d
 #define RTC_CENT_OFF   0x48   /* century = year / 100 (bank 1) */
+#define RTC_XRAM_ADDR  0x50   /* bank-1 extended RAM address port */
+#define RTC_XRAM_DATA  0x53   /* bank-1 extended RAM data port */
 
 static bool sgi_bridge_rtc_dbg(void)
 {
@@ -1123,6 +1125,40 @@ static void sgi_bridge_rtc_rebase(SGIBRIDGEState *s, int sec, int min, int hour,
     s->rtc_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 }
 
+/*
+ * The PROM stores its environment in the DS1687 NVRAM (bank-0 user RAM in
+ * sio_regs plus the bank-1 extended RAM) and checksums it, so both are
+ * file-backed when a path is set, mirroring the Indy NVRAM file.
+ */
+static void sgi_bridge_nvram_load(SGIBRIDGEState *s)
+{
+    gchar *data = NULL;
+    gsize len = 0;
+    size_t base = sizeof(s->sio_regs);
+
+    if (s->nvram_file &&
+        g_file_get_contents(s->nvram_file, &data, &len, NULL) && len > 0) {
+        memcpy(s->sio_regs, data, MIN(len, base));
+        if (len > base) {
+            memcpy(s->rtc_xram, data + base,
+                   MIN(len - base, sizeof(s->rtc_xram)));
+        }
+    }
+    g_free(data);
+}
+
+static void sgi_bridge_nvram_save(SGIBRIDGEState *s)
+{
+    uint8_t buf[sizeof(s->sio_regs) + sizeof(s->rtc_xram)];
+
+    if (!s->nvram_file) {
+        return;
+    }
+    memcpy(buf, s->sio_regs, sizeof(s->sio_regs));
+    memcpy(buf + sizeof(s->sio_regs), s->rtc_xram, sizeof(s->rtc_xram));
+    g_file_set_contents(s->nvram_file, (const gchar *)buf, sizeof(buf), NULL);
+}
+
 static uint64_t sgi_bridge_rtc_read(SGIBRIDGEState *s, unsigned idx)
 {
     int sec, min, hour, wday, mday, mon, year;
@@ -1148,6 +1184,12 @@ static uint64_t sgi_bridge_rtc_read(SGIBRIDGEState *s, unsigned idx)
         case RTC_YEAR_OFF: v = sgi_bridge_bcd_enc(year % 100); break;
         default:           v = sgi_bridge_bcd_enc(year / 100); break;
         }
+        break;
+    case RTC_XRAM_ADDR:
+        v = s->rtc_xram_addr;
+        break;
+    case RTC_XRAM_DATA:
+        v = s->rtc_xram[s->rtc_xram_addr & 0x7f];
         break;
     case RTC_CTLD_OFF:
         v = 0x80;                 /* VRT: battery valid, clock running */
@@ -1217,10 +1259,18 @@ static void sgi_bridge_rtc_write(SGIBRIDGEState *s, unsigned idx, uint8_t val)
         }
         sgi_bridge_rtc_rebase(s, sec, min, hour, mday, mon, year);
         return;
+    case RTC_XRAM_ADDR:
+        s->rtc_xram_addr = val;
+        return;
+    case RTC_XRAM_DATA:
+        s->rtc_xram[s->rtc_xram_addr & 0x7f] = val;
+        sgi_bridge_nvram_save(s);
+        return;
     case RTC_CTLD_OFF:
         return;                   /* status register: read-only here */
     default:
         s->sio_regs[idx] = val;
+        sgi_bridge_nvram_save(s);
         return;
     }
 }
@@ -1811,7 +1861,10 @@ static void sgi_bridge_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ioc3_regs, 0, sizeof(s->ioc3_regs));
     memset(s->sio_regs, 0, sizeof(s->sio_regs));
+    memset(s->rtc_xram, 0, sizeof(s->rtc_xram));
     s->sio_index = 0;
+    s->rtc_xram_addr = 0;
+    sgi_bridge_nvram_load(s);
     /*
      * Latch the host wall clock as the RTC epoch so the calendar the PROM and
      * kernel read is live from reset (ml/clksupport.c warns about a frozen
@@ -2069,6 +2122,7 @@ static void sgi_bridge_instance_init(Object *obj)
 
 static const Property sgi_bridge_properties[] = {
     DEFINE_NIC_PROPERTIES(SGIBRIDGEState, nic_conf),
+    DEFINE_PROP_STRING("nvram", SGIBRIDGEState, nvram_file),
 };
 
 static void sgi_bridge_class_init(ObjectClass *klass, const void *data)

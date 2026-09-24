@@ -192,6 +192,16 @@ struct SGIBRIDGEState {
     int64_t rtc_epoch_ns;
 
     /*
+     * DS1687 battery-backed NVRAM.  Bank 0 user RAM is sio_regs above the
+     * clock/control registers; bank 1 extended RAM is addressed through
+     * X_RAM_ADDR (0x50) / X_RAM_DATA (0x53) (sys/ds1687clk.h).  The PROM
+     * stores its environment here and checksums it, so both must persist.
+     */
+    uint8_t rtc_xram[128];
+    uint8_t rtc_xram_addr;
+    char *nvram_file;
+
+    /*
      * IOC3 SuperIO UART A (serial console).
      *
      * In 16550-compatibility mode the IOC3 UART is byte-spaced: the register
