@@ -772,13 +772,24 @@ static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
         return;
     }
 
-    w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
-    err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
-    if (len >= 6 && (buf[0] & 1)) {
-        err |= IOC3_ERXBUF_MULTICAST;
-        if (buf[0] == 0xff && buf[1] == 0xff && buf[2] == 0xff &&
-            buf[3] == 0xff && buf[4] == 0xff && buf[5] == 0xff) {
-            err |= IOC3_ERXBUF_BROADCAST;
+    if (emcr & IOC3_EMCR_LOOPBACK) {
+        /*
+         * IOC3 internal loopback: no FCS is appended and the MAC reports no
+         * status bits.  The POST loopback diag (diag_enet.c) builds its
+         * expected RX word with valid=1, byte_cnt == packet_len and every
+         * status bit zero, so match that exactly.
+         */
+        w0 = IOC3_ERXBUF_V | ((uint32_t)len << IOC3_ERXBUF_BYTECNT_SHIFT);
+        err = 0;
+    } else {
+        w0 = IOC3_ERXBUF_V | ((uint32_t)(len + 4) << IOC3_ERXBUF_BYTECNT_SHIFT);
+        err = IOC3_ERXBUF_GOODPKT | IOC3_ERXBUF_LONGEVENT;
+        if (len >= 6 && (buf[0] & 1)) {
+            err |= IOC3_ERXBUF_MULTICAST;
+            if (buf[0] == 0xff && buf[1] == 0xff && buf[2] == 0xff &&
+                buf[3] == 0xff && buf[4] == 0xff && buf[5] == 0xff) {
+                err |= IOC3_ERXBUF_BROADCAST;
+            }
         }
     }
 
