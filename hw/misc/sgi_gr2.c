@@ -480,17 +480,18 @@ static bool sgi_gr2_re3_tile_rects(SGIGr2State *s)
 }
 
 /* expOpStippledFillRects (token 331 == the stipple fill op) draws the WxH 8bpp
- * PATTERN bitmap streamed in PUC_DATA into the rectangles that follow it.  The
- * DDX stores each rectangle as SIX words - the stipple phase, then the
- * coordinate, per axis, then the far corner:
- *     [x1 % W, x1, y1 % H, y1, x2, y2]
- * so the rectangle is (data[n-5], data[n-3], data[n-2], data[n-1]).  The
- * four-word walkback in rect_groups cannot see this: it drops the two phase
- * words and reads (data[n-4], data[n-3], data[n-2], data[n-1]), which turns the
- * Console icon's (210,16)-(295,83) into (16,16)-(295,83) and smears the pattern
- * left by 194px.  The phase words are a self-check, not magic: for a genuine
- * rect, x1 % W == data[n-6] and y1 % H == data[n-4] (210%85=40, 16%67=16), so
- * an op that is not this shape is left to the rect-list path untouched. */
+ * PATTERN bitmap streamed in PUC_DATA into its destination rectangle(s).  The
+ * destination and the pattern PHASE come from a token-321 six-word group at the
+ * end of the payload, [org_x, x0, org_y, y0, x1, y1] -- the same group the
+ * expTileRects menu texture uses.  org is the PATTERN ORIGIN in screen space,
+ * not a modulo of the rect corner: the Home window's panes share one 16x16 tile
+ * with org (6,6) and origins (341,213), (326,355), so the old "x1 % W == phase
+ * word" self-check rejects them and the 4-word walkback then reads the origin
+ * words as the rect, smearing the pane 300+ px to the left (it took the Console
+ * icon's (210,16) for (16,16)).  Sample at (x - org_x) % W, (y - org_y) % H.
+ *
+ * A payload with no token-321 group still falls back to the tail-parse, which
+ * is the shape the Console icon arrives in. */
 static bool sgi_gr2_re3_pattern_fill(SGIGr2State *s)
 {
     unsigned n = s->re3_data_n, nwords, x, y, x1, y1, x2, y2;
@@ -506,6 +507,74 @@ static bool sgi_gr2_re3_pattern_fill(SGIGr2State *s)
         return false;
     }
     nwords = (w * h + 3) / 4;
+    if (7 + nwords > n) {
+        return false;
+    }
+    /* Same two-colour form as the tile: data[2] is the base colour, data[1]
+     * indexes the second, and any other pattern byte is a direct 8bpp index. */
+    c0 = s->re3_data[2] << 3;
+    c1 = c0 | (s->re3_data[1] << 1);
+
+    if (s->re3_spanr_seen && s->re3_nspanr) {
+        unsigned g;
+
+        if (!s->scanout) {
+            return true;
+        }
+        for (g = 0; g < s->re3_nspanr; g++) {
+            unsigned o = s->re3_spanr_off[g];
+            int ox, oy;
+
+            if (o + 6 > n) {
+                continue;
+            }
+            ox = (int)s->re3_data[o];
+            x1 = s->re3_data[o + 1];
+            oy = (int)s->re3_data[o + 2];
+            y1 = s->re3_data[o + 3];
+            x2 = s->re3_data[o + 4];
+            y2 = s->re3_data[o + 5];
+            if (x2 <= x1 || y2 <= y1 || x1 >= SGI_GR2_SCREEN_W ||
+                y1 >= SGI_GR2_SCREEN_H) {
+                continue;
+            }
+            if (x2 > SGI_GR2_SCREEN_W) {
+                x2 = SGI_GR2_SCREEN_W;
+            }
+            if (y2 > SGI_GR2_SCREEN_H) {
+                y2 = SGI_GR2_SCREEN_H;
+            }
+            for (y = y1; y < y2; y++) {
+                for (x = x1; x < x2; x++) {
+                    unsigned px = (unsigned)(((int)x - ox) % (int)w + (int)w) % w;
+                    unsigned py = (unsigned)(((int)y - oy) % (int)h + (int)h) % h;
+                    unsigned p = py * w + px;
+                    uint32_t word;
+                    uint8_t v, idx;
+
+                    if (p / 4 >= nwords) {
+                        continue;
+                    }
+                    word = s->re3_data[7 + p / 4];
+                    v = (word >> (8 * (3 - (p % 4)))) & 0xff;
+                    if (v == (s->re3_data[1] & 0xff)) {
+                        idx = c1;
+                    } else if (v == (s->re3_data[2] & 0xff)) {
+                        idx = c0;
+                    } else {
+                        idx = v;
+                    }
+                    sgi_gr2_put(s, x, y, idx);
+                }
+            }
+            trace_sgi_gr2_re3_rect((uint8_t)c1, 0, x1, y1, x2, y2);
+        }
+        sgi_gr2_update_display(s);
+        return true;
+    }
+
+    /* No token-321 group: the Console-icon shape, a six-word rect tail
+     * [x1 % W, x1, y1 % H, y1, x2, y2] after the pattern. */
     if (7 + nwords + 6 > n) {
         return false;
     }
@@ -529,10 +598,6 @@ static bool sgi_gr2_re3_pattern_fill(SGIGr2State *s)
     if (!s->scanout) {
         return true;
     }
-    /* Same two-colour form as the tile: data[2] is the base colour, data[1]
-     * indexes the second, and any other pattern byte is a direct 8bpp index. */
-    c0 = s->re3_data[2] << 3;
-    c1 = c0 | (s->re3_data[1] << 1);
     for (y = y1; y < y2; y++) {
         for (x = x1; x < x2; x++) {
             unsigned p = (y - y1) * w + (x - x1);
