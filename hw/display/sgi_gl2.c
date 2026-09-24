@@ -238,6 +238,7 @@ struct SGIGL2State {
     bool mm_active;
     bool ge_cmd_is_raw;           /* current in-flight command is a raw GE op */
     bool ge_reconfig;             /* collecting a variable-length GEreconfigure */
+    int32_t viewport[8];          /* GEloadviewport: vcx vcy vsx vsy ... */
 
     bool testpattern;
     bool trace;
@@ -516,13 +517,38 @@ static uint64_t gl2_read(void *opaque, hwaddr addr, unsigned size)
                     s->fb_left = s->fb_storemm * 33;
                     s->fb_phase = 2;
                     return (uint16_t)(s->fb_left + 3);
-                default:                /* matrix payload: the kernel reads
-                                         * only what it needs, so never latch
-                                         * on the modelled count */
+                default: {              /* matrix payload: struct matdata
+                                         * is { short dummy; Matrix mat; } --
+                                         * 33 shorts per level.  Return the
+                                         * real matrix, not zeros: the kernel
+                                         * round-trips it through GEstoremm on
+                                         * save and GEloadmm on restore, so a
+                                         * zero readback silently collapses
+                                         * the client's matrix. */
+                    unsigned total = s->fb_storemm * 33;
+                    unsigned k = total - s->fb_left;
+                    unsigned boff;
+
                     if (s->fb_left > 0) {
                         s->fb_left--;
                     }
-                    return 0;
+                    if (k >= total) {
+                        return 0;       /* trailing dummy words */
+                    }
+                    boff = k % 33;
+                    if (boff == 0) {
+                        return 0x0003;  /* dummy slot: GEstoremm word */
+                    }
+                    {
+                        unsigned li = (boff - 1) / 2;    /* long 0..15 */
+                        unsigned half = (boff - 1) & 1;
+                        float v = s->matrix[li % 4][li / 4];
+                        uint32_t bits;
+
+                        memcpy(&bits, &v, 4);
+                        return half ? (bits & 0xffff) : (bits >> 16);
+                    }
+                }
                 }
             }
             if (fbc_trace_on()) {
@@ -779,6 +805,34 @@ static bool buf_trace_on(void)
         on = getenv("SGI_GL2_BUF_TRACE") != NULL;
     }
     return on;
+}
+
+static bool xlog_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("SGI_GE_XLOG") != NULL;
+    }
+    return on;
+}
+
+static void gl2_xlog(SGIGL2State *s, const char *tag)
+{
+    int r;
+
+    fprintf(stderr, "GEXLOG %s char=(%d,%d) top=%d vp=", tag,
+            s->char_x, s->char_y, s->matrix_top);
+    for (r = 0; r < 8; r++) {
+        fprintf(stderr, "%d,", s->viewport[r]);
+    }
+    fprintf(stderr, " M=");
+    for (r = 0; r < 4; r++) {
+        fprintf(stderr, "[%.4g %.4g %.4g %.4g]",
+                s->matrix[r][0], s->matrix[r][1],
+                s->matrix[r][2], s->matrix[r][3]);
+    }
+    fprintf(stderr, "\n");
 }
 
 /*
@@ -1054,6 +1108,9 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
             s->char_x = (int16_t)args[1];
             s->char_y = (int16_t)args[2];
             s->charpos_pending = false;
+            if (xlog_on()) {
+                gl2_xlog(s, "CHARPOS-inline");
+            }
         } else {
             /*
              * Bare form (the GL library's im_cmov2i: im_passcmd(1,
@@ -1067,6 +1124,9 @@ static void gl2_ge_exec(SGIGL2State *s, uint16_t cmd,
         break;
 
     case 0x1c:                          /* FBCdrawchars: fontchar descriptors */
+        if (xlog_on()) {
+            gl2_xlog(s, "DRAWCHARS");
+        }
         for (i = 0; i + 3 < nargs; i += 4) {
             unsigned offset = args[i];
             int w = args[i + 1] >> 8;
@@ -1414,6 +1474,22 @@ static void gl2_ge_raw_exec(SGIGL2State *s, uint16_t w,
         break;
 
     case 0x05:                          /* GEloadviewport */
+        if (nargs >= 16) {
+            int k;
+
+            for (k = 0; k < 8; k++) {
+                s->viewport[k] = (int32_t)(((uint32_t)args[2 * k] << 16) |
+                                           args[2 * k + 1]);
+            }
+            if (xlog_on()) {
+                fprintf(stderr, "GEXLOG viewport set:");
+                for (k = 0; k < 8; k++) {
+                    fprintf(stderr, " %d", s->viewport[k]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        break;
     case 0x06:                          /* GEsethitmode */
     case 0x09: case 0x0a: case 0x0b:    /* viewport stack */
     case 0x0c:                          /* GEreconfigure */
@@ -1594,6 +1670,9 @@ static void gl2_ge_word(SGIGL2State *s, uint16_t w)
                     s->char_x = x;
                     s->char_y = y;
                     s->charpos_pending = false;
+                    if (xlog_on()) {
+                        gl2_xlog(s, "CHARPOS-GEpoint");
+                    }
                 }
             }
             s->ge_poly_got = 0;
@@ -1846,6 +1925,7 @@ static void gl2_reset(DeviceState *dev)
     s->mm_active = false;
     s->ge_cmd_is_raw = false;
     s->ge_reconfig = false;
+    memset(s->viewport, 0, sizeof(s->viewport));
     memset(s->microram, 0, sizeof(s->microram));
     s->cur_map = 0;
     s->rgb_color = s->rgb_we = 0;
