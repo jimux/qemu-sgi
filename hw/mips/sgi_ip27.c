@@ -1045,6 +1045,16 @@ static void sgi_ip27_init(MachineState *machine) {
      * -> "ERROR: unconnected router").  Both hubs here are the two node slots
      * of module 0, so ports 4 and 5.  Registers are reached only through the
      * hubs' NI vector engine; there is no latency model.
+     *
+     * Port order matters because nasid_loop() derives the hub's local NASID
+     * from its router port, and the PROM then relocates itself to that node's
+     * local memory (tlb_ram_cac_node, tlb.s).  hub[0] is the board whose RAM
+     * QEMU backs at node 0 (and carries the CPUs/BaseIO), so it must be the
+     * module's n0 board.  With hub[0] on port 4 the PROM gave it NASID 1,
+     * tlb_ram_cac_node(1) re-addressed its cached code to node 1's RAM -- which
+     * a CPU-dead node 1 never populated -- and the CPU ran off the end of the
+     * (zeroed) 2 MB window into an XTLB Refill fetch at 0xc00000001fe00000.
+     * hub[0] on port 5 yields NASID 0 and the relocation finds the PROM copy.
      */
     router = g_new0(SGIRouterState, 1);
     /*
@@ -1055,8 +1065,8 @@ static void sgi_ip27_init(MachineState *machine) {
      * router.
      */
     sgi_router_init(router, 0x00000000c0ffee01ULL, 0x8, 2);
-    sgi_router_connect(router, 4, hubs[0]);
-    sgi_router_connect(router, 5, hubs[1]);
+    sgi_router_connect(router, 4, hubs[1]);
+    sgi_router_connect(router, 5, hubs[0]);
     sgi_hub_set_router(hubs[0], router);
     sgi_hub_set_router(hubs[1], router);
   }
