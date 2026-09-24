@@ -124,6 +124,9 @@ static void mc68681_update_irq(MC68681State *s)
 
 static void mc68681_rx_push(MC68681State *s, int ch, uint8_t data)
 {
+    if (getenv("SGI_KBD_LOG") && ch == 0) {
+        fprintf(stderr, "DUART0A RX push %02x\n", data);
+    }
     if (s->fifo_len[ch] == MC68681_RX_FIFO) {
         s->sr[ch] |= SR_OVERRUN;
         return;
@@ -360,8 +363,13 @@ static uint64_t mc68681_read(void *opaque, hwaddr addr, unsigned size)
         return s->sr[ch];
     case 2:
         return 0; /* BRG test */
-    case 3:
-        return mc68681_rhr_read(s, ch);
+    case 3: {
+        uint8_t rv = mc68681_rhr_read(s, ch);
+        if (getenv("SGI_KBD_LOG") && ch == 0) {
+            fprintf(stderr, "DUART0A RHR read -> %02x\n", rv);
+        }
+        return rv;
+    }
     case 4:
         return s->ipcr;
     case 5:
