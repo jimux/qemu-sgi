@@ -92,6 +92,13 @@ struct SGIHubState {
 
   uint32_t nasid;
   uint32_t num_cpus;
+  /*
+   * Node-board slot id reported in MD_SLOTID_USTAT[2:0] (indexes
+   * nodeslot_table[]): 7 = n1, 6 = n2.  Both node boards of a two-node module
+   * must differ, otherwise their hwgraph paths collide and the kernel's
+   * klhwg_connect_hubs() gets GRAPH_DUP adding the hub->router edge.
+   */
+  uint32_t slot_id;
 
   /* PI: CPU presence/enable and per-slice state. */
   uint64_t cpu_present[SGI_HUB_MAX_CPUS];

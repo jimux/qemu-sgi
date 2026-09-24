@@ -1673,7 +1673,7 @@ static void sgi_hub_reset(DeviceState *dev) {
    * single-node Origin 200 is the MotherBoard, whose node slot is 1 (index 7,
    * SLOTNUM_NODE_CLASS|1).
    */
-  s->slotid_ustat = 0x10 | 0x7;
+  s->slotid_ustat = 0x10 | (s->slot_id & 0x7);
 
   /* PCF8584 I2C controller: powered up idle (no transaction, no own address). */
   s->i2c_ctl = 0;
@@ -1737,6 +1737,7 @@ static void sgi_hub_realize(DeviceState *dev, Error **errp) {
 static const Property sgi_hub_properties[] = {
     DEFINE_PROP_UINT32("nasid", SGIHubState, nasid, 0),
     DEFINE_PROP_UINT32("num-cpus", SGIHubState, num_cpus, 1),
+    DEFINE_PROP_UINT32("slot-id", SGIHubState, slot_id, 7),
     DEFINE_PROP_UINT64("mem-config", SGIHubState, mem_config, 0),
 };
 
