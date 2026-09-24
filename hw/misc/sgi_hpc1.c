@@ -357,6 +357,15 @@ static int sgi_hpc1_kbd_keycode(QKeyCode q)
     case Q_KEY_CODE_APOSTROPHE: return 50; case Q_KEY_CODE_BRACKET_LEFT: return 49;
     case Q_KEY_CODE_BRACKET_RIGHT: return 56; case Q_KEY_CODE_BACKSLASH: return 57;
     case Q_KEY_CODE_GRAVE_ACCENT: return 55;
+    /* Modifiers carry the same guest-side offset (guest X keycode = V+7, from
+     * the guest's own keymap): Shift_L=13, Shift_R=12, Control_L=10,
+     * Caps_Lock=11, Alt_L/Meta_L=91, Alt_R/Meta_R=92, Control_R=93.  Without
+     * these the HLE dropped every modifier, so shift-q arrived as plain q. */
+    case Q_KEY_CODE_SHIFT: return 6;       case Q_KEY_CODE_SHIFT_R: return 5;
+    case Q_KEY_CODE_CTRL: return 3;        case Q_KEY_CODE_CTRL_R: return 86;
+    case Q_KEY_CODE_ALT: return 84;        case Q_KEY_CODE_ALT_R: return 85;
+    case Q_KEY_CODE_META_L: return 84;     case Q_KEY_CODE_META_R: return 85;
+    case Q_KEY_CODE_CAPS_LOCK: return 4;
     default: return -1;
     }
 }
