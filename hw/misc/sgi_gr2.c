@@ -1622,10 +1622,20 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
             } else if (s->ge_clip_n == 2) {
                 s->ge_clip_w = (int)v;
             } else if (s->ge_clip_n == 3) {
+                int wy;
+
                 s->ge_clip_h = (int)v;
+                wy = SGI_GR2_SCREEN_H - (s->ge_clip_y + s->ge_clip_h);
+                if (s->ge_clip_x != s->ge_win_x || wy != s->ge_win_y ||
+                    s->ge_clip_w != s->ge_win_w ||
+                    s->ge_clip_h != s->ge_win_h) {
+                    trace_sgi_gr2_ge7_winrect(s->ge_clip_x, wy, s->ge_clip_w,
+                                              s->ge_clip_h);
+                }
                 s->ge_win_x = s->ge_clip_x;
-                s->ge_win_y = SGI_GR2_SCREEN_H -
-                              (s->ge_clip_y + s->ge_clip_h);
+                s->ge_win_y = wy;
+                s->ge_win_w = s->ge_clip_w;
+                s->ge_win_h = s->ge_clip_h;
                 s->ge_clip_armed = false;
             }
             s->ge_clip_n++;
