@@ -312,13 +312,91 @@ static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
     sgi_gr2_update_display(s);
 }
 
+/* expOpStippledFillRects (token 331 == the stipple fill op) draws the WxH 8bpp
+ * PATTERN bitmap streamed in PUC_DATA into the rectangles that follow it.  The
+ * DDX stores each rectangle as SIX words - the stipple phase, then the
+ * coordinate, per axis, then the far corner:
+ *     [x1 % W, x1, y1 % H, y1, x2, y2]
+ * so the rectangle is (data[n-5], data[n-3], data[n-2], data[n-1]).  The
+ * four-word walkback in rect_groups cannot see this: it drops the two phase
+ * words and reads (data[n-4], data[n-3], data[n-2], data[n-1]), which turns the
+ * Console icon's (210,16)-(295,83) into (16,16)-(295,83) and smears the pattern
+ * left by 194px.  The phase words are a self-check, not magic: for a genuine
+ * rect, x1 % W == data[n-6] and y1 % H == data[n-4] (210%85=40, 16%67=16), so
+ * an op that is not this shape is left to the rect-list path untouched. */
+static bool sgi_gr2_re3_pattern_fill(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n, nwords, x, y, x1, y1, x2, y2;
+    uint32_t w, h, c0, c1;
+
+    if (n < 13 || s->re3_data[0] != 0xff || s->re3_data[1] != 3 ||
+        s->re3_data[5] != 2 || s->re3_data[6] != 0xd022) {
+        return false;
+    }
+    w = s->re3_data[3];
+    h = s->re3_data[4];
+    if (w == 0 || h == 0 || w > SGI_GR2_SCREEN_W || h > SGI_GR2_SCREEN_H) {
+        return false;
+    }
+    nwords = (w * h + 3) / 4;
+    if (7 + nwords + 6 > n) {
+        return false;
+    }
+    x1 = s->re3_data[n - 5];
+    y1 = s->re3_data[n - 3];
+    x2 = s->re3_data[n - 2];
+    y2 = s->re3_data[n - 1];
+    if (x2 <= x1 || y2 <= y1 ||
+        s->re3_data[n - 6] != x1 % w || s->re3_data[n - 4] != y1 % h) {
+        return false;
+    }
+    if (x1 >= SGI_GR2_SCREEN_W || y1 >= SGI_GR2_SCREEN_H) {
+        return false;
+    }
+    if (x2 > SGI_GR2_SCREEN_W) {
+        x2 = SGI_GR2_SCREEN_W;
+    }
+    if (y2 > SGI_GR2_SCREEN_H) {
+        y2 = SGI_GR2_SCREEN_H;
+    }
+    if (!s->scanout) {
+        return true;
+    }
+    /* Same two-colour form as the tile: data[2] is the base colour, data[1]
+     * indexes the second, and any other pattern byte is a direct 8bpp index. */
+    c0 = s->re3_data[2] << 3;
+    c1 = c0 | (s->re3_data[1] << 1);
+    for (y = y1; y < y2; y++) {
+        for (x = x1; x < x2; x++) {
+            unsigned p = (y - y1) * w + (x - x1);
+            uint32_t word = s->re3_data[7 + p / 4];
+            uint8_t v = (word >> (8 * (3 - (p % 4)))) & 0xff;
+            uint8_t idx;
+
+            if (v == (s->re3_data[1] & 0xff)) {
+                idx = c1;
+            } else if (v == (s->re3_data[2] & 0xff)) {
+                idx = c0;
+            } else {
+                idx = v;
+            }
+            sgi_gr2_put(s, x, y, idx);
+        }
+    }
+    trace_sgi_gr2_re3_rect((uint8_t)c1, 0, x1, y1, x2, y2);
+    sgi_gr2_update_display(s);
+    return true;
+}
+
 /* Number of trailing rectangle groups in the current sub-op's PUC_DATA.  The
- * DDX's expDrawSolidRects/expStippledFillRects store the geometry as groups of
- * four (x1,y1,x2,y2) after a short non-rectangle prefix ("0xff 0x3 0x0", and for
- * some ops the clip bounds 0x4ff 0x0 0x3ff before it).  Rather than assume the
+ * DDX's expDrawSolidRects stores the geometry as groups of four (x1,y1,x2,y2)
+ * after a short non-rectangle prefix ("0xff 0x3 0x0", and for some ops the clip
+ * bounds 0x4ff 0x0 0x3ff before it).  Rather than assume the
  * prefix length, walk back from the end while each group is a sane rectangle:
  * the longest valid suffix is the list, and the prefix is left alone.  This is
- * the layout read off the DDX store sequences (note 31), not a guessed tail. */
+ * the layout read off the DDX store sequences (note 31), not a guessed tail.
+ * expOpStippledFillRects does NOT use this shape - its rects carry interleaved
+ * stipple phases and are handled by sgi_gr2_re3_pattern_fill. */
 static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s, bool stippled)
 {
     unsigned n = s->re3_data_n, groups = 0;
@@ -865,16 +943,19 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         sgi_gr2_re3_draw_image(s);
         return;
     }
-    if (s->re3_stipple_valid && !(s->re3_mono_seen && s->re3_fg_valid)) {
-        /* Stippled rect list: the root backdrop is one full-screen rect, but a
-         * stippled sub-op with its own small rects (a cursor, a shade band) must
-         * paint only those — painting the whole screen here would wipe them.
-         * expStippledFillRects programs BOTH the MONO token (312) and the FG
-         * token (314) as part of its GC setup, so an op carrying both is an
-         * op-stippled GLYPH/image blit (IP20 draws the Console icon this way):
-         * its payload is an 8bpp bitmap, not a rect list, and painting it as
-         * rect stipples smears the bitmap across the screen.  Send it to the
-         * mono/image path instead.  A plain stipple op sets 318 alone. */
+    if (s->re3_stipple_valid) {
+        /* Stippled op.  Two shapes share token 318: a rect list (the root
+         * backdrop is one full-screen rect, and a stippled sub-op with its own
+         * small rects must paint only those), and expOpStippledFillRects, whose
+         * payload is an 8bpp WxH PATTERN bitmap plus its phase-encoded rects -
+         * this is how IP20 draws the Console icon.  Painting the pattern op as
+         * rect stipples smears the bitmap across the screen (the icon showed as
+         * vertical stripes spilling 194px left), so try the pattern renderer
+         * first; it only claims the op on a self-checked shape, and anything
+         * else falls through to the rect list. */
+        if (sgi_gr2_re3_pattern_fill(s)) {
+            return;
+        }
         sgi_gr2_re3_paint_rects(s, true);
         return;
     }
