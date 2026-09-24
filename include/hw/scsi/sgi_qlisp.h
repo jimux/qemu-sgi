@@ -70,6 +70,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIQLispState, SGI_QLISP)
 #define BUS_ISR_RISC_INT        0x0004
 #define BUS_SEMA_LOCK           0x0001
 
+/* Bus Interface Control register (ICR) bits (ql_standalone.h) */
+#define ICR_SOFT_RESET          0x0001
+#define ICR_ENABLE_RISC_INT     0x0004
+
 /* Mailbox command/status (ql_standalone.h) */
 #define MBOX_CMD_NOP                    0x0000
 #define MBOX_CMD_LOAD_RAM               0x0001

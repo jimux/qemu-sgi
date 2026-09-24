@@ -949,14 +949,26 @@ static void qlisp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (getenv("QLISP_DEBUG")) {
             fprintf(stderr, "sgi-qlisp: ICR wr %04x\n", val & 0xffff);
         }
-        /* Soft reset asserts HCCR_RESET; our RISC resets instantly so clear it
-         * (a poll waiting for the reset to finish then exits). */
-        if (val & 0x0080) {
+        /*
+         * A chip soft reset stops any running firmware and clears the RISC's
+         * command/queue state and the mailbox registers.  The ARCS standalone
+         * driver issues ICR_ENABLE_RISC_INT|ICR_SOFT_RESET and then waits for
+         * mailbox0 to read 0; the IRIX kernel relies on it as well.  The bit
+         * here used to be tested as 0x0080, which the driver never sets, so the
+         * reset was silently ignored and the request engine stayed armed across
+         * it -- which is what left a stale response pointer in mailbox5 and made
+         * the PROM's post-init-0 mailbox register test fail its compare.
+         */
+        if (val & ICR_SOFT_RESET) {
+            int n;
             s->firmware_running = false;
             s->cmd_pending = false;
-            ql_reg_put(s, QL_HCCR, HCCR_RESET);
+            memset(&s->req, 0, sizeof(s->req));
+            memset(&s->rsp, 0, sizeof(s->rsp));
+            for (n = 0; n < 8; n++) {
+                ql_mbox_put(s, n, 0);
+            }
             ql_reg_put(s, QL_HCCR, 0);
-            ql_reg_put(s, QL_MBOX0, MBOX_STS_COMMAND_COMPLETE);
         }
         ql_reg_put(s, QL_BUS_ICR, val & 0xffff);
         break;
