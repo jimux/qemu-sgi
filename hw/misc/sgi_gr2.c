@@ -1517,19 +1517,17 @@ static void sgi_gr2_ge7_mat_word(SGIGr2State *s, float *dst, hwaddr tok,
     }
 }
 
-/* One component of a light position (token 127).  Each bind writes a complete
- * 3-float run.  The wire does not carry a light index next to the run: the
- * guest's own libGLcore pushes every light's state in sequence to the SAME
- * port (__glExpFreeLightLUT and __glExpUpdateLightingState write token 128
- * repeatedly), so the identity is positional and we cannot yet tell the lights
- * apart.  Until it is derived, keep one current light: the colour and the
- * position runs pair by write order and "valid once it has a position" holds. */
+/* One component of a light position (token 127).  A run is four floats
+ * (x, y, z, w); the position is the first three.  The run belongs to the light
+ * selected by the last (5.0, index) pair on token 128 - the index the wire
+ * does carry - so it lands in that light's own slot, and a light is valid once
+ * it has a position. */
 static void sgi_gr2_ge7_light_word(SGIGr2State *s, float f)
 {
     unsigned li = s->ge_light_cur;
 
     s->ge_lpos[s->ge_lpos_n++] = f;
-    if (s->ge_lpos_n < 3) {
+    if (s->ge_lpos_n < 4) {
         return;
     }
     s->ge_lpos_n = 0;
@@ -1670,7 +1668,21 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         s->ge_lpos_n = 0;
         break;
     case SGI_GR2_GE7_SPOTLIGHT:
-        break; /* token 128: see the light-word path (position update) */
+        /* Token 128 is __glExpUpdateLightingState / __glExpValidateLighting.
+         * ValidateLighting walks the enabled lights in ascending index order
+         * and writes pairs (5.0, index) and (6.0, index) to this port: the
+         * first word is a parameter id, the second is the LIGHT INDEX.  That
+         * is the index the wire carries; use it to select the slot the colour
+         * and position runs that follow belong to. */
+        if (s->ge_light_pend) {
+            if (v < SGI_GR2_GE7_MAX_LIGHTS) {
+                s->ge_light_cur = v;
+            }
+            s->ge_light_pend = false;
+        } else if (v == 0x40a00000u) { /* 5.0 */
+            s->ge_light_pend = true;
+        }
+        break;
 
     case SGI_GR2_GE7_LCOLOR:
         sgi_gr2_ge7_mat_word(s, s->ge_light_color[s->ge_light_cur], offset,
