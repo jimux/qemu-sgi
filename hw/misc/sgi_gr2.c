@@ -602,7 +602,14 @@ static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
                                      x1, y1, w, h);
             trace_sgi_gr2_re3_rect(fg, s->ramdac[fg], x1, y1, x2, y2);
         } else {
-            uint32_t rgb = sgi_gr2_re3_fill(s, s->re3_colour, x1, y1, w, h);
+            uint32_t rgb;
+
+            /* Remember the origin: a terminal's per-row bg clear rect precedes
+             * its glyph strip and carries the text x the strip omits. */
+            s->re3_last_rect_x = (int)x1;
+            s->re3_last_rect_y = (int)y1;
+            s->re3_last_rect_valid = true;
+            rgb = sgi_gr2_re3_fill(s, s->re3_colour, x1, y1, w, h);
 
             /* The name-label bars are drawn as solid rects in colour 222 just
              * before their glyphs; remember the row so the glyph blit has a
@@ -1096,6 +1103,64 @@ static void sgi_gr2_re3_copy_rect(SGIGr2State *s, int sx, int sy, int w, int h,
     sgi_gr2_update_display(s);
 }
 
+/* expDrawMonoImage with the classic [0xff,3,0] prefix (OP token 0x1009): the
+ * terminal text of a winterm/xterm.  After the prefix come 11-word glyph pieces
+ * {row y, cell width w, height h, (h+1)/2 bitmap words}, one per character, all
+ * on the same row; x advances by w from the text origin.  That origin is NOT on
+ * the wire -- the DDX clears the row's text area with a solid bg rect just
+ * before -- so re3_last_rect_x supplies it.  Returns false for an op without
+ * the prefix, leaving the menu's pen349 text to sgi_gr2_re3_draw_text. */
+static bool sgi_gr2_re3_draw_monostrip(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n, i;
+    uint8_t fg = s->re3_monocol_valid ? (uint8_t)s->re3_monocol
+                                      : s->re3_colour;
+    bool overlay = (s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY);
+    int x, drawn = 0;
+
+    if (n < 6 || s->re3_data[0] != 0xff || s->re3_data[1] != 3) {
+        return false;
+    }
+    x = s->re3_last_rect_valid ? s->re3_last_rect_x : 0;
+    i = 3;
+    while (i + 3 <= n) {
+        uint32_t Y = s->re3_data[i], W = s->re3_data[i + 1];
+        uint32_t H = s->re3_data[i + 2];
+        unsigned nw, k;
+
+        if (W == 0 || W > 64 || H == 0 || H > 64) {
+            break;
+        }
+        nw = (H + 1) / 2;
+        if (i + 3 + nw > n) {
+            break;
+        }
+        for (k = 0; k < H; k++) {
+            uint32_t word = s->re3_data[i + 3 + k / 2];
+            uint32_t rowbits = ((k & 1) ? (word >> 4) : (word >> 20)) & 0xfff;
+            int b;
+
+            for (b = 0; b < (int)W && b < 12; b++) {
+                if ((rowbits >> (11 - b)) & 1) {
+                    if (overlay) {
+                        sgi_gr2_ovl_put(s, x + b, (int)Y + k, fg & 3);
+                    } else {
+                        sgi_gr2_put(s, x + b, (int)Y + k, fg);
+                    }
+                }
+            }
+        }
+        x += W;
+        i += 3 + nw;
+        drawn++;
+    }
+    if (!drawn) {
+        return false;
+    }
+    sgi_gr2_update_display(s);
+    return true;
+}
+
 /* Evaluate the pending draw sub-op.  Called at token 331 (which starts a new
  * sub-op) and token 490 (the terminator), because one 490-terminated region can
  * hold several 331 sub-ops: the grainy root's stipple and the panel's own
@@ -1168,6 +1233,12 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
          * that actually says "span list", and drawing such an op as text would
          * drop the whole cube (EZsetup's icon). */
         sgi_gr2_re3_draw_stippled_spans(s);
+        return;
+    }
+    if (s->re3_mono_seen && s->re3_npens == 0 && sgi_gr2_re3_draw_monostrip(s)) {
+        /* The winterm/xterm glyph strip: [0xff,3,0] then (y,w,h,bitmap) pieces,
+         * and NO pens.  Ops that carry a 349 pen (the toolchest/4Dwm labels) are
+         * left to sgi_gr2_re3_draw_text below, which places them correctly. */
         return;
     }
     if (s->re3_mono_seen && s->re3_npens) {
