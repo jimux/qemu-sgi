@@ -459,6 +459,12 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
     }
 
     uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
+    uint32_t buf_d = (bufmode >> BM_BUF_DEPTH_SHIFT) & 3;
+    uint32_t pix_d = (bufmode >> BM_PIX_DEPTH_SHIFT) & 3;
+    int px_bpp = 1 << pix_d;          /* destination PIXEL width (1/2/4) */
+    int word_bpp = 1 << buf_d;        /* destination WORD width (1/2/4)  */
+    bool dpix = (bufmode >> 1) & 1;   /* doublePix: word split front/back */
+    int dpix_sel = bufmode & 1;       /* which half is drawn             */
 
     /*
      * @@SEMANTICS@@ — an 8-bit CI pixel in a 32-bit-word CI buffer lives in
@@ -468,6 +474,22 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
      */
     if (pix_type == 0 && crim_ci_lane(bufmode)) {
         phys += 1;
+    }
+
+    /*
+     * @@SEMANTICS@@ — 16+16 / 8+8 double buffering.  CRIME 1.5 Table 7-5:
+     * BufMode.bufDepth is the buffer WORD depth, pixDepth the PIXEL depth,
+     * and doublePix "each word of the color buffer is split into a front and
+     * back half for double buffering" with doublePixSel choosing the half.
+     * The O2 GL visual is the 16-bit A1_RGB5 pixel (spec Fig 7-5) packed two
+     * per 32-bit word (the DDX programs dst BufMode 0x426/0x427: bufDepth=32,
+     * pixDepth=16, pixType=RGBA, doublePix=1, sel 0/1), and the GBE scans the
+     * same half via WID typ RGB5 + buf BOTTOM(1)/TOP(2).  A pixel-depth below
+     * the word depth therefore owns one half of the word, selected by
+     * doublePixSel (lower half when clear, upper when set).
+     */
+    if (pix_type != 0 && dpix && px_bpp == 2 && px_bpp < word_bpp) {
+        phys += dpix_sel ? (word_bpp - px_bpp) : 0;
     }
 
     /*
@@ -500,13 +522,32 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
         break;
     }
     case 1:                             /* RGB canonical -> ABGR memory */
-        bpp = 4;
-        b[0] = 0; b[1] = color >> 8; b[2] = color >> 16; b[3] = color >> 24;
-        break;
     case 2:                             /* RGBA canonical -> ABGR memory */
     default:
-        bpp = 4;
-        b[0] = color; b[1] = color >> 8; b[2] = color >> 16; b[3] = color >> 24;
+        if (pix_type != 0 && px_bpp < word_bpp && px_bpp == 2) {
+            /*
+             * 16-bit RGB(A) pixel in a 32-bit word (16+16 double buffer):
+             * pack the canonical RGBA into A1_RGB5 (spec CRIME 1.5 Fig 7-5,
+             * bits [15]=A [14:10]=R [9:5]=G [4:0]=B) and store it, big-
+             * endian, in the doublePixSel half selected above.  The GBE
+             * WID typ RGB5 + buf reads exactly this half.
+             */
+            uint32_t R = (color >> 24) & 0xff;
+            uint32_t G = (color >> 16) & 0xff;
+            uint32_t B = (color >> 8) & 0xff;
+            uint32_t A = color & 0xff;
+            uint32_t v = (((A >> 7) & 1) << 15) | ((R >> 3) << 10) |
+                         ((G >> 3) << 5) | (B >> 3);
+            bpp = 2;
+            b[0] = (v >> 8) & 0xff;
+            b[1] = v & 0xff;
+        } else {
+            bpp = 4;
+            b[0] = (pix_type == 1) ? 0 : color;
+            b[1] = color >> 8;
+            b[2] = color >> 16;
+            b[3] = color >> 24;
+        }
         break;
     }
 
@@ -527,6 +568,16 @@ static void sgi_crime_re_put_pixel(SGICRIMEREState *s, uint32_t bufmode,
             } else {
                 b[0] = color & 0xff;
             }
+        } else if (bpp == 2) {
+            /* 16-bit A1_RGB5 in a double-buffered word (see the switch). */
+            uint32_t R = (color >> 24) & 0xff;
+            uint32_t G = (color >> 16) & 0xff;
+            uint32_t B = (color >> 8) & 0xff;
+            uint32_t A = color & 0xff;
+            uint32_t v = (((A >> 7) & 1) << 15) | ((R >> 3) << 10) |
+                         ((G >> 3) << 5) | (B >> 3);
+            b[0] = (v >> 8) & 0xff;
+            b[1] = v & 0xff;
         } else {
             b[0] = (pix_type == 1) ? 0 : color;
             b[1] = color >> 8;
@@ -1532,7 +1583,16 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
     uint32_t bufmode = (dst_tlb << BM_BUF_TYPE_SHIFT)
                      | (depth_code << BM_BUF_DEPTH_SHIFT)
                      | (s->bufmode_dst & (BM_PIX_TYPE_MASK |
-                                          BM_PIX_DEPTH_MASK));
+                                          BM_PIX_DEPTH_MASK))
+                     /*
+                      * Keep doublePix/doublePixSel so a 16+16 double-
+                      * buffered clear lands in the same word half as the
+                      * GL draws (and as the GBE WID's buf selects).  The
+                      * old mask dropped them, so the GL clear always hit
+                      * the lower half and the scanned (upper) buffer came
+                      * up stale.
+                      */
+                     | (s->bufmode_dst & 0x3u);
     int dx = x1 > x2 ? -1 : 1;
     int dy = y1 > y2 ? -1 : 1;
 
