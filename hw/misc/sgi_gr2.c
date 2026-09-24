@@ -22,6 +22,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/sgi_gr2.h"
 #include "trace.h"
+#include <math.h>
 
 /* Vertical retrace, as a real CRT would produce it.  The board raises its GIO
  * interrupt at ~60 Hz once started; the pulse is asserted for the blanking
@@ -59,6 +60,50 @@ static uint32_t sgi_gr2_word_write(uint64_t value, unsigned byte, unsigned size)
 }
 
 static void sgi_gr2_update_display(void *opaque);
+static void sgi_gr2_vc1_advance(SGIGr2State *s);
+
+/* Direct-colour 3-3-2 expansion (expDrawImage24).  In the 8-bit 3-3-2 visual the
+ * stored byte is an RGB triple: bits 7-5 red, bits 4-3 blue, bits 2-0 green, each
+ * a level into a gamma ramp.  The levels below are the SGI 8-bit visual's ramp as
+ * measured from the reference and from the guest's own BT457 DAC writes (the
+ * paltram sequence cycles 81,122,134,155,184,201,209,233).  The cube image,
+ * EZsetup's icon, decodes 33/33 against this formula (see note 49). */
+static const uint8_t sgi_gr2_ramp_rg[8] = { 0, 81, 122, 155, 184, 209, 233, 255 };
+static const uint8_t sgi_gr2_ramp_b[4]  = { 0, 134, 201, 255 };
+
+static uint32_t sgi_gr2_re3_332(uint8_t v)
+{
+    uint8_t r = sgi_gr2_ramp_rg[(v >> 5) & 7];
+    uint8_t g = sgi_gr2_ramp_rg[v & 7];
+    uint8_t b = sgi_gr2_ramp_b[(v >> 3) & 3];
+
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+/* Every scanout write goes through one of these, so the direct-colour flag is
+ * kept in step with the byte.  A later fill (for example `xsetroot -solid`) over
+ * a pixel an image op once drew must clear the flag, or that pixel keeps being
+ * expanded 3-3-2 and the fill comes out speckled. */
+static inline void sgi_gr2_put(SGIGr2State *s, int x, int y, uint8_t idx)
+{
+    size_t o = (size_t)y * SGI_GR2_SCREEN_W + x;
+
+    s->scanout[o] = idx;
+    if (s->scanout332) {
+        s->scanout332[o] = 0;
+    }
+}
+
+static inline void sgi_gr2_put332(SGIGr2State *s, int x, int y, uint8_t idx)
+{
+    size_t o = (size_t)y * SGI_GR2_SCREEN_W + x;
+
+    s->scanout[o] = idx;
+    if (s->scanout332) {
+        s->scanout332[o] = 1;
+    }
+}
+
 
 /* RE3 solid-rectangle fill.  In the 8-bit mode the guest runs, the latched
  * colour is a RAMDAC index, and that is what the framebuffer stores — the
@@ -89,7 +134,7 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
     }
     for (yy = y; yy < y + h; yy++) {
         for (xx = x; xx < x + w; xx++) {
-            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = colour;
+            sgi_gr2_put(s, xx, yy, colour);
         }
     }
     sgi_gr2_update_display(s);
@@ -102,7 +147,7 @@ static uint32_t sgi_gr2_re3_fill(SGIGr2State *s, uint8_t colour,
 static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
                              int x0, int y0, int x1, int y1)
 {
-    int dx, dy, sx, sy, err;
+    int dx, dy, sx, sy, err, e2;
 
     if (!s->scanout) {
         return;
@@ -115,7 +160,7 @@ static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
     for (;;) {
         if (x0 >= 0 && x0 < SGI_GR2_SCREEN_W &&
             y0 >= 0 && y0 < SGI_GR2_SCREEN_H) {
-            s->scanout[y0 * SGI_GR2_SCREEN_W + x0] = colour;
+            sgi_gr2_put(s, x0, y0, colour);
         }
         if (x0 == x1 && y0 == y1) {
             break;
@@ -125,11 +170,16 @@ static void sgi_gr2_re3_line(SGIGr2State *s, uint8_t colour,
             y0 < -SGI_GR2_SCREEN_H || y0 > 2 * SGI_GR2_SCREEN_H) {
             break;
         }
-        if (2 * err >= -dy) {
+        /* Both step decisions must see the SAME error term.  Re-reading err
+         * after the first step (the old code did) makes a line overshoot its
+         * endpoint and then wander to the bound below, painting a spurious
+         * trail across the screen - 4421 of 20000 random segments in test. */
+        e2 = 2 * err;
+        if (e2 > -dy) {
             err -= dy;
             x0 += sx;
         }
-        if (2 * err <= dx) {
+        if (e2 < dx) {
             err += dx;
             y0 += sy;
         }
@@ -168,9 +218,97 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
         for (xx = x; xx < x + w; xx++) {
             bool on = (pattern >> (31 - (xx & 31))) & 1;
 
-            s->scanout[yy * SGI_GR2_SCREEN_W + xx] = on ? fg : bg;
+            sgi_gr2_put(s, xx, yy, on ? fg : bg);
         }
     }
+    sgi_gr2_update_display(s);
+}
+
+/* expTileRects repeats the tile across its destination.  The destination is the
+ * clip rectangle list set by the preceding expValidateClip ops (one per exposed
+ * rect, seen as a 304 with four coordinate words, no colour token, 490
+ * terminated).  The list persists until a tile consumes it; the startup
+ * clusters that precede any list are left alone rather than filled full-screen,
+ * which is what keeps the toolchest. */
+static void sgi_gr2_re3_tile_rects(SGIGr2State *s)
+{
+    unsigned n = s->re3_data_n;
+    uint32_t w, h, nwords, c0, c1;
+    unsigned r;
+
+    if (n < 7) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    w = s->re3_data[3];
+    h = s->re3_data[4];
+    if (w == 0 || h == 0 || (w & 3) || w > SGI_GR2_SCREEN_W ||
+        h > SGI_GR2_SCREEN_H) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    nwords = (w * h) / 4;
+    if (nwords == 0 || 7 + nwords - 1 > n) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    if (!s->scanout) {
+        return;
+    }
+    /* The two tile colours are given by the op header, not by the tile pixels:
+     * data[2] is the base and data[1] indexes the second colour.  The DDX forms
+     * the base as (byte << 3) ("sll v1,v1,0x3" in expTileRects), so the root
+     * weave's header (data[1]=3, data[2]=1) gives 1<<3 = 8 and 8 | (3<<1) = 14.
+     * Index 8 is grey and 14 teal, matching the weave the expDrawImage24 restore
+     * paints in the exposed rects (the same grey/teal the control shows). */
+    c0 = s->re3_data[2] << 3;
+    c1 = c0 | (s->re3_data[1] << 1);
+    if (s->re3_nclip == 0) {
+        trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    for (r = 0; r < s->re3_nclip; r++) {
+        int rx1, ry1, rx2, ry2, x, y;
+
+        rx1 = s->re3_clip[r][0];
+        ry1 = s->re3_clip[r][1];
+        rx2 = s->re3_clip[r][2];
+        ry2 = s->re3_clip[r][3];
+        if (rx1 < 0) {
+            rx1 = 0;
+        }
+        if (ry1 < 0) {
+            ry1 = 0;
+        }
+        if (rx2 > SGI_GR2_SCREEN_W) {
+            rx2 = SGI_GR2_SCREEN_W;
+        }
+        if (ry2 > SGI_GR2_SCREEN_H) {
+            ry2 = SGI_GR2_SCREEN_H;
+        }
+        for (y = ry1; y < ry2; y++) {
+            unsigned row = (unsigned)(y % h) * w;
+
+            for (x = rx1; x < rx2; x++) {
+                uint32_t word, p = row + (unsigned)(x % w);
+                uint8_t v, idx;
+
+                word = (p / 4 == 0) ? s->re3_tile_word0
+                                    : s->re3_data[7 + (p / 4 - 1)];
+                v = (word >> (8 * (3 - (p % 4)))) & 0xff;
+                if (v == (s->re3_data[1] & 0xff)) {
+                    idx = c1;
+                } else if (v == (s->re3_data[2] & 0xff)) {
+                    idx = c0;
+                } else {
+                    idx = v;
+                }
+                sgi_gr2_put(s, x, y, idx);
+            }
+        }
+    }
+    trace_sgi_gr2_re3_tile(w, h, s->re3_nclip);
+    s->re3_nclip = 0;
     sgi_gr2_update_display(s);
 }
 
@@ -181,7 +319,7 @@ static void sgi_gr2_re3_stipple_fill(SGIGr2State *s, uint8_t fg, uint8_t bg,
  * prefix length, walk back from the end while each group is a sane rectangle:
  * the longest valid suffix is the list, and the prefix is left alone.  This is
  * the layout read off the DDX store sequences (note 31), not a guessed tail. */
-static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
+static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s, bool stippled)
 {
     unsigned n = s->re3_data_n, groups = 0;
 
@@ -195,6 +333,16 @@ static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
             y2 > SGI_GR2_SCREEN_H) {
             break;
         }
+        /* A stippled fill carries a stipple pattern/mask header ahead of its
+         * rect list.  That header can end in words that, together with the
+         * run of zeros before them, look like one more rectangle starting at
+         * the screen origin — expStippledFillRects on this DDX emits exactly
+         * one rect (the root weave is the full-screen (0,0,1280,1024) group),
+         * so a further origin-anchored group read out of the header is a
+         * parse artifact, not geometry.  Stop there. */
+        if (stippled && groups > 0 && x1 == 0 && y1 == 0) {
+            break;
+        }
         groups++;
     }
     return groups;
@@ -205,7 +353,7 @@ static unsigned sgi_gr2_re3_rect_groups(SGIGr2State *s)
 static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
 {
     unsigned n = s->re3_data_n;
-    unsigned groups = sgi_gr2_re3_rect_groups(s), g;
+    unsigned groups = sgi_gr2_re3_rect_groups(s, stippled), g;
     uint8_t fg = s->re3_fg_valid ? s->re3_fg : s->re3_colour;
 
     if (groups == 0) {
@@ -307,8 +455,11 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
 
         if (x >= SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
             count == 0 || count > 64) {
+            trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
             break;
         }
+        trace_sgi_gr2_re3_spanstip(s->re3_colour, s->ramdac[s->re3_colour],
+                                   x, y, count);
         for (k = 0; k < count; k++) {
             uint32_t xx = x + k;
 
@@ -316,19 +467,95 @@ static void sgi_gr2_re3_draw_stippled_spans(SGIGr2State *s)
                 break;
             }
             if ((pattern >> (31 - (k & 31))) & 1) {
-                s->scanout[y * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+                sgi_gr2_put(s, xx, y, s->re3_colour);
             }
         }
     }
     sgi_gr2_update_display(s);
 }
 
-/* Draw a filled polygon (libgd token 302).  After the same "0xff 0x3 0x0"
- * prefix come three header words (0x3ab, 0xc6, 0x2a0 in every op) then the
- * outline as (x,y) vertex pairs, the last pair repeating the first to close the
- * loop.  Filled with an even-odd scanline walk.  These are the glyph outlines —
- * the X server's text goes through expPolyGlyphBlt, which fills glyphs the same
- * way. */
+/* Draw a colour image (expDrawImage24, token 342).  Each 342 starts one run and
+ * streams, through PUC_DATA, a group of (y, width, height, nwords_per_row, 2, 0)
+ * followed by height*nwords_per_row 32-bit words, each holding four 8-bit
+ * palette indices, most significant byte first - so one row is nwords_per_row
+ * words, four pixels each.  The run x is 342's value; its data index is recorded
+ * at write time, so the decoder needs no guessed geometry.
+ *
+ * The 98x98 icon arrives as scanlines, each one row high, two runs per row
+ * (x=459 w=64 and x=523 w=34); the text cursor in the login field arrives as
+ * 8-row blocks of 6-px rows at x=464.  Every group is padded with 0xdeadbeef to
+ * a fixed 22 PUC_DATA words.  The indices are written to scanout as-is; the
+ * palette is applied there, like every other RE3 draw (see sgi_gr2_re3_332). */
+static void sgi_gr2_re3_draw_image(SGIGr2State *s)
+{
+    unsigned k;
+
+    if (!s->scanout) {
+        return;
+    }
+    for (k = 0; k < s->re3_nimg; k++) {
+        unsigned off = s->re3_img_off[k];
+        uint32_t x = s->re3_img_x[k];
+        uint32_t y, w, height, nrow, j, p;
+        bool m332;
+
+        if (off + 6 > s->re3_data_n) {
+            break;
+        }
+        y = s->re3_data[off];
+        w = s->re3_data[off + 1];
+        height = s->re3_data[off + 2];
+        nrow = s->re3_data[off + 3];
+        /* The group header's sixth word selects the pixel interpretation: 0 means
+         * the bytes are RAMDAC indices (the root weave, grey/teal), 2 means they
+         * are direct 3-3-2 (the EZsetup cube and the desktop icons).  Both arrive
+         * as expDrawImage24, so the header is the only discriminator. */
+        m332 = (s->re3_data[off + 5] == 2);
+        if (w == 0 || w > SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
+            x >= SGI_GR2_SCREEN_W || height == 0 ||
+            height > SGI_GR2_SCREEN_H || nrow == 0 ||
+            nrow * height > SGI_GR2_RE3_DATA_MAX) {
+            trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
+            continue;
+        }
+        if (off + 6 + nrow * height > s->re3_data_n) {
+            break;
+        }
+        if (k == 0) {
+            trace_sgi_gr2_re3_image(x, y, w, s->re3_nimg);
+        }
+        for (j = 0; j < height; j++) {
+            uint32_t r;
+
+            for (r = 0; r < nrow; r++) {
+                uint32_t word = s->re3_data[off + 6 + j * nrow + r];
+
+                for (p = 0; p < 4; p++) {
+                    uint32_t px = x + r * 4 + p, py = y + j;
+
+                    if (px >= x + w || px >= SGI_GR2_SCREEN_W ||
+                        py >= SGI_GR2_SCREEN_H) {
+                        continue;
+                    }
+                    if (m332) {
+                        sgi_gr2_put332(s, px, py, (word >> (24 - 8 * p)) & 0xff);
+                    } else {
+                        sgi_gr2_put(s, px, py, (word >> (24 - 8 * p)) & 0xff);
+                    }
+                }
+            }
+        }
+    }
+    sgi_gr2_update_display(s);
+}
+
+/* Draw a polyline (libgd token 302).  After the same "0xff 0x3 0x0" prefix come
+ * three header words (0x3ab, 0xc6, 0x2a0 in every op) then one or more contours
+ * as (x,y) vertex pairs, each closed by repeating its first vertex.  These are
+ * the account icons: the reference shows light interiors with thin black edges,
+ * so the contours are STROKED (fill is the fallback, behind sgi-gr2.poly-stroke).
+ * The payload list is split on the repeated first vertex so one contour is never
+ * joined to the next. */
 #define SGI_GR2_POLY_MAX 64
 static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
 {
@@ -358,6 +585,28 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
     }
     if (nv < 3) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, n);
+        return;
+    }
+    if (s->poly_stroke) {
+        /* Test seam: stroke each contour (split where a vertex repeats the
+         * contour's first) instead of filling.  Kept behind a runtime property
+         * so one build can be A/B'd with no rebuild or trace differences. */
+        unsigned cstart = 0;
+
+        for (i = 1; i < nv; i++) {
+            if (i - cstart >= 2 && vx[i] == vx[cstart] && vy[i] == vy[cstart]) {
+                unsigned k;
+
+                for (k = cstart; k + 1 <= i; k++) {
+                    trace_sgi_gr2_re3_seg(s->re3_colour, s->ramdac[s->re3_colour],
+                                          vx[k], vy[k], vx[k + 1], vy[k + 1]);
+                    sgi_gr2_re3_line(s, s->re3_colour, vx[k], vy[k],
+                                     vx[k + 1], vy[k + 1]);
+                }
+                cstart = i + 1;
+            }
+        }
+        sgi_gr2_update_display(s);
         return;
     }
     ymin = ymax = vy[0];
@@ -392,21 +641,27 @@ static void sgi_gr2_re3_draw_polygon(SGIGr2State *s)
             int xx;
 
             for (xx = xa; xx <= xb; xx++) {
-                s->scanout[sy * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
+                sgi_gr2_put(s, xx, sy, s->re3_colour);
             }
         }
     }
     sgi_gr2_update_display(s);
 }
 
-/* Draw the name-label glyphs (expDrawMonoImage).  Token 349 is written TWICE
- * per glyph with the pen x, each followed by a piece (f0,f1,h) and h/2 bitmap
- * words.  A glyph is the two pieces STACKED from its top row (drawing them at
- * the same x is what makes the letters readable, not side by side); each piece
- * is 8 px wide, high byte = row 2k, low byte = row 2k+1, bit 15 the leftmost.
- * Set bits take the current colour.  The text y is not on the wire — the DDX
- * bakes the origin in — so it comes from the label bar (colour 222) drawn just
- * before the glyphs; without one the op is flagged, not placed by guesswork. */
+/* Draw the text glyphs (expDrawMonoImage).  Token 349 is the pen x; it is
+ * followed by a piece header (f0, f1, h) and the piece's bitmap.  The first
+ * header word f0 is the piece's DESTINATION Y - verified by placing every glyph
+ * run at y=f0: "Login name:", the four account names, and the "Log in"/"Help"
+ * buttons all land correctly, and the second piece of a glyph carries f0+8, one
+ * piece-height lower, so no separate stacking rule is needed.  (The old code
+ * used a y latched from a colour-222 bar, which only existed for the account
+ * names, so the static labels were dropped.)
+ *
+ * A piece is h rows tall and SIXTEEN pixels wide, packed TWO rows per 32-bit
+ * word: row 2k is the high half (bits 31-16), row 2k+1 the low half (bits 15-0),
+ * bit 15 the leftmost pixel.  The word count is ceil(h/2), so an odd h keeps its
+ * last row in the high half.  Set bits take the current colour. */
+
 /* Draw ONE IP20 glyph.  Its pen x is X; its y, w, h and bitmap begin at
  * re3_data[off].  Token 0x40510 is per-glyph — one 490-terminated region can
  * carry several pens (the shell redraws the prompt as a run of them), and only
@@ -467,68 +722,107 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
     unsigned p;
     bool any = false;
 
-    /* IP20 path: the origin is on the wire.  Token 0x40510 is the pen x and the
-     * three PUC_DATA words after it are y, w, h; token 0x404e0 is the colour.
-     * The bitmap is two rows per word, 12 px in bits 31..20 then 15..4, bit 15
-     * the leftmost.  This is tried first and, when it fires, replaces the XZ
-     * label-bar link entirely — the XZ path cannot reach here (0x40510 is never
-     * written there), so its output is unchanged. */
     if (s->re3_monox_valid) {
         sgi_gr2_re3_draw_mono_pen(s, s->re3_monox, s->re3_mono_off);
         return;
     }
 
-    if (!s->re3_label_valid) {
-        trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
-        return;
-    }
-    for (p = 0; p + 1 < s->re3_npens; p += 2) {
+
+    for (p = 0; p < s->re3_npens; p++) {
+        unsigned off = s->re3_pen_off[p];
         uint32_t pen = s->re3_pen_val[p];
-        int y = s->re3_label_y + 3;
-        unsigned half;
+        uint32_t f0, f1, h, k, nwords;
+        unsigned gw;
 
-        for (half = 0; half < 2; half++) {
-            unsigned off = s->re3_pen_off[p + half];
-            uint32_t f0, f1, h, k;
+        if (off + 3 > s->re3_data_n) {
+            continue;
+        }
+        f0 = s->re3_data[off];       /* destination y */
+        f1 = s->re3_data[off + 1];   /* glyph width in pixels */
+        h = s->re3_data[off + 2];
+        nwords = (h + 1) / 2;
+        if (f0 >= SGI_GR2_SCREEN_H || pen >= SGI_GR2_SCREEN_W ||
+            h < 1 || h > 64 ||
+            off + 3 + nwords > s->re3_data_n) {
+            continue;
+        }
+        gw = (f1 >= 1 && f1 <= 16) ? f1 : 8;
+        for (k = 0; k < nwords; k++) {
+            uint32_t w = s->re3_data[off + 3 + k];
+            int r0 = (int)f0 + 2 * (int)k;
+            int b;
 
-            if (off + 3 > s->re3_data_n) {
-                continue;
-            }
-            f0 = s->re3_data[off];
-            f1 = s->re3_data[off + 1];
-            h = s->re3_data[off + 2];
-            if (f0 >= SGI_GR2_SCREEN_W || f1 >= SGI_GR2_SCREEN_H ||
-                h < 2 || h > 64 || (h & 1) ||
-                off + 3 + h / 2 > s->re3_data_n) {
-                continue;
-            }
-            for (k = 0; k < h / 2; k++) {
-                uint32_t w = s->re3_data[off + 3 + k];
-                int b;
+            for (b = 0; b < (int)gw; b++) {
+                int xx = (int)pen + b;
 
-                for (b = 0; b < 8; b++) {
-                    int xx = (int)pen + b, r0 = y + 2 * (int)k;
-
-                    if (xx >= SGI_GR2_SCREEN_W) {
-                        break;
-                    }
-                    if (r0 < SGI_GR2_SCREEN_H && ((w >> (15 - b)) & 1)) {
-                        s->scanout[r0 * SGI_GR2_SCREEN_W + xx] = s->re3_colour;
-                    }
-                    if (r0 + 1 < SGI_GR2_SCREEN_H && ((w >> (7 - b)) & 1)) {
-                        s->scanout[(r0 + 1) * SGI_GR2_SCREEN_W + xx] =
-                            s->re3_colour;
-                    }
+                if (xx >= SGI_GR2_SCREEN_W) {
+                    break;
+                }
+                if (r0 < SGI_GR2_SCREEN_H && ((w >> (31 - b)) & 1)) {
+                    sgi_gr2_put(s, xx, r0, s->re3_colour);
+                }
+                if (2 * k + 1 < h && r0 + 1 < SGI_GR2_SCREEN_H &&
+                    ((w >> (15 - b)) & 1)) {
+                    sgi_gr2_put(s, xx, r0 + 1, s->re3_colour);
                 }
             }
-            y += (int)h;
-            any = true;
         }
+        any = true;
     }
     if (!any) {
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
         return;
     }
+    sgi_gr2_update_display(s);
+}
+
+/* expCopyRect screen-to-screen (token 340).  The DDX writes 340 = words-per-row
+ * and then seven PUC_DATA words: stride, src_x, src_y, width, height, dst_x,
+ * dst_y.  Both source and destination are on the scanout, which is the
+ * window-move / scroll case; an off-screen pixmap source is not modelled yet.
+ * Overlapping copies run in the direction that does not clobber unread source
+ * rows.  Indices and the direct-colour flag move together. */
+static void sgi_gr2_re3_copy_rect(SGIGr2State *s, int sx, int sy, int w, int h,
+                                  int dx, int dy)
+{
+    int r;
+
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+    if (sx + w > SGI_GR2_SCREEN_W) { w = SGI_GR2_SCREEN_W - sx; }
+    if (dx + w > SGI_GR2_SCREEN_W) { w = SGI_GR2_SCREEN_W - dx; }
+    if (sy + h > SGI_GR2_SCREEN_H) { h = SGI_GR2_SCREEN_H - sy; }
+    if (dy + h > SGI_GR2_SCREEN_H) { h = SGI_GR2_SCREEN_H - dy; }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (dy < sy || (dy == sy && dx < sx)) {
+        for (r = 0; r < h; r++) {
+            size_t so = (size_t)(sy + r) * SGI_GR2_SCREEN_W + sx;
+            size_t dofs = (size_t)(dy + r) * SGI_GR2_SCREEN_W + dx;
+
+            memmove(s->scanout + dofs, s->scanout + so, w);
+            if (s->scanout332) {
+                memmove(s->scanout332 + dofs, s->scanout332 + so, w);
+            }
+        }
+    } else {
+        for (r = h - 1; r >= 0; r--) {
+            size_t so = (size_t)(sy + r) * SGI_GR2_SCREEN_W + sx;
+            size_t dofs = (size_t)(dy + r) * SGI_GR2_SCREEN_W + dx;
+
+            memmove(s->scanout + dofs, s->scanout + so, w);
+            if (s->scanout332) {
+                memmove(s->scanout332 + dofs, s->scanout332 + so, w);
+            }
+        }
+    }
+    trace_sgi_gr2_re3_copy(sx, sy, w, h, dx, dy);
     sgi_gr2_update_display(s);
 }
 
@@ -542,6 +836,35 @@ static void sgi_gr2_re3_draw_text(SGIGr2State *s)
  * at. */
 static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
 {
+    if (s->re3_solid_seen && s->re3_data_n == 4 && !s->re3_colour_valid) {
+        /* expValidateClip: one exposed rectangle for a following tile fill.  It
+         * carries the 304 marker and four (x1,y1,x2,y2) words but no colour, so
+         * it is a clip rectangle, not a fill.  The tile op that follows repeats
+         * its bitmap inside this list. */
+        if (s->re3_nclip < ARRAY_SIZE(s->re3_clip)) {
+            s->re3_clip[s->re3_nclip][0] = s->re3_data[0];
+            s->re3_clip[s->re3_nclip][1] = s->re3_data[1];
+            s->re3_clip[s->re3_nclip][2] = s->re3_data[2];
+            s->re3_clip[s->re3_nclip][3] = s->re3_data[3];
+            s->re3_nclip++;
+            trace_sgi_gr2_re3_clip(s->re3_data[0], s->re3_data[1],
+                                   s->re3_data[2], s->re3_data[3]);
+        }
+        return;
+    }
+    if (s->re3_tile_seen) {
+        /* expTileRects: tile a bitmap across the screen (the root weave).  The
+         * op streams the tile via token 315 and PUC_DATA, so decide it here from
+         * the packet itself rather than from any rect heuristic. */
+        sgi_gr2_re3_tile_rects(s);
+        return;
+    }
+    if (s->re3_image_seen) {
+        /* expDrawImage24: a colour image, not a fill.  Checked first because its
+         * 4316 PUC_DATA words and 196 342 markers match no other shape. */
+        sgi_gr2_re3_draw_image(s);
+        return;
+    }
     if (s->re3_stipple_valid) {
         /* Stippled rect list: the root backdrop is one full-screen rect, but a
          * stippled sub-op with its own small rects (a cursor, a shade band) must
@@ -555,16 +878,22 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
         return;
     }
-    if (s->re3_mono_seen) {
+    if (s->re3_spanstip_seen) {
+        /* Checked before the mono-image path: token 312 marks BOTH
+         * expImageGlyphBlt and expOpStippledFillRects, so a span op carries the
+         * 312 marker without any glyph in it.  The 347 span token is the one
+         * that actually says "span list", and drawing such an op as text would
+         * drop the whole cube (EZsetup's icon). */
+        sgi_gr2_re3_draw_stippled_spans(s);
+        return;
+    }
+    if (s->re3_mono_seen && s->re3_npens) {
+        /* Glyphs need a 349 pen to be placed; a 312 with no pen is not text. */
         sgi_gr2_re3_draw_text(s);
         return;
     }
     if (s->re3_poly_seen) {
         sgi_gr2_re3_draw_polygon(s);
-        return;
-    }
-    if (s->re3_spanstip_seen) {
-        sgi_gr2_re3_draw_stippled_spans(s);
         return;
     }
     if (s->re3_line_seen) {
@@ -584,6 +913,12 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         return;
     }
     if (s->re3_data_n || s->re3_data_overflow) {
+        /* No known marker: an op we do not model (3D geometry, for instance).
+         * Log its opening words so the token/payload family can be named. */
+        if (s->re3_data_n >= 2) {
+            trace_sgi_gr2_re3_unknown(s->re3_data[0], s->re3_data[1],
+                                      s->re3_data_n);
+        }
         trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
     }
 }
@@ -598,6 +933,8 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
     s->re3_mono_seen = false;
+    s->re3_image_seen = false;
+    s->re3_nimg = 0;
     s->re3_monox_valid = false;
     s->re3_monocol_valid = false;
     s->re3_npens = 0;
@@ -607,6 +944,751 @@ static void sgi_gr2_re3_reset_subop(SGIGr2State *s)
     s->re3_rop_valid = false;
     s->re3_data_n = 0;
     s->re3_data_overflow = false;
+    s->re3_copy_active = false;
+    s->re3_copy_n = 0;
+    s->re3_tile_seen = false;
+    s->re3_tile_word0 = 0;
+}
+
+/* The guest PC of the instruction performing the current MMIO access.  cpu->mem_io_pc
+ * is the HOST return address (see include/hw/core/cpu.h), useless for attributing a
+ * poll to guest code; cc->get_pc() returns the guest's own PC instead. */
+static uint32_t sgi_gr2_guest_pc(void)
+{
+    if (current_cpu && current_cpu->cc->get_pc) {
+        return (uint32_t)current_cpu->cc->get_pc(current_cpu);
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- *
+ * GE7 3D: transform + Z-raster for the immediate-mode GL token stream.
+ *
+ * The offline decoder (tmp/indy-video-xz/b2/tools/gr2_ge7_decode.py) is the
+ * oracle for this: it established that object-space vertices are sent on token
+ * 2659, three floats at a time; that a polygon is a triangle fan delimited by
+ * bgnpolygon/endpolygon (420/1454 .. 65/1125); and that the transform is
+ * projection * modelview applied as column-major M*v (libgl emits the
+ * transpose of IRIS GL's internal row-major matrices).  The offline numbers
+ * agree that MV is a rigid rotation (det +1), that every vertex has w>0, and
+ * that the whole bust lands inside the canonical volume.  The viewport is the
+ * one thing the FIFO carries that the offline pass did not use: gl_g_viewport
+ * puts x on token 60 and (y,w,h) on the next three PUC_DATA words.
+ * ------------------------------------------------------------------------- */
+
+static inline float sgi_gr2_u2f(uint32_t v)
+{
+    union { uint32_t u; float f; } x;
+
+    x.u = v;
+    return x.f;
+}
+
+/* Map an intensity level (0..31) to a palette index.  The target is a neutral
+ * grey of that intensity and the entry is chosen by nearest RGB distance, not
+ * nearest luminance: a luminance match alone picks red or blue entries whose
+ * brightness happens to coincide, which streaks a near-grey material.  RGB
+ * distance keeps the mapping on the grey axis.  Rebuilt per polygon batch:
+ * 32 x 256 comparisons. */
+static void sgi_gr2_ge7_greylut(SGIGr2State *s, uint8_t lut[32])
+{
+    int g, i;
+
+    for (g = 0; g < 32; g++) {
+        int target = g * 255 / 31;
+        int best = 0, bestd = 1 << 30;
+
+        for (i = 0; i < 256; i++) {
+            uint32_t rgb = s->ramdac[i];
+            int r = (rgb >> 16) & 0xff;
+            int gg = (rgb >> 8) & 0xff;
+            int b = rgb & 0xff;
+            int dr = r - target, dg = gg - target, db = b - target;
+            int d = dr * dr + dg * dg + db * db;
+
+            if (d < bestd) {
+                bestd = d;
+                best = i;
+            }
+        }
+        lut[g] = (uint8_t)best;
+    }
+}
+
+/* gl_clear: fill a drawable rectangle with the palette's black and reset its
+ * depth, so the window shows the GL client's background instead of the desktop
+ * underneath.  powerflip's window is black, which is the palette entry nearest
+ * luminance zero. */
+static void sgi_gr2_ge7_clear_rect(SGIGr2State *s, int vx, int vy, int vw,
+                                   int vh)
+{
+    int x, y, i;
+    uint8_t idx = 0;
+    int bestd = 1 << 30;
+
+    if (!s->scanout) {
+        return;
+    }
+    for (i = 0; i < 256; i++) {
+        uint32_t rgb = s->ramdac[i];
+        int lum = (((rgb >> 16) & 0xff) * 77 + ((rgb >> 8) & 0xff) * 150 +
+                   (rgb & 0xff) * 29) >> 8;
+
+        if (lum < bestd) {
+            bestd = lum;
+            idx = (uint8_t)i;
+        }
+    }
+    for (y = MAX(vy, 0); y < MIN(vy + vh, SGI_GR2_SCREEN_H); y++) {
+        for (x = MAX(vx, 0); x < MIN(vx + vw, SGI_GR2_SCREEN_W); x++) {
+            sgi_gr2_put(s, x, y, idx);
+            if (s->ge_zbuf) {
+                s->ge_zbuf[(size_t)y * SGI_GR2_SCREEN_W + x] = 0x7f7f7f7f;
+            }
+        }
+    }
+    s->ge_3d_seen = true;
+}
+
+/* True when the MSINGLE combined matrix (token 54) is the current transform,
+ * i.e. it was written more recently than the separate modelview/projection.
+ * powerflip sets 54 only at init and drives 55/56, so it is unaffected; ideas
+ * draws its lines/meshes in MSINGLE and relies on 54. */
+static bool sgi_gr2_ge7_single_active(const SGIGr2State *s)
+{
+    return s->ge_single_valid && s->ge_seq54 > s->ge_seq55 &&
+           s->ge_seq54 > s->ge_seq56;
+}
+
+/* Transform an object-space point by projection*modelview.  Returns false if
+ * the point is behind the eye (w <= 0) so it is skipped rather than projected
+ * through the eye. */
+static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
+                              float *sx, float *sy, float *sz)
+{
+    static const float ident[16] = { 1, 0, 0, 0, 0, 1, 0, 0,
+                                     0, 0, 1, 0, 0, 0, 0, 1 };
+    const float *mv, *proj;
+    float cam[4], clip[4];
+    int r, c;
+
+    if (sgi_gr2_ge7_single_active(s)) {
+        mv = s->ge_single;
+        proj = ident;
+    } else {
+        if (!s->ge_mv_valid || !s->ge_proj_valid) {
+            return false;
+        }
+        mv = s->ge_mv;
+        proj = s->ge_proj;
+    }
+    for (r = 0; r < 4; r++) {
+        cam[r] = mv[3 * 4 + r]; /* v[3] = 1 */
+        for (c = 0; c < 3; c++) {
+            cam[r] += mv[c * 4 + r] * p[c];
+        }
+    }
+    for (r = 0; r < 4; r++) {
+        clip[r] = 0.0f;
+        for (c = 0; c < 4; c++) {
+            clip[r] += proj[c * 4 + r] * cam[c];
+        }
+    }
+    if (clip[3] <= 0.0f) {
+        return false;
+    }
+    *sx = clip[0] / clip[3];
+    *sy = clip[1] / clip[3];
+    *sz = clip[2] / clip[3];
+    return true;
+}
+
+/* Rasterise the buffered polygon (a triangle fan) into `scanout`, Z-buffered.
+ * The viewport maps NDC to pixels; if the guest has not yet sent one, fall
+ * back to the whole screen. */
+/* Evaluate the guest's Phong model for one eye-space normal and return the
+ * intensity (0..1).  Shared by the triangle and line rasterisers. */
+static float sgi_gr2_ge7_inten(const SGIGr2State *s, const float n[3],
+                               float lx, float ly, float lz,
+                               float hx, float hy, float hz, float shininess)
+{
+    float nn[3], ndl, ndh, col[3];
+    float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    int c;
+
+    if (nl > 1e-9f) {
+        nn[0] = n[0] / nl;
+        nn[1] = n[1] / nl;
+        nn[2] = n[2] / nl;
+    } else {
+        nn[0] = 0.0f;
+        nn[1] = 0.0f;
+        nn[2] = 1.0f;
+    }
+    /* Two-sided, as for the triangles: a normal facing away is flipped. */
+    if (nn[2] < 0.0f) {
+        nn[0] = -nn[0];
+        nn[1] = -nn[1];
+        nn[2] = -nn[2];
+    }
+    ndl = MAX(nn[0] * lx + nn[1] * ly + nn[2] * lz, 0.0f);
+    ndh = MAX(nn[0] * hx + nn[1] * hy + nn[2] * hz, 0.0f);
+    for (c = 0; c < 3; c++) {
+        col[c] = s->ge_emission[c] +
+                 s->ge_ambient[c] * s->ge_ambient_sum[c] +
+                 s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
+                                    s->ge_specular[c] * powf(ndh, shininess));
+        col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
+    }
+    return MIN(MAX(0.299f * col[0] + 0.587f * col[1] + 0.114f * col[2],
+                   0.0f), 1.0f);
+}
+
+static void sgi_gr2_ge7_draw(SGIGr2State *s)
+{
+    float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
+    float sz[SGI_GR2_GE7_MAX_VERTS];
+    float iv[SGI_GR2_GE7_MAX_VERTS]; /* per-vertex light intensity          */
+    int vx, vy, vw, vh;
+    unsigned i;
+    uint8_t lut[32];
+    /* Eye-space light and half vectors.  The guest sets one light position
+     * (token 127, (0,0,1) for powerflip) and the eye is at the origin looking
+     * down -z, so both point along +z; a positional light at finite distance
+     * would need the vertex, which the stream does not carry per component. */
+    float lx, ly, lz;
+    float hx, hy, hz;
+    const float shininess = 8.0f;
+
+    if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
+        return;
+    }
+    /* The light direction is the guest's, normalized; fall back to a headlight
+     * if no material/light has been seen yet. */
+    {
+        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
+                   s->ge_lpos[1] * s->ge_lpos[1] +
+                   s->ge_lpos[2] * s->ge_lpos[2];
+
+        if (s->ge_mat_valid && ll > 1e-6f) {
+            ll = sqrtf(ll);
+            lx = s->ge_lpos[0] / ll;
+            ly = s->ge_lpos[1] / ll;
+            lz = s->ge_lpos[2] / ll;
+        } else {
+            lx = 0.0f;
+            ly = 0.0f;
+            lz = 1.0f;
+        }
+        /* half vector between the (infinitely far) light and the eye */
+        hx = lx;
+        hy = ly;
+        hz = lz + 1.0f;
+        ll = sqrtf(hx * hx + hy * hy + hz * hz);
+        if (ll > 1e-6f) {
+            hx /= ll;
+            hy /= ll;
+            hz /= ll;
+        }
+    }
+    if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
+        vx = s->vp_x;
+        vy = s->vp_y;
+        vw = s->vp_w;
+        vh = s->vp_h;
+    } else {
+        vx = 0;
+        vy = 0;
+        vw = SGI_GR2_SCREEN_W;
+        vh = SGI_GR2_SCREEN_H;
+    }
+    /* The client writes window-relative coordinates; the window's origin on
+     * screen is the X server's state (the client never emits winposition into
+     * the FIFO and the GE has no window-origin register - see note 78).  With
+     * no origin source the drawable sits at the screen origin. */
+    vx += s->ge_win_x;
+    vy += s->ge_win_y;
+    if (s->ge_need_clear && !sgi_gr2_ge7_single_active(s)) {
+        /* Only the 3D modelview/projection path clears per frame; a MSINGLE
+         * app (ideas) writes 55 per object, so clearing there would wipe its
+         * line art mid-frame. */
+        sgi_gr2_ge7_clear_rect(s, vx, vy, vw, vh);
+        s->ge_need_clear = false;
+    }
+    for (i = 0; i < s->ge_poly_n; i++) {
+        float cx, cy, cz;
+        float px, py;
+        int c;
+
+        if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz)) {
+            return; /* part of the polygon is behind the eye: skip it whole */
+        }
+        px = vx + (cx + 1.0f) * 0.5f * vw;
+        py = vy + (1.0f - (cy + 1.0f) * 0.5f) * vh; /* viewport y from the top */
+        sx[i] = px;
+        sy[i] = py;
+        sz[i] = cz;
+        /* Rotate this vertex's own normal into eye space (the object-space
+         * normal was captured with the vertex, not shared per polygon), then
+         * shade it with the guest's material and light. */
+        {
+            float een[3];
+
+            for (c = 0; c < 3; c++) {
+                een[c] = s->ge_mv[c * 4 + 0] * s->ge_vnormal[i][0] +
+                         s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
+                         s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
+            }
+            iv[i] = sgi_gr2_ge7_inten(s, een, lx, ly, lz, hx, hy, hz,
+                                      shininess);
+        }
+    }
+    sgi_gr2_ge7_greylut(s, lut);
+    for (i = 1; i + 1 < s->ge_poly_n; i++) {
+        unsigned ia = s->ge_strip ? i - 1 : 0; /* fan apex, or strip prev-2 */
+        float ax = sx[ia], ay = sy[ia], az = sz[ia], i0 = iv[ia];
+        float bx = sx[i], by = sy[i], bz = sz[i], i1 = iv[i];
+        float cx = sx[i + 1], cy = sy[i + 1], cz = sz[i + 1], i2 = iv[i + 1];
+        int64_t fx0, fy0, fx1, fy1, fx2, fy2;
+        int64_t area, e0, e1, e2;
+        float w0, w1, w2, inv;
+        int minx, maxx, miny, maxy, x, y;
+
+        /* Fixed-point edge functions with four sub-pixel bits.  Coordinates
+         * become multiples of 1/16 and pixel centres sit at (x*16+8).  Done in
+         * integers so a shared edge is bit-identical for the two triangles that
+         * meet there and the top-left rule can hand it to exactly one of them,
+         * which no epsilon in floating point can guarantee. */
+        fx0 = (int64_t)lroundf(ax * 16.0f);
+        fy0 = (int64_t)lroundf(ay * 16.0f);
+        fx1 = (int64_t)lroundf(bx * 16.0f);
+        fy1 = (int64_t)lroundf(by * 16.0f);
+        fx2 = (int64_t)lroundf(cx * 16.0f);
+        fy2 = (int64_t)lroundf(cy * 16.0f);
+        area = (fx1 - fx0) * (fy2 - fy0) - (fy1 - fy0) * (fx2 - fx0);
+        if (area == 0) {
+            continue;
+        }
+        if (area < 0) {
+            /* Normalise winding so all three edge functions are non-negative
+             * inside the triangle.  Swap the B and C vertices and everything
+             * interpolated with them. */
+            float tf;
+
+            tf = bx; bx = cx; cx = tf;
+            tf = by; by = cy; cy = tf;
+            tf = bz; bz = cz; cz = tf;
+            tf = i1; i1 = i2; i2 = tf;
+            fx1 = (int64_t)lroundf(bx * 16.0f);
+            fy1 = (int64_t)lroundf(by * 16.0f);
+            fx2 = (int64_t)lroundf(cx * 16.0f);
+            fy2 = (int64_t)lroundf(cy * 16.0f);
+            area = -area;
+        }
+        inv = 1.0f / (float)area;
+        /* Pixel-centre bounding box, one pixel of slack for the fixed-point
+         * rounding. */
+        minx = (int)(MIN(fx0, MIN(fx1, fx2)) >> 4) - 1;
+        maxx = (int)(MAX(fx0, MAX(fx1, fx2)) >> 4) + 1;
+        miny = (int)(MIN(fy0, MIN(fy1, fy2)) >> 4) - 1;
+        maxy = (int)(MAX(fy0, MAX(fy1, fy2)) >> 4) + 1;
+        /* Clip to the drawable: the GL viewport (plus its window origin) is the
+         * only region a GL client may paint.  Without this the transformed
+         * vertices spill over the window frame and neighbouring windows. */
+        minx = MAX(minx, vx);
+        miny = MAX(miny, vy);
+        maxx = MIN(maxx, vx + vw - 1);
+        maxy = MIN(maxy, vy + vh - 1);
+        minx = MAX(minx, 0);
+        miny = MAX(miny, 0);
+        maxx = MIN(maxx, SGI_GR2_SCREEN_W - 1);
+        maxy = MIN(maxy, SGI_GR2_SCREEN_H - 1);
+        if (minx > maxx || miny > maxy) {
+            continue;
+        }
+        /* Top-left tie-break for the edges: a pixel whose centre lies exactly
+         * on a shared edge is claimed by the triangle for which that edge is a
+         * top or left edge, so exactly one of the two writes it. */
+        for (y = miny; y <= maxy; y++) {
+            for (x = minx; x <= maxx; x++) {
+                int64_t px = (int64_t)x * 16 + 8;
+                int64_t py = (int64_t)y * 16 + 8;
+                float ig, z;
+                size_t o;
+                int li;
+
+                /* e0 for edge A->B, e1 for B->C, e2 for C->A. */
+                e0 = (fx1 - fx0) * (py - fy0) - (fy1 - fy0) * (px - fx0);
+                e1 = (fx2 - fx1) * (py - fy1) - (fy2 - fy1) * (px - fx1);
+                e2 = (fx0 - fx2) * (py - fy2) - (fy0 - fy2) * (px - fx2);
+                if (e0 < 0 || e1 < 0 || e2 < 0) {
+                    continue;
+                }
+                if (e0 == 0 &&
+                    !((fy1 == fy0 && fx1 > fx0) || fy1 > fy0)) {
+                    continue;
+                }
+                if (e1 == 0 &&
+                    !((fy2 == fy1 && fx2 > fx1) || fy2 > fy1)) {
+                    continue;
+                }
+                if (e2 == 0 &&
+                    !((fy0 == fy2 && fx0 > fx2) || fy0 > fy2)) {
+                    continue;
+                }
+                /* Barycentrics from the integer edge functions: e1 is weight
+                 * of A, e2 of B, e0 of C. */
+                w0 = (float)e1 * inv;
+                w1 = (float)e2 * inv;
+                w2 = (float)e0 * inv;
+                ig = MIN(MAX(w0 * i0 + w1 * i1 + w2 * i2, 0.0f), 1.0f);
+                li = (int)(ig * 31.0f + 0.5f);
+                li = MIN(MAX(li, 0), 31);
+                z = w0 * az + w1 * bz + w2 * cz;
+                o = (size_t)y * SGI_GR2_SCREEN_W + x;
+                if (z < s->ge_zbuf[o]) {
+                    s->ge_zbuf[o] = z;
+                    sgi_gr2_put(s, x, y, lut[li]);
+                }
+            }
+        }
+        s->ge_polys++;
+    }
+    s->ge_3d_seen = true;
+}
+
+/* Draw the buffered line vertices (BGNLINE 380/1110 .. ENDLINE 87).  Each
+ * vertex is a gl_v2f pair; it is promoted to 3D with z=0 and carried through
+ * the same projection*modelview and viewport as the triangles, then the
+ * segment is plotted.  Intensity comes from the same material/light state. */
+static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
+{
+    int vx, vy, vw, vh;
+    uint8_t pl[32];
+    float lx, ly, lz, hx, hy, hz;
+    float nx[3] = { 0.0f, 0.0f, 1.0f };
+    float px[SGI_GR2_GE7_MAX_LVERTS], py[SGI_GR2_GE7_MAX_LVERTS];
+    unsigned i;
+    const float shininess = 8.0f;
+    int idx;
+
+    if (s->ge_line_n < 2 || !s->scanout || !s->ge_zbuf) {
+        return;
+    }
+    if (s->vp_valid && s->vp_w > 0 && s->vp_h > 0) {
+        vx = s->vp_x; vy = s->vp_y; vw = s->vp_w; vh = s->vp_h;
+    } else {
+        vx = 0; vy = 0; vw = SGI_GR2_SCREEN_W; vh = SGI_GR2_SCREEN_H;
+    }
+    vx += s->ge_win_x;
+    vy += s->ge_win_y;
+    {
+        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
+                   s->ge_lpos[1] * s->ge_lpos[1] +
+                   s->ge_lpos[2] * s->ge_lpos[2];
+
+        if (s->ge_mat_valid && ll > 1e-6f) {
+            ll = sqrtf(ll);
+            lx = s->ge_lpos[0] / ll;
+            ly = s->ge_lpos[1] / ll;
+            lz = s->ge_lpos[2] / ll;
+        } else {
+            lx = 0.0f; ly = 0.0f; lz = 1.0f;
+        }
+        hx = lx; hy = ly; hz = lz + 1.0f;
+        ll = sqrtf(hx * hx + hy * hy + hz * hz);
+        if (ll > 1e-6f) {
+            hx /= ll; hy /= ll; hz /= ll;
+        }
+    }
+    sgi_gr2_ge7_greylut(s, pl);
+    idx = pl[MIN(MAX((int)(sgi_gr2_ge7_inten(s, nx, lx, ly, lz, hx, hy, hz,
+                                             shininess) * 31.0f + 0.5f),
+                     0), 31)];
+    for (i = 0; i < s->ge_line_n; i++) {
+        float p[3];
+        float cx, cy, cz;
+
+        p[0] = s->ge_line[i][0];
+        p[1] = s->ge_line[i][1];
+        p[2] = 0.0f;
+        if (!sgi_gr2_ge7_xform(s, p, &cx, &cy, &cz)) {
+            px[i] = -1e9f;
+            continue;
+        }
+        px[i] = vx + (cx + 1.0f) * 0.5f * vw;
+        py[i] = vy + (1.0f - (cy + 1.0f) * 0.5f) * vh;
+    }
+    for (i = 1; i < s->ge_line_n; i++) {
+        float x0 = px[i - 1], y0 = py[i - 1];
+        float x1 = px[i], y1 = py[i];
+        int steps, st;
+
+        if (x0 < -1e8f || x1 < -1e8f) {
+            continue;
+        }
+        steps = (int)MAX(fabsf(x1 - x0), fabsf(y1 - y0));
+        if (steps <= 0) {
+            continue;
+        }
+        if (steps > 4096) {
+            steps = 4096;
+        }
+        for (st = 0; st <= steps; st++) {
+            float t = (float)st / (float)steps;
+            int x = (int)(x0 + (x1 - x0) * t + 0.5f);
+            int y = (int)(y0 + (y1 - y0) * t + 0.5f);
+            float z = -1.0f; /* 2D lines on top: they are the app's ink, not
+                              * depth-sorted geometry (ideas). */
+            size_t o;
+
+            x = MAX(x, vx); y = MAX(y, vy);
+            if (x >= SGI_GR2_SCREEN_W || y >= SGI_GR2_SCREEN_H ||
+                x >= vx + vw || y >= vy + vh) {
+                continue;
+            }
+            o = (size_t)y * SGI_GR2_SCREEN_W + x;
+            if (z < s->ge_zbuf[o]) {
+                s->ge_zbuf[o] = z;
+                sgi_gr2_put(s, x, y, (uint8_t)idx);
+            }
+        }
+    }
+    s->ge_3d_seen = true;
+}
+
+/* Feed one FIFO token word to the GE7 3D path.  Returns true if the token was
+ * a 3D command port (so the caller can skip unrelated paths if it wants). */
+/* Accumulate one component of a material/light vector.  The client repeats
+ * the token for every component, so a change of token starts a new vector;
+ * components past the third (e.g. diffuse's alpha) are collected and dropped
+ * rather than spilling into the next vector. */
+static void sgi_gr2_ge7_mat_word(SGIGr2State *s, float *dst, hwaddr tok,
+                                 float f)
+{
+    if (s->ge_mat_tok != tok) {
+        s->ge_mat_tok = tok;
+        s->ge_mat_n = 0;
+    }
+    if (s->ge_mat_n < 3) {
+        dst[s->ge_mat_n] = f;
+    }
+    s->ge_mat_n++;
+    if (s->ge_mat_n >= 3) {
+        s->ge_mat_valid = true;
+    }
+}
+
+static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
+{
+    uint32_t v = (uint32_t)value;
+
+    /* Any token that is not the viewport's own data word closes an armed
+     * viewport early (its three words are always contiguous). */
+    if (s->vp_armed && offset != SGI_GR2_GE7_VIEWPORT &&
+        offset != SGI_GR2_HQ_TOKEN_START) {
+        s->vp_armed = false;
+    }
+    /* The window rect is the same shape: token 485 carries x, the next three
+     * PUC_DATA words are y_bottom, w and h. */
+    if (s->ge_clip_armed && offset != SGI_GR2_GE7_WINRECT &&
+        offset != SGI_GR2_HQ_TOKEN_START) {
+        s->ge_clip_armed = false;
+    }
+    /* A matrix operand is always 16 consecutive words on its own port.  Any
+     * other token ends a run, so a partial run cannot leak into the next
+     * matrix and misalign it. */
+    if (offset != SGI_GR2_GE7_MV) {
+        s->ge_mv_n = 0;
+    }
+    if (offset != SGI_GR2_GE7_PROJ) {
+        s->ge_proj_n = 0;
+    }
+    if (offset != SGI_GR2_GE7_SINGLE) {
+        s->ge_single_n = 0;
+    }
+
+    switch (offset) {
+    case SGI_GR2_GE7_WINRECT:
+        /* The GL window's screen rect.  The DDX emits it per frame, so the
+         * origin we latch here follows a window move without any extra
+         * instrumentation.  y is bottom-origin (the raster path below is
+         * top-origin), so convert once the height is known. */
+        s->ge_clip_x = (int)v;
+        s->ge_clip_n = 1;
+        s->ge_clip_armed = true;
+        break;
+    case SGI_GR2_GE7_VIEWPORT:
+        s->vp_x = (int)v;
+        s->vp_n = 1;
+        s->vp_armed = true;
+        s->vp_valid = false;
+        break;
+    case SGI_GR2_HQ_TOKEN_START: /* token 479: viewport/window (y,w,h) or GE data */
+        if (s->vp_armed) {
+            if (s->vp_n == 1) {
+                s->vp_y = (int)v;
+            } else if (s->vp_n == 2) {
+                s->vp_w = (int)v;
+            } else if (s->vp_n == 3) {
+                s->vp_h = (int)v;
+                s->vp_valid = true;
+                s->vp_armed = false;
+            }
+            s->vp_n++;
+        } else if (s->ge_clip_armed) {
+            if (s->ge_clip_n == 1) {
+                s->ge_clip_y = (int)v;
+            } else if (s->ge_clip_n == 2) {
+                s->ge_clip_w = (int)v;
+            } else if (s->ge_clip_n == 3) {
+                s->ge_clip_h = (int)v;
+                s->ge_win_x = s->ge_clip_x;
+                s->ge_win_y = SGI_GR2_SCREEN_H -
+                              (s->ge_clip_y + s->ge_clip_h);
+                s->ge_clip_armed = false;
+            }
+            s->ge_clip_n++;
+        }
+        break;
+    case SGI_GR2_GE7_MV:
+        s->ge_mv[s->ge_mv_n++] = sgi_gr2_u2f(v);
+        if (s->ge_mv_n == 16) {
+            s->ge_mv_n = 0;
+            s->ge_mv_valid = true;
+            s->ge_seq55 = ++s->ge_seq;
+            /* A fresh modelview begins a frame: clear the Z-buffer to "far"
+             * (0x7f7f7f7f ~ +3.4e38) so the previous frame does not occlude
+             * it, and mark the drawable for a colour clear.  The FIFO stream
+             * carries gl_clear (token 158) only once at start-up, so the
+             * per-frame double-buffer clear is stood in for here. */
+            if (s->ge_zbuf) {
+                memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+                       SGI_GR2_SCREEN_H * sizeof(float));
+            }
+            s->ge_need_clear = true;
+        }
+        break;
+    case SGI_GR2_GE7_SINGLE:
+        /* MSINGLE combined matrix: the whole transform in one 16-float run. */
+        s->ge_single[s->ge_single_n++] = sgi_gr2_u2f(v);
+        if (s->ge_single_n == 16) {
+            s->ge_single_n = 0;
+            s->ge_single_valid = true;
+            s->ge_seq54 = ++s->ge_seq;
+        }
+        break;
+    case SGI_GR2_GE7_PROJ:
+        s->ge_proj[s->ge_proj_n++] = sgi_gr2_u2f(v);
+        if (s->ge_proj_n == 16) {
+            s->ge_proj_n = 0;
+            s->ge_proj_valid = true;
+            s->ge_seq56 = ++s->ge_seq;
+        }
+        break;
+    case SGI_GR2_GE7_TEX:
+        break; /* texture matrix: not modelled, the bust is untextured */
+    case SGI_GR2_GE7_AMBIENT:
+        sgi_gr2_ge7_mat_word(s, s->ge_ambient, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_DIFFUSE:
+        sgi_gr2_ge7_mat_word(s, s->ge_diffuse, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_SPECULAR:
+        sgi_gr2_ge7_mat_word(s, s->ge_specular, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_EMISSION:
+        sgi_gr2_ge7_mat_word(s, s->ge_emission, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_LCOLOR:
+        sgi_gr2_ge7_mat_word(s, s->ge_lcolor, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_LPOS:
+        sgi_gr2_ge7_mat_word(s, s->ge_lpos, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_AMBIENT_SUM:
+        sgi_gr2_ge7_mat_word(s, s->ge_ambient_sum, offset, sgi_gr2_u2f(v));
+        break;
+    case SGI_GR2_GE7_LMCOLOR:
+        break; /* lighting-model selector: the material above is what we use */
+    case SGI_GR2_GE7_NORMAL:
+        switch (s->ge_n_n++) {
+        case 0: s->ge_normal[0] = sgi_gr2_u2f(v); break;
+        case 1: s->ge_normal[1] = sgi_gr2_u2f(v); break;
+        case 2: s->ge_normal[2] = sgi_gr2_u2f(v); s->ge_n_n = 0; break;
+        }
+        break;
+    case SGI_GR2_GE7_VTX:
+        switch (s->ge_v_n++) {
+        case 0: s->ge_vx = sgi_gr2_u2f(v); break;
+        case 1: s->ge_vy = sgi_gr2_u2f(v); break;
+        case 2:
+            s->ge_vz = sgi_gr2_u2f(v);
+            s->ge_v_n = 0;
+            if (s->ge_poly_n < SGI_GR2_GE7_MAX_VERTS) {
+                s->ge_poly[s->ge_poly_n][0] = s->ge_vx;
+                s->ge_poly[s->ge_poly_n][1] = s->ge_vy;
+                s->ge_poly[s->ge_poly_n][2] = s->ge_vz;
+                /* the normal that preceded this vertex belongs to it */
+                s->ge_vnormal[s->ge_poly_n][0] = s->ge_normal[0];
+                s->ge_vnormal[s->ge_poly_n][1] = s->ge_normal[1];
+                s->ge_vnormal[s->ge_poly_n][2] = s->ge_normal[2];
+                s->ge_poly_n++;
+            }
+            break;
+        }
+        break;
+    case SGI_GR2_GE7_BGN:
+    case SGI_GR2_GE7_BGN_B:
+        s->ge_poly_n = 0;
+        s->ge_strip = false;
+        break;
+    case SGI_GR2_GE7_END:
+    case SGI_GR2_GE7_END_B:
+        sgi_gr2_ge7_draw(s);
+        s->ge_poly_n = 0;
+        s->ge_strip = false;
+        break;
+    case SGI_GR2_GE7_BGNLINE:
+    case SGI_GR2_GE7_BGNLINE_B:
+        s->ge_line_n = 0;
+        s->ge_line_pn = 0;
+        break;
+    case SGI_GR2_GE7_V2F:
+        /* gl_v2f/gl_v2i: two coordinates per vertex (token 4707). */
+        s->ge_line_pending[s->ge_line_pn++] = sgi_gr2_u2f(v);
+        if (s->ge_line_pn == 2) {
+            s->ge_line_pn = 0;
+            if (s->ge_line_n < SGI_GR2_GE7_MAX_LVERTS) {
+                s->ge_line[s->ge_line_n][0] = s->ge_line_pending[0];
+                s->ge_line[s->ge_line_n][1] = s->ge_line_pending[1];
+                s->ge_line_n++;
+            }
+        }
+        break;
+    case SGI_GR2_GE7_ENDLINE:
+        sgi_gr2_ge7_draw_lines(s);
+        s->ge_line_n = 0;
+        break;
+    case SGI_GR2_GE7_BGNTMESH:
+    case SGI_GR2_GE7_BGNTMESH_B:
+        s->ge_poly_n = 0;
+        s->ge_strip = true;
+        break;
+    case SGI_GR2_GE7_ENDTMESH:
+        sgi_gr2_ge7_draw(s);
+        s->ge_poly_n = 0;
+        s->ge_strip = false;
+        break;
+    case SGI_GR2_GE7_ZCLEAR:
+        if (s->ge_zbuf) {
+            memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+                   SGI_GR2_SCREEN_H * sizeof(float));
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
@@ -677,21 +1759,21 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
     /* The HQ2 block is the polled surface: log each access with the reading PC
      * so the poll loop (and the value it expects) can be read off directly. */
     if (offset >= SGI_GR2_HQ_OFF && offset < SGI_GR2_HQ_OFF + 0x80) {
-        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+        uint32_t pc = sgi_gr2_guest_pc();
 
         trace_sgi_gr2_hqread(offset, val, pc);
     }
     /* The token FIFO is written as the command channel; any READ of it is the
      * board's read-back/consumption contract, so log those with the PC too. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
-        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+        uint32_t pc = sgi_gr2_guest_pc();
 
         trace_sgi_gr2_fiforead(offset, val, pc);
     }
     /* VC1 / XMAP / RE3 / GE / bdvers reads with the PC: the last surface that
      * could hold the "display is up" gate the DDX waits on. */
     if (offset >= SGI_GR2_HQUCODE_OFF) {
-        uint32_t pc = current_cpu ? (uint32_t)current_cpu->mem_io_pc : 0;
+        uint32_t pc = sgi_gr2_guest_pc();
 
         trace_sgi_gr2_regread(offset, val, pc);
     }
@@ -718,6 +1800,48 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * the whole register block. */
     if (offset >= SGI_GR2_FIFO_OFF && offset < SGI_GR2_FIFO_OFF + 0x20000) {
         trace_sgi_gr2_fifo(offset, value, size);
+        /* The GE7 3D command ports ride the same FIFO as the 2D RE3 ops; feed
+         * them the token before the 2D paths see it. */
+        if (size == 4) {
+            sgi_gr2_ge7_token(s, offset, value);
+        }
+        /* Arm the drain flush; it fires only once the token stream pauses, which
+         * is when real hardware would have executed the op. */
+        if (s->fifo_flush_timer) {
+            timer_mod(s->fifo_flush_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      SGI_GR2_FIFO_FLUSH_MS);
+        }
+    }
+    /* VC1: an addressed 16-bit register file and SRAM, both auto-incrementing.
+     * addrlo/addrhi carry a byte address; cmd0 is the register port (the cursor's
+     * x/y go here) and sram the bitmap port (Gr2LoadVC1SRAM streams the cursor). */
+    if (offset == SGI_GR2_VC1_ADDRLO) {
+        s->vc1_addrlo = value & 0xff;
+        return;
+    }
+    if (offset == SGI_GR2_VC1_ADDRHI) {
+        s->vc1_addrhi = value & 0xff;
+        return;
+    }
+    if (offset == SGI_GR2_VC1_CMD0) {
+        unsigned a = ((((unsigned)s->vc1_addrhi << 8) | s->vc1_addrlo) >> 1);
+
+        if (a < SGI_GR2_VC1_REG_WORDS) {
+            s->vc1_reg[a] = value & 0xffff;
+        }
+        sgi_gr2_vc1_advance(s);
+        sgi_gr2_update_display(s);
+        return;
+    }
+    if (offset == SGI_GR2_VC1_SRAM) {
+        unsigned a = ((((unsigned)s->vc1_addrhi << 8) | s->vc1_addrlo) >> 1);
+
+        if (a < SGI_GR2_VC1_SRAM_WORDS) {
+            s->vc1_sram[a] = value & 0xffff;
+        }
+        sgi_gr2_vc1_advance(s);
+        return;
     }
     /* RE3 producer, 8-bit mode.  The DDX writes the fill colour (a RAMDAC
      * INDEX) to the RE3 colour token, then pushes the rectangle's geometry as
@@ -760,6 +1884,19 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->prev_puc = s->last_puc;
         s->last_puc = value;
         s->last_puc_valid = true;
+        /* expCopyRect: the seven words after 340 close the op (no 490). */
+        if (s->re3_copy_active) {
+            s->re3_copy_v[s->re3_copy_n++] = value;
+            if (s->re3_copy_n == 7) {
+                sgi_gr2_re3_copy_rect(s, (int)s->re3_copy_v[1],
+                                      (int)s->re3_copy_v[2],
+                                      (int)s->re3_copy_v[3],
+                                      (int)s->re3_copy_v[4],
+                                      (int)s->re3_copy_v[5],
+                                      (int)s->re3_copy_v[6]);
+                s->re3_copy_active = false;
+            }
+        }
         /* Keep the sub-op's PUC_DATA for the rect-list decoder.  The weave op's
          * 1024 spans arrive before its own 331, so they fill and then reset the
          * buffer at the 331; only the tail that belongs to the 331 matters. */
@@ -788,6 +1925,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (size == 4 && offset == SGI_GR2_RE3_OP_TOKEN) {
         sgi_gr2_re3_flush_fill(s);
         sgi_gr2_re3_reset_subop(s);
+        /* The op type is (type | 0x1000); 0x100b is expTileRects, which streams
+         * its tile bitmap and repaints the root.  Remember it for the flush that
+         * runs when the next op's 331 arrives.  Any other op ends the clip list
+         * the tile fill consumes. */
+        s->re3_tile_seen = (value == SGI_GR2_RE3_TILE_OP);
     }
     if (size == 4 && offset == SGI_GR2_RE3_MODE_TOKEN) {
         s->re3_rop = (uint32_t)value;
@@ -823,6 +1965,22 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         s->re3_monox_valid = true;
         s->re3_mono_seen = true;
     }
+    if (size == 4 && offset == SGI_GR2_RE3_IMAGE_TOKEN) {
+        /* One image run: remember its x and where its PUC_DATA group begins. */
+        if (s->re3_nimg < SGI_GR2_RE3_IMG_MAX) {
+            s->re3_img_x[s->re3_nimg] = (uint32_t)value;
+            s->re3_img_off[s->re3_nimg] = s->re3_data_n;
+            s->re3_nimg++;
+        }
+        s->re3_image_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_COPY_TOKEN) {
+        /* expCopyRect: 340 = words-per-row, then seven PUC_DATA words.  No 490,
+         * so the copy fires on the seventh. */
+        s->re3_copy_wpr = (uint32_t)value;
+        s->re3_copy_n = 0;
+        s->re3_copy_active = true;
+    }
     if (size == 4 && offset == SGI_GR2_RE3_PEN_TOKEN) {
         /* The pen x for one glyph piece; remember where its data starts. */
         if (s->re3_npens < SGI_GR2_RE3_PEN_MAX) {
@@ -837,6 +1995,14 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == SGI_GR2_RE3_SPANS_TOKEN) {
         s->re3_spans_seen = true;
+    }
+    if (size == 4 && offset == SGI_GR2_RE3_TILE_TOKEN) {
+        /* expTileRects streams its tile bitmap's first word on the tile data
+         * port; the rest arrives as PUC_DATA.  Keep it so the tile can be
+         * reconstructed from both streams. */
+        if (s->re3_tile_seen) {
+            s->re3_tile_word0 = (uint32_t)value;
+        }
     }
     if (size == 4 && offset == SGI_GR2_RE3_FG_TOKEN) {
         s->re3_fg = value & 0xff;
@@ -932,6 +2098,35 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     } else if (offset == SGI_GR2_XMAP_PAL_CTL) {
         s->ramdac_ctl = value & 0xff;
     }
+    /* BT457 DAC palette/gamma RAM (SGI_GR2_DAC0_OFF): the colour byte at +4 is
+     * written to the current address at +0 and the address auto-increments, so
+     * a run after an address write is a ramp load.  Built from the guest, never
+     * assumed: the golden streams an identity ramp at the boot DAC probe and
+     * the display gamma when Xsgi starts. */
+    if (offset >= SGI_GR2_DAC0_OFF &&
+        offset < SGI_GR2_DAC0_OFF + SGI_GR2_DAC_NDAC * SGI_GR2_DAC_STRIDE) {
+        unsigned k;
+
+        for (k = 0; k < size; k++) {
+            uint64_t o = offset + k;
+            unsigned rel = o - SGI_GR2_DAC0_OFF;
+            unsigned dac = rel / SGI_GR2_DAC_STRIDE;
+            unsigned reg = rel % SGI_GR2_DAC_STRIDE;
+            uint8_t byte = (value >> (8 * (size - 1 - k))) & 0xff;
+
+            if (reg == SGI_GR2_DAC_ADDR) {
+                s->dac_addr[dac] = byte;
+            } else if (reg == SGI_GR2_DAC_PALT) {
+                uint8_t idx = s->dac_addr[dac];
+
+                s->dac_ramp[dac][idx] = byte;
+                s->dac_addr[dac] = (idx + 1) & 0xff;
+                s->dac_ramp_set = true;
+                trace_sgi_gr2_dac(dac, idx, byte);
+            }
+        }
+        return;
+    }
     /* Unpopulated GE units discard writes. */
     if (offset >= SGI_GR2_GE_OFF &&
         offset < SGI_GR2_GE_OFF + SGI_GR2_GE_UNITS * SGI_GR2_GE_STRIDE) {
@@ -950,6 +2145,42 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * polls it); a stray write must not corrupt the level/error bits. */
     if (offset >= SGI_GR2_HQ_FIFOSTAT &&
         offset < SGI_GR2_HQ_FIFOSTAT + 4) {
+        return;
+    }
+    /* bdvers is strapping: the bitplane/Z/revision bits are wired by the board
+     * and must survive the PROM/ARCS and driver config writes to the same
+     * register.  The ARCS Gr2InitInfo and the kernel Gr2Probe read
+     * (~rd0)&0xf for the revision and rd1 bits 4/5 for 24-bit and Z; if a
+     * config write is allowed to clear those, the board is reported as
+     * "missing bitplanes missing Z" and powerflip refuses.  Preserve the
+     * strapped bits, take the rest from the write. */
+    if (offset >= SGI_GR2_BDVERS_OFF &&
+        offset < SGI_GR2_BDVERS_OFF + 16) {
+        static const uint8_t strap_mask[16] = {
+            0x0f, 0x0f, 0x0f, 0x0f,  /* 0x6c000: revision nibble strapped */
+            0x30, 0x30, 0x30, 0x30,  /* 0x6c004: bit4=24-bit, bit5=Z       */
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        };
+        static const uint8_t strap_val[16] = {
+            SGI_GR2_BDVERS0, SGI_GR2_BDVERS0, SGI_GR2_BDVERS0, SGI_GR2_BDVERS0,
+            SGI_GR2_BDVERS1, SGI_GR2_BDVERS1, SGI_GR2_BDVERS1, SGI_GR2_BDVERS1,
+            SGI_GR2_BDVERS2, SGI_GR2_BDVERS2, SGI_GR2_BDVERS2, SGI_GR2_BDVERS2,
+            SGI_GR2_BDVERS3, SGI_GR2_BDVERS3, SGI_GR2_BDVERS3, SGI_GR2_BDVERS3,
+        };
+        unsigned k;
+
+        for (k = 0; k < size; k++) {
+            uint64_t o = offset + k - SGI_GR2_BDVERS_OFF;
+            uint8_t byte = (value >> (8 * (size - 1 - k))) & 0xff;
+
+            if (o < 16) {
+                s->regs[offset + k] = (byte & ~strap_mask[o]) |
+                                      (strap_val[o] & strap_mask[o]);
+            } else {
+                s->regs[offset + k] = byte;
+            }
+        }
         return;
     }
     for (i = 0; i < size; i++) {
@@ -993,9 +2224,46 @@ static void sgi_gr2_fill_bars(SGIGr2State *s)
     }
     for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
         for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
-            s->scanout[y * SGI_GR2_SCREEN_W + x] = x * 8 / SGI_GR2_SCREEN_W;
+            sgi_gr2_put(s, x, y, x * 8 / SGI_GR2_SCREEN_W);
         }
     }
+}
+
+/* VC1 byte address -> the next address after a 16-bit port write. */
+static void sgi_gr2_vc1_advance(SGIGr2State *s)
+{
+    unsigned a = ((((unsigned)s->vc1_addrhi << 8) | s->vc1_addrlo) + 2) & 0xffff;
+
+    s->vc1_addrlo = a & 0xff;
+    s->vc1_addrhi = (a >> 8) & 0xff;
+}
+
+/* The hardware cursor: VC1 reg 0x20 holds the bitmap address (0x0a00), 0x22/0x24
+ * the x/y, 0x26 the mode.  The registers are RASTER coordinates, so the visible
+ * position is reg minus the horizontal/vertical backporch (GR2_CURS_*OFF_1280);
+ * at reset they read 0, which puts the sprite off-screen, so a fresh boot shows
+ * no cursor.  The image is 16x16 at 2 bpp - 0 transparent, 1 black, 2 white,
+ * 3 invert - loaded through the sram port by Gr2LoadVC1SRAM. */
+static bool sgi_gr2_vc1_cursor(SGIGr2State *s, int *cx, int *cy)
+{
+    unsigned base = s->vc1_reg[0x20 >> 1]; /* byte addr 0x20 = cursor image base */
+
+    if (base != SGI_GR2_VC1_CURSOR_ADDR) {
+        return false;
+    }
+    *cx = (int)s->vc1_reg[0x22 >> 1] - SGI_GR2_VC1_CURS_XOFF;
+    *cy = (int)s->vc1_reg[0x24 >> 1] - SGI_GR2_VC1_CURS_YOFF;
+    return true;
+}
+
+static unsigned sgi_gr2_vc1_cursor_code(SGIGr2State *s, int x, int y)
+{
+    unsigned p = y * SGI_GR2_VC1_CURSOR_W + x;
+    unsigned base = SGI_GR2_VC1_CURSOR_ADDR >> 1;
+    uint16_t w = s->vc1_sram[base + (p >> 3)];
+    unsigned byte = (w >> (8 * (1 - ((p >> 2) & 1)))) & 0xff;
+
+    return (byte >> (6 - 2 * (p & 3))) & 3;
 }
 
 static void sgi_gr2_update_display(void *opaque)
@@ -1020,9 +2288,58 @@ static void sgi_gr2_update_display(void *opaque)
         int x;
 
         /* The palette is applied HERE, at scanout, so a pixel drawn before its
-         * entry was programmed still shows the entry's final colour. */
+         * entry was programmed still shows the entry's final colour.  A pixel
+         * flagged as direct-colour (from an image op) is expanded 3-3-2 instead,
+         * so the cube and the CLUT-indexed panel share one screen. */
         for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
-            row[x] = s->ramdac[src[x]];
+            uint8_t idx = src[x];
+
+            if (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x]) {
+                row[x] = sgi_gr2_re3_332(idx);
+            } else {
+                /* The CLUT byte is pre-gamma: run each channel through the
+                 * guest's BT457 output ramp.  The 332 path is left alone — its
+                 * ramp is already the final display value (measured from the
+                 * control), so applying gamma again would over-brighten it. */
+                uint32_t rgb = s->ramdac[idx];
+                uint8_t r = s->dac_ramp[0][(rgb >> 16) & 0xff];
+                uint8_t g = s->dac_ramp[1][(rgb >> 8) & 0xff];
+                uint8_t b = s->dac_ramp[2][rgb & 0xff];
+
+                row[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            }
+        }
+    }
+    /* The cursor is a hardware sprite: drawn on top here, never in the buffer. */
+    {
+        int cx, cy;
+
+        if (sgi_gr2_vc1_cursor(s, &cx, &cy)) {
+            for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
+                uint32_t *row = dest + (y * stride) / 4;
+                int py = y - cy;
+                int x;
+
+                if (py < 0 || py >= SGI_GR2_VC1_CURSOR_W) {
+                    continue;
+                }
+                for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
+                    int px = x - cx;
+                    unsigned code;
+
+                    if (px < 0 || px >= SGI_GR2_VC1_CURSOR_W) {
+                        continue;
+                    }
+                    code = sgi_gr2_vc1_cursor_code(s, px, py);
+                    if (code == 1) {
+                        row[x] = 0x000000;
+                    } else if (code == 2) {
+                        row[x] = 0xffffff;
+                    } else if (code == 3) {
+                        row[x] ^= 0xffffff;
+                    }
+                }
+            }
         }
     }
     dpy_gfx_update(s->con, 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
@@ -1061,6 +2378,8 @@ static void sgi_gr2_retrace_tick(void *opaque)
 static void sgi_gr2_reset(DeviceState *dev)
 {
     SGIGr2State *s = SGI_GR2(dev);
+    int i;
+
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ucode, 0, sizeof(s->ucode));
     s->gepc = 0;
@@ -1073,6 +2392,14 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->ramdac_index = 0;
     s->ramdac_ctl = 0;
     s->ramdac_stage_n = 0;
+    /* Output ramps start as the identity until the guest programs them. */
+    for (i = 0; i < 256; i++) {
+        s->dac_ramp[0][i] = i;
+        s->dac_ramp[1][i] = i;
+        s->dac_ramp[2][i] = i;
+    }
+    memset(s->dac_addr, 0, sizeof(s->dac_addr));
+    s->dac_ramp_set = false;
     s->re3_colour = 0;
     s->re3_colour_valid = false;
     s->re3_solid_seen = false;
@@ -1081,6 +2408,8 @@ static void sgi_gr2_reset(DeviceState *dev)
     s->re3_spanstip_seen = false;
     s->re3_poly_seen = false;
     s->re3_mono_seen = false;
+    s->re3_image_seen = false;
+    s->re3_nimg = 0;
     s->re3_monox_valid = false;
     s->re3_monocol_valid = false;
     s->re3_mono_off = 0;
@@ -1130,6 +2459,29 @@ static void sgi_gr2_reset(DeviceState *dev)
     }
 }
 
+/* The FIFO has gone quiet: run the glyph op still sitting in the buffer.  Glyph
+ * ops are the ones the DDX leaves unterminated - it flushes each by starting the
+ * next glyph's 331 and writes no 490 - so the last glyph of a run (the 't' of
+ * "guest") had no successor to flush it and was dropped.  Every other shape
+ * carries its 490; flushing those on idle would draw ops the DDX never committed
+ * (the root stipple op has no 490, and the pre-registered no-draw negative
+ * expects it absent), so only a pending glyph op is run here. */
+static void sgi_gr2_fifo_flush_cb(void *opaque)
+{
+    SGIGr2State *s = opaque;
+
+    if (s->re3_npens > 0) {
+        sgi_gr2_re3_flush_fill(s);
+        sgi_gr2_re3_reset_subop(s);
+    }
+    /* A paused token stream is the end of a draw batch.  For the 3D path the
+     * whole bust was just rasterised, so refresh the display once here rather
+     * than on every endpolygon (which would rescan 1280x1024 5000 times). */
+    if (s->ge_3d_seen) {
+        sgi_gr2_update_display(s);
+    }
+}
+
 static void sgi_gr2_realize(DeviceState *dev, Error **errp)
 {
     SGIGr2State *s = SGI_GR2(dev);
@@ -1145,6 +2497,8 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
                                     sgi_gr2_retrace_tick, s);
     s->retrace_lower_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                           sgi_gr2_retrace_lower, s);
+    s->fifo_flush_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                       sgi_gr2_fifo_flush_cb, s);
     timer_mod(s->retrace_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / SGI_GR2_RETRACE_HZ);
@@ -1154,6 +2508,14 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
     if (s->present) {
         s->scanout = g_new0(uint8_t,
                             (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        s->scanout332 = g_new0(uint8_t,
+                               (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        /* GE7 Z-buffer.  Allocated up front and cleared to "far" (0x7f7f7f7f
+         * ~ +3.4e38) so the first frame draws. */
+        s->ge_zbuf = g_new(float,
+                           (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
+               SGI_GR2_SCREEN_H * sizeof(float));
         s->con = graphic_console_init(dev, 0, &sgi_gr2_gfx_ops, s);
         qemu_console_resize(s->con, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
     }
@@ -1162,6 +2524,7 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
 static const Property sgi_gr2_properties[] = {
     DEFINE_PROP_BOOL("present", SGIGr2State, present, false),
     DEFINE_PROP_BOOL("scanout-bars", SGIGr2State, scanout_bars, false),
+    DEFINE_PROP_BOOL("poly-stroke", SGIGr2State, poly_stroke, true),
     DEFINE_PROP_UINT8("ges", SGIGr2State, ges, 2),
     DEFINE_PROP_UINT8("bitplanes", SGIGr2State, bitplanes, 24),
     DEFINE_PROP_BOOL("zbuffer", SGIGr2State, zbuffer, true),

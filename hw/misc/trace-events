@@ -435,6 +435,8 @@ sgi_hpc3_scsi_dma_chain(int ch, uint32_t desc, uint32_t nbp, int eox) "SCSI%d ch
 sgi_hpc3_scsi_irq(int ch, uint32_t status) "SCSI%d IRQ status=0x%08x"
 sgi_hpc3_int3(int level, uint32_t stat, uint32_t mask) "INT3 local%d stat=0x%02x mask=0x%02x"
 sgi_hpc3_int3_map(int irq, int ip) "INT3 mapped irq%d -> IP%d"
+sgi_hpc3_map_mask(int which, uint32_t val) "INT3 map_mask%d = 0x%02x"
+sgi_hpc3_int3_rd(int which, uint32_t addr, uint32_t val) "INT3 rd%d addr=0x%x val=0x%02x"
 sgi_hpc3_pit(int timer, uint32_t count) "PIT timer%d count=%u"
 sgi_hpc3_scc_tx(int ch, uint8_t data) "SCC ch%d TX 0x%02x"
 sgi_hpc3_scc_rx(int ch, uint8_t data) "SCC ch%d RX 0x%02x"
@@ -495,6 +497,7 @@ sgi_mace_audio_mscust(uint64_t addr, uint64_t val) "MSC/UST 0x%02"PRIx64" = 0x%0
 sgi_mace_isa_reg(int rw, uint64_t addr, uint64_t val) "ISA rw=%d 0x%03"PRIx64" = 0x%016"PRIx64
 sgi_mace_ds_slot(int phase, int64_t width_ns) "DS slot phase=%d width=%"PRId64"ns"
 sgi_mace_ds_state(int phase, int data, int idx) "DS state phase=%d data=%d idx=%d"
+sgi_mace_rtc_read(int reg, int value) "RTC calendar reg=%d = 0x%02x (host clock)"
 
 # sgi_crime.c (O2 CRIME interrupt controller)
 sgi_crime_irq(int irq, int level, uint64_t intstat, uint64_t intmask) "crime irq %d level=%d intstat=0x%08"PRIx64" intmask=0x%08"PRIx64
@@ -527,7 +530,15 @@ sgi_mace_i2c(int wr, uint64_t reg, uint64_t val) "I2C wr=%d reg 0x%02"PRIx64" = 
 sgi_mace_video_frame(int input, unsigned w, unsigned h, unsigned fourcc, uint64_t len) "video-in%d frame %ux%u fourcc=0x%08x len=%"PRIu64
 sgi_mace_video_vout_field(unsigned fmt, unsigned stride, unsigned lines, uint64_t read, uint64_t total, int interleaved, uint64_t field_off) "VOUT field fmt=%u stride=%u lines=%u read=%"PRIu64"/%"PRIu64" inter=%d foff=0x%"PRIx64
 
-# sgi_gr2.c (GR2 / "Express" register shell; core from origin/indy-video-xz)
+# sgi_vino.c (Indy VINO register shell)
+sgi_vino_read(uint64_t off, unsigned size, uint64_t val, int present) "VINO read off=0x%"PRIx64" size=%u -> 0x%"PRIx64" (present=%d)"
+sgi_vino_write(uint64_t off, uint64_t val, unsigned size, int present) "VINO write off=0x%"PRIx64" val=0x%"PRIx64" size=%u (present=%d)"
+sgi_vino_desc(int ch, uint64_t addr, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) "VINO ch%d next_4_desc=0x%"PRIx64" desc=%08x %08x %08x %08x"
+sgi_vino_field(int ch, uint32_t count, uint32_t bytes) "VINO ch%d field=%u captured %u bytes"
+sgi_vino_frame(uint32_t w, uint32_t h, uint32_t fourcc, size_t len) "VINO host frame %ux%u fourcc=0x%x len=%zu"
+sgi_vino_field_src(int ch, uint32_t row_bytes, size_t frame_len, int use_frame) "VINO ch%d field row_bytes=%u frame_len=%zu use_frame=%d"
+
+# sgi_gr2.c (Indy XZ GR2 / "Express" register shell)
 sgi_gr2_read(uint64_t off, unsigned size, uint64_t val) "GR2 read  off=0x%05"PRIx64" size=%u -> 0x%"PRIx64
 sgi_gr2_write(uint64_t off, uint64_t val, unsigned size) "GR2 write off=0x%05"PRIx64" val=0x%"PRIx64" size=%u"
 sgi_gr2_fifo(uint64_t off, uint64_t val, unsigned size) "GR2 fifo  off=0x%05"PRIx64" val=0x%"PRIx64" size=%u"
@@ -540,6 +551,13 @@ sgi_gr2_re3_stipple(uint8_t fg, uint8_t bg, uint32_t pattern, uint32_t w, uint32
 sgi_gr2_puc_span(uint8_t idx, uint32_t rgb, uint32_t x0, uint32_t x1, uint32_t y0) "GR2 puc span idx=%u rgb=0x%06x x=%u..%u y=%u"
 sgi_gr2_re3_rect(uint8_t colour, uint32_t rgb, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2) "GR2 re3 rect colour=%u rgb=0x%06x (%u,%u)-(%u,%u)"
 sgi_gr2_re3_seg(uint8_t colour, uint32_t rgb, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) "GR2 re3 seg colour=%u rgb=0x%06x (%u,%u)-(%u,%u)"
+sgi_gr2_re3_spanstip(uint8_t colour, uint32_t rgb, uint32_t x, uint32_t y, uint32_t count) "GR2 re3 spanstip colour=%u rgb=0x%06x (%u,%u) count=%u"
+sgi_gr2_re3_image(uint32_t x, uint32_t y, uint32_t w, uint32_t runs) "GR2 re3 image x=%u y=%u w=%u runs=%u"
+sgi_gr2_re3_copy(int sx, int sy, int w, int h, int dx, int dy) "GR2 re3 copy (%d,%d) %dx%d -> (%d,%d)"
+sgi_gr2_re3_tile(uint32_t w, uint32_t h, uint32_t nclip) "GR2 re3 tile %ux%u nclip=%u"
+sgi_gr2_re3_clip(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2) "GR2 re3 clip (%u,%u)-(%u,%u)"
 sgi_gr2_re3_unmatched(uint32_t rop, uint32_t ndata) "GR2 re3 unmatched rop=0x%x ndata=%u"
+sgi_gr2_re3_unknown(uint32_t d0, uint32_t d1, uint32_t ndata) "GR2 re3 unknown d0=0x%x d1=0x%x ndata=%u"
 sgi_gr2_re3_mono(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t colour) "GR2 re3 mono (%u,%u) %ux%u colour=%u"
 sgi_gr2_ramdac(uint32_t index, uint32_t rgb) "GR2 ramdac idx=%u rgb=0x%06x"
+sgi_gr2_dac(uint32_t chan, uint32_t idx, uint32_t val) "GR2 dac chan=%u idx=%u val=%u"
