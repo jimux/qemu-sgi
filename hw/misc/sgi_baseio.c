@@ -345,9 +345,12 @@ static void sgi_baseio_mcr_write(SGIBaseIODS *ds, uint64_t val) {
 #define IOC3_EMCR_RST 0x80000000
 #define IOC3_EISR_RXTHRESHINT 0x00000002
 #define IOC3_EISR_TXEMPTY 0x00010000
+#define IOC3_EISR_TXEXPLICIT 0x00400000
 #define IOC3_ETXD_D0V 0x00010000
 #define IOC3_ETXD_B1V 0x00020000
 #define IOC3_ETXD_B2V 0x00040000
+#define IOC3_ETXD_INTWHENDONE 0x00001000
+#define IOC3_ETCIR_IDLE 0x80000000
 #define IOC3_ETBR_L_RINGSZ_MASK 0x00000001
 #define IOC3_ETBR_L_TXRINGBASE_MASK 0xffffc000
 #define IOC3_ETPIR_TXPRODUCE_MASK 0x0000ffff
@@ -406,6 +409,7 @@ static void sgi_baseio_phy_init(SGIBaseIOState *s) {
 }
 
 static int sgi_baseio_rxtrace = -1;
+static int sgi_baseio_txtrace = -1;
 
 /* Defined below with the bridge-interrupt delivery block; the RX/TX engines
  * latch EISR asynchronously and must re-evaluate the Ethernet line. */
@@ -510,6 +514,16 @@ static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
   int ntxd = (etbr_l & IOC3_ETBR_L_RINGSZ_MASK) ? 512 : 128;
   uint32_t ring_bytes = ntxd * IOC3_TXDSZ;
   uint32_t emcr = s->eth_regs[SGI_IOC3_EMCR];
+  bool explicit_int = false;
+
+  if (sgi_baseio_txtrace < 0) {
+    sgi_baseio_txtrace = getenv("SGIBASEIO_TXTRACE") != NULL;
+  }
+  if (sgi_baseio_txtrace) {
+    printf("[TXTRACE] drain etpir=0x%x cons=0x%x base=0x%" PRIx64
+           " ntxd=%d emcr=0x%x nic=%d\n",
+           etpir, (unsigned)s->eth_txcons, base, ntxd, emcr, !!s->nic);
+  }
 
   while (s->eth_txcons != etpir) {
     uint8_t desc[IOC3_TXDSZ];
@@ -520,6 +534,10 @@ static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
 
     if (dma_memory_read(&address_space_memory, base + s->eth_txcons, desc,
                         sizeof(desc), MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+      if (sgi_baseio_txtrace) {
+        printf("[TXTRACE] desc-read FAIL cons=0x%x base=0x%" PRIx64 "\n",
+               (unsigned)s->eth_txcons, base);
+      }
       break;
     }
     cmd = ldl_be_p(desc);
@@ -529,6 +547,9 @@ static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
     d0cnt = bufcnt & 0x7f;
     b1cnt = (bufcnt >> 8) & 0x7ff;
     b2cnt = (bufcnt >> 20) & 0x7ff;
+    if (cmd & IOC3_ETXD_INTWHENDONE) {
+      explicit_int = true; /* real IOC3 latches EISR_TXEXPLICIT on completion */
+    }
 
     if ((cmd & IOC3_ETXD_D0V) && d0cnt <= sizeof(frame)) {
       memcpy(frame, desc + 24, d0cnt);
@@ -545,6 +566,12 @@ static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
       flen += b2cnt;
     }
 
+    if (sgi_baseio_txtrace) {
+      printf("[TXTRACE] desc cons=0x%x cmd=0x%x bufcnt=0x%x p1=0x%" PRIx64
+             " p2=0x%" PRIx64 " d0cnt=%u b1cnt=%u b2cnt=%u flen=%zu\n",
+             (unsigned)s->eth_txcons, cmd, bufcnt, p1, p2, d0cnt, b1cnt, b2cnt, flen);
+    }
+
     if (emcr & IOC3_EMCR_LOOPBACK) {
       sgi_baseio_eth_deliver(s, frame, flen);
     } else if (s->nic && flen > 0) {
@@ -552,8 +579,11 @@ static void sgi_baseio_eth_tx_drain(SGIBaseIOState *s) {
     }
     s->eth_txcons = (s->eth_txcons + IOC3_TXDSZ) % ring_bytes;
   }
-  s->eth_regs[SGI_IOC3_ETCIR] = s->eth_txcons;
+  s->eth_regs[SGI_IOC3_ETCIR] = s->eth_txcons | IOC3_ETCIR_IDLE;
   s->eth_regs[SGI_IOC3_EISR] |= IOC3_EISR_TXEMPTY;
+  if (explicit_int) {
+    s->eth_regs[SGI_IOC3_EISR] |= IOC3_EISR_TXEXPLICIT;
+  }
   sgi_baseio_eth_irq_sync(s);
 }
 
@@ -1230,6 +1260,13 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
       v &= ~0x00000800; /* management ops complete instantly (BUSY clear) */
     } else if (idx == SGI_IOC3_MIDR_R) {
       v = s->phy_read_data & 0xffff;
+    } else if (idx == SGI_IOC3_ETCIR) {
+      if (sgi_baseio_txtrace < 0) {
+        sgi_baseio_txtrace = getenv("SGIBASEIO_TXTRACE") != NULL;
+      }
+      if (sgi_baseio_txtrace) {
+        printf("[TXTRACE] ETCIR read=0x%x\n", (unsigned)v);
+      }
     }
     return v;
   }
@@ -1629,6 +1666,13 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
       sgi_baseio_eth_irq_sync(s);
     } else if (idx == SGI_IOC3_ETPIR) {
       s->eth_regs[idx] = val;
+      if (sgi_baseio_txtrace < 0) {
+        sgi_baseio_txtrace = getenv("SGIBASEIO_TXTRACE") != NULL;
+      }
+      if (sgi_baseio_txtrace) {
+        printf("[TXTRACE] ETPIR write=0x%x (cons=0x%x)\n",
+               (unsigned)(val & 0xffff), (unsigned)s->eth_txcons);
+      }
       sgi_baseio_eth_tx_drain(s);
     } else if (idx == SGI_IOC3_MIDR_W) {
       s->phy_write_data = val & 0xffff;
