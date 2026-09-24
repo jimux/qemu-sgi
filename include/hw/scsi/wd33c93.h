@@ -89,6 +89,29 @@
 #define SCSI_STATUS_UNEX_RDATA              0x48  /* TC=0, chip receiving (DATA OUT/write) */
 #define SCSI_STATUS_UNEX_SDATA              0x49  /* TC=0, chip sending (DATA IN/read) */
 #define SCSI_STATUS_DISCONNECT              0x85
+/*
+ * A Level I Select (0x06/0x07) stops after selection and reports
+ * SELECT_SUCCESS; the target then asserts REQ in the next bus phase and the
+ * chip raises a SEPARATE interrupt of SCSI_STATUS_REQ | phase (REQ 0x88 plus
+ * the 3-bit phase).  Select-with-ATN leaves ATN asserted so the target moves
+ * to MESSAGE OUT -> 0x8e; plain Select goes to COMMAND -> 0x8a.  Level I
+ * TRANSFER_INFO (0x20) moves data in the current phase and completes with
+ * SCSI_STATUS_TRANSFER_SUCCESS | phase.  (WD33C93 datasheet Level I
+ * commands; MAME wd33c9x SEL/SEL_ATN and COMMAND_CC_TRANSFER_INFO.)
+ */
+#define SCSI_STATUS_REQ                     0x88  /* REQ asserted in <phase> */
+#define SCSI_STATUS_REQ_COMMAND             0x8a  /* REQ | COMMAND phase */
+#define SCSI_STATUS_REQ_MSG_OUT             0x8e  /* REQ | MSG OUT phase */
+
+/*
+ * SCSI bus phases (3-bit phase field of the status/REQ interrupt)
+ */
+#define SCSI_PHASE_DATA_OUT                 0
+#define SCSI_PHASE_DATA_IN                  1
+#define SCSI_PHASE_COMMAND                  2
+#define SCSI_PHASE_STATUS                   3
+#define SCSI_PHASE_MSG_OUT                  6
+#define SCSI_PHASE_MSG_IN                   7
 
 /*
  * Command Register values
@@ -183,6 +206,14 @@ struct WD33C93State {
      * with LCI set, so the timeout must be deferred, not completed inline. */
     QEMUTimer *select_timer;
     bool select_pending;
+
+    /* Level I Select stops after selection: the driver reads SELECT_SUCCESS,
+     * then the chip must raise the separate REQ interrupt for the next bus
+     * phase.  Deliver it on the next SCSI Status read so the driver sees the
+     * two events in order.  bus_phase is the current SCSI bus phase used by
+     * TRANSFER_INFO. */
+    uint8_t queued_status;
+    uint8_t bus_phase;
 };
 
 /*

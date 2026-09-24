@@ -431,6 +431,17 @@ static void wd33c93_do_select(WD33C93State *s, bool with_atn)
     }
 
     /* Selection successful */
+    /*
+     * A Level I Select (0x06/0x07) stops after selection.  Report
+     * SELECT_SUCCESS, then queue the separate REQ interrupt for the next bus
+     * phase (MESSAGE OUT when ATN is asserted, else COMMAND).  The driver
+     * waits for the two events in sequence and moves the data with Level I
+     * TRANSFER_INFO commands.
+     * (WD33C93 datasheet Level I commands; MAME wd33c9x SEL/SEL_ATN.)
+     */
+    s->regs[WD_COMMAND_PHASE] = 0x10;   /* PH_SELECT */
+    s->bus_phase = with_atn ? SCSI_PHASE_MSG_OUT : SCSI_PHASE_COMMAND;
+    s->queued_status = SCSI_STATUS_REQ | s->bus_phase;
     wd33c93_complete_cmd(s, SCSI_STATUS_SELECT_SUCCESS);
 }
 
@@ -538,8 +549,26 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
         break;
 
     case CMD_TRANSFER_INFO:
-        WD_DPRINTF("TRANSFER_INFO\n");
+        WD_DPRINTF("TRANSFER_INFO phase=%d\n", s->bus_phase);
         s->aux_status |= ASR_CIP | ASR_BSY;
+
+        /*
+         * Level I TRANSFER_INFO moves the bytes of the CURRENT bus phase and
+         * completes with SCSI_STATUS_TRANSFER_SUCCESS | phase; the target then
+         * advances to the next phase and asserts REQ, which we queue for the
+         * driver's next wait.  Handle the post-Select MESSAGE OUT phase (the
+         * identify/message has been sent with TRANSFER_SUCCESS|MSG_OUT, the
+         * target moves to COMMAND); other phases fall through to the paths
+         * below.  (WD33C93 datasheet; MAME wd33c9x INIT_XFR.)
+         */
+        if (s->bus_phase == SCSI_PHASE_MSG_OUT) {
+            s->regs[WD_COMMAND_PHASE] = 0x30;
+            s->bus_phase = SCSI_PHASE_COMMAND;
+            s->queued_status = SCSI_STATUS_REQ_COMMAND;
+            wd33c93_complete_cmd(s, SCSI_STATUS_TRANSFER_SUCCESS |
+                                 SCSI_PHASE_MSG_OUT);
+            break;
+        }
 
         /*
          * TRANSFER_INFO can be used in three ways:
@@ -679,6 +708,16 @@ uint8_t wd33c93_data_read(WD33C93State *s)
         val = s->scsi_status;
         /* Reading status clears interrupt */
         wd33c93_lower_irq(s);
+        /*
+         * A Level I Select queues the follow-up REQ interrupt; raise it once
+         * the host has read SELECT_SUCCESS so the driver sees the two events
+         * in order.
+         */
+        if (s->queued_status) {
+            s->scsi_status = s->queued_status;
+            s->queued_status = 0;
+            wd33c93_raise_irq(s);
+        }
         {
                 wd33c93_debug_seq++;
             if (DBG_SEQ_ACTIVE()) {
@@ -1019,6 +1058,8 @@ static void wd33c93_reset(DeviceState *dev)
     s->current_req = NULL;
     s->drq_state = false;
     wd33c93_cancel_select(s);
+    s->queued_status = 0;
+    s->bus_phase = SCSI_PHASE_DATA_OUT;
 
     fifo8_reset(&s->fifo);
 }
