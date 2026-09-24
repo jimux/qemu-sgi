@@ -167,6 +167,19 @@ extern const VMStateDescription vmstate_mips_cpu;
 
 static inline bool cpu_mips_hw_interrupts_enabled(CPUMIPSState *env)
 {
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I has no EXL and no ERL: Status[1] is KUc (current
+         * kernel/user) and Status[2] is IEp.  Gating on them (as the
+         * MIPS III/IV branch below does) wrongly disables interrupts in
+         * user mode (KUc = 1 -> bit 1 set) and in any state with the
+         * previous-IE bit set.  Interrupts are taken whenever IE (bit 0)
+         * is set and the CPU is not halted for DMA.
+         */
+        return (env->CP0_Status & (1 << CP0St_IE)) &&
+            !(env->hflags & MIPS_HFLAG_DM) &&
+            !(env->active_tc.CP0_TCStatus & (1 << CP0TCSt_IXMT));
+    }
     return (env->CP0_Status & (1 << CP0St_IE)) &&
         !(env->CP0_Status & (1 << CP0St_EXL)) &&
         !(env->CP0_Status & (1 << CP0St_ERL)) &&
