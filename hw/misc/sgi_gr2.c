@@ -31,6 +31,12 @@
 #define SGI_GR2_RETRACE_HZ       60
 #define SGI_GR2_RETRACE_PULSE_NS (500 * 1000) /* ~40 scanlines of blanking */
 
+/* RE3 mode token 309 value the DDX uses for OVERLAY-plane draws.  Measured
+ * while a 4Dwm menu is posted (the menu's solid rect is 304 + rop 3 at exactly
+ * the menu window's geometry); main-plane fills carry 0 and the weave's
+ * trailing black rect carries 0xf. */
+#define SGI_GR2_RE3_MODE_OVERLAY 3
+
 /* The RAMDAC palette is not a static table: the guest's DDX programs it
  * through the XMAP_PAL_* registers at server start, and the model builds
  * it from that write stream (see the header).  Reset clears it to black. */
@@ -101,6 +107,34 @@ static inline void sgi_gr2_put332(SGIGr2State *s, int x, int y, uint8_t idx)
     s->scanout[o] = idx;
     if (s->scanout332) {
         s->scanout332[o] = 1;
+    }
+}
+
+/* Overlay-plane pixel.  Values are 2-bit; 0 is the transparent index, so a
+ * zeroed overlay leaves the main plane visible. */
+static inline void sgi_gr2_ovl_put(SGIGr2State *s, int x, int y, uint8_t v)
+{
+    if (s->overlay && x >= 0 && y >= 0 &&
+        x < SGI_GR2_SCREEN_W && y < SGI_GR2_SCREEN_H) {
+        s->overlay[(size_t)y * SGI_GR2_SCREEN_W + x] = v & 3;
+    }
+}
+
+/* Fill a rectangle in the overlay plane (a mode-309 == 3 draw).  Same clipping
+ * as the main-plane fill. */
+static void sgi_gr2_ovl_fill(SGIGr2State *s, uint8_t colour,
+                             int x, int y, int w, int h)
+{
+    int xx, yy;
+
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > SGI_GR2_SCREEN_W) { w = SGI_GR2_SCREEN_W - x; }
+    if (y + h > SGI_GR2_SCREEN_H) { h = SGI_GR2_SCREEN_H - y; }
+    for (yy = y; yy < y + h; yy++) {
+        for (xx = x; xx < x + w; xx++) {
+            sgi_gr2_ovl_put(s, xx, yy, colour);
+        }
     }
 }
 
@@ -444,6 +478,20 @@ static void sgi_gr2_re3_paint_rects(SGIGr2State *s, bool stippled)
         uint32_t x2 = s->re3_data[o + 2], y2 = s->re3_data[o + 3];
         int w = x2 - x1 + 1, h = y2 - y1 + 1;
 
+        /* Mode token 309 value 3 marks an OVERLAY-plane draw.  Measured while a
+         * 4Dwm menu is posted: the menu's own solid rect arrives as 304 plus
+         * data (401,301)-(577,680) with rop 3, i.e. exactly the menu window's
+         * 176x379 geometry.  The main plane is mode 0; the weave's trailing
+         * black rect is 0xf.  Route mode-3 fills into the overlay buffer so the
+         * main plane (and therefore the greeter/desktop) is untouched. */
+        if (!stippled && s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY) {
+            sgi_gr2_ovl_fill(s, s->re3_colour, x1, y1, w, h);
+            trace_sgi_gr2_re3_rect(s->re3_colour,
+                                   s->ovl_ramdac[s->re3_colour & 3],
+                                   x1, y1, x2, y2);
+            sgi_gr2_update_display(s);
+            continue;
+        }
         if (stippled) {
             sgi_gr2_re3_stipple_fill(s, fg, s->re3_colour, s->re3_stipple,
                                      x1, y1, w, h);
@@ -988,11 +1036,11 @@ static void sgi_gr2_re3_flush_fill(SGIGr2State *s)
         return;
     }
     if (s->re3_solid_seen) {
-        /* Token 309 is the sub-op's GC/ROP mode.  Real fills seen so far carry
-         * 0; the weave op's trailing full-screen black rect carries 0xf, and
-         * painting it would wipe the weave, so a non-zero mode is flagged, not
-         * painted, until its meaning is pinned. */
-        if (s->re3_rop == 0) {
+        /* Token 309 is the sub-op's GC/ROP mode.  Mode 0 is a main-plane fill;
+         * mode 3 is an OVERLAY-plane fill (4Dwm menus); the weave op's trailing
+         * full-screen black rect carries 0xf and must NOT be painted (it would
+         * wipe the weave).  paint_rects routes mode 3 into the overlay buffer. */
+        if (s->re3_rop == 0 || s->re3_rop == SGI_GR2_RE3_MODE_OVERLAY) {
             sgi_gr2_re3_paint_rects(s, false);
         } else {
             trace_sgi_gr2_re3_unmatched(s->re3_rop, s->re3_data_n);
@@ -1916,6 +1964,7 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
 
         if (a < SGI_GR2_VC1_REG_WORDS) {
             s->vc1_reg[a] = value & 0xffff;
+            trace_sgi_gr2_vc1_reg(a << 1, value & 0xffff);
         }
         sgi_gr2_vc1_advance(s);
         sgi_gr2_update_display(s);
@@ -2178,12 +2227,24 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
                     s->ramdac_ctl == SGI_GR2_XMAP_PAL_BANK_ALT) {
                     s->ramdac[s->ramdac_index] = rgb;
                     trace_sgi_gr2_ramdac(s->ramdac_index, rgb);
+                } else if (s->ramdac_ctl == SGI_GR2_XMAP_PAL_BANK_OVERLAY &&
+                           s->ramdac_index < SGI_GR2_OVL_COLOURS) {
+                    /* The 4-entry OVERLAY map.  4Dwm menus program red/white/
+                     * black into entries 1..3 here; entry 0 is left
+                     * unprogrammed and is the transparent index. */
+                    s->ovl_ramdac[s->ramdac_index] = rgb;
+                    s->ovl_ramdac_set = true;
+                    trace_sgi_gr2_ovl_pal(s->ramdac_ctl, s->ramdac_index, rgb);
+                } else {
+                    /* Other banks (0x00/0x01): recorded, not yet used. */
+                    trace_sgi_gr2_ovl_pal(s->ramdac_ctl, s->ramdac_index, rgb);
                 }
                 s->ramdac_stage_n = 0;
             }
         }
     } else if (offset == SGI_GR2_XMAP_PAL_CTL) {
         s->ramdac_ctl = value & 0xff;
+        trace_sgi_gr2_pal_ctl(s->ramdac_ctl);
     }
     /* BT457 DAC palette/gamma RAM (SGI_GR2_DAC0_OFF): the colour byte at +4 is
      * written to the current address at +0 and the address auto-increments, so
@@ -2380,8 +2441,20 @@ static void sgi_gr2_update_display(void *opaque)
          * so the cube and the CLUT-indexed panel share one screen. */
         for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
             uint8_t idx = src[x];
+            uint8_t ov = s->overlay ? s->overlay[y * SGI_GR2_SCREEN_W + x] : 0;
 
-            if (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x]) {
+            if (ov != 0 && s->ovl_ramdac_set) {
+                /* Overlay over main, index 0 transparent: overlay pixels (the
+                 * 4Dwm menu) win, everything else shows the main plane through.
+                 * The 4-entry overlay map is a normal CLUT, so the DAC output
+                 * ramp applies exactly as it does to the main palette. */
+                uint32_t rgb = s->ovl_ramdac[ov & 3];
+                uint8_t r = s->dac_ramp[0][(rgb >> 16) & 0xff];
+                uint8_t g = s->dac_ramp[1][(rgb >> 8) & 0xff];
+                uint8_t b = s->dac_ramp[2][rgb & 0xff];
+
+                row[x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            } else if (s->scanout332 && s->scanout332[y * SGI_GR2_SCREEN_W + x]) {
                 row[x] = sgi_gr2_re3_332(idx);
             } else {
                 /* The CLUT byte is pre-gamma: run each channel through the
@@ -2597,6 +2670,11 @@ static void sgi_gr2_realize(DeviceState *dev, Error **errp)
                             (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
         s->scanout332 = g_new0(uint8_t,
                                (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
+        /* Overlay plane, zero-initialised: 0 everywhere means "transparent", so
+         * the main plane shows and the greeter/desktop are unchanged until a
+         * menu (or any other mode-3 draw) lands in it. */
+        s->overlay = g_new0(uint8_t,
+                            (size_t)SGI_GR2_SCREEN_W * SGI_GR2_SCREEN_H);
         /* GE7 Z-buffer.  Allocated up front and cleared to "far" (0x7f7f7f7f
          * ~ +3.4e38) so the first frame draws. */
         s->ge_zbuf = g_new(float,
