@@ -847,6 +847,122 @@ static int sgi_crime_re_emit(SGICRIMEREState *s, int wx, int wy,
     return status;
 }
 
+/* ------------------------------------------------------------------ */
+/* Texture look-up                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * @@SEMANTICS@@ — CRIME texture texel look-up.  Spec §7.3.7.6 "Texel
+ * Look-up" and §7.3.7.7 "Filtering" are TBD in CRIME 1.5, so the storage
+ * map here was measured against the r4 golden; the texel tile map is
+ * exactly:
+ *
+ *   i = (u>>5)*2048 + (v>>6)*8192 + ((v>>2)&3)*512 + ((v>>4)&3)*128
+ *     + ((u&31)>>1)*8 + (v&3)*2 + (u&1)
+ *
+ * where i is a 32-bit texel WORD index.  tile = i>>14 selects the n-th
+ * valid 64 KB TLB.tex tile in descriptor order (bit 15 = valid, bits
+ * 14:0 = phys>>16), and the word sits at base + (i & 0x3fff)*4.  Each
+ * word is big-endian [R,G,B,A].
+ *
+ * This is level 0 of the texture; the O2 GL window magnifies the 64x64
+ * flowers2 texture (LOD 0), so mip-level selection does not arise here.
+ * Measured exact (tmp/o2-qemu-emulation/2026-09-23-crime-texcoords/
+ * REPORT.md §1a): the per-fragment coordinates below land on 0/31/63 at
+ * the quad corners and reconstruct a perfect 64x64 flower.
+ */
+static bool sgi_crime_re_tex_lookup(SGICRIMEREState *s, int u, int v,
+                                    uint32_t *out)
+{
+    uint32_t i;
+    int tile, cnt = 0, tn;
+    uint8_t b[4];
+
+    if (u < 0 || v < 0) {
+        return false;
+    }
+    i = (uint32_t)((u >> 5) * 2048) + (uint32_t)((v >> 6) * 8192)
+      + (uint32_t)(((v >> 2) & 3) * 512) + (uint32_t)(((v >> 4) & 3) * 128)
+      + (uint32_t)(((u & 31) >> 1) * 8) + (uint32_t)((v & 3) * 2)
+      + (uint32_t)(u & 1);
+
+    tile = (int)(i >> 14);
+    for (tn = 0; tn < CRM_TLB_TEX_ENTRIES * 4; tn++) {
+        uint16_t d = sgi_crime_re_tile_desc(s, 3, tn);
+        if (!(d & 0x8000)) {
+            continue;
+        }
+        if (cnt == tile) {
+            hwaddr phys = ((hwaddr)(d & 0x7fff) << 16)
+                        + (hwaddr)((i & 0x3fff) * 4);
+            address_space_rw(&address_space_memory, phys,
+                             MEMTXATTRS_UNSPECIFIED, b, 4, false);
+            *out = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16)
+                 | ((uint32_t)b[2] << 8) | b[3];
+            return true;
+        }
+        cnt++;
+    }
+    return false;
+}
+
+/*
+ * Evaluate the homogeneous texture-coordinate planes at pixel (px,py).
+ * SQs/TQs are 36.12 and Qs 18.12 (spec Table 7-3); like the depth and
+ * shade planes they are anchored at the FLOORED reference vertex:
+ * __glCrmFillTriangle forms SQs/TQs/Qs at (floor(ref) - ref) offsets (the
+ * same f20/f22 it uses for z0 and the shade planes).
+ */
+static inline void crim_tex_plane(SGICRIMEREState *s, int px, int py,
+                                  int refx, int refy,
+                                  int64_t *sq, int64_t *tq, int64_t *q)
+{
+    *sq = s->tex_sq0 + s->tex_dsqdx * (px - refx)
+                    + s->tex_dsqdy * (py - refy);
+    *tq = s->tex_tq0 + s->tex_dtqdx * (px - refx)
+                    + s->tex_dtqdy * (py - refy);
+    *q  = (int64_t)s->tex_q0 + (int64_t)s->tex_dqdx * (px - refx)
+                             + (int64_t)s->tex_dqdy * (py - refy);
+}
+
+/*
+ * Per-fragment texel of a textured GL fragment.  s = SQs/Qs, t = TQs/Qs,
+ * and the texture coordinate is (s - 2^14)/2^8 (the +4096 rounding the
+ * writer applies to each initial value, §7.3.7.1).  Clamp to the texture
+ * width/height encoded in Texture.format bits [39:36]/[35:32].
+ */
+static bool sgi_crime_re_tex_sample(SGICRIMEREState *s, int px, int py,
+                                    int refx, int refy, uint32_t *out)
+{
+    int64_t sq, tq, q;
+    int uw = 1 << (int)((s->tex_format >> 36) & 0xf);
+    int vh = 1 << (int)((s->tex_format >> 32) & 0xf);
+    int u, v;
+
+    if (uw <= 0 || vh <= 0) {
+        return false;
+    }
+    crim_tex_plane(s, px, py, refx, refy, &sq, &tq, &q);
+    if (q == 0) {
+        return false;
+    }
+    u = (int)(((sq / q) - 16384) / 256);
+    v = (int)(((tq / q) - 16384) / 256);
+    if (u < 0) {
+        u = 0;
+    }
+    if (u >= uw) {
+        u = uw - 1;
+    }
+    if (v < 0) {
+        v = 0;
+    }
+    if (v >= vh) {
+        v = vh - 1;
+    }
+    return sgi_crime_re_tex_lookup(s, u, v, out);
+}
+
 /*
  * TRI: intersection of three half-planes (spec §7.3.6). Edge functions
  * Ei(x,y) = Ai*x + Bi*y + Ci with Ai = dy, Bi = -dx (§7.3.5.2 EQ 2-4);
@@ -1019,6 +1135,18 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                           | ((uint32_t)crim_shade_clamp(g) << 16)
                           | ((uint32_t)crim_shade_clamp(b) << 8)
                           | (uint32_t)crim_shade_clamp(a);
+                }
+                if (s->drawmode & DM_ENTEXTURE) {
+                    /*
+                     * Textured fragment: the texel replaces the shaded
+                     * colour.  Same floored reference vertex as the depth
+                     * and shade planes.
+                     */
+                    uint32_t tex;
+                    if (sgi_crime_re_tex_sample(s, px, py, refx, refy,
+                                                &tex)) {
+                        color = tex;
+                    }
                 }
                 int64_t z25 = 0;
                 if (depth_enable) {
