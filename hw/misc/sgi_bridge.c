@@ -548,6 +548,19 @@ static void sgi_bridge_ds_line_write(SGIDS *ds, uint64_t val)
  */
 static uint64_t ioc3_dma_addr(uint64_t a)
 {
+    /*
+     * IP30: the ef driver programs the IOC3 rings and descriptor buffers with
+     * the result of pciio_dmatrans_addr(), a 64-bit PCI DMA address whose high
+     * word carries the PCI64 attributes (sys/PCI/bridge.h: PCI64_ATTR_* occupy
+     * bits 48..63 -- BAR is 0x0100..., TARG 0xf000...).  Measured: the rx/tx
+     * ring bases read back as 0x81000000_206fc000, i.e. attribute word
+     * 0x81000000 above the IP30 physical 0x206fc000.  Strip the attributes so
+     * the DMA lands in RAM; without this every received frame is refused at
+     * the ring descriptor (refused:DESCREAD) and the network never answers.
+     */
+    if (a >> 32) {
+        return a & 0x0000ffffffffffffULL;
+    }
     if ((a & 0xf0000000ULL) == 0xa0000000ULL) {
         return a & 0x0fffffffULL;
     }
