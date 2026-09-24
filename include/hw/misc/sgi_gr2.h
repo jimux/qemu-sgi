@@ -136,6 +136,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_MAX_LIGHTS  3      /* light slots the shade sums       */
 #define SGI_GR2_GE7_LPOS        0x401fc /* token 127, light position XYZ   */
 #define SGI_GR2_GE7_CULL_FACE   0x40070 /* token 28 = __glExpEnableCullFace/  */
+#define SGI_GR2_GE7_CULL_FACE_CW 0x4006c /* token 27 = the CW half of the pair */
                                          /* PassCullFace in the guest's own    */
                                          /* libGLcore (IP22GR2NG1), not a light */
 #define SGI_GR2_GE7_SPEC_LUT    0x401d0 /* token 116: the specular table the   */
@@ -551,6 +552,8 @@ struct SGIGr2State {
     bool ge_light_pend;            /* token-128 pair: index is the next word */
     unsigned ge_lpos_n;            /* words collected for the current light   */
     bool ge_dither;                /* ordered dither before the 3-3-2 pack   */
+    bool ge_cull_cw;               /* token 27: front face is CW (cull CCW)  */
+    bool ge_cull_ccw;              /* token 28: front face is CCW (cull CW)  */
     float ge_spec_lut[128];        /* token 116: the guest's specular table  */
     int ge_spec_lut_n;             /* words collected into it                 */
     hwaddr ge_mat_tok;             /* last material token (run boundary)     */

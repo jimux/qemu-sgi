@@ -1341,6 +1341,17 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         if (area == 0) {
             continue;
         }
+        /* Back-face culling (tokens 27/28).  This edge-function area is in
+         * window space with y downward, so a GL front face (CCW in the y-up
+         * window) comes out negative and a back face positive; keep whichever
+         * winding the front-face polarity says is the front one. */
+        if (s->ge_cull_ccw || s->ge_cull_cw) {
+            bool front = s->ge_cull_ccw ? (area < 0) : (area > 0);
+
+            if (!front) {
+                continue;
+            }
+        }
         if (area < 0) {
             /* Normalise winding so all three edge functions are non-negative
              * inside the triangle.  Swap the B and C vertices and everything
@@ -1701,12 +1712,19 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         s->ge_spec_lut[s->ge_spec_lut_n++] = sgi_gr2_u2f(v);
         break;
     case SGI_GR2_GE7_CULL_FACE:
-        /* Token 28 is __glExpEnableCullFace / __glExpPassCullFace in the
-         * guest's own libGLcore.so (IP22GR2NG1), NOT a light bind: it is a
-         * cull-face on/off flag, which is why its values are only 0/1.  Phase 3
-         * keyed the light slots on it by mistake.  Do not model it here. */
+        /* Tokens 27 and 28 are a PAIR, both written by the guest's own
+         * libGLcore.so (IP22GR2NG1): __glExpPassCullFace writes 27=1,28=0 for
+         * front-face GL_CW (1028), 27=0,28=1 for GL_CCW (1029), and both=1 for
+         * the 1032 mode; __glExpEnableCullFace writes both to 0 when the
+         * context's cull flag is clear.  So culling is on iff either is set,
+         * and which winding to keep is the polarity.  Phase 3 once keyed the
+         * light slots on token 28 by mistake. */
+        s->ge_cull_ccw = (v != 0);
         s->ge_mat_n = 0;
         s->ge_lpos_n = 0;
+        break;
+    case SGI_GR2_GE7_CULL_FACE_CW:
+        s->ge_cull_cw = (v != 0);
         break;
     case SGI_GR2_GE7_SPOTLIGHT:
         /* Token 128 is __glExpUpdateLightingState / __glExpValidateLighting.
