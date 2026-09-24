@@ -18,6 +18,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/misc/sgi_heart.h"
+#include "exec/cpu-common.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
@@ -469,7 +470,13 @@ static uint64_t sgi_heart_read(void *opaque, hwaddr offset, unsigned size)
         val = s->trigger;
         break;
     case HEART_PRID:
-        val = s->prid;
+        /*
+         * Per-CPU "who am I" (cpuid()): the PROM's SMP bring-up reads this to
+         * pick the bootmaster and route every other CPU to its slave path.
+         * A fixed value makes every CPU claim id 0 (all bootmasters), which
+         * stalls the bring-up with no output.  Return the requesting CPU.
+         */
+        val = current_cpu ? current_cpu->cpu_index : s->prid;
         break;
     case HEART_SYNC:
         val = s->sync;
@@ -674,14 +681,18 @@ static const MemoryRegionOps sgi_heart_ops = {
     },
 };
 
-static void sgi_heart_mlan_init(SGIDS2502BUS *bus)
+static void sgi_heart_mlan_init(SGIDS2502BUS *bus, int num_cpus)
 {
     static const uint8_t fru_rom[1][6] = {
         {0xc0, 0x01, 0x02, 0x03, 0x04, 0x05}, /* CPU module */
     };
-    /* pon_nic.c requires the CPU module NIC name to contain "PM10"/"PM20";
-     * PM10 needs h_status PROC_ACTIVE == 0x1 (a single active CPU). */
-    static const char *fru_name[1] = {"PM10"};
+    /*
+     * pon_nic.c requires the CPU module NIC name to match the active CPU
+     * count: "PM10" needs h_status PROC_ACTIVE == 0x1 (one CPU), "PM20"
+     * needs 0x3 (two CPUs).  h_status already advertises one PROC_ACTIVE bit
+     * per present CPU, so the name must follow num_cpus.
+     */
+    const char *fru_name[1] = {num_cpus >= 2 ? "PM20" : "PM10"};
     int i;
 
     sgi_ds2502_bus_init(bus, "heart");
@@ -722,7 +733,7 @@ static void sgi_heart_reset(DeviceState *dev)
     s->piur_acc_err = 0;
     s->mlan_clk_div = 0;
     s->mlan_ctl = 0;
-    sgi_heart_mlan_init(&s->mlan);
+    sgi_heart_mlan_init(&s->mlan, s->num_cpus);
 
     memset(s->imr, 0, sizeof(s->imr));
     s->set_isr = 0;

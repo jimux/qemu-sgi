@@ -252,6 +252,7 @@ static void sgi_octane_init(MachineState *machine)
     DeviceState *heart_dev;
     DeviceState *bridge_dev;
     Clock *cpuclk;
+    MIPSCPU *octane_cpus[2];
 
     if (machine->ram_size > OCTANE_RAM_MAX) {
         error_report("RAM size more than 128GB is not supported");
@@ -269,17 +270,29 @@ static void sgi_octane_init(MachineState *machine)
     cpuclk = clock_new(OBJECT(machine), "cpu-refclk");
     clock_set_hz(cpuclk, 300000000);
 
-    machine->smp.cpus = 1;
-    MIPSCPU *cpu = mips_cpu_create_with_clock(MIPS_CPU_TYPE_NAME("R10000"),
-                                              cpuclk, true);
-    cpu_mips_irq_init_cpu(cpu);
-    cpu_mips_clock_init(cpu);
-    qemu_register_reset(main_cpu_reset, cpu);
+    {
+        int ncpus = machine->smp.cpus;
+
+        if (ncpus > 2) {
+            ncpus = 2;
+        }
+        machine->smp.cpus = ncpus;
+        for (int i = 0; i < ncpus; i++) {
+            MIPSCPU *c = mips_cpu_create_with_clock(
+                MIPS_CPU_TYPE_NAME("R10000"), cpuclk, true);
+
+            cpu_mips_irq_init_cpu(c);
+            cpu_mips_clock_init(c);
+            qemu_register_reset(main_cpu_reset, c);
+            octane_cpus[i] = c;
+        }
+    }
+    MIPSCPU *cpu = octane_cpus[0];
 
     /* HEART PIU at 0x0FF00000. */
     heart_dev = qdev_new(TYPE_SGI_HEART);
     qdev_prop_set_uint32(heart_dev, "ram-size", machine->ram_size);
-    qdev_prop_set_uint32(heart_dev, "num-cpus", 1);
+    qdev_prop_set_uint32(heart_dev, "num-cpus", machine->smp.cpus);
     object_property_set_link(OBJECT(heart_dev), "mem", OBJECT(machine->ram),
                              &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(heart_dev), &error_fatal);
@@ -613,7 +626,7 @@ static void sgi_octane_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_id = "sgi.ram";
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("R10000");
     mc->default_cpus = 1;
-    mc->max_cpus = 1;
+    mc->max_cpus = 2;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
 }
