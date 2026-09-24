@@ -98,6 +98,7 @@ static inline void sgi_gr2_put(SGIGr2State *s, int x, int y, uint8_t idx)
     if (s->scanout332) {
         s->scanout332[o] = 0;
     }
+    s->fb_dirty = true;
 }
 
 static inline void sgi_gr2_put332(SGIGr2State *s, int x, int y, uint8_t idx)
@@ -108,6 +109,7 @@ static inline void sgi_gr2_put332(SGIGr2State *s, int x, int y, uint8_t idx)
     if (s->scanout332) {
         s->scanout332[o] = 1;
     }
+    s->fb_dirty = true;
 }
 
 /* Overlay-plane pixel.  Values are 2-bit; 0 is the transparent index, so a
@@ -2709,6 +2711,8 @@ static void sgi_gr2_update_display(void *opaque)
         }
     }
     dpy_gfx_update(s->con, 0, 0, SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+    /* Everything written so far is now on the display surface. */
+    s->fb_dirty = false;
 }
 
 static const GraphicHwOps sgi_gr2_gfx_ops = {
@@ -2736,6 +2740,12 @@ static void sgi_gr2_retrace_tick(void *opaque)
         s->retrace_active = true;
         qemu_irq_raise(s->irq);
         timer_mod(s->retrace_lower_timer, now + SGI_GR2_RETRACE_PULSE_NS);
+    }
+    /* Present a dirty framebuffer once per retrace, like a VBLANK: the GE7
+     * raster path (put332) never presented, so a GL-only client's output waited
+     * for a stray 2D/VC1 op to refresh before it was ever shown. */
+    if (s->fb_dirty) {
+        sgi_gr2_update_display(s);
     }
     timer_mod(s->retrace_timer,
               now + NANOSECONDS_PER_SECOND / SGI_GR2_RETRACE_HZ);

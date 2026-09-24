@@ -330,6 +330,11 @@ struct SGIGr2State {
      * index.  At scanout a flagged pixel is expanded 3-3-2, an unflagged one
      * goes through ramdac[], so both visual modes coexist on the same screen. */
     uint8_t *scanout332;
+    /* Set by every framebuffer write; the 60 Hz retrace presents and clears it.
+     * The GE7 raster path (put332) never called the display update itself, so a
+     * GL-only client's output was written but only shown when some unrelated
+     * 2D/VC1 op happened to refresh.  Presenting on retrace fixes that. */
+    bool fb_dirty;
     /* Overlay plane (2 bits/pixel; one byte per pixel here).  0 is TRANSPARENT
      * — the main plane shows through — and 1..3 index the 4-entry overlay
      * colormap.  4Dwm menus are depth-2 override-redirect windows: the DDX
