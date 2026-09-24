@@ -935,6 +935,96 @@ static void sgi_bridge_eth_deliver(SGIBRIDGEState *s, const uint8_t *buf,
     s->eth_regs[IOC3_EISR] |= IOC3_EISR_RXTHRESHINT;
 }
 
+/*
+ * IOC3 TX checksum offload.
+ *
+ * The ef stack advertises IFF_CKSUM (ifconfig shows CKSUM on ef0), so it
+ * leaves the IPv4 header checksum and the TCP/UDP checksum for the hardware to
+ * complete.  This model does no offload, so it must fill them in here or every
+ * TCP/UDP segment is dropped by the peer.  ICMP is NOT offloaded, which is why
+ * `ping` worked against the slirp gateway while TCP connections timed out.
+ *
+ * Compute both from scratch: that is idempotent, so a packet whose checksums
+ * were already computed in software is unchanged.
+ */
+static uint32_t ioc3_csum_add(const uint8_t *p, int len, uint32_t sum)
+{
+    int i;
+
+    for (i = 0; i + 1 < len; i += 2) {
+        sum += (p[i] << 8) | p[i + 1];
+    }
+    if (i < len) {
+        sum += p[i] << 8;
+    }
+    return sum;
+}
+
+static uint16_t ioc3_csum_fold(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return (uint16_t)~sum;
+}
+
+static void ioc3_eth_tx_checksums(uint8_t *f, size_t n)
+{
+    uint8_t *ip;
+    int ihl, l4len;
+    uint16_t eth, c;
+    uint8_t proto;
+    uint32_t sum;
+
+    if (n < 34) {
+        return;
+    }
+    eth = (f[12] << 8) | f[13];
+    if (eth != 0x0800) {              /* only IPv4 */
+        return;
+    }
+    ip = f + 14;
+    if ((ip[0] >> 4) != 4) {
+        return;
+    }
+    ihl = (ip[0] & 0x0f) * 4;
+    if (ihl < 20 || (size_t)(14 + ihl) > n) {
+        return;
+    }
+
+    ip[10] = 0;
+    ip[11] = 0;
+    c = ioc3_csum_fold(ioc3_csum_add(ip, ihl, 0));
+    ip[10] = c >> 8;
+    ip[11] = c & 0xff;
+
+    proto = ip[9];
+    if (proto != 6 && proto != 17) {  /* TCP or UDP only */
+        return;
+    }
+    l4len = ((ip[2] << 8) | ip[3]) - ihl;
+    if (l4len <= 0 || (size_t)(14 + ihl + l4len) > n) {
+        return;
+    }
+
+    {
+        uint8_t *l4 = ip + ihl;
+
+        sum = ioc3_csum_add(ip + 12, 8, 0);     /* src + dst */
+        sum += proto;
+        sum += l4len;
+        l4[16] = 0;
+        l4[17] = 0;
+        sum = ioc3_csum_add(l4, l4len, sum);
+        c = ioc3_csum_fold(sum);
+        if (proto == 17 && c == 0) {
+            c = 0xffff;                          /* UDP: 0 means "no cksum" */
+        }
+        l4[16] = c >> 8;
+        l4[17] = c & 0xff;
+    }
+}
+
 static void sgi_bridge_eth_tx_drain(SGIBRIDGEState *s)
 {
     uint32_t etpir = s->eth_regs[IOC3_ETPIR] & IOC3_ETPIR_TXPRODUCE_MASK;
@@ -980,6 +1070,9 @@ static void sgi_bridge_eth_tx_drain(SGIBRIDGEState *s)
             flen += b2cnt;
         }
 
+        if (flen > 0) {
+            ioc3_eth_tx_checksums(frame, flen);
+        }
         if (emcr & IOC3_EMCR_LOOPBACK) {
             sgi_bridge_eth_deliver(s, frame, flen);
         } else if (s->nic && flen > 0) {
