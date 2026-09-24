@@ -547,6 +547,7 @@ sgi_gr2_ge7_ink(int nverts, int pixels, int r, int g, int b) "GR2 ge7 ink nverts
 sgi_gr2_ge7_inkstate(int normal_r, int normal_g, int normal_b, int diff_r, int diff_g, int diff_b, int puc, int re3) "GR2 ge7 inkstate normal=%d,%d,%d diffuse=%d,%d,%d puc=%d re3=%d"
 sgi_gr2_ge7_poly(int nverts, int pixels, int r, int g, int b) "GR2 ge7 poly nverts=%d pixels=%d rgb=%d,%d,%d"
 sgi_gr2_ge7_ztest(int nverts, int pixels, int zrej, int zmin_m, int zmax_m) "GR2 ge7 ztest nverts=%d pixels=%d zrej=%d zmin_m=%d zmax_m=%d"
+sgi_gr2_ge7_discard(int poly_in, int behind, int culled, int zrej, int empty, int written) "GR2 ge7 discard in=%d behind=%d cull=%d zrej=%d empty=%d px=%d"
 sgi_gr2_fiforead(uint64_t off, uint64_t val, uint32_t pc) "GR2 fiforead off=0x%05"PRIx64" val=0x%08"PRIx64" pc=%08x"
 sgi_gr2_regread(uint64_t off, uint64_t val, uint32_t pc) "GR2 regread off=0x%05"PRIx64" val=0x%08"PRIx64" pc=%08x"
 sgi_gr2_hqread(uint64_t off, uint64_t val, uint32_t pc) "GR2 hqread off=0x%05"PRIx64" val=0x%08"PRIx64" pc=%08x"

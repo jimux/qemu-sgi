@@ -1396,6 +1396,9 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     unsigned i;
     unsigned poly_px = 0; /* pixels this polygon paints (trace diagnostic) */
     unsigned poly_zrej = 0; /* pixels the Z test threw away (item 4) */
+    unsigned culled = 0;   /* triangles dropped by the back-face test */
+    unsigned empty = 0;    /* triangles that covered no pixel */
+    unsigned px0;
     float zmin = 1e30f, zmax = -1e30f; /* NDC z range this call wrote */
     const float shininess = 8.0f;
 
@@ -1432,7 +1435,11 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         int c;
 
         if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz)) {
-            return; /* part of the polygon is behind the eye: skip it whole */
+            /* part of the polygon is behind the eye: skip it whole */
+            trace_sgi_gr2_ge7_discard((int)s->ge_poly_n, 1, (int)culled,
+                                      (int)poly_zrej, (int)empty,
+                                      (int)poly_px);
+            return;
         }
         px = vx + (cx + 1.0f) * 0.5f * vw;
         py = vy + (1.0f - (cy + 1.0f) * 0.5f) * vh; /* viewport y from the top */
@@ -1464,6 +1471,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         float w0, w1, w2, inv;
         int minx, maxx, miny, maxy, x, y;
 
+        px0 = poly_px;
+
         /* Fixed-point edge functions with four sub-pixel bits.  Coordinates
          * become multiples of 1/16 and pixel centres sit at (x*16+8).  Done in
          * integers so a shared edge is bit-identical for the two triangles that
@@ -1487,6 +1496,7 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
             bool front = s->ge_cull_ccw ? (area < 0) : (area > 0);
 
             if (!front) {
+                culled++;
                 continue;
             }
         }
@@ -1580,8 +1590,13 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                 }
             }
         }
+        if (poly_px == px0) {
+            empty++;
+        }
         s->ge_polys++;
     }
+    trace_sgi_gr2_ge7_discard((int)s->ge_poly_n, 0, (int)culled,
+                              (int)poly_zrej, (int)empty, (int)poly_px);
     trace_sgi_gr2_ge7_poly(s->ge_poly_n, (int)poly_px,
                            (int)(vcol[0][0] * 255.0f + 0.5f),
                            (int)(vcol[0][1] * 255.0f + 0.5f),
