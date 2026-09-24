@@ -1347,6 +1347,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     int vx, vy, vw, vh;
     unsigned i;
     unsigned poly_px = 0; /* pixels this polygon paints (trace diagnostic) */
+    unsigned poly_zrej = 0; /* pixels the Z test threw away (item 4) */
+    float zmin = 1e30f, zmax = -1e30f; /* NDC z range this call wrote */
     const float shininess = 8.0f;
 
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
@@ -1523,6 +1525,10 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                     s->ge_zbuf[o] = z;
                     sgi_gr2_put332(s, x, y, sgi_gr2_ge7_332(s, col, x, y));
                     poly_px++;
+                    zmin = MIN(zmin, z);
+                    zmax = MAX(zmax, z);
+                } else {
+                    poly_zrej++;
                 }
             }
         }
@@ -1532,6 +1538,9 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                            (int)(vcol[0][0] * 255.0f + 0.5f),
                            (int)(vcol[0][1] * 255.0f + 0.5f),
                            (int)(vcol[0][2] * 255.0f + 0.5f));
+    trace_sgi_gr2_ge7_ztest(s->ge_poly_n, (int)poly_px, (int)poly_zrej,
+                            poly_px ? (int)(zmin * 10000.0f) : 0,
+                            poly_px ? (int)(zmax * 10000.0f) : 0);
     s->ge_3d_seen = true;
 }
 
