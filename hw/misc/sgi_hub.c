@@ -1520,6 +1520,14 @@ static bool sgi_hub_bte_offset(hwaddr off, int *n, hwaddr *reg) {
   return false;
 }
 
+/* Truthy env gate: an exported-but-empty variable (as run_bte.sh does with
+ * SGI_HUB_BTE_FAIL= and SGI_HUB_BTEDBG=0) must read as OFF, not as set. */
+static bool sgi_hub_env_on(const char *name) {
+  const char *v = getenv(name);
+
+  return v && *v && v[0] != '0';
+}
+
 static void sgi_hub_bte_run(SGIHubState *s, int n) {
   uint64_t src = s->bte_src[n];
   uint64_t dest = s->bte_dest[n];
@@ -1531,7 +1539,7 @@ static void sgi_hub_bte_run(SGIHubState *s, int n) {
    * copying, so the kernel's bte_pbcopy() falls back to its CPU bcopy.  Lets a
    * run A/B whether a lost migration copy is the BTE or something else.
    */
-  if (getenv("SGI_HUB_BTE_FAIL")) {
+  if (sgi_hub_env_on("SGI_HUB_BTE_FAIL")) {
     status = IBLS_ERROR;
     goto complete;
   }
@@ -1557,8 +1565,12 @@ complete:
     address_space_write(&address_space_memory, s->bte_notify[n],
                         MEMTXATTRS_UNSPECIFIED, &be, sizeof(be));
   }
+  if (sgi_hub_env_on("SGI_HUB_BTEDBG")) {
+    fprintf(stderr, "sgi-hub: BTE%d COMPLETE status=0x%04" PRIx64
+            " notify=0x%016" PRIx64 "\n", n, status, s->bte_notify[n]);
+  }
 
-  if (getenv("SGI_HUB_BTEDBG")) {
+  if (sgi_hub_env_on("SGI_HUB_BTEDBG")) {
     /* fprintf(stderr): keep BTE copies in the same ordered stream as the
      * IP27_WW plugin and IP27_TLB printer so a store/dest/remap can be
      * correlated per ASID. */
@@ -1575,6 +1587,10 @@ static uint64_t sgi_hub_ii_read(SGIHubState *s, hwaddr off) {
   if (sgi_hub_bte_offset(off, &n, &reg)) {
     switch (reg) {
     case 0x00:
+      if (sgi_hub_env_on("SGI_HUB_BTEDBG")) {
+        fprintf(stderr, "sgi-hub: BTE%d STAT-READ -> 0x%04" PRIx64 "\n",
+                n, s->bte_stat[n]);
+      }
       return s->bte_stat[n];
     case 0x08:
       return s->bte_src[n];
@@ -1626,6 +1642,11 @@ static void sgi_hub_ii_write(SGIHubState *s, hwaddr off, uint64_t val) {
     switch (reg) {
     case 0x00: /* IBLS: length/status (IBLS_BUSY | len>>7) */
       s->bte_stat[n] = val & (IBLS_BUSY | IBLS_ERROR | IBLS_LENGTH_MASK);
+      if (sgi_hub_env_on("SGI_HUB_BTEDBG")) {
+        fprintf(stderr, "sgi-hub: BTE%d ARM stat=0x%04" PRIx64 " (len=%" PRIu64 ")\n",
+                n, s->bte_stat[n],
+                (uint64_t)((s->bte_stat[n] & IBLS_LENGTH_MASK) << BTE_LEN_SHIFT));
+      }
       break;
     case 0x08:
       s->bte_src[n] = val;
@@ -1636,6 +1657,12 @@ static void sgi_hub_ii_write(SGIHubState *s, hwaddr off, uint64_t val) {
     case 0x18: /* IBCT: start the transfer if armed */
       if (s->bte_stat[n] & IBLS_BUSY) {
         sgi_hub_bte_run(s, n);
+      } else if (sgi_hub_env_on("SGI_HUB_BTEDBG")) {
+        /* A CTRL write with no armed length is a transfer the kernel issued
+         * that this model would otherwise silently drop. */
+        fprintf(stderr, "sgi-hub: BTE%d CTRL-DROPPED stat=0x%04" PRIx64
+                " src=0x%016" PRIx64 " dest=0x%016" PRIx64 "\n",
+                n, s->bte_stat[n], s->bte_src[n], s->bte_dest[n]);
       }
       break;
     case 0x20:
