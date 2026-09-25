@@ -1181,8 +1181,10 @@ static void sgi_hpc3_virtuix_update_irq(SGIHPC3VirtuixState *s)
      */
     s->int3_local0_stat &= (INT3_LOCAL0_FIFO | INT3_LOCAL0_SCSI0 |
                              INT3_LOCAL0_SCSI1 | INT3_LOCAL0_ETHERNET |
-                             INT3_LOCAL0_MC_DMA | INT3_LOCAL0_MAPPABLE0);
-    s->int3_local1_stat &= (INT3_LOCAL1_LCL0 | INT3_LOCAL1_HPC_DMA |
+                             INT3_LOCAL0_MC_DMA | INT3_LOCAL0_PARALLEL |
+                             INT3_LOCAL0_GRAPHICS | INT3_LOCAL0_MAPPABLE0);
+    s->int3_local1_stat &= (INT3_LOCAL1_ISDN_A | INT3_LOCAL1_ISDN_B |
+                             INT3_LOCAL1_LCL0 | INT3_LOCAL1_HPC_DMA |
                              INT3_LOCAL1_GIO2);
     int local0_pending = (s->int3_local0_stat & s->int3_local0_mask) ? 1 : 0;
     int local1_pending = (s->int3_local1_stat & s->int3_local1_mask) ? 1 : 0;
@@ -1245,6 +1247,41 @@ static void sgi_hpc3_virtuix_gio_retrace_irq(void *opaque, int n, int level)
         s->int3_local1_stat |= INT3_LOCAL1_GIO2;
     } else {
         s->int3_local1_stat &= ~INT3_LOCAL1_GIO2;
+    }
+
+    sgi_hpc3_virtuix_update_irq(s);
+}
+
+/*
+ * Handle a paravirtual device interrupt (virtuix-only).  Four dedicated INT3
+ * lines so pvchan/pvaudio/pvgpu stop sharing the CP0 software-interrupt bit
+ * (env.irq[1], the CP0_Cause race class).  Each line maps to a spare INT3
+ * source the IRIX kernel already carries a local vector for, so a guest driver
+ * registers through the stock setlclvector():
+ *   n=0 -> Local0 PARALLEL (VECTOR_PLP=5)       pvchan
+ *   n=1 -> Local0 GRAPHICS (VECTOR_GIO1=6)      pvaudio
+ *   n=2 -> Local1 ISDN_A   (VECTOR_ISDN_ISAC=8) pvgpu
+ *   n=3 -> Local1 ISDN_B   (VECTOR_ISDN_HSCX=10) reserved
+ * Delivery inherits HPC3's CPU0-only cpu-irq outputs, same as SCSI/retrace.
+ */
+static void sgi_hpc3_virtuix_pv_irq(void *opaque, int n, int level)
+{
+    SGIHPC3VirtuixState *s = SGI_HPC3_VIRTUIX(opaque);
+
+    if (n <= 1) {
+        uint8_t bit = (n == 0) ? INT3_LOCAL0_PARALLEL : INT3_LOCAL0_GRAPHICS;
+        if (level) {
+            s->int3_local0_stat |= bit;
+        } else {
+            s->int3_local0_stat &= ~bit;
+        }
+    } else {
+        uint8_t bit = (n == 2) ? INT3_LOCAL1_ISDN_A : INT3_LOCAL1_ISDN_B;
+        if (level) {
+            s->int3_local1_stat |= bit;
+        } else {
+            s->int3_local1_stat &= ~bit;
+        }
     }
 
     sgi_hpc3_virtuix_update_irq(s);
@@ -3669,6 +3706,10 @@ static void sgi_hpc3_virtuix_init(Object *obj)
                             "gio-retrace", 1);
     qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_mc_dma_irq,
                             "mc-dma-irq", 1);
+
+    /* Paravirtual device interrupt lines (virtuix): pvchan, pvaudio, pvgpu.
+     * Dedicated INT3 sources, off the CP0 software-interrupt bit (env.irq[1]). */
+    qdev_init_gpio_in_named(DEVICE(s), sgi_hpc3_virtuix_pv_irq, "pv-irq", 4);
 
     /* Initialize PS/2 keyboard and mouse child devices */
     object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_SGI_PS2_KBD_VIRTUIX);

@@ -1903,6 +1903,9 @@ static void sgi_virtuix_init(MachineState *machine) {
         qdev_set_id(glaccel_dev, g_strdup("glaccel"), &error_fatal);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(glaccel_dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(glaccel_dev), 0, 0x1fa20000ULL);
+        /* PV IRQ line 2: HPC3 INT3 Local1 ISDN_A -> VECTOR_ISDN_ISAC (8). */
+        sysbus_connect_irq(SYS_BUS_DEVICE(glaccel_dev), 0,
+                           qdev_get_gpio_in_named(hpc3_dev, "pv-irq", 2));
     }
 
     newport_dev = qdev_new(TYPE_SGI_NEWPORT_VIRTUIX);
@@ -1929,22 +1932,25 @@ static void sgi_virtuix_init(MachineState *machine) {
       DeviceState *pvchan_dev = qdev_new(TYPE_SGI_PVCHAN);
       sysbus_realize_and_unref(SYS_BUS_DEVICE(pvchan_dev), &error_fatal);
       sysbus_mmio_map(SYS_BUS_DEVICE(pvchan_dev), 0, SGI_VIRTUIX_PVCHAN_BASE);
-      /* pvchan IRQ → CPU IP1 (unused on virtuix; PROM and IRIX route IP1 only
-       * for GIO slot 2, which virtuix doesn't populate). */
-      sysbus_connect_irq(SYS_BUS_DEVICE(pvchan_dev), 0, cpu->env.irq[1]);
+      /* pvchan IRQ -> HPC3 INT3 pv line 0 (Local0 PARALLEL -> VECTOR_PLP=5):
+       * a real maskable local-interrupt line, not the CP0 software-int bit. */
+      sysbus_connect_irq(SYS_BUS_DEVICE(pvchan_dev), 0,
+                         qdev_get_gpio_in_named(hpc3_dev, "pv-irq", 0));
   }
 
   /* Paravirtual audio: ring-buffer PCM device drained to the host -audiodev.
    * Always instantiated so the guest pvaudio driver can attach; produces sound
    * only when `-global sgi-pvaudio.audiodev=aud0` explicitly wires a backend
    * (no-audiodev boots stay silent — see sgi_pvaudio_realize).  IRQ kept masked
-   * driver-side (userland throttles via BUF_TAIL polling); wire to IP1 like
-   * pvchan for hygiene. */
+   * driver-side (userland throttles via BUF_TAIL polling); wire to its own
+   * HPC3 INT3 pv line for hygiene. */
   {
       DeviceState *pvaudio_dev = qdev_new(TYPE_SGI_PVAUDIO);
       sysbus_realize_and_unref(SYS_BUS_DEVICE(pvaudio_dev), &error_fatal);
       sysbus_mmio_map(SYS_BUS_DEVICE(pvaudio_dev), 0, SGI_VIRTUIX_PVAUDIO_BASE);
-      sysbus_connect_irq(SYS_BUS_DEVICE(pvaudio_dev), 0, cpu->env.irq[1]);
+      /* pv line 1: INT3 Local0 GRAPHICS -> VECTOR_GIO1 (6). */
+      sysbus_connect_irq(SYS_BUS_DEVICE(pvaudio_dev), 0,
+                         qdev_get_gpio_in_named(hpc3_dev, "pv-irq", 1));
   }
 
   /*
