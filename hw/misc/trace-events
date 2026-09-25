@@ -551,7 +551,6 @@ sgi_gr2_ge7_tri(int degen, int clipbox, int bboxempty, int minx, int miny, int m
 sgi_gr2_ge7_lpos(int x, int y, int z, int mvvalid) "GR2 ge7 lpos %d,%d,%d mvvalid=%d"
 sgi_gr2_ge7_nrm(int o0, int o1, int o2, int e0, int e1, int e2) "GR2 ge7 nrm obj=%d,%d,%d eye=%d,%d,%d"
 sgi_gr2_ge7_cam(int czmin, int czmax, int nzmin, int nzmax, int vx, int vy, int vw, int vh) "GR2 ge7 cam eyeZ=%d,%d ndcZ=%d,%d vp=%d,%d %dx%d"
-sgi_gr2_ge7_drawmat(int nverts, int mvt0, int mvt1, int mvt2, int p0, int p5, int nvsum, int single) "GR2 ge7 drawmat nverts=%d mvt=%d,%d,%d p0=%d p5=%d nvsum=%d single=%d"
 sgi_gr2_ge7_discard(int poly_in, int behind, int culled, int zrej, int empty, int written) "GR2 ge7 discard in=%d behind=%d cull=%d zrej=%d empty=%d px=%d"
 sgi_gr2_xmap_ctl(uint32_t off, uint32_t val) "GR2 xmap ctl off=0x%05x val=0x%08x"
 sgi_gr2_board_write(uint32_t off, uint32_t val, uint32_t pc) "GR2 board write off=0x%05x val=0x%08x pc=0x%08x"

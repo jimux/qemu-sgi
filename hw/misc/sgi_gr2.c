@@ -1586,29 +1586,6 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     if (s->ge_poly_n < 3 || !s->scanout || !s->ge_zbuf) {
         return;
     }
-    /* Temporary diagnostic, OFF BY DEFAULT (a trace event emits only when
-     * enabled, e.g. `trace-event sgi_gr2_ge7_drawmat on`): records the
-     * transform in force at the draw plus a signature of the draw's own
-     * vertices, to pin a suspected modelview/projection desync against the
-     * offline gate walk (notes 163/164).  REMOVE before any merge. */
-    {
-        const bool sg = sgi_gr2_ge7_single_active(s);
-        const float *mat = sg ? s->ge_single : s->ge_mv;
-        int nvsum = 0;
-        unsigned k;
-
-        for (k = 0; k + 2 < s->ge_poly_n; k += 3) {
-            nvsum += (int)((s->ge_poly[k][0] + s->ge_poly[k][1] +
-                            s->ge_poly[k][2]) * 1000.0f);
-        }
-        trace_sgi_gr2_ge7_drawmat((int)s->ge_poly_n,
-                                  (int)(mat[12] * 1000.0f),
-                                  (int)(mat[13] * 1000.0f),
-                                  (int)(mat[14] * 1000.0f),
-                                  (int)(s->ge_proj[0] * 1000.0f),
-                                  (int)(s->ge_proj[5] * 1000.0f),
-                                  nvsum, sg ? 1 : 0);
-    }
     sgi_gr2_ge7_draw_rect(s, &vx, &vy, &vw, &vh);
     for (i = 0; i < s->ge_poly_n; i++) {
         float cx, cy, cz, ez;
