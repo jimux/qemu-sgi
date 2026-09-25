@@ -938,19 +938,26 @@ static void sgi_ip27_init(MachineState *machine) {
      * node/brick tag above the local RAM offset (NODE_OFFSET(n) = n << 32 in
      * M-mode).  The IRIX kernel builds its wired PDA physical address from
      * fpage (CAC-tagged); by the time it reaches EntryLo it is e.g.
-     * 0x1c0004a4000 -- tag 0x1c<<32 with local offset 0x4a4000, valid node-0
-     * RAM.  In single-node mode every tag k resolves to node 0.  In two-node
-     * mode tag 1 is the real second node and tags 2..MAX still fall through to
-     * node 0 (the kernel's node-0 aliases such as the 0x1c0 PDA tag).
+     * 0x1c0004a4000 -- tag 0x1c0 with local offset 0x4a4000, valid node-0
+     * RAM.  The node is the low bit of the tag (physical bit 32 = NASID bit 0);
+     * the upper tag bits are kernel/directory attributes.  So a node-1 page
+     * appears both as tag 1 (0x1_0033c000, the loader's staging form) and as
+     * higher odd tags such as 0x141 (0x141_0033c000 -- measured: the two-node
+     * kernel maps init's text page 0 with tag 0x141, and the content sits at
+     * node-1 offset 0x33c000).  In single-node mode every tag k resolves to
+     * node 0; in two-node mode odd tags resolve to node 1 and even tags to
+     * node 0.  Getting this wrong made the kernel read node-0 RAM for a
+     * node-1-tagged mapping -- init then faulted on a corrupt FILE* (0x1018).
      *
      * Reproduce the memory controller's BANK-SLOT layout (bank b at b << 29),
      * not a flat window: a page in the second DIMM carries tag | 0x20000000
      * (MD_BANK_SHFT = 29).
      */
     for (i = 1; i <= IP27_NODE_TAG_MAX; i++) {
-      MemoryRegion *tag_ram = (nnodes == 2 && i == 1) ? ram1 : ram0;
-      const char *name = (nnodes == 2 && i == 1) ? "sgi-ip27.ram.nodetag1"
-                                                 : "sgi-ip27.ram.nodetag";
+      bool real1 = (nnodes == 2 && (i & 1));
+      MemoryRegion *tag_ram = real1 ? ram1 : ram0;
+      const char *name = real1 ? "sgi-ip27.ram.nodetag1"
+                               : "sgi-ip27.ram.nodetag";
 
       ip27_add_ram_banks(system_memory, (uint64_t)i << 32, tag_ram, node_ram,
                          banksz, name);
