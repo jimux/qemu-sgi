@@ -92,12 +92,27 @@
 #define IP27_PROM_BASE 0x1fc00000ULL
 #define IP27_PROM_SIZE (1 * MiB)
 /*
- * Two-node mode gives the PROM a larger RAM region: its pcfg/klconfig
- * structures push the BSS/stack past the 1 MB single-node window (measured
- * stack at ~0x1fdef6b0).  Kept separate so the single-node machine is
- * byte-for-byte unchanged.
+ * Two-node PROM window size.  The mapped IP27 PROM aperture is
+ * [0x1fc00000, base + size); node-0 RAM bank slot 1 begins at
+ * 0x20000000 (MD_BANK_SHFT = 29, see ip27_add_ram_banks), so the window
+ * MUST NOT extend to or past 0x20000000 or it silently shadows the first
+ * bytes of bank 1: a BTE migration copy whose destination falls in that
+ * shadow lands in the PROM region instead of RAM, and the tagged TLB
+ * alias then reads an empty page (the two-node coredump storm).
+ *
+ * The authentic IP27 map (kern/sys/SN/SN0/addrs.h) is a 1 MB image at
+ * 0x1fc00000 (IP27PROM_BASE_MAPPED, IP27PROM_SIZE_MAX = 0x100000) with
+ * the PROM's data/PCFG at physical 0x01a00000/0x01b00000 (node RAM), not
+ * above 0x1fc00000.  This model instead uses the mapped window as the
+ * PROM's code+scratch RAM, and the two-node PROM needs roughly 4 MB of
+ * it (a 1 MB window boots single-node but PANICs the two-node kernel;
+ * [ASSUMPTION] this model simplification should eventually be replaced
+ * by backing the PROM data at its authentic 0x01a00000/0x01b00000
+ * addresses).  4 MB is the largest window that ends exactly at
+ * 0x20000000 and therefore cannot overlap node RAM.  Single-node keeps
+ * its authentic 1 MB window byte-for-byte.
  */
-#define IP27_PROM_SIZE_TWO (8 * MiB)
+#define IP27_PROM_SIZE_TWO (4 * MiB)
 
 /*
  * LBOOT window: the local hub's boot flash (and other directory-bus devices).
@@ -847,10 +862,26 @@ static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
         nnz++;
       }
     }
-    fprintf(stderr, "IP27_CMP vpn=%016" PRIx64 " asid=%04x len=%" PRIx64
-            " diff=%" PRIu64 " first=%" PRIx64 " oldnz=%" PRIu64
-            " newnz=%" PRIu64 " old=%016" PRIx64 " new=%016" PRIx64
-            "\n", page_va, asid, len, diff, first, onz, nnz, old_pa, new_pa);
+    {
+      uint64_t as_old = 0, as_new = 0;
+      MemoryRegionSection ns = memory_region_find(get_system_memory(), new_pa, 1);
+
+      address_space_read(&address_space_memory, old_pa,
+                         MEMTXATTRS_UNSPECIFIED, &as_old, sizeof(as_old));
+      address_space_read(&address_space_memory, new_pa,
+                         MEMTXATTRS_UNSPECIFIED, &as_new, sizeof(as_new));
+      fprintf(stderr, "IP27_NEWMR new=%016" PRIx64 " mr=%s off_in_region=%"
+              PRIx64 " off_in_as=%" PRIx64 "\n", new_pa,
+              ns.mr ? memory_region_name(ns.mr) : "<none>",
+              (uint64_t)ns.offset_within_region,
+              (uint64_t)ns.offset_within_address_space);
+      fprintf(stderr, "IP27_CMP vpn=%016" PRIx64 " asid=%04x len=%" PRIx64
+              " diff=%" PRIu64 " first=%" PRIx64 " oldnz=%" PRIu64
+              " newnz=%" PRIu64 " old=%016" PRIx64 " new=%016" PRIx64
+              " as_old=%016" PRIx64 " as_new=%016" PRIx64 "\n",
+              page_va, asid, len, diff, first, onz, nnz, old_pa, new_pa,
+              as_old, as_new);
+    }
     /*
      * IP27_CMP_SCAN=1 additionally hunts both nodes' RAM for the source page
      * so the destination of a lost copy can be located.  Expensive; opt-in.

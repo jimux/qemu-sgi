@@ -22,6 +22,7 @@
 #include "qemu/main-loop.h"
 #include "system/runstate.h"
 #include "system/address-spaces.h"
+#include "system/memory.h"
 
 static void sgi_hub_reset_bh(void *opaque);
 #include "target/mips/cpu.h"
@@ -1574,9 +1575,24 @@ complete:
     /* fprintf(stderr): keep BTE copies in the same ordered stream as the
      * IP27_WW plugin and IP27_TLB printer so a store/dest/remap can be
      * correlated per ASID. */
+    uint64_t rb_src = 0, rb_dst = 0;
+    MemoryRegionSection ds = memory_region_find(get_system_memory(), dest, 1);
+
+    if (len) {
+      address_space_read(&address_space_memory, src, MEMTXATTRS_UNSPECIFIED,
+                         &rb_src, sizeof(rb_src));
+      address_space_read(&address_space_memory, dest, MEMTXATTRS_UNSPECIFIED,
+                         &rb_dst, sizeof(rb_dst));
+    }
+    fprintf(stderr, "sgi-hub: BTE%d DEST-MR dest=0x%016" PRIx64
+            " mr=%s off_in_region=%" PRIx64 " off_in_as=%" PRIx64 "\n",
+            n, dest, ds.mr ? memory_region_name(ds.mr) : "<none>",
+            (uint64_t)ds.offset_within_region,
+            (uint64_t)ds.offset_within_address_space);
     fprintf(stderr, "sgi-hub: BTE%d copy src=0x%016" PRIx64 " dest=0x%016"
-            PRIx64 " len=%" PRIu64 "\n",
-            n, src, dest, len);
+            PRIx64 " len=%" PRIu64 " rb_src=%016" PRIx64 " rb_dst=%016"
+            PRIx64 "\n",
+            n, src, dest, len, rb_src, rb_dst);
   }
 }
 
