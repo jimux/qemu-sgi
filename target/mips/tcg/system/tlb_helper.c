@@ -807,6 +807,22 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
                          (uint64_t)env->CP0_EntryHi);
 
     /*
+     * IP27_LOWFAULT=1: capture only near-NULL user faults -- the signature of
+     * the two-node rc2 core dumps (rld/small utilities dereferencing a lost
+     * pointer, BadVAddr 0x0/0x54/0xc/0x3c18 and user PCs ~0x0fb6xxxx).  Low
+     * volume so it does not perturb timing the way a whole-run
+     * trace:mips_mmu_fault does.
+     */
+    if (getenv("IP27_LOWFAULT") && (uint64_t)address < 0x10000ULL &&
+        (uint64_t)env->active_tc.PC < 0x80000000ULL) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "IP27_LOWFAULT badva=0x%016" PRIx64 " pc=0x%016" PRIx64
+                      " exc=%d access=%d entryhi=0x%016" PRIx64 "\n",
+                      (uint64_t)address, (uint64_t)env->active_tc.PC,
+                      exception, (int)access_type, (uint64_t)env->CP0_EntryHi);
+    }
+
+    /*
      * Low-noise wild-address detector.  On this n32 IRIX system legitimate
      * faults are on user VAs (< 0x80000000), kseg0/1 (0x80000000-0xBFFFFFFF),
      * or the sign-extended kernel range (>= 0xFFFFFFFF80000000).  Anything in
