@@ -40,6 +40,15 @@
  * an expTileRects payload, [org_x, x0, org_y, y0, x1, y1].  Measured on the
  * 4Dwm menu item texture; see sgi_gr2_re3_tile_rects. */
 #define SGI_GR2_RE3_SPANR_TOKEN 0x40504
+/* Token 322 (FIFO offset 0x40508): the same six-word destination group, but
+ * emitted by the STIPPLE fill op (expOpStippledFillRects, the token-318 pattern)
+ * rather than by expTileRects.  The DDX writes it right after the pattern bitmap
+ * as [org_x, x0, org_y, y0, x1, y1].  Without it the stipple op's destination is
+ * unparsed and its black pattern floods over the toolchest label (pixwatch
+ * (21,43)); see sgi_gr2_re3_pattern_fill.  Only the IP20 Xsgi stream emits this
+ * token (the XZ DDX writes token 321 instead), so honouring it leaves the XZ
+ * gates byte-identical. */
+#define SGI_GR2_RE3_SPANR2_TOKEN 0x40508
 
 /* The RAMDAC palette is not a static table: the guest's DDX programs it
  * through the XMAP_PAL_* registers at server start, and the model builds
@@ -2878,9 +2887,11 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
     if (size == 4 && offset == SGI_GR2_RE3_SPANS_TOKEN) {
         s->re3_spans_seen = true;
     }
-    if (size == 4 && offset == SGI_GR2_RE3_SPANR_TOKEN) {
-        /* Token 321: one expTileRects menu-item destination group.  A single
-         * payload can carry many (each glyph pixel run), so record them all. */
+    if (size == 4 && (offset == SGI_GR2_RE3_SPANR_TOKEN ||
+                      offset == SGI_GR2_RE3_SPANR2_TOKEN)) {
+        /* Token 321 (expTileRects) and token 322 (the stipple fill op) carry the
+         * same six-word destination group.  A single payload can carry many (one
+         * per glyph pixel run / exposed rect), so record them all. */
         s->re3_spanr_seen = true;
         if (s->re3_nspanr < SGI_GR2_RE3_PEN_MAX) {
             s->re3_spanr_off[s->re3_nspanr++] = s->re3_data_n;
