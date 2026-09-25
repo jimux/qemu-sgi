@@ -420,7 +420,14 @@ static void sgi_ip6_kbd_event(DeviceState *dev, QemuConsole *src,
          * wire scancode is therefore the label MINUS ONE.
          */
         code -= 1;
-        b = (key->down ? 0x00 : 0x80) | (code & 0x7f);
+        /*
+         * MEASURED against IRIX's keyboard driver: IRIX expects bit7 = 1 for
+         * key DOWN and 0 for key UP (the opposite of what the PROM's menu path
+         * tolerated - the PROM accepts either, so this polarity works for the
+         * whole boot). With the inverted polarity every event read as a
+         * release and no character was produced.
+         */
+        b = (key->down ? 0x80 : 0x00) | (code & 0x7f);
         qemu_log_mask(LOG_UNIMP,
                       "sgi-ip6-kbd: key event qcode=%d code=%d %s -> %02x\n",
                       key->key->u.qcode.data, code,
