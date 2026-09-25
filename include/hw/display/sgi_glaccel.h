@@ -31,6 +31,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
                                      * completion (guest acks via a STATUS W1C read /
                                      * IRQ_ENABLE=0); 0 -> no interrupts (old kernels
                                      * that poll STATUS_DONE are unaffected, default 0) */
+#define SGI_GLACCEL_GL_GEN 0x38     /* R: GL-state generation (design 03).  Advances on
+                                     * every VMState post_load (= checkpoint restore) and
+                                     * whenever the in-process renderer (re)creates its
+                                     * host GL context.  The host GL context and all GL
+                                     * objects/lists/textures it holds are NOT migrated, so
+                                     * a restored guest's live clients must re-create
+                                     * their contexts; the guest shim polls this at flush
+                                     * and surfaces a "GL context lost" instead of
+                                     * silently compositing nothing.  0 at fresh boot. */
 
 /* Execution Commands */
 #define GLACCEL_CMD_RESET   (1 << 0)
@@ -208,6 +217,7 @@ struct SGIGLAccelState {
     /* Registers */
     uint32_t status;
     uint32_t irq_enable;   /* pv-irq opt-in (guest driver writes IRQ_ENABLE) */
+    uint32_t gl_state_gen; /* design 03: GL-state generation (host GL context identity) */
     uint32_t width;
     uint32_t height;
     uint32_t cmd_base;

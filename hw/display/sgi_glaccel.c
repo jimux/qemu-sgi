@@ -2008,6 +2008,13 @@ static uint64_t sgi_glaccel_read(void *opaque, hwaddr addr, unsigned size)
         return s->winmodel ? s->wm_gen : 0;
     case SGI_GLACCEL_IRQ_ENABLE:
         return s->irq_enable;
+    case SGI_GLACCEL_GL_GEN:
+        /* design 03: GL-state generation.  The host GL context and every GL object
+         * (display lists, textures, …) it holds are host state and are NOT migrated;
+         * this value changes across a checkpoint restore (post_load) and on an
+         * in-process renderer (re)creation, so a live guest client that polls it can
+         * detect the loss and re-create instead of rendering nothing. */
+        return s->gl_state_gen;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad register offset 0x%" HWADDR_PRIx "\n",
@@ -2457,6 +2464,10 @@ static void sgi_glaccel_realize(DeviceState *dev, Error **errp)
     s->gl_listen_fd = -1;
     s->cur_ctx = 0;
     s->wm_pub_ctx = -1;   /* no window-model publisher yet */
+    /* design 03: a fresh boot has generation 1; a checkpoint restore's VMState
+     * post_load increments it, so a still-running guest GL client that baselined
+     * the pre-restore value observes the change and re-creates its context. */
+    s->gl_state_gen = 1;
     /* window-model present coalescer: at most one model-driven composite per
      * display refresh (the model STATE is always committed synchronously). */
     s->wm_present_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
@@ -2532,13 +2543,26 @@ static const Property sgi_glaccel_props[] = {
 /* M2 design 02: device VMState for the pvgpu MMIO registers.  The internal
  * framebuffer and per-context GL state are host state and are NOT carried — a
  * restored guest must redraw / re-create its GL contexts (design 03). */
+/* design 03: a checkpoint restore boots a fresh QEMU whose in-process renderer has an
+ * empty host GL context (no objects/lists/textures).  Bump the GL-state generation on
+ * load so a restored guest's still-running GL clients observe the loss through
+ * SGI_GLACCEL_GL_GEN and re-create, instead of compositing nothing. */
+static int sgi_glaccel_post_load(void *opaque, int version_id)
+{
+    SGIGLAccelState *s = opaque;
+    s->gl_state_gen++;
+    return 0;
+}
+
 static const VMStateDescription vmstate_sgi_glaccel = {
     .name = "sgi-glaccel",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = sgi_glaccel_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(status, SGIGLAccelState),
         VMSTATE_UINT32(irq_enable, SGIGLAccelState),
+        VMSTATE_UINT32(gl_state_gen, SGIGLAccelState),
         VMSTATE_UINT32(width, SGIGLAccelState),
         VMSTATE_UINT32(height, SGIGLAccelState),
         VMSTATE_UINT32(cmd_base, SGIGLAccelState),
