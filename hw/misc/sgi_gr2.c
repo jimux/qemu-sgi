@@ -1610,6 +1610,14 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                          s->ge_mv[c * 4 + 1] * s->ge_vnormal[i][1] +
                          s->ge_mv[c * 4 + 2] * s->ge_vnormal[i][2];
             }
+            if (i == 0) {
+                trace_sgi_gr2_ge7_nrm(
+                    (int)(s->ge_vnormal[0][0] * 1000.0f),
+                    (int)(s->ge_vnormal[0][1] * 1000.0f),
+                    (int)(s->ge_vnormal[0][2] * 1000.0f),
+                    (int)(een[0] * 1000.0f), (int)(een[1] * 1000.0f),
+                    (int)(een[2] * 1000.0f));
+            }
             sgi_gr2_ge7_shade(s, een, shininess, vcol[i]);
         }
     }
@@ -1917,6 +1925,10 @@ static void sgi_gr2_ge7_light_word(SGIGr2State *s, float f)
     s->ge_lights[li][2] = s->ge_lpos[2];
     s->ge_light_valid[li] = true;
     s->ge_mat_valid = true;
+    trace_sgi_gr2_ge7_lpos((int)(s->ge_lpos[0] * 1000.0f),
+                           (int)(s->ge_lpos[1] * 1000.0f),
+                           (int)(s->ge_lpos[2] * 1000.0f),
+                           s->ge_mv_valid ? 1 : 0);
 }
 
 static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)

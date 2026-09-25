@@ -548,6 +548,8 @@ sgi_gr2_ge7_inkstate(int normal_r, int normal_g, int normal_b, int diff_r, int d
 sgi_gr2_ge7_poly(int nverts, int pixels, int r, int g, int b) "GR2 ge7 poly nverts=%d pixels=%d rgb=%d,%d,%d"
 sgi_gr2_ge7_ztest(int nverts, int pixels, int zrej, int zmin_m, int zmax_m) "GR2 ge7 ztest nverts=%d pixels=%d zrej=%d zmin_m=%d zmax_m=%d"
 sgi_gr2_ge7_tri(int degen, int clipbox, int bboxempty, int minx, int miny, int maxx, int maxy) "GR2 ge7 tri degen=%d clipbox=%d bboxempty=%d batch_bbox=%d,%d..%d,%d"
+sgi_gr2_ge7_lpos(int x, int y, int z, int mvvalid) "GR2 ge7 lpos %d,%d,%d mvvalid=%d"
+sgi_gr2_ge7_nrm(int o0, int o1, int o2, int e0, int e1, int e2) "GR2 ge7 nrm obj=%d,%d,%d eye=%d,%d,%d"
 sgi_gr2_ge7_discard(int poly_in, int behind, int culled, int zrej, int empty, int written) "GR2 ge7 discard in=%d behind=%d cull=%d zrej=%d empty=%d px=%d"
 sgi_gr2_xmap_ctl(uint32_t off, uint32_t val) "GR2 xmap ctl off=0x%05x val=0x%08x"
 sgi_gr2_board_write(uint32_t off, uint32_t val, uint32_t pc) "GR2 board write off=0x%05x val=0x%08x pc=0x%08x"
