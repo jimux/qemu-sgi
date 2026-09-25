@@ -377,6 +377,18 @@ static uint64_t sgi_baseio_dma_addr(uint64_t a) {
    * word is the physical offset (e.g. 0x15000000_01ce0000).  IP30 instead
    * yields a K1-segment address (0xa0xxxxxx) in a zero-extended 64-bit value.
    */
+  /*
+   * IP27 XKPHYS node IO-space dirmap (IO_BASE 0x9200000000000000 | NASID<<32):
+   * the fabric routes it to the *named node's* memory, so re-tag instead of
+   * discarding the high word (same treatment the ISP path's
+   * sgi_baseio_dma_xlate() received in 3e3c4ebc4a; QEMU maps node tag n at
+   * n << 32).  Node 0 addresses are unchanged.
+   */
+  if ((a >> 56) >= 0x90ULL && (a >> 56) <= 0x9fULL) {
+    uint64_t nasid = (a >> 32) & 0xffULL;
+
+    return (nasid << 32) | (a & 0xffffffffULL);
+  }
   if ((a >> 32) != 0) {
     return a & 0xffffffffULL; /* dirmap: low word is the physical address */
   }
