@@ -132,6 +132,17 @@
 
 static uint64_t ip27_phys(uint64_t va) { return va & IP27_PAMASK; }
 
+/*
+ * Truthy diagnostic gate.  run_bte.sh exports these variables empty (or as
+ * "0"), and getenv() reports a present-but-empty variable as non-NULL; without
+ * this every diagnostic would be ON by default and could inject behaviour.
+ */
+static bool ip27_env_on(const char *name) {
+  const char *v = getenv(name);
+
+  return v && *v && v[0] != '0';
+}
+
 /* Physical base of node `nasid`'s widget-`wid` small window. */
 static uint64_t ip27_swin_phys(uint32_t nasid, uint32_t wid) {
   return ip27_phys(IP27_IO_BASE | ((uint64_t)nasid << 32) |
@@ -404,7 +415,7 @@ static void sgi_ip27_load_prom(const char *filename, MemoryRegion *prom,
   uint8_t *dst = memory_region_get_ram_ptr(prom);
   uint8_t *flash_dst = ip27_flash_code;
 
-  ip27_flash_dbg = getenv("IP27_FLASH_DBG") != NULL;
+  ip27_flash_dbg = ip27_env_on("IP27_FLASH_DBG");
 
   if (!g_file_get_contents(filename, &data, &len, &err)) {
     error_report("sgi-ip27: could not read PROM '%s': %s", filename,
@@ -897,7 +908,7 @@ static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
       const char *m = getenv("IP27_CMP_SCAN_MAX");
       cmpscan_max = m ? atoi(m) : 25;
     }
-    if (len >= 32 && getenv("IP27_CMP_SCAN") && asid != 0 &&
+    if (len >= 32 && ip27_env_on("IP27_CMP_SCAN") && asid != 0 &&
         cmpscan_used++ < cmpscan_max) {
       int nd;
       const uint8_t *sig = op + (first + 32 <= len ? first : 0);
@@ -1106,7 +1117,7 @@ static void sgi_ip27_init(MachineState *machine) {
      * populated bank0 (128 MB) so 128..512 MB is a real hole; if two-node stops
      * coredumping the flat/bank overhang was the collision.
      */
-    if (getenv("IP27_FLAT128") && nnodes == 2) {
+    if (ip27_env_on("IP27_FLAT128") && nnodes == 2) {
       MemoryRegion *flat = g_new(MemoryRegion, 1);
 
       memory_region_init_alias(flat, NULL, "sgi-ip27.ram.flat128", ram, 0,
@@ -1195,7 +1206,7 @@ static void sgi_ip27_init(MachineState *machine) {
    * storing PC being in the loader (see ip27_seg2redir_write) so ordinary RAM
    * users saw normal memory; reads were never relocated.
    */
-  if (getenv("IP27_SEG2REDIR")) {
+  if (ip27_env_on("IP27_SEG2REDIR")) {
     IP27Seg2Redir *t = g_new0(IP27Seg2Redir, 1);
     t->ram = ram;
     t->phys = 0x38ea58;
@@ -1208,7 +1219,7 @@ static void sgi_ip27_init(MachineState *machine) {
   /* IP27_WATCH=1: watch-window over the flat RW page (diagnostic, see above).
    * IP27_WATCH_PHYS / IP27_WATCH_LEN select the window (hex), default the
    * seg2 page. */
-  if (getenv("IP27_WATCH")) {
+  if (ip27_env_on("IP27_WATCH")) {
     IP27Watch *w = g_new0(IP27Watch, 1);
     const char *ph = getenv("IP27_WATCH_PHYS");
     const char *ln = getenv("IP27_WATCH_LEN");
@@ -1226,7 +1237,7 @@ static void sgi_ip27_init(MachineState *machine) {
   /*
    * IP27_CMP=1: register the node-remap content comparator (diagnostic only).
    */
-  if (getenv("IP27_CMP")) {
+  if (ip27_env_on("IP27_CMP")) {
     ip27_cmp_ram0 = ram;
     ip27_cmp_ram1 = ram1;
     mips_sgi_set_tlb_node_remap_hook(ip27_tlb_node_remap_cmp);
@@ -1239,7 +1250,7 @@ static void sgi_ip27_init(MachineState *machine) {
    * node-1/node-0 address-aliasing bug shows up as the poison value in a
    * node-0 location (vs. genuine disk/kernel content).  Diagnostic only.
    */
-  if (nnodes == 2 && ram1 && getenv("IP27_POISON1")) {
+  if (nnodes == 2 && ram1 && ip27_env_on("IP27_POISON1")) {
     uint64_t pat = strtoull(getenv("IP27_POISON1"), NULL, 16);
     void *rp = memory_region_get_ram_ptr(ram1);
     uint64_t n = node_ram / 8;
