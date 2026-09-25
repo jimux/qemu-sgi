@@ -184,8 +184,19 @@ static void wd33c93_do_abort(WD33C93State *s)
     fifo8_reset(&s->fifo);
     wd33c93_set_drq(s, false);
 
-    /* For now, complete with disconnect status */
-    wd33c93_complete_cmd(s, SCSI_STATUS_DISCONNECT);
+    /*
+     * ABORT completes with SCSI_STATUS_RESET (RESET_EAF when advanced
+     * features are enabled), not a disconnect.  This mirrors MAME
+     * wd33c9x.cpp (COMMAND_CC_ABORT pushes SCSI_STATUS_RESET/RESET_EAF)
+     * and the WD33C93 datasheet.  Reporting DISCONNECT (0x85) here put
+     * the IRIX driver into its ST_DISCONNECT dispatch with the command
+     * register holding C93ABORT (0x01), a combination the driver accepts
+     * in no phase (wd93.c:2504 / scsi.c:2181), forcing a spurious
+     * "illegal disconnection interrupt" bus reset.  ST_RESET (0x00) has
+     * an explicit handler (wd93.c:2591 handle_reset / scsi.c:2272).
+     */
+    wd33c93_complete_cmd(s, (s->regs[WD_OWN_ID] & OWN_ID_EAF) ?
+                         SCSI_STATUS_RESET_EAF : SCSI_STATUS_RESET);
 }
 
 /*
@@ -461,6 +472,17 @@ static void wd33c93_execute_cmd(WD33C93State *s, uint8_t cmd)
             scsi_req_unref(s->current_req);
             s->current_req = NULL;
         }
+        /*
+         * The IRIX driver accepts a disconnect completion only when the
+         * Command Phase register holds PH_DISCONNECT (0x43) with a live
+         * subchannel, or PH_NOSELECT (0x00) when the last command was
+         * C93DISC (the CMD_DISCONNECT we are completing here).  Our
+         * synthetic completion has no target-initiated disconnect, so
+         * report the idle phase; leaving the previous phase (e.g. 0x60)
+         * trips the "illegal disconnection interrupt" bus reset at
+         * wd93.c:2504 / scsi.c:2181.
+         */
+        s->regs[WD_COMMAND_PHASE] = 0x00;  /* PH_NOSELECT */
         wd33c93_complete_cmd(s, SCSI_STATUS_DISCONNECT);
         break;
 
