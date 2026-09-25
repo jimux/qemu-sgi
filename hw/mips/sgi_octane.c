@@ -287,6 +287,17 @@ static const MemoryRegionOps mgras_widget_id_ops = {
  * "number in a can" (sys/xtalk/hq4.h HQ4_WIDGET_NIC) MicroLAN register, read
  * by the widget probe with the same MCR protocol as the HEART/bridge. */
 #define MGRAS_HQ4_NIC 0x11098
+/*
+ * XMAP RE/RAC signature register (mgrashw.h MGRAS_XMAP_RE_RAC =
+ * CRS(7)|DW4 = 0x380), at the PROM's DCB-slave window offset 0x71f80.
+ * MgrasSyncREPP() (mgras_init.c) polls it until the decoded signature == 1:
+ *   a = word[3:0]; b = word[11:8]; c = word[19:16];
+ *   signature = (a == b) ? a : c;
+ * A real in-sync RE broadcasts a signature of 1; return a word with
+ * a == b == 1 so the handshake completes.
+ */
+#define MGRAS_XMAP_RERAC_SIG 0x71f80
+#define MGRAS_REPP_SYNC_WORD 0x00000101U
 
 typedef struct SGIMgrasWin {
     SGIDS2502 nic;
@@ -301,6 +312,18 @@ static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
 
     if (off == MGRAS_HQ4_NIC || off == MGRAS_HQ4_NIC + 4) {
         return 0x2 | (s->nic.data_bit & 1);   /* MCR_DONE | MCR_DATA */
+    }
+    if (off == MGRAS_XMAP_RERAC_SIG) {
+        return MGRAS_REPP_SYNC_WORD;          /* PP1/RE repp-sync signature */
+    }
+    /*
+     * HQ FIFO-ready status.  The PROM polls window+0x20000 for bit 1 (a
+     * done/ready flag) and reads a level at +0x20008 / +0x20100.  A no-op
+     * FIFO is always drained/ready, so report the ready bit set and a zero
+     * level (the level checks pass on 0).
+     */
+    if (off == 0x20000) {
+        return 0x2;
     }
     if (off + size <= sizeof(s->reg)) {
         for (i = 0; i < size; i++) {
