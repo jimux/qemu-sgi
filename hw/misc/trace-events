@@ -510,6 +510,8 @@ sgi_crime_re_xfer(uint32_t srcmode, uint32_t dstmode, uint32_t srcaddr, uint32_t
 sgi_crime_re_ppwrite(int off, uint64_t value, int size) "pp off=0x%x val=0x%016"PRIx64" size=%d"
 sgi_crime_re_regread(int off, int size, uint64_t val) "regread off=0x%x size=%d val=0x%016"PRIx64
 sgi_crime_re_go(uint64_t off, uint32_t prim, uint32_t dm, uint32_t winoff) "go off=0x%08"PRIx64" prim=0x%08x dm=0x%08x winoff=0x%08x"
+sgi_crime_re_ibwrite(int off, int size, uint64_t raw) "ibwrite off=0x%x size=%d raw=0x%016"PRIx64
+sgi_crime_re_prim(uint32_t prim, int go, uint32_t winoff, uint32_t dm, int off, int size, uint64_t raw, uint64_t pc) "prim=0x%08x go=%d winoff=0x%08x dm=0x%08x off=0x%x size=%d raw=0x%016"PRIx64" pc=0x%"PRIx64
 sgi_crime_re_tri(int v0x, int v0y, int v1x, int v1y, int v2x, int v2y, int inside, int wrote, uint32_t winoff, uint32_t clipmode) "tri v0=(%d,%d) v1=(%d,%d) v2=(%d,%d) inside=%d wrote=%d winoff=0x%08x clip=0x%08x"
 sgi_crime_re_texreg(uint32_t off, uint64_t val) "texreg off=0x%x val=0x%016"PRIx64
 sgi_crime_re_depthreg(uint32_t off, uint64_t val) "depthreg off=0x%x val=0x%016"PRIx64

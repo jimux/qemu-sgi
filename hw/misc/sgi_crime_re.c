@@ -35,6 +35,7 @@
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "exec/cpu-common.h"
 #include "trace.h"
 
 /* CRM_LOGICOP_* (crimedef.h) */
@@ -2338,6 +2339,10 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
     bool go = (offset & CRM_GO_OFFSET) != 0;
     hwaddr off = offset & ~CRM_GO_OFFSET;
 
+    if (off < CRM_RE_TLB_BASE) {
+        trace_sgi_crime_re_ibwrite((int)off, (int)size, value);
+    }
+
     /* ---- Interface buffer (0x0000-0x0FFF) ---- */
     if (off < CRM_RE_TLB_BASE) {
         if (off < CRM_RE_INTFBUF_DATA + 8 * (hwaddr)CRIME_FIFO_DEPTH) {
@@ -2414,8 +2419,27 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
              */
             sgi_crime_re_pp_store(s, p, (uint32_t)(value >> 32));
             sgi_crime_re_pp_store(s, p + 4, v);
+            /*
+             * Diagnostic only: log the raw store that touches the
+             * Primitive register plus its source code site.  The `pc`
+             * field is the host translated-block address (mem_io_pc),
+             * used as a fingerprint to tell which guest store site
+             * wrote a Primitive value; it is not a guest PC.
+             */
+            if (p == CRM_PRIMITIVE_REG || p + 4 == CRM_PRIMITIVE_REG) {
+                trace_sgi_crime_re_prim(s->primitive, (int)go,
+                                        s->winoffset_dst, s->drawmode,
+                                        (int)p, (int)size, value,
+                                        (uint64_t)(current_cpu ? current_cpu->mem_io_pc : 0));
+            }
         } else {
             sgi_crime_re_pp_store(s, p, v);
+            if (p == CRM_PRIMITIVE_REG) {
+                trace_sgi_crime_re_prim(s->primitive, (int)go,
+                                        s->winoffset_dst, s->drawmode,
+                                        (int)p, (int)size, value,
+                                        (uint64_t)(current_cpu ? current_cpu->mem_io_pc : 0));
+            }
         }
 
         /*
