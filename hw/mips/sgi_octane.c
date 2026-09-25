@@ -290,20 +290,23 @@ static const MemoryRegionOps mgras_widget_id_ops = {
 
 typedef struct SGIMgrasWin {
     SGIDS2502 nic;
+    uint8_t reg[0x100000];   /* register-level bring-up store (mgras_hw) */
 } SGIMgrasWin;
 
 static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
 {
     SGIMgrasWin *s = opaque;
+    unsigned i;
+    uint64_t v = 0;
 
     if (off == MGRAS_HQ4_NIC || off == MGRAS_HQ4_NIC + 4) {
         return 0x2 | (s->nic.data_bit & 1);   /* MCR_DONE | MCR_DATA */
     }
-    if (off == 0x20100 && current_cpu) {
-        MIPSCPU *cpu = MIPS_CPU(current_cpu);
-        qemu_log_mask(LOG_UNIMP, "mgras-win R 0x20100 PC=0x%llx ra=0x%llx\n",
-                      (unsigned long long)cpu->env.active_tc.PC,
-                      (unsigned long long)cpu->env.active_tc.gpr[31]);
+    if (off + size <= sizeof(s->reg)) {
+        for (i = 0; i < size; i++) {
+            v = (v << 8) | s->reg[off + i];   /* big-endian, as the PROM reads */
+        }
+        return v;
     }
     qemu_log_mask(LOG_UNIMP, "mgras-win R off=0x%llx size=%u\n",
                   (unsigned long long)off, size);
@@ -313,9 +316,16 @@ static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
 static void mgras_win_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     SGIMgrasWin *s = opaque;
+    unsigned i;
 
     if (off == MGRAS_HQ4_NIC || off == MGRAS_HQ4_NIC + 4) {
         sgi_ds2502_mcr(&s->nic, val);
+        return;
+    }
+    if (off + size <= sizeof(s->reg)) {
+        for (i = 0; i < size; i++) {
+            s->reg[off + i] = (val >> (8 * (size - 1 - i))) & 0xff;
+        }
         return;
     }
     qemu_log_mask(LOG_UNIMP, "mgras-win W off=0x%llx val=0x%llx size=%u\n",
