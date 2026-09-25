@@ -865,10 +865,30 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
             exception = EXCP_TLBL;
         }
         break;
-    case TLBRET_DIRTY:
+    case TLBRET_DIRTY: {
         /* TLB match but 'D' bit is cleared */
+        /*
+         * @DIAG@ IP27_TLBDIRTY: a store to a page mapped read-only (no D bit).
+         * Log the faulting address and the culprit registers so a PROM that
+         * writes through a read-only alias can be pinpointed.  Inert otherwise.
+         */
+        static int dinit, don;
+        if (!dinit) {
+            dinit = 1;
+            don = getenv("IP27_TLBDIRTY") != NULL;
+        }
+        if (don) {
+            fprintf(stderr, "IP27_TLBDIRTY store addr=%016" PRIx64
+                    " pc=%016" PRIx64 " gp=%016" PRIx64 " v0=%016" PRIx64
+                    " ra=%016" PRIx64 "\n",
+                    (uint64_t)address, (uint64_t)env->active_tc.PC,
+                    (uint64_t)env->active_tc.gpr[28],
+                    (uint64_t)env->active_tc.gpr[2],
+                    (uint64_t)env->active_tc.gpr[31]);
+        }
         exception = EXCP_LTLBL;
         break;
+    }
     case TLBRET_XI:
         /* Execute-Inhibit Exception */
         if (env->CP0_PageGrain & (1 << CP0PG_IEC)) {

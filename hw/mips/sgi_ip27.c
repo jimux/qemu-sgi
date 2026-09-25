@@ -172,9 +172,14 @@ static void main_cpu_reset(void *opaque) {
    * The PROM runs in XKSEG (KSEG3), which is TLB-mapped, and changes ASID as
    * it initialises; the bootstrap mapping must be global (EntryLo G bit 0)
    * so it survives those ASID changes.  flags: V(0x2) | G(0x1) | C=2(0x10).
+   *
+   * IP27_PROM_WD (diagnostic): add the D bit (0x17) so the bootstrap PROM
+   * mapping is writable.  Used to A/B whether a PROM store to 0x1fc00000
+   * faults only because this entry lacks D (6.156 vs 6.150).  Inert by default.
    */
   mips_cpu_install_mapping(cpu, 0xc00000001fc00000ULL, 0x1fc00000ULL,
-                           0x001fe000, 1, 0x13);
+                           0x001fe000, 1,
+                           getenv("IP27_PROM_WD") ? 0x17 : 0x13);
 }
 
 /*
