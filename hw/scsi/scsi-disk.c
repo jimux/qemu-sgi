@@ -2116,6 +2116,12 @@ static void scsi_disk_emulate_write_data(SCSIRequest *req)
             ds->dl_len = MIN(r->req.cmd.xfer, SCSI_DMA_BUF_SIZE);
             ds->dl_buf = g_memdup2(r->iov.iov_base, ds->dl_len);
             scsi_disk_dl_diag("store", ds->dl_buf, ds->dl_len);
+            /* Decisive: residual is 0 only if the data-out phase actually
+             * consumed the payload (scsi_req_data); the enqueue datalen
+             * logged by the HBA is always -xfer for any TO_DEV command. */
+            fprintf(stderr, "[scsi-disk dl-diag] complete xfer=%" PRIu64
+                    " residual=%" PRIu64 "\n",
+                    r->req.cmd.xfer, r->req.residual);
         }
         scsi_req_complete(&r->req, GOOD);
         break;
@@ -2387,16 +2393,16 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
          * (CDB {3b 00 00 00 00 00 00 20 04 00}); the parameter list is
          * DATA-OUT and is kept in the device-buffer shadow in
          * scsi_disk_emulate_write_data().  The generic parser already computes
-         * xfer = buf[6..8] and mode TO_DEV; a bare accept without the transfer
-         * set up leaves a negative residual (datalen=-8196) and crashes.  The
-         * emulated path sizes buflen but does not allocate a buffer of its own,
-         * so allocate it here -- the tail of this function asserts
-         * iov_len == xfer for a TO_DEV command.  Only mode 0 is supported. */
+         * xfer = buf[6..8] and mode TO_DEV, and the prologue above has already
+         * set buflen = MAX(4096, xfer) and allocated iov_base -- so the shared
+         * tail (iov_len = MIN(buflen, xfer) == xfer) sets up the transfer
+         * exactly as it does for MODE_SELECT.  Do NOT call scsi_init_iovec()
+         * here: it recomputes iov_len as sector_count * 512, which is 0 for a
+         * no-sector command.  Only mode 0 is supported. */
         if ((buf[1] & 0x1f) != 0 ||
             req->cmd.xfer > SCSI_DMA_BUF_SIZE) {
             goto illegal_request;
         }
-        scsi_init_iovec(r, req->cmd.xfer);
         break;
     case READ_BUFFER:
         /* Companion read-back (SPC device-buffer read, mode 0): return the
