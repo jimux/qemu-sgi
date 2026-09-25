@@ -765,6 +765,148 @@ static const MemoryRegionOps ip27_watch_ops = {
   .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
+
+/*
+ * Node-remap content comparator (IP27_CMP=1).  Registered as the target's
+ * same-VPN remap hook; when a user TLB entry with a valid old mapping is
+ * replaced by one mapping the same VPN to a different physical page, it reads
+ * the old and new pages straight out of node RAM and reports how many bytes
+ * differ.  A COW / NUMA migration must carry the page's content, so a large
+ * diff with the destination all-zero proves the copy did not land -- the
+ * "losing write".  Also prints rld's pObj_Head word (VA 0x0fbdbbd8, page
+ * offset 0x3bd8) before and after, which is the value whose loss makes the
+ * runtime linker dereference NULL.  Env-gated and inert by default.
+ */
+static MemoryRegion *ip27_cmp_ram0;
+static MemoryRegion *ip27_cmp_ram1;
+
+static bool ip27_cmp_ptr(uint64_t pa, uint8_t **out) {
+  uint64_t off = pa & 0xffffffffULL;
+  MemoryRegion *mr = ((pa >> 32) & 1) ? ip27_cmp_ram1 : ip27_cmp_ram0;
+
+  if (!mr) {
+    return false;
+  }
+  if (off >= 0x20000000ULL && off < 0x28000000ULL) {
+    off = off - 0x18000000ULL; /* bank 1 -> second 128 MB of the node */
+  } else if (off >= 0x8000000ULL) {
+    return false; /* hole in the bank-slot layout */
+  }
+  *out = (uint8_t *)memory_region_get_ram_ptr(mr) + off;
+  return true;
+}
+
+static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
+                                    uint64_t len, uint32_t asid,
+                                    uint64_t page_va) {
+  uint8_t *op, *np;
+  uint64_t diff = 0, first = len, k;
+
+  if (!ip27_cmp_ptr(old_pa, &op) || !ip27_cmp_ptr(new_pa, &np)) {
+    fprintf(stderr, "IP27_CMP vpn=%016" PRIx64 " asid=%04x UNMAPPED"
+            " old=%016" PRIx64 " new=%016" PRIx64 "\n",
+            page_va, asid, old_pa, new_pa);
+    return;
+  }
+  for (k = 0; k < len; k++) {
+    if (op[k] != np[k]) {
+      if (diff == 0) {
+        first = k;
+      }
+      diff++;
+    }
+  }
+  if ((page_va & ~0x3fffULL) == 0x0fbd8000ULL) {
+    uint64_t ov = 0, nv = 0;
+
+    if (0x3bd8 + 8 <= len) {
+      memcpy(&ov, op + 0x3bd8, 8);
+      memcpy(&nv, np + 0x3bd8, 8);
+    }
+    fprintf(stderr, "IP27_CMP pObjHead vpn=%016" PRIx64 " asid=%04x"
+            " diff=%" PRIu64 " oldPa=%016" PRIx64 " newPa=%016" PRIx64
+            " oldVal=%016" PRIx64 " newVal=%016" PRIx64 "\n",
+            page_va, asid, diff, old_pa, new_pa, ov, nv);
+    return;
+  }
+  if (diff == 0) {
+    return; /* ordinary carry-preserving remap */
+  }
+  {
+    uint64_t onz = 0, nnz = 0, k2;
+
+    for (k2 = 0; k2 < len; k2++) {
+      if (op[k2]) {
+        onz++;
+      }
+      if (np[k2]) {
+        nnz++;
+      }
+    }
+    fprintf(stderr, "IP27_CMP vpn=%016" PRIx64 " asid=%04x len=%" PRIx64
+            " diff=%" PRIu64 " first=%" PRIx64 " oldnz=%" PRIu64
+            " newnz=%" PRIu64 " old=%016" PRIx64 " new=%016" PRIx64
+            "\n", page_va, asid, len, diff, first, onz, nnz, old_pa, new_pa);
+    /*
+     * IP27_CMP_SCAN=1 additionally hunts both nodes' RAM for the source page
+     * so the destination of a lost copy can be located.  Expensive; opt-in.
+     */
+    if (len >= 32 && getenv("IP27_CMP_SCAN")) {
+      int nd;
+      const uint8_t *sig = op + (first + 32 <= len ? first : 0);
+      for (nd = 0; nd < 2; nd++) {
+        MemoryRegion *mr = nd ? ip27_cmp_ram1 : ip27_cmp_ram0;
+        uint8_t *base;
+        uint64_t i, sz;
+
+        if (!mr || !memory_region_is_ram(mr)) {
+          continue;
+        }
+        base = (uint8_t *)memory_region_get_ram_ptr(mr);
+        sz = memory_region_size(mr);
+        for (i = 0; i + first + 32 <= sz; i++) {
+          if (memcmp(base + i + first, sig, 32) == 0) {
+            uint64_t lo = i, hi = i + len;
+            uint64_t llo = (lo >= 0x20000000ULL && lo < 0x28000000ULL) ?
+                           lo - 0x18000000ULL : lo;
+            uint64_t lhi = (hi >= 0x20000000ULL && hi < 0x28000000ULL) ?
+                           hi - 0x18000000ULL : hi;
+            fprintf(stderr, "IP27_CMP src-copy found node%d host+%012" PRIx64
+                    " (local %012" PRIx64 "..%012" PRIx64 ") pagematch=%d\n",
+                    nd, i, llo, lhi, memcmp(base + i, op, 32) == 0);
+          }
+        }
+      }
+    }
+  }
+}
+
+/*
+ * IP27_CMP fill observer: for the rld .data page (VA 0x0fbd8000, pObj_Head at
+ * offset 0x3bd8) print the 32-bit word actually at the mapped physical on each
+ * softmmu fill.  This shows whether rld's runtime store to pObj_Head is visible
+ * to later loads, and whether a node-0 vs node-1 mapping gives different data.
+ */
+static void ip27_tlb_fill_value(uint64_t va, uint64_t pa, int acc,
+                                uint32_t asid) {
+  uint8_t *p;
+  uint32_t val;
+
+  if ((va & ~0x3fffULL) != 0x0fbd8000ULL) {
+    return;
+  }
+  if (!ip27_cmp_ptr(pa & ~0x3fffULL, &p)) {
+    fprintf(stderr, "IP27_VAL va=%016" PRIx64 " pa=%016" PRIx64
+            " asid=%04x acc=%d UNMAPPED\n", va, pa, asid, acc);
+    return;
+  }
+  /* pObj_Head offset 0x3bd8; report the aligned word covering the access. */
+  val = (uint32_t)((p[0x3bd8] << 24) | (p[0x3bd9] << 16) |
+                   (p[0x3bda] << 8) | p[0x3bdb]);
+  fprintf(stderr, "IP27_VAL va=%016" PRIx64 " pa=%016" PRIx64
+          " asid=%04x acc=%d pObjHead=%08x\n", va, pa, asid, acc, val);
+}
+
 static void sgi_ip27_init(MachineState *machine) {
   Clock *cpuclk;
   MemoryRegion *prom;
@@ -1016,6 +1158,17 @@ static void sgi_ip27_init(MachineState *machine) {
     memory_region_add_subregion_overlap(system_memory, w->phys, &w->mr, 12);
     fprintf(stderr, "sgi-ip27: watch window phys=0x%" PRIx64 " len=0x%" PRIx64
             "\n", (uint64_t)w->phys, (uint64_t)w->len);
+  }
+
+  /*
+   * IP27_CMP=1: register the node-remap content comparator (diagnostic only).
+   */
+  if (getenv("IP27_CMP")) {
+    ip27_cmp_ram0 = ram;
+    ip27_cmp_ram1 = ram1;
+    mips_sgi_set_tlb_node_remap_hook(ip27_tlb_node_remap_cmp);
+    mips_sgi_set_tlb_fill_hook(ip27_tlb_fill_value);
+    fprintf(stderr, "sgi-ip27: node-remap content comparator ON\n");
   }
 
   /*

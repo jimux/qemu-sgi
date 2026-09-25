@@ -1450,4 +1450,17 @@ void mips_cpu_install_mapping(MIPSCPU *cpu, uint64_t vaddr, uint64_t paddr,
 void mips_cpu_pin_kernel_mapping(uint64_t vpn, uint64_t paddr,
                                  uint32_t pagemask, uint32_t flags);
 
+/*
+ * Diagnostic-only hook registration for the SGI IP27 NUMA bring-up: the
+ * machine installs a callback invoked when a user TLB entry is remapped to a
+ * different node, so it can compare the old/new page content.  Inert unless a
+ * machine registers one.
+ */
+void mips_sgi_set_tlb_node_remap_hook(void (*fn)(uint64_t old_pa,
+                                                 uint64_t new_pa,
+                                                 uint64_t len, uint32_t asid,
+                                                 uint64_t page_va));
+void mips_sgi_set_tlb_fill_hook(void (*fn)(uint64_t va, uint64_t pa, int acc,
+                                           uint32_t asid));
+
 #endif /* MIPS_CPU_H */

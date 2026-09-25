@@ -30,6 +30,61 @@
 #include "exec/helper-proto.h"
 #include "trace.h"
 
+/*
+ * @DIAG@ IP27 TLB/VA watch.  Env-gated -- IP27_TLBWATCH="<lo>:<hi>" as hex VAs
+ * -- and off by default, so it is inert on every machine.  The SN0 two-node
+ * bring-up uses it to log every guest-TLB install and every softmmu refill for
+ * a user VA range (e.g. rld, 0x0fb00000:0x0fc00000) so a remap of the same VPN
+ * between NUMA nodes becomes visible: a store that fills to a node-1 physical
+ * and a load that fills to the node-0 alias of the same offset is the losing
+ * write.  Called from the TLB fill path only; never changes behaviour.
+ */
+static bool ip27_tlbwatch(target_ulong va)
+{
+    static int inited;
+    static bool on;
+    static uint64_t lo, hi;
+
+    if (!inited) {
+        const char *s = getenv("IP27_TLBWATCH");
+        inited = 1;
+        if (s && sscanf(s, "%" SCNx64 ":%" SCNx64, &lo, &hi) == 2 && hi > lo) {
+            on = true;
+        }
+    }
+    return on && (uint64_t)va >= lo && (uint64_t)va < hi;
+}
+
+/*
+ * @DIAG@ Optional machine hook, registered by the SGI IP27 machine under an
+ * env gate.  Called when a guest-TLB entry for a user VPN with a valid old
+ * mapping is replaced by one that maps the SAME VPN to a different NUMA node
+ * (physical bit 32).  The machine compares the two pages so a COW / NUMA
+ * migration whose copy did not actually land is caught at the remap.  NULL on
+ * every other machine.
+ */
+static void (*mips_sgi_tlb_node_remap_hook)(uint64_t old_pa, uint64_t new_pa,
+                                            uint64_t len, uint32_t asid,
+                                            uint64_t page_va);
+
+void mips_sgi_set_tlb_node_remap_hook(void (*fn)(uint64_t, uint64_t, uint64_t,
+                                                 uint32_t, uint64_t))
+{
+    mips_sgi_tlb_node_remap_hook = fn;
+}
+
+/*
+ * @DIAG@ Second hook: called on each softmmu fill inside the watched VA range
+ * so a machine can print the word actually stored there.  NULL by default.
+ */
+static void (*mips_sgi_tlb_fill_hook)(uint64_t va, uint64_t pa, int acc,
+                                      uint32_t asid);
+
+void mips_sgi_set_tlb_fill_hook(void (*fn)(uint64_t, uint64_t, int, uint32_t))
+{
+    mips_sgi_tlb_fill_hook = fn;
+}
+
 /* TLB management */
 static void r4k_mips_tlb_flush_extra(CPUMIPSState *env, int first)
 {
@@ -69,9 +124,24 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
 {
     r4k_tlb_t *tlb;
     uint64_t mask = env->CP0_PageMask >> (TARGET_PAGE_BITS + 1);
+    target_ulong diag_vpn = env->CP0_EntryHi & (TARGET_PAGE_MASK << 1);
+    bool diag = ip27_tlbwatch(diag_vpn);
+    uint16_t diag_old_asid = 0;
+    uint64_t diag_old_pfn0 = 0, diag_old_pfn1 = 0;
+    int diag_old_inval = 0;
+    target_ulong diag_old_vpn = 0;
+    uint32_t diag_old_pm = 0;
 
     /* XXX: detect conflicting TLBs and raise a MCHECK exception when needed */
     tlb = &env->tlb->mmu.r4k.tlb[idx];
+    if (diag) {
+        diag_old_asid = tlb->ASID;
+        diag_old_pfn0 = tlb->PFN[0];
+        diag_old_pfn1 = tlb->PFN[1];
+        diag_old_inval = tlb->EHINV;
+        diag_old_vpn = tlb->VPN;
+        diag_old_pm = tlb->PageMask;
+    }
     if (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) {
         tlb->EHINV = 1;
         return;
@@ -106,6 +176,37 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
     tlb->RI1 = (env->CP0_EntryLo1 >> CP0EnLo_RI) & 1;
     tlb->PFN[1] = (get_tlb_pfn_from_entrylo(env, env->CP0_EntryLo1) & ~mask)
                   << 12;
+
+    if (diag) {
+        fprintf(stderr,
+                "IP27_TLB idx=%d asid=%04x vpn=%016" PRIx64
+                " old(vpn=%016" PRIx64 " asid=%04x pm=%08x pfn0=%012" PRIx64
+                " pfn1=%012" PRIx64 " inval=%d) new(pfn0=%012" PRIx64
+                " pfn1=%012" PRIx64 ") pm=%08x pc=%016" PRIx64 "\n",
+                idx, tlb->ASID, (uint64_t)tlb->VPN,
+                (uint64_t)diag_old_vpn, diag_old_asid, diag_old_pm,
+                diag_old_pfn0, diag_old_pfn1, diag_old_inval,
+                (uint64_t)tlb->PFN[0], (uint64_t)tlb->PFN[1], tlb->PageMask,
+                (uint64_t)(current_cpu ? cpu_env(current_cpu)->active_tc.PC
+                                       : 0));
+    }
+
+    if (diag && mips_sgi_tlb_node_remap_hook && !diag_old_inval &&
+        diag_old_vpn == tlb->VPN && diag_old_asid == tlb->ASID) {
+        uint64_t plen = ((uint64_t)mask + 1) * TARGET_PAGE_SIZE;
+        int h;
+
+        for (h = 0; h < 2; h++) {
+            uint64_t op = h ? diag_old_pfn1 : diag_old_pfn0;
+            uint64_t np = h ? tlb->PFN[1] : tlb->PFN[0];
+
+            if (op && np && op != np) {
+                mips_sgi_tlb_node_remap_hook(op, np, plen, tlb->ASID,
+                                             (uint64_t)tlb->VPN +
+                                             (uint64_t)h * plen);
+            }
+        }
+    }
 }
 
 static void r4k_helper_tlbinv(CPUMIPSState *env)
@@ -597,6 +698,38 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
     CPUState *cs = env_cpu(env);
     int exception = 0, error_code = 0;
 
+    /*
+     * @DIAG@ IP27_WILD: dump the register state of a user-mode wild fault (a
+     * near-NULL dereference) so the crashing DSO instruction and its operand
+     * registers are visible on serial.  Env-gated; inert otherwise.
+     */
+    {
+        static int winit, won;
+        if (!winit) {
+            winit = 1;
+            won = getenv("IP27_WILD") != NULL;
+        }
+        if (won && (env->hflags & MIPS_HFLAG_UM) &&
+            (uint64_t)address < 0x10000ULL) {
+            fprintf(stderr,
+                    "IP27_WILD pc=%016" PRIx64 " va=%016" PRIx64
+                    " acc=%d a0=%016" PRIx64 " a1=%016" PRIx64
+                    " a2=%016" PRIx64 " a3=%016" PRIx64
+                    " v0=%016" PRIx64 " v1=%016" PRIx64
+                    " ra=%016" PRIx64 " sp=%016" PRIx64 "\n",
+                    (uint64_t)env->active_tc.PC, (uint64_t)address,
+                    (int)access_type,
+                    (uint64_t)env->active_tc.gpr[4],
+                    (uint64_t)env->active_tc.gpr[5],
+                    (uint64_t)env->active_tc.gpr[6],
+                    (uint64_t)env->active_tc.gpr[7],
+                    (uint64_t)env->active_tc.gpr[2],
+                    (uint64_t)env->active_tc.gpr[3],
+                    (uint64_t)env->active_tc.gpr[31],
+                    (uint64_t)env->active_tc.gpr[29]);
+        }
+    }
+
     if (access_type == MMU_INST_FETCH) {
         error_code |= EXCP_INST_NOTAVAIL;
     }
@@ -1047,12 +1180,35 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         qemu_log_mask(CPU_LOG_MMU,
                       "%s address=%" VADDR_PRIx " ret %d\n", __func__, address,
                       ret);
+        if (ip27_tlbwatch(address)) {
+            fprintf(stderr,
+                    "IP27_VA fault va=%016" PRIx64 " ret=%d acc=%d mmu=%d"
+                    " asid=%04x pc=%016" PRIx64 "\n",
+                    (uint64_t)address, ret, (int)access_type, mmu_idx,
+                    (unsigned)(env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask),
+                    (uint64_t)env->active_tc.PC);
+        }
         break;
     }
     if (ret == TLBRET_MATCH) {
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      physical & TARGET_PAGE_MASK, prot,
                      mmu_idx, TARGET_PAGE_SIZE);
+        if (ip27_tlbwatch(address)) {
+            fprintf(stderr,
+                    "IP27_VA fill va=%016" PRIx64 " pa=%016" PRIx64
+                    " acc=%d mmu=%d asid=%04x pc=%016" PRIx64 "\n",
+                    (uint64_t)address, (uint64_t)physical, (int)access_type,
+                    mmu_idx,
+                    (unsigned)(env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask),
+                    (uint64_t)env->active_tc.PC);
+        }
+        if (mips_sgi_tlb_fill_hook) {
+            mips_sgi_tlb_fill_hook((uint64_t)address, (uint64_t)physical,
+                                   (int)access_type,
+                                   (unsigned)(env->CP0_EntryHi &
+                                              env->CP0_EntryHi_ASID_mask));
+        }
         return true;
     }
 #if !defined(TARGET_MIPS64)
