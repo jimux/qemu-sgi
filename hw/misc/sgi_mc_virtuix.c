@@ -1073,15 +1073,17 @@ static void sgi_mc_virtuix_reset(DeviceState *dev)
     {
         int shift = sgi_mc_virtuix_addr_shift(s);
         uint32_t bank_max = 32u << shift;      /* size code 0x1f => 32 units */
-        /* Physical bank slots szmem() scans: two in SEG0, then SEG1. */
-        static const uint32_t bank_base[3] = {
-            0x08000000, 0x10000000, 0x20000000
+        /* Physical bank slots szmem() scans: two in SEG0, then SEG1.  M4.5-L2:
+         * a 4th bank at SEG1 0x28000000 (a patched -DIP22 kernel scans 4 banks,
+         * MAX_MEM_BANKS 3->4) raises the ceiling 384MB -> 512MB. */
+        static const uint32_t bank_base[4] = {
+            0x08000000, 0x10000000, 0x20000000, 0x28000000
         };
         uint32_t remaining = s->ram_size;
         uint32_t ram_off = 0;
         uint16_t fld[MC_NUM_BANKS] = { 0 };
 
-        for (int b = 0; b < 3 && b < MC_NUM_BANKS && remaining > 0; b++) {
+        for (int b = 0; b < 4 && b < MC_NUM_BANKS && remaining > 0; b++) {
             uint32_t sz = MIN(remaining, bank_max);
             s->banks[b].installed_size = sz;
             s->banks[b].ram_offset = ram_off;
@@ -1090,7 +1092,7 @@ static void sgi_mc_virtuix_reset(DeviceState *dev)
             remaining -= sz;
         }
         if (remaining) {
-            qemu_log("sgi_mc: %u MB RAM exceeds the IP22 384MB bank ceiling; "
+            qemu_log("sgi_mc: %u MB RAM exceeds the 512MB 4-bank ceiling; "
                      "%u MB left unmapped (needs the IP55-native kernel)\n",
                      s->ram_size / (1024 * 1024),
                      remaining / (1024 * 1024));
