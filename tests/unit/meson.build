@@ -1,5 +1,7 @@
 
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
+# the shared SGI host-queue/microcode helpers (sgi_hq_common.c) under test
+testsgi = declare_dependency(sources: '../../hw/misc/sgi_hq_common.c')
 
 tests = {
   'check-block-qdict': [],
@@ -34,6 +36,7 @@ tests = {
   'test-rcu-simpleq': [],
   'test-rcu-tailq': [],
   'test-rcu-slist': [],
+  'test-sgi-hq': [testsgi],
   'test-qdist': [],
   'test-qht': [],
   'test-qtree': [],
