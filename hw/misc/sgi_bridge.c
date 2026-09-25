@@ -519,7 +519,10 @@ static bool sgi_bridge_sio_async(void)
 {
     static int v = -1;
     if (v < 0) {
-        v = getenv("SGIBRIDGE_SIO_ASYNC") != NULL;
+        /* Faithful async console TX drain is the default; SGIBRIDGE_SIO_SYNC
+         * (or SGIBRIDGE_SIO_IRQ) restores the old synchronous drain. */
+        v = getenv("SGIBRIDGE_SIO_SYNC") == NULL &&
+            getenv("SGIBRIDGE_SIO_IRQ") == NULL;
     }
     return v;
 }
