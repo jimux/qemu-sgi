@@ -89,6 +89,31 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEREState, SGI_CRIME_RE)
 #define CRMSTAT_IB_STPTR_SHIFT  0
 #define CRMSTAT_IB_STPTR_MASK   0x3f
 
+/*
+ * Interface-buffer control register (IntfBuf.ctl @0x400, write-only) —
+ * the programmable stall/interrupt watermarks, from crimereg.h
+ * CrmIntfBufCtlReg (#else macros) and CRIME 1.5 spec §7.3.3.1:
+ *
+ *   fullLevel   [27:21]  "intLevel"   — level at/above which the RE raises
+ *                                       the FIFO-full interrupt (CRM_INT_RE4)
+ *   emptyLevel  [20:14]               — FIFO-empty watermark (CRM_INT_RE3)
+ *   stallLevel  [13:7]                — level above which the host interface
+ *                                       stalls host writes for stallCount cycles
+ *   stallCount  [6:0]                 — "stallCycle", 66 MHz cycles to stall
+ *
+ * These are *thresholds*, not the occupancy; the live occupancy is the
+ * status register's intfBufLevel field (CRMSTAT_IB_LEVEL).  See the model's
+ * sgi_crime_re_ib_level() for how it is derived from the ring state.
+ */
+#define CRMIBCTL_FULL_SHIFT      21
+#define CRMIBCTL_FULL_MASK       0x7f
+#define CRMIBCTL_EMPTY_SHIFT     14
+#define CRMIBCTL_EMPTY_MASK      0x7f
+#define CRMIBCTL_STALL_LEVEL_SHIFT 7
+#define CRMIBCTL_STALL_LEVEL_MASK  0x7f
+#define CRMIBCTL_STALL_COUNT_SHIFT 0
+#define CRMIBCTL_STALL_COUNT_MASK  0x7f
+
 /* TLB sub-offsets (crimedef.h) */
 #define CRM_TLB_FB_A_OFFSET     0x000
 #define CRM_TLB_FB_B_OFFSET     0x200

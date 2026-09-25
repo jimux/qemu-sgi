@@ -2229,6 +2229,25 @@ static uint64_t sgi_crime_re_tlb_read(SGICRIMEREState *s, hwaddr off)
     return 0;
 }
 
+/*
+ * Interface-buffer occupancy (status register intfBufLevel, bits 24:18).
+ *
+ * CRIME 1.5 spec §7.3.3.1: the host "can avoid overflows by examining the
+ * interface buffer FIFO level indicated in the intfBufLevel field Status
+ * register" — i.e. the level is the number of posted entries the rendering
+ * engine has not yet retired, (WrPtr - RdPtr) mod 64.  We give the RE an
+ * independent RdPtr and advance it as each posted write is applied to the
+ * register file; because the engine in this model retires a write on the
+ * host MMIO store that posted it (never back-pressured), RdPtr tracks WrPtr
+ * and the level reads 0, below every CRMIBCTL_* watermark — so the RE3/RE4
+ * FIFO interrupts never fire.  That is the truthful level for a
+ * synchronous engine, not a hardcoded constant.
+ */
+static uint32_t sgi_crime_re_ib_level(SGICRIMEREState *s)
+{
+    return (s->ib_wrptr - s->ib_rdptr) & CRMSTAT_IB_LEVEL_MASK;
+}
+
 static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned size)
 {
     SGICRIMEREState *s = SGI_CRIME_RE(opaque);
@@ -2260,7 +2279,7 @@ static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned siz
         uint32_t wr = s->ib_wrptr & CRMSTAT_IB_WRPTR_MASK;
         uint32_t rd = s->ib_rdptr & CRMSTAT_IB_RDPTR_MASK;
         uint32_t stptr = s->ib_startptr & CRMSTAT_IB_STPTR_MASK;
-        uint32_t level = (s->ib_wrptr - s->ib_rdptr) & CRMSTAT_IB_LEVEL_MASK;
+        uint32_t level = sgi_crime_re_ib_level(s);
 
         st |= level << CRMSTAT_IB_LEVEL_SHIFT;
         st |= rd << CRMSTAT_IB_RDPTR_SHIFT;
@@ -2371,6 +2390,22 @@ static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned siz
  * The data slot holds the write value in the word the wmask selects:
  * crmRestorePP() reads (wmask 2) the low word, (wmask 1) the high word,
  * or (wmask 3) the whole 64 bits and stores it at the decoded target.
+ *
+ * Context save/restore is driven by the guest kernel (gf_PcxSwap ->
+ * crmSavePP -> crmLoadTlbABC -> crmRestorePP), which harvests
+ * pending = (WrPtr - StartPtr) mod 64 descriptors and replays them.  The
+ * replay honours the per-context copy mask CRM_CXSW_* (crimedef.h):
+ *   LSTIPPLE 0x01, MTE 0x04, TEXTURE 0x08, SHADE 0x10, SZ 0x20, MISC 0x40,
+ *   CRM_CXSW_ALL = 0x7d, and CRM_CXSW_NOT_GL 0x80.
+ * crmRestorePP()'s disassembly gates each block on those bits (LSTIPPLE at
+ * 0x802698dc, MTE at 0x802698f8, SHADE at 0x802699d0, SZ at 0x802699a8,
+ * MISC at 0x80269978, TEXTURE at 0x802699d4); for an X context (NOT_GL) it
+ * deliberately does NOT round-trip Vertex.GL, Shade, Scissor, Fog,
+ * Antialias, Blend, Depth, AlphaTest, Stencil or Texture, keeping only
+ * Vertex.X and Shade.fgColor (crimedef.h comment; spec Table 7-3 marks the
+ * per-register G/NG class).  The device honours the mask by storing every
+ * write and returning the last write on read-back, so whichever subset the
+ * kernel chooses to save/restore round-trips exactly.
  */
 static void sgi_crime_re_ib_post(SGICRIMEREState *s, unsigned page,
                                  hwaddr reg_off, unsigned size,
@@ -2407,6 +2442,8 @@ static void sgi_crime_re_ib_post(SGICRIMEREState *s, unsigned page,
 
     s->ib_data[s->ib_wrptr] = data;
     s->ib_addr[s->ib_wrptr] = desc;
+    trace_sgi_crime_re_ibpost(s->ib_wrptr, (int)page, (int)wmask,
+                              (int)reg_off, data, start ? 1 : 0);
     s->ib_wrptr = (s->ib_wrptr + 1) & (CRIME_FIFO_DEPTH - 1);
     s->ib_rdptr = s->ib_wrptr;          /* retired synchronously */
 }
@@ -2607,6 +2644,8 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
             s->ib_startptr = (uint32_t)value & CRMSTAT_IB_STPTR_MASK;
             s->ib_wrptr = s->ib_startptr;
             s->ib_rdptr = s->ib_startptr;
+            trace_sgi_crime_re_ctxsw((int)value, (int)s->ib_wrptr,
+                                     (int)s->ib_rdptr, (int)s->ib_startptr);
         }
         return;
     }
