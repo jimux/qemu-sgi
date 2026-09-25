@@ -1934,6 +1934,19 @@ static void sgi_bridge_write(void *opaque, hwaddr offset, uint64_t val,
                 } else if (idx == IOC3_ERCIR) {
                     s->guest_ercir = val;
                     s->eth_regs[idx] = val;
+                } else if (idx == IOC3_EISR) {
+                    /*
+                     * EISR is write-1-to-clear: ef_intr() reads it and writes
+                     * the same value back to clear the observed bits ("read and
+                     * clear all interrupt bits" / "write back to clear",
+                     * if_ef.c and the ARCS ef driver).  Storing the value
+                     * verbatim kept EISR & EIER nonzero, so the IOC3 Ethernet
+                     * level interrupt never de-asserted and ef_intr re-entered
+                     * forever at `ifconfig ef0` (network bring-up).  Clear the
+                     * written bits and re-drive the line.
+                     */
+                    s->eth_regs[IOC3_EISR] &= ~(uint32_t)val;
+                    sgi_bridge_eth_irq_update(s);
                 } else {
                     s->eth_regs[idx] = val;
                 }
