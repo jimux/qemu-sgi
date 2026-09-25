@@ -302,7 +302,15 @@ static const MemoryRegionOps mgras_widget_id_ops = {
 typedef struct SGIMgrasWin {
     SGIDS2502 nic;
     uint8_t reg[0x100000];   /* register-level bring-up store (mgras_hw) */
+    uint16_t vc3_sram[0x8000];  /* VC3 video line/frame/cursor/DID tables */
+    uint32_t vc3_ram_addr;      /* VC3 RAM_ADDR (index reg 7), 16-bit shorts */
 } SGIMgrasWin;
+
+/* VC3 window (struct 0x62000 -> PROM 0x72000) register offsets. */
+#define MGRAS_VC3_INDEXDATA_OFF 0x72038   /* (reg<<24)|(data16<<8) */
+#define MGRAS_VC3_RAM_OFF       0x72190   /* 16-bit SRAM data port */
+#define MGRAS_VC3_RAM64_OFF     0x72180   /* 64-bit SRAM data port */
+#define MGRAS_VC3_RAM_ADDR_REG  7         /* VC3_RAM_ADDR sub-register */
 
 static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -325,6 +333,20 @@ static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
     if (off == 0x20000) {
         return 0x2;
     }
+    /*
+     * CMAP0/1 status (MGRAS_CMAP_STATUS = CRS(4)|DW1 = 0x208; PROM offsets
+     * 0x71208/0x71608).  mgras_cmapSetCmd()/the XMAP wait spin on
+     * `while (!(base->cmap0.status & 0x08))`, so report the ready bit 3.
+     */
+    if (off == 0x71208 || off == 0x71608) {
+        return 0x08;
+    }
+    /* VC3 SRAM data port: read back the current short, then auto-increment. */
+    if (off == MGRAS_VC3_RAM_OFF || off == MGRAS_VC3_RAM64_OFF) {
+        v = s->vc3_sram[s->vc3_ram_addr & 0x7fff];
+        s->vc3_ram_addr = (s->vc3_ram_addr + 1) & 0x7fff;
+        return v;
+    }
     if (off + size <= sizeof(s->reg)) {
         for (i = 0; i < size; i++) {
             v = (v << 8) | s->reg[off + i];   /* big-endian, as the PROM reads */
@@ -343,6 +365,17 @@ static void mgras_win_write(void *opaque, hwaddr off, uint64_t val, unsigned siz
 
     if (off == MGRAS_HQ4_NIC || off == MGRAS_HQ4_NIC + 4) {
         sgi_ds2502_mcr(&s->nic, val);
+        return;
+    }
+    /* VC3 index/data register: capture VC3_RAM_ADDR writes. */
+    if (off == MGRAS_VC3_INDEXDATA_OFF) {
+        if ((val >> 24) == MGRAS_VC3_RAM_ADDR_REG) {
+            s->vc3_ram_addr = (val >> 8) & 0x7fff;
+        }
+    }
+    if (off == MGRAS_VC3_RAM_OFF || off == MGRAS_VC3_RAM64_OFF) {
+        s->vc3_sram[s->vc3_ram_addr & 0x7fff] = val & 0xffff;
+        s->vc3_ram_addr = (s->vc3_ram_addr + 1) & 0x7fff;
         return;
     }
     if (off + size <= sizeof(s->reg)) {
