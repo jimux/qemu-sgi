@@ -45,6 +45,7 @@
 #include "hw/display/sgi_glaccel.h"
 #include "hw/misc/sgi_heart.h"
 #include "hw/misc/sgi_bridge.h"
+#include "hw/misc/sgi_ds2502.h"
 #include "hw/misc/sgi_sflash.h"
 #include "target/mips/internal.h"
 #include "hw/misc/sgi_pvaudio.h"
@@ -276,15 +277,34 @@ static const MemoryRegionOps mgras_widget_id_ops = {
     .write = NULL,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
-        .min_access_size = 4,
+        .min_access_size = 1,
         .max_access_size = 8,
     },
 };
 
 /* Temporary I0 instrumentation: log every access to the MGRAS window so the
- * POST hang shows which register the PROM polls. */
+ * POST hang shows which register the PROM polls.  Offset 0x11098 is the HQ4
+ * "number in a can" (sys/xtalk/hq4.h HQ4_WIDGET_NIC) MicroLAN register, read
+ * by the widget probe with the same MCR protocol as the HEART/bridge. */
+#define MGRAS_HQ4_NIC 0x11098
+
+typedef struct SGIMgrasWin {
+    SGIDS2502 nic;
+} SGIMgrasWin;
+
 static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
 {
+    SGIMgrasWin *s = opaque;
+
+    if (off == MGRAS_HQ4_NIC || off == MGRAS_HQ4_NIC + 4) {
+        return 0x2 | (s->nic.data_bit & 1);   /* MCR_DONE | MCR_DATA */
+    }
+    if (off == 0x20100 && current_cpu) {
+        MIPSCPU *cpu = MIPS_CPU(current_cpu);
+        qemu_log_mask(LOG_UNIMP, "mgras-win R 0x20100 PC=0x%llx ra=0x%llx\n",
+                      (unsigned long long)cpu->env.active_tc.PC,
+                      (unsigned long long)cpu->env.active_tc.gpr[31]);
+    }
     qemu_log_mask(LOG_UNIMP, "mgras-win R off=0x%llx size=%u\n",
                   (unsigned long long)off, size);
     return 0;
@@ -292,6 +312,12 @@ static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
 
 static void mgras_win_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
+    SGIMgrasWin *s = opaque;
+
+    if (off == MGRAS_HQ4_NIC || off == MGRAS_HQ4_NIC + 4) {
+        sgi_ds2502_mcr(&s->nic, val);
+        return;
+    }
     qemu_log_mask(LOG_UNIMP, "mgras-win W off=0x%llx val=0x%llx size=%u\n",
                   (unsigned long long)off, (unsigned long long)val, size);
 }
@@ -301,7 +327,7 @@ static const MemoryRegionOps mgras_win_ops = {
     .write = mgras_win_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
-        .min_access_size = 4,
+        .min_access_size = 1,
         .max_access_size = 8,
     },
 };
@@ -536,7 +562,11 @@ static void sgi_octane_init(MachineState *machine)
         MemoryRegion *mg_id = g_new(MemoryRegion, 1);
 
         if (getenv("OCTANE_MGRAS")) {
-            memory_region_init_io(mg, NULL, &mgras_win_ops, NULL,
+            static const uint8_t nic_serial[6] = { 0, 0, 0, 0, 0, 1 };
+            SGIMgrasWin *mgs = g_new0(SGIMgrasWin, 1);
+
+            sgi_ds2502_build_nic(&mgs->nic, nic_serial);
+            memory_region_init_io(mg, NULL, &mgras_win_ops, mgs,
                                   "sgi.mgras-widget", 16 * MiB);
             memory_region_add_subregion(system_memory, OCTANE_MGRAS_WIDGET, mg);
 

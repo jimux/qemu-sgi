@@ -49,7 +49,10 @@ void sgi_ds2502_build_board(SGIDS2502 *ds, const char *serial,
  * clocked out before the record (extra_bits = 0).
  */
 void sgi_ds2502_build_mac(SGIDS2502 *ds, const uint8_t mac[6],
-                          const uint8_t rom_serial[6]);
+                           const uint8_t rom_serial[6]);
+
+/* Program a bare "number in a can" ROM id (READ ROM 0x33, no data memory). */
+void sgi_ds2502_build_nic(SGIDS2502 *ds, const uint8_t rom_serial[6]);
 
 /* Reset the part to the command state (a 1-wire reset pulse). */
 void sgi_ds2502_reset(SGIDS2502 *ds);

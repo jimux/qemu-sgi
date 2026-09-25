@@ -195,6 +195,20 @@ done:;
     ds->extra_bits = 0; /* nic_eaddr reads the record from byte 0 */
 }
 
+/*
+ * Program a bare "number in a can" ROM id (the Dallas NIC read by the XIO
+ * widget probe via READ ROM 0x33).  There is no data memory; only the 64-bit
+ * ROM id (family + 48-bit serial + CRC-8) is meaningful.
+ */
+void sgi_ds2502_build_nic(SGIDS2502 *ds, const uint8_t rom_serial[6])
+{
+    memset(ds->mem, 0xff, sizeof(ds->mem));
+    ds->rom[0] = 0x01;   /* DS2401 number-in-a-can family */
+    memcpy(&ds->rom[1], rom_serial, 6);
+    ds->rom[7] = sgi_ds_crc8(ds->rom, 7);
+    ds->extra_bits = 0;
+}
+
 void sgi_ds2502_reset(SGIDS2502 *ds)
 {
     ds->state = SGI_DS_CMD;
