@@ -316,6 +316,10 @@ struct SGIBaseIOState {
   uint32_t int_mode;          /* BRIDGE_INT_MODE (0x11c) */
   uint32_t int_device;        /* BRIDGE_INT_DEVICE (0x124): line -> slot map */
   uint32_t int_host_err;      /* BRIDGE_INT_HOST_ERR (0x12c) */
+  /* BRIDGE_DEVICE(x) (0x204 + x*8): per-device control (flags | addr offset).
+   * Written by the PROM to configure the IOC3/ISP mapping; a latch suffices
+   * (bit BRIDGE_DEV_DEV_IO_MEM + BRIDGE_DEV_OFF_MASK). */
+  uint32_t bridge_device[8];
   /* Vector delivered to the hub per line (the ack we must send on deassert). */
   int int_delivered[8];
 

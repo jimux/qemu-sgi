@@ -1574,6 +1574,10 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off >= 0x134 && off < 0x174 && ((off - 0x134) & 7) == 0) {
     return s->int_addr[(off - 0x134) >> 3];
   }
+  /* BRIDGE_DEVICE(x) (0x204 + x*8): per-device control latch. */
+  if (off >= 0x204 && off < 0x244 && ((off - 0x204) & 7) == 0) {
+    return s->bridge_device[(off - 0x204) >> 3];
+  }
   /*
    * IOC3 byte-bus window at bridge+0x280000 (IOC3_BYTEBUS_DEV0 = 0x80000
    * within the IOC3; DEV0..3 span 512 KB).  This is the DS1386-class
@@ -1704,6 +1708,11 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   if (off >= 0x134 && off < 0x174 && ((off - 0x134) & 7) == 0) {
     s->int_addr[(off - 0x134) >> 3] = val;
     sgi_baseio_int_sync(s);
+    return;
+  }
+  /* BRIDGE_DEVICE(x) (0x204 + x*8): latch the per-device control word. */
+  if (off >= 0x204 && off < 0x244 && ((off - 0x204) & 7) == 0) {
+    s->bridge_device[(off - 0x204) >> 3] = (uint32_t)val;
     return;
   }
   /* IOC3 serial DMA ring: latch the base (SBBR) and drain on a STPIR write. */
