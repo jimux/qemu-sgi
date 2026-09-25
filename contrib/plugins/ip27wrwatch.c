@@ -22,42 +22,107 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 static uint64_t ww_lo = 1;
 static uint64_t ww_hi = 0;
 
+/*
+ * Physical cells where the watched VA was successfully stored.  Any LATER
+ * store to one of those cells, whatever its virtual address, is the in-place
+ * clobber we are hunting (the observed failure zeroes a live user page via a
+ * different, kernel mapping) -- its PC names the writer.
+ */
+#define WW_MAX_PHYS 1024
+static uint64_t ww_phys[WW_MAX_PHYS];
+static int ww_nphys;
+
+/*
+ * Normalise to the CELL two physical addresses share: node (tag parity at bit
+ * 32), bank (bit 29) and the offset within the bank.  The machine's tag-alias
+ * loop makes every tag k at the same bank/offset the same cell, so a clobber
+ * arriving through a different tag must still compare equal.
+ */
+static uint64_t ww_cell(uint64_t pa)
+{
+    uint64_t node = (pa >> 32) & 1;
+    uint64_t bank = (pa >> 29) & 1;
+    uint64_t off = pa & 0x1fffffffULL;
+
+    return (off << 2) | (bank << 1) | node;
+}
+
+static void ww_remember(uint64_t pa)
+{
+    uint64_t c = ww_cell(pa);
+    int i;
+
+    for (i = 0; i < ww_nphys; i++) {
+        if (ww_phys[i] == c) {
+            return;
+        }
+    }
+    if (ww_nphys < WW_MAX_PHYS) {
+        ww_phys[ww_nphys++] = c;
+    }
+}
+
+static bool ww_known(uint64_t pa)
+{
+    uint64_t c = ww_cell(pa);
+    int i;
+
+    for (i = 0; i < ww_nphys; i++) {
+        if (ww_phys[i] == c) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t ww_val(qemu_plugin_meminfo_t info)
+{
+    qemu_plugin_mem_value mv = qemu_plugin_mem_get_value(info);
+
+    switch (mv.type) {
+    case QEMU_PLUGIN_MEM_VALUE_U8:
+        return mv.data.u8;
+    case QEMU_PLUGIN_MEM_VALUE_U16:
+        return mv.data.u16;
+    case QEMU_PLUGIN_MEM_VALUE_U32:
+        return mv.data.u32;
+    case QEMU_PLUGIN_MEM_VALUE_U128:
+        return mv.data.u128.low;
+    default:
+        return mv.data.u64;
+    }
+}
+
 static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
                      uint64_t vaddr, void *udata)
 {
     uint64_t pc = (uint64_t)(uintptr_t)udata;
-    qemu_plugin_mem_value mv;
+    bool is_store = qemu_plugin_mem_is_store(info);
+    struct qemu_plugin_hwaddr *h = qemu_plugin_get_hwaddr(info, vaddr);
+    uint64_t pa = h ? qemu_plugin_hwaddr_phys_addr(h) : 0;
     uint64_t val;
 
-    if (vaddr < ww_lo || vaddr >= ww_hi) {
-        return;
-    }
-    mv = qemu_plugin_mem_get_value(info);
-    switch (mv.type) {
-    case QEMU_PLUGIN_MEM_VALUE_U8:
-        val = mv.data.u8;
-        break;
-    case QEMU_PLUGIN_MEM_VALUE_U16:
-        val = mv.data.u16;
-        break;
-    case QEMU_PLUGIN_MEM_VALUE_U32:
-        val = mv.data.u32;
-        break;
-    case QEMU_PLUGIN_MEM_VALUE_U128:
-        val = mv.data.u128.low;
-        break;
-    default:
-        val = mv.data.u64;
-        break;
-    }
-    {
-        struct qemu_plugin_hwaddr *h = qemu_plugin_get_hwaddr(info, vaddr);
-        uint64_t pa = h ? qemu_plugin_hwaddr_phys_addr(h) : 0;
-
+    if (vaddr >= ww_lo && vaddr < ww_hi) {
+        val = ww_val(info);
         fprintf(stderr, "IP27_WW %s pc=0x%016" PRIx64
                         " vaddr=0x%016" PRIx64 " pa=0x%016" PRIx64
                         " val=0x%016" PRIx64 " size=%u\n",
-                qemu_plugin_mem_is_store(info) ? "W" : "R",
+                is_store ? "W" : "R", pc, vaddr, pa, val,
+                1u << qemu_plugin_mem_size_shift(info));
+        if (is_store) {
+            ww_remember(pa);
+        }
+        return;
+    }
+    /*
+     * A store to a cell we have seen the watched VA stored to, via any other
+     * virtual address: the clobber.
+     */
+    if (is_store && pa && ww_known(pa)) {
+        val = ww_val(info);
+        fprintf(stderr, "IP27_WWCLOBBER pc=0x%016" PRIx64
+                        " vaddr=0x%016" PRIx64 " pa=0x%016" PRIx64
+                        " val=0x%016" PRIx64 " size=%u\n",
                 pc, vaddr, pa, val,
                 1u << qemu_plugin_mem_size_shift(info));
     }
