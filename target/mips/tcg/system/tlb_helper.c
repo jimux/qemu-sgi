@@ -218,6 +218,32 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
                                        : 0),
                 (uint64_t)env->active_tc.gpr[31],
                 (uint64_t)env->CP0_EntryLo0, (uint64_t)env->CP0_EntryLo1);
+
+        /*
+         * IP27_POBJTEST: for the rld pObj_Head page, read the word at offset
+         * 0x3bd8 from (a) the physical QEMU derives today and (b) the physical
+         * derived per the SN0 pte_t layout (PFN = pte[31:6], node = numa_home
+         * pte[39:35] placed at bit 32).  If (b) holds pObj_Head (0x0fbe1418)
+         * where (a) reads 0, the extraction is the bug.
+         */
+        if (getenv("IP27_POBJTEST") && tlb->VPN == 0x0fbd8000ULL &&
+            tlb->ASID != 4 && tlb->PFN[0]) {
+            uint64_t elo = (uint64_t)env->CP0_EntryLo0;
+            uint64_t pfn_lo = (elo >> 6) & 0x3ffffffULL;
+            uint64_t numa = (elo >> 35) & 0x1fULL;
+            uint64_t cur = (uint64_t)tlb->PFN[0];
+            uint64_t corr = (pfn_lo << 12) | (numa << 32);
+            uint32_t vcur, vcor;
+
+            vcur = address_space_ldl(env_cpu(env)->as, cur | 0x3bd8,
+                                     MEMTXATTRS_UNSPECIFIED, NULL);
+            vcor = address_space_ldl(env_cpu(env)->as, corr | 0x3bd8,
+                                     MEMTXATTRS_UNSPECIFIED, NULL);
+            fprintf(stderr, "IP27_POBJTEST asid=%04x cur=0x%016" PRIx64
+                    "(0x%08x) corr=0x%016" PRIx64 "(0x%08x) numa=%" PRIu64
+                    " pfn_lo=0x%" PRIx64 "\n",
+                    tlb->ASID, cur, vcur, corr, vcor, numa, pfn_lo);
+        }
     }
 
     if (mips_sgi_tlb_node_remap_hook && !diag_old_inval &&
