@@ -2035,31 +2035,6 @@ static void scsi_disk_emulate_write_same(SCSIDiskReq *r, uint8_t *inbuf)
                                    scsi_write_same_complete, data);
 }
 
-/* TEMPORARY DIAGNOSTIC for the SGI device-buffer round-trip (WRITE_BUFFER ->
- * READ_BUFFER): log an FNV-1a hash and the head/tail of each stored/served
- * buffer so the IP6 trace can be compared side by side.  Remove once the
- * semantics are settled. */
-static void scsi_disk_dl_diag(const char *what, const uint8_t *p, size_t n)
-{
-    uint32_t h = 2166136261u;
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        h = (h ^ p[i]) * 16777619u;
-    }
-    fprintf(stderr, "[scsi-disk dl-diag] %s len=%zu fnv=%08x "
-            "head=%02x%02x%02x%02x%02x%02x%02x%02x "
-            "tail=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-            what, n, h,
-            n > 0 ? p[0] : 0, n > 1 ? p[1] : 0, n > 2 ? p[2] : 0,
-            n > 3 ? p[3] : 0, n > 4 ? p[4] : 0, n > 5 ? p[5] : 0,
-            n > 6 ? p[6] : 0, n > 7 ? p[7] : 0,
-            n > 7 ? p[n - 8] : 0, n > 6 ? p[n - 7] : 0,
-            n > 5 ? p[n - 6] : 0, n > 4 ? p[n - 5] : 0,
-            n > 3 ? p[n - 4] : 0, n > 2 ? p[n - 3] : 0,
-            n > 1 ? p[n - 2] : 0, n > 0 ? p[n - 1] : 0);
-}
-
 static void scsi_disk_emulate_write_data(SCSIRequest *req)
 {
     SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
@@ -2115,13 +2090,6 @@ static void scsi_disk_emulate_write_data(SCSIRequest *req)
             g_free(ds->dl_buf);
             ds->dl_len = MIN(r->req.cmd.xfer, SCSI_DMA_BUF_SIZE);
             ds->dl_buf = g_memdup2(r->iov.iov_base, ds->dl_len);
-            scsi_disk_dl_diag("store", ds->dl_buf, ds->dl_len);
-            /* Decisive: residual is 0 only if the data-out phase actually
-             * consumed the payload (scsi_req_data); the enqueue datalen
-             * logged by the HBA is always -xfer for any TO_DEV command. */
-            fprintf(stderr, "[scsi-disk dl-diag] complete xfer=%" PRIu64
-                    " residual=%" PRIu64 "\n",
-                    r->req.cmd.xfer, r->req.residual);
         }
         scsi_req_complete(&r->req, GOOD);
         break;
@@ -2417,8 +2385,6 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
             memcpy(r->iov.iov_base, s->dl_buf,
                    MIN(s->dl_len, req->cmd.xfer));
         }
-        scsi_disk_dl_diag("serve", r->iov.iov_base,
-                          MIN(s->dl_len, req->cmd.xfer));
         break;
     default:
         trace_scsi_disk_emulate_command_UNKNOWN(buf[0],
