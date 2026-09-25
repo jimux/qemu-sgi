@@ -68,6 +68,7 @@
 #define OCTANE_HEART_WIDGET 0x18000000ULL  /* HEART XIO widget 8 window */
 #define OCTANE_BRIDGE_BASE 0x1F000000ULL   /* BRIDGE widget 0xF */
 #define OCTANE_XBOW_BASE   0x10000000ULL   /* Xbow crossbar widget 0 */
+#define OCTANE_MGRAS_WIDGET 0x19000000ULL  /* MGRAS/Impact graphics, XIO widget 9 */
 #define OCTANE_PROM_BASE   0x1FC00000ULL   /* PROM (BRIDGE+0xC00000) */
 #define OCTANE_FLASH_ALT_BASE 0x1FE00000ULL /* alt flash window (BRIDGE+0xE00000) */
 #define OCTANE_PROM_SIZE   (1 * MiB)       /* IP30 PROM is 1MB */
@@ -162,6 +163,13 @@ typedef struct SGIXbowRegs {
 
 static bool xbow_link_present(int port)
 {
+    /* XIO widget 9 (MGRAS/Impact graphics) is behind OCTANE_MGRAS: presenting
+     * it makes the PROM discover and run the MGRAS init, which currently
+     * panics on the unmodelled register file (I0 -> I1 boundary).  Off by
+     * default so the met unattended-boot item stays green. */
+    if (port == 9) {
+        return getenv("OCTANE_MGRAS") != NULL;
+    }
     return port == 8 || port == 0xf;
 }
 
@@ -235,6 +243,62 @@ static uint64_t heart_widget_id_read(void *opaque, hwaddr off, unsigned size)
 static const MemoryRegionOps heart_widget_id_ops = {
     .read = heart_widget_id_read,
     .write = NULL,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+};
+
+/*
+ * MGRAS / IMPACT (HQ4) graphics widget-ID word, from sys/xtalk/hq4.h:
+ * part 0xc003 at [27:12], mfg 0x2aa at [10:1], rev at [31:28].  The ARCS
+ * graphics drivers match on mfg+part (MGRAS/mgras_init.c), so presenting this
+ * word at the widget-1 window base is what makes the board discoverable.
+ */
+#define MGRAS_WID_ID_VAL 0x0000000010c003554ULL
+
+static uint64_t mgras_widget_id_read(void *opaque, hwaddr off, unsigned size)
+{
+    if (off >= 8) {
+        return 0;
+    }
+    if (size == 8) {
+        return MGRAS_WID_ID_VAL;
+    }
+    /* 32-bit access: +0 is the high word, +4 the low word. */
+    return (off == 0) ? (uint32_t)(MGRAS_WID_ID_VAL >> 32)
+                      : (uint32_t)MGRAS_WID_ID_VAL;
+}
+
+static const MemoryRegionOps mgras_widget_id_ops = {
+    .read = mgras_widget_id_read,
+    .write = NULL,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+};
+
+/* Temporary I0 instrumentation: log every access to the MGRAS window so the
+ * POST hang shows which register the PROM polls. */
+static uint64_t mgras_win_read(void *opaque, hwaddr off, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "mgras-win R off=0x%llx size=%u\n",
+                  (unsigned long long)off, size);
+    return 0;
+}
+
+static void mgras_win_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "mgras-win W off=0x%llx val=0x%llx size=%u\n",
+                  (unsigned long long)off, (unsigned long long)val, size);
+}
+
+static const MemoryRegionOps mgras_win_ops = {
+    .read = mgras_win_read,
+    .write = mgras_win_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 4,
@@ -458,6 +522,28 @@ static void sgi_octane_init(MachineState *machine)
         memory_region_init_io(hw_id, NULL, &heart_widget_id_ops, NULL,
                               "sgi.heart-widget-id", 8);
         memory_region_add_subregion(hw, 0, hw_id);
+    }
+
+    /*
+     * MGRAS / IMPACT (HQ4) graphics at XIO widget 9 (0x19000000).  Only the
+     * widget-ID word is modelled for now: the xbow reports the link present
+     * and this window answers with the HQ4 part/mfg, so the PROM's widget
+     * discovery identifies an IMPACT board.  The rest of the 16MB window is
+     * RAM-backed; the MGRAS register file (I1) will overlay it.
+     */
+    {
+        MemoryRegion *mg = g_new(MemoryRegion, 1);
+        MemoryRegion *mg_id = g_new(MemoryRegion, 1);
+
+        if (getenv("OCTANE_MGRAS")) {
+            memory_region_init_io(mg, NULL, &mgras_win_ops, NULL,
+                                  "sgi.mgras-widget", 16 * MiB);
+            memory_region_add_subregion(system_memory, OCTANE_MGRAS_WIDGET, mg);
+
+            memory_region_init_io(mg_id, NULL, &mgras_widget_id_ops, NULL,
+                                  "sgi.mgras-widget-id", 8);
+            memory_region_add_subregion(mg, 0, mg_id);
+        }
     }
 
     /*
