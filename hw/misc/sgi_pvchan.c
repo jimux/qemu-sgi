@@ -29,6 +29,7 @@
 #include "chardev/char-fe.h"
 #include "ui/input.h"
 #include "ui/clipboard.h"
+#include "migration/vmstate.h"
 
 /* ---- singleton (for HMP lookups) ------------------------------------------ */
 static SGIPvChanState *pvchan_instance;
@@ -893,12 +894,38 @@ static void sgi_pvchan_reset(DeviceState *dev)
     qemu_irq_lower(s->irq);
 }
 
+/* M2 design 02: device VMState so a checkpoint/restore does not silently drop
+ * the pv device registers.  The rings themselves live in guest RAM (migrated
+ * with RAM); only the MMIO-programmed registers are saved here.  The chardev is
+ * re-bound by the destination launcher, so host-transport state is not saved. */
+static const VMStateDescription vmstate_sgi_pvchan = {
+    .name = "sgi-pvchan",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(status, SGIPvChanState),
+        VMSTATE_UINT32(h2g_base, SGIPvChanState),
+        VMSTATE_UINT32(h2g_len, SGIPvChanState),
+        VMSTATE_UINT32(h2g_write, SGIPvChanState),
+        VMSTATE_UINT32(h2g_read, SGIPvChanState),
+        VMSTATE_UINT32(h2g_dbell, SGIPvChanState),
+        VMSTATE_UINT32(g2h_base, SGIPvChanState),
+        VMSTATE_UINT32(g2h_len, SGIPvChanState),
+        VMSTATE_UINT32(g2h_write, SGIPvChanState),
+        VMSTATE_UINT32(g2h_read, SGIPvChanState),
+        VMSTATE_UINT32(g2h_dbell, SGIPvChanState),
+        VMSTATE_UINT32(irq_enable, SGIPvChanState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void sgi_pvchan_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     device_class_set_props(dc, sgi_pvchan_props);
     dc->realize = sgi_pvchan_realize;
     device_class_set_legacy_reset(dc, sgi_pvchan_reset);
+    dc->vmsd = &vmstate_sgi_pvchan;
 }
 
 static const TypeInfo sgi_pvchan_type = {

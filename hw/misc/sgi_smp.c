@@ -4,6 +4,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/sgi_smp.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qom/object.h"
@@ -145,12 +146,27 @@ static const Property sgi_smp_properties[] = {
     DEFINE_PROP_UINT32("num-cpus", SGISMPState, num_cpus, 1),
 };
 
+/* M2 design 02: device VMState (register/control state; CPU pointers are
+ * re-established on the destination). */
+static const VMStateDescription vmstate_sgi_smp = {
+  .name = "sgi-smp",
+  .version_id = 1,
+  .minimum_version_id = 1,
+  .fields = (const VMStateField[]) {
+    VMSTATE_UINT32(num_cpus, SGISMPState),
+    VMSTATE_UINT32(boot_addr, SGISMPState),
+    VMSTATE_UINT32(boot_status, SGISMPState),
+    VMSTATE_END_OF_LIST()
+  },
+};
+
 static void sgi_smp_class_init(ObjectClass *klass, const void *data) {
   DeviceClass *dc = DEVICE_CLASS(klass);
 
   dc->realize = sgi_smp_realize;
   device_class_set_legacy_reset(dc, sgi_smp_reset);
   device_class_set_props(dc, sgi_smp_properties);
+  dc->vmsd = &vmstate_sgi_smp;
 }
 
 static const TypeInfo sgi_smp_info = {

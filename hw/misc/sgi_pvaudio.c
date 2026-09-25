@@ -17,6 +17,7 @@
 #include "hw/misc/sgi_pvaudio.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "hw/core/sysbus.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
@@ -428,12 +429,38 @@ static const Property sgi_pvaudio_properties[] = {
     DEFINE_AUDIO_PROPERTIES(SGIPVAudioState, audio_be),
 };
 
+/* M2 design 02: device VMState (registers/ring indices; the ring is guest RAM). */
+static const VMStateDescription vmstate_sgi_pvaudio = {
+    .name = "sgi-pvaudio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ctrl, SGIPVAudioState),
+        VMSTATE_UINT32(status, SGIPVAudioState),
+        VMSTATE_UINT32(intr_stat, SGIPVAudioState),
+        VMSTATE_UINT32(intr_mask, SGIPVAudioState),
+        VMSTATE_UINT32(buf_base, SGIPVAudioState),
+        VMSTATE_UINT32(buf_size, SGIPVAudioState),
+        VMSTATE_UINT32(buf_head, SGIPVAudioState),
+        VMSTATE_UINT32(buf_tail, SGIPVAudioState),
+        VMSTATE_UINT32(sample_rate, SGIPVAudioState),
+        VMSTATE_UINT32(channels, SGIPVAudioState),
+        VMSTATE_UINT32(bits, SGIPVAudioState),
+        VMSTATE_UINT32(cap_base, SGIPVAudioState),
+        VMSTATE_UINT32(cap_size, SGIPVAudioState),
+        VMSTATE_UINT32(cap_head, SGIPVAudioState),
+        VMSTATE_UINT32(cap_tail, SGIPVAudioState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void sgi_pvaudio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = sgi_pvaudio_realize;
     device_class_set_props(dc, sgi_pvaudio_properties);
+    dc->vmsd = &vmstate_sgi_pvaudio;
 }
 
 static const TypeInfo sgi_pvaudio_info = {

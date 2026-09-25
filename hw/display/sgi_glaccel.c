@@ -14,6 +14,7 @@
 
 /* clang-format off */
 #include "qemu/osdep.h"
+#include "migration/vmstate.h"
 /* clang-format on */
 #include "hw/display/sgi_glaccel.h"
 #include "hw/core/irq.h"
@@ -2512,11 +2513,33 @@ static const Property sgi_glaccel_props[] = {
     DEFINE_PROP_BOOL("winmodel", SGIGLAccelState, winmodel, true),
 };
 
+/* M2 design 02: device VMState for the pvgpu MMIO registers.  The internal
+ * framebuffer and per-context GL state are host state and are NOT carried — a
+ * restored guest must redraw / re-create its GL contexts (design 03). */
+static const VMStateDescription vmstate_sgi_glaccel = {
+    .name = "sgi-glaccel",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(status, SGIGLAccelState),
+        VMSTATE_UINT32(width, SGIGLAccelState),
+        VMSTATE_UINT32(height, SGIGLAccelState),
+        VMSTATE_UINT32(cmd_base, SGIGLAccelState),
+        VMSTATE_UINT32(cmd_len, SGIGLAccelState),
+        VMSTATE_UINT32(fb_base, SGIGLAccelState),
+        VMSTATE_UINT32(format, SGIGLAccelState),
+        VMSTATE_UINT32(stride, SGIGLAccelState),
+        VMSTATE_BOOL(invalidate, SGIGLAccelState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void sgi_glaccel_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->realize = sgi_glaccel_realize;
     device_class_set_props(dc, sgi_glaccel_props);
+    dc->vmsd = &vmstate_sgi_glaccel;
     object_class_property_add_str(klass, "cmd-file", NULL, glaccel_set_cmd_file);
 }
 
