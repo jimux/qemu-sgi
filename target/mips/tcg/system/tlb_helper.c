@@ -208,14 +208,16 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
                 " old(vpn=%016" PRIx64 " asid=%04x pm=%08x pfn0=%012" PRIx64
                 " pfn1=%012" PRIx64 " inval=%d) new(pfn0=%012" PRIx64
                 " pfn1=%012" PRIx64 ") pm=%08x pc=%016" PRIx64
-                " ra=%016" PRIx64 "\n",
+                " ra=%016" PRIx64 " elo0=%016" PRIx64 " elo1=%016" PRIx64
+                "\n",
                 idx, tlb->ASID, (uint64_t)tlb->VPN,
                 (uint64_t)diag_old_vpn, diag_old_asid, diag_old_pm,
                 diag_old_pfn0, diag_old_pfn1, diag_old_inval,
                 (uint64_t)tlb->PFN[0], (uint64_t)tlb->PFN[1], tlb->PageMask,
                 (uint64_t)(current_cpu ? cpu_env(current_cpu)->active_tc.PC
                                        : 0),
-                (uint64_t)env->active_tc.gpr[31]);
+                (uint64_t)env->active_tc.gpr[31],
+                (uint64_t)env->CP0_EntryLo0, (uint64_t)env->CP0_EntryLo1);
     }
 
     if (mips_sgi_tlb_node_remap_hook && !diag_old_inval &&
