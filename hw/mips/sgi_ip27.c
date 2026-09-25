@@ -728,6 +728,7 @@ typedef struct IP27Watch {
   MemoryRegion mr;
   MemoryRegion *ram;
   uint64_t phys;
+  uint64_t len;
 } IP27Watch;
 
 static uint64_t ip27_watch_read(void *opaque, hwaddr off, unsigned size) {
@@ -992,14 +993,41 @@ static void sgi_ip27_init(MachineState *machine) {
     memory_region_add_subregion_overlap(system_memory, t->phys, &t->mr, 11);
   }
 
-  /* IP27_WATCH=1: watch-window over the flat RW page (diagnostic, see above). */
+  /* IP27_WATCH=1: watch-window over the flat RW page (diagnostic, see above).
+   * IP27_WATCH_PHYS / IP27_WATCH_LEN select the window (hex), default the
+   * seg2 page. */
   if (getenv("IP27_WATCH")) {
     IP27Watch *w = g_new0(IP27Watch, 1);
+    const char *ph = getenv("IP27_WATCH_PHYS");
+    const char *ln = getenv("IP27_WATCH_LEN");
+
     w->ram = ram;
-    w->phys = 0x3f3000;
+    w->phys = ph ? strtoull(ph, NULL, 16) : 0x3f3000;
+    w->len = ln ? strtoull(ln, NULL, 16) : 0x1000;
     memory_region_init_io(&w->mr, NULL, &ip27_watch_ops, w,
-                          "sgi-ip27.watch", 0x1000);
+                          "sgi-ip27.watch", w->len);
     memory_region_add_subregion_overlap(system_memory, w->phys, &w->mr, 12);
+    fprintf(stderr, "sgi-ip27: watch window phys=0x%" PRIx64 " len=0x%" PRIx64
+            "\n", (uint64_t)w->phys, (uint64_t)w->len);
+  }
+
+  /*
+   * IP27_POISON1=<hex64>: fill node 1's RAM with a distinctive pattern so a
+   * node-1/node-0 address-aliasing bug shows up as the poison value in a
+   * node-0 location (vs. genuine disk/kernel content).  Diagnostic only.
+   */
+  if (nnodes == 2 && ram1 && getenv("IP27_POISON1")) {
+    uint64_t pat = strtoull(getenv("IP27_POISON1"), NULL, 16);
+    void *rp = memory_region_get_ram_ptr(ram1);
+    uint64_t n = node_ram / 8;
+    uint64_t *p64 = rp;
+    uint64_t k;
+
+    for (k = 0; k < n; k++) {
+      p64[k] = pat;
+    }
+    fprintf(stderr, "sgi-ip27: poisoned node-1 RAM (%" PRIu64 " MB) with "
+            "0x%016" PRIx64 "\n", node_ram >> 20, pat);
   }
 
 
