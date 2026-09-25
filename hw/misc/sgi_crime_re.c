@@ -1006,8 +1006,16 @@ static bool sgi_crime_re_tex_sample(SGICRIMEREState *s, int px, int py,
     if (q == 0) {
         return false;
     }
-    u = (int)(((sq / q) - 16384) / 256);
-    v = (int)(((tq / q) - 16384) / 256);
+    /*
+     * Normalise the perspective-divided coordinate.  (s - 2^14) spans 2^14
+     * units per *full* texture map, so the texel index is
+     * (s - 2^14) * size / 2^14.  The former hard-coded /256 is that only
+     * when size == 64: on blast's 256x256 planet map it left u,v four times
+     * too small, so the whole primitive sampled the top-left 1/16 of the
+     * map (the near-black corner of nebula.rgb) and drew a black silhouette.
+     */
+    u = (int)((((sq / q) - 16384) * (int64_t)uw) / 16384);
+    v = (int)((((tq / q) - 16384) * (int64_t)vh) / 16384);
     if (u < 0) {
         u = 0;
     }
