@@ -282,6 +282,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGICRIMEREState, SGI_CRIME_RE)
  * pending primitive) */
 #define CRM_GO_OFFSET           0x800
 
+/*
+ * Shadow (read-back) files.
+ *
+ * The RE pixel-pipe, MTE and TLB registers are read/write latches: the
+ * IRIX driver's crmSavePP() reads them back to save the switching-out
+ * context and crmRestorePP() re-writes them on the way in (its copy set
+ * is CRMDRAWREGS+MTE, masked by CRM_CXSW_*).  A read of a register must
+ * therefore return the last value written, or the save/restore cannot
+ * round-trip and the switching-in context runs with zeroed registers.
+ *
+ * Rather than reconstructing every read from the named state fields, a
+ * flat last-written image of each register page is kept.  Every accepted
+ * write lands here (including registers whose drawing behaviour is not
+ * modelled yet, which must still latch for a faithful round-trip).
+ */
+#define CRM_RE_PIXPIPE_SIZE     0x200   /* 0x2000-0x21ff, 128 x 32-bit */
+#define CRM_RE_MTE_SIZE         0x80    /* 0x3000-0x307f,  32 x 32-bit */
+
 struct SGICRIMEREState {
     SysBusDevice parent_obj;
 
@@ -378,6 +396,15 @@ struct SGICRIMEREState {
     uint64_t mte_src0, mte_src1;
     uint64_t mte_dst0, mte_dst1;
     uint32_t mte_srcystep, mte_dstystep;
+
+    /*
+     * Last-written register images (read-back semantics for
+     * crmSavePP()/crmRestorePP() and any other reader).  Indexed in
+     * 32-bit words from each page base; go-offset aliases are masked
+     * off before indexing.
+     */
+    uint32_t pp_shadow[CRM_RE_PIXPIPE_SIZE / 4];
+    uint32_t mte_shadow[CRM_RE_MTE_SIZE / 4];
 };
 
 #endif /* HW_MISC_SGI_CRIME_RE_H */

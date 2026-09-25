@@ -1975,6 +1975,11 @@ static void sgi_crime_re_mte_run(SGICRIMEREState *s)
 /* Store one 32-bit pixpipe register (offset relative to pixpipe base) */
 static void sgi_crime_re_pp_store(SGICRIMEREState *s, hwaddr p, uint32_t v)
 {
+    /* latch every pixel-pipe write for read-back (crmSavePP) */
+    if (p < CRM_RE_PIXPIPE_SIZE) {
+        s->pp_shadow[p >> 2] = v;
+    }
+
     switch (p) {
     /* ---- bufmodes / clip / draw ---- */
     case CRM_BUF_MODE_SRC_REG:
@@ -2180,6 +2185,11 @@ static void sgi_crime_re_pp_store(SGICRIMEREState *s, hwaddr p, uint32_t v)
 /* Store one 32-bit MTE register (offset relative to MTE page base) */
 static void sgi_crime_re_mte_store(SGICRIMEREState *s, hwaddr m, uint32_t v)
 {
+    /* latch every MTE write for read-back (crmSavePP saves MTE too) */
+    if (m < CRM_RE_MTE_SIZE) {
+        s->mte_shadow[m >> 2] = v;
+    }
+
     switch (m) {
     case CRM_MTE_MODE_REG:        s->mte_mode = v; return;
     case CRM_MTE_BYTEMASK_REG:    s->mte_bytemask = v; return;
@@ -2196,7 +2206,29 @@ static void sgi_crime_re_mte_store(SGICRIMEREState *s, hwaddr m, uint32_t v)
     }
 }
 
-static uint64_t sgi_crime_re_read(void *opaque, hwaddr offset, unsigned size)
+static uint64_t sgi_crime_re_tlb_read(SGICRIMEREState *s, hwaddr off)
+{
+    hwaddr t = off - CRM_RE_TLB_BASE;
+
+    if (t < 0x200) {
+        return s->tlb_fb[0][t / 8];
+    } else if (t < 0x400) {
+        return s->tlb_fb[1][(t - 0x200) / 8];
+    } else if (t < 0x600) {
+        return s->tlb_fb[2][(t - 0x400) / 8];
+    } else if (t < CRM_TLB_CID_OFFSET) {
+        return s->tlb_tex[(t - CRM_TLB_TEX_OFFSET) / 8];
+    } else if (t < CRM_TLB_LINEAR_A_OFFSET) {
+        return s->tlb_cid[(t - CRM_TLB_CID_OFFSET) / 8];
+    } else if (t < CRM_TLB_LINEAR_A_OFFSET + 0x80) {
+        return s->tlb_linear[0][(t - CRM_TLB_LINEAR_A_OFFSET) / 8];
+    } else if (t < CRM_TLB_LINEAR_B_OFFSET + 0x80) {
+        return s->tlb_linear[1][(t - CRM_TLB_LINEAR_B_OFFSET) / 8];
+    }
+    return 0;
+}
+
+static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned size)
 {
     SGICRIMEREState *s = SGI_CRIME_RE(opaque);
 
@@ -2257,6 +2289,43 @@ static uint64_t sgi_crime_re_read(void *opaque, hwaddr offset, unsigned size)
          */
         if (offset == CRM_RE_INTFBUF_CTL) {
             return s->ib_ctl;
+        }
+
+        /*
+         * Read-back of the latched register pages.  crmSavePP() reads
+         * the pixel-pipe and MTE registers to save the switching-out
+         * context; returning 0 made every saved shadow all-zero, so
+         * the matching crmRestorePP() loaded zeros and the resumed
+         * context silently lost its draws.  Return the last write.
+         */
+        if (offset >= CRM_RE_TLB_BASE && offset < CRM_RE_PIXPIPE_BASE) {
+            return sgi_crime_re_tlb_read(s, offset);
+        }
+        if (offset >= CRM_RE_PIXPIPE_BASE && offset < CRM_RE_MTE_BASE) {
+            hwaddr p = (offset & ~(hwaddr)CRM_GO_OFFSET) - CRM_RE_PIXPIPE_BASE;
+
+            if (p + 4 <= CRM_RE_PIXPIPE_SIZE) {
+                uint64_t lo = s->pp_shadow[p >> 2];
+
+                if (size == 8 && p + 8 <= CRM_RE_PIXPIPE_SIZE) {
+                    return (lo << 32) | s->pp_shadow[(p >> 2) + 1];
+                }
+                return lo;
+            }
+            return 0;
+        }
+        if (offset >= CRM_RE_MTE_BASE && offset < CRM_RE_STATUS_BASE) {
+            hwaddr m = (offset & ~(hwaddr)CRM_GO_OFFSET) - CRM_RE_MTE_BASE;
+
+            if (m + 4 <= CRM_RE_MTE_SIZE) {
+                uint64_t lo = s->mte_shadow[m >> 2];
+
+                if (size == 8 && m + 8 <= CRM_RE_MTE_SIZE) {
+                    return (lo << 32) | s->mte_shadow[(m >> 2) + 1];
+                }
+                return lo;
+            }
+            return 0;
         }
         return 0;
     }
@@ -2357,6 +2426,8 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
          * last register write by START_OFFSET").
          */
         if (go) {
+            trace_sgi_crime_re_go(off, s->primitive, s->drawmode,
+                                  s->winoffset_dst);
             sgi_crime_re_draw(s);
         }
         return;
@@ -2380,12 +2451,22 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
                 break;
             }
             }
+            /*
+             * The 64-bit src/dst registers bypass mte_store(); latch
+             * both halves here so the read-back image stays complete.
+             */
+            if (m + 8 <= CRM_RE_MTE_SIZE) {
+                s->mte_shadow[m >> 2] = (uint32_t)(value >> 32);
+                s->mte_shadow[(m >> 2) + 1] = (uint32_t)v;
+            }
         } else {
             sgi_crime_re_mte_store(s, m, v);
         }
 
         /* MTE_SET32_AND_GO(MTE_MODE, op) — the go bit starts it */
         if (go) {
+            trace_sgi_crime_re_go(off, s->primitive, s->drawmode,
+                                  s->winoffset_dst);
             sgi_crime_re_mte_run(s);
         }
         return;
@@ -2405,6 +2486,14 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
         }
         return;
     }
+}
+
+static uint64_t sgi_crime_re_read(void *opaque, hwaddr offset, unsigned size)
+{
+    uint64_t v = sgi_crime_re_read_impl(opaque, offset, size);
+
+    trace_sgi_crime_re_regread((int)offset, (int)size, v);
+    return v;
 }
 
 static const MemoryRegionOps sgi_crime_re_ops = {
@@ -2481,6 +2570,8 @@ static void sgi_crime_re_reset(DeviceState *dev)
     s->mte_dst1 = 0;
     s->mte_srcystep = 0;
     s->mte_dstystep = 0;
+    memset(s->pp_shadow, 0, sizeof(s->pp_shadow));
+    memset(s->mte_shadow, 0, sizeof(s->mte_shadow));
     s->status = CRMSTAT_ALL_IDLE;
 }
 
@@ -2541,6 +2632,9 @@ static const VMStateDescription vmstate_sgi_crime_re = {
         VMSTATE_UINT64(mte_dst1, SGICRIMEREState),
         VMSTATE_UINT32(mte_srcystep, SGICRIMEREState),
         VMSTATE_UINT32(mte_dstystep, SGICRIMEREState),
+        VMSTATE_UINT32_ARRAY(pp_shadow, SGICRIMEREState,
+                             CRM_RE_PIXPIPE_SIZE / 4),
+        VMSTATE_UINT32_ARRAY(mte_shadow, SGICRIMEREState, CRM_RE_MTE_SIZE / 4),
         VMSTATE_END_OF_LIST()
     }
 };
