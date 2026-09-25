@@ -1711,6 +1711,31 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                                       shininess);
         }
     }
+    /* Framing self-consistency gate: shared event contract, branch-local emit
+     * site.  Publishes the camera/viewport and the unclipped batch bbox the
+     * rasteriser is about to write, so analysis_tools/gr2_selfconsistency.py
+     * can check the guest's own matrices/vertices predict the pixels.  Eye
+     * space Z is not tracked on this lighting path, so it is reported as 0;
+     * the ndcZ range is real. */
+    {
+        float nzmin = sz[0], nzmax = sz[0];
+        int bb_minx = (int)floorf(sx[0]), bb_miny = (int)floorf(sy[0]);
+        int bb_maxx = (int)ceilf(sx[0]), bb_maxy = (int)ceilf(sy[0]);
+        unsigned k;
+
+        for (k = 1; k < s->ge_poly_n; k++) {
+            nzmin = MIN(nzmin, sz[k]);
+            nzmax = MAX(nzmax, sz[k]);
+            bb_minx = MIN(bb_minx, (int)floorf(sx[k]));
+            bb_miny = MIN(bb_miny, (int)floorf(sy[k]));
+            bb_maxx = MAX(bb_maxx, (int)ceilf(sx[k]));
+            bb_maxy = MAX(bb_maxy, (int)ceilf(sy[k]));
+        }
+        trace_sgi_gr2_ge7_cam(0, 0, (int)(nzmin * 1000.0f),
+                              (int)(nzmax * 1000.0f), vx, vy, vw, vh);
+        trace_sgi_gr2_ge7_tri(0, 0, bb_minx > bb_maxx, bb_minx, bb_miny,
+                              bb_maxx, bb_maxy);
+    }
     sgi_gr2_ge7_greylut(s, lut);
     for (i = 1; i + 1 < s->ge_poly_n; i++) {
         unsigned ia = s->ge_strip ? i - 1 : 0; /* fan apex, or strip prev-2 */
