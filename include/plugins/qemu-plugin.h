@@ -711,6 +711,17 @@ uint64_t qemu_plugin_hwaddr_phys_addr(const struct qemu_plugin_hwaddr *haddr);
 QEMU_PLUGIN_API
 const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h);
 
+/*
+ * qemu_plugin_current_asid() - address-space id of the CPU currently running.
+ *
+ * Returns the executing CPU's current address-space identifier where the
+ * target has one (MIPS: CP0 EntryHi ASID), else 0.  Lets a memory callback
+ * attribute a store/load to the guest context (process) it ran in.  Only
+ * meaningful from a vCPU callback.
+ */
+QEMU_PLUGIN_API
+uint32_t qemu_plugin_current_asid(void);
+
 /**
  * typedef qemu_plugin_vcpu_mem_cb_t - memory callback function type
  * @vcpu_index: the executing vCPU

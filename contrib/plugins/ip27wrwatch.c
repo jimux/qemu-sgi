@@ -100,14 +100,15 @@ static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     bool is_store = qemu_plugin_mem_is_store(info);
     struct qemu_plugin_hwaddr *h = qemu_plugin_get_hwaddr(info, vaddr);
     uint64_t pa = h ? qemu_plugin_hwaddr_phys_addr(h) : 0;
+    uint32_t asid = qemu_plugin_current_asid();
     uint64_t val;
 
     if (vaddr >= ww_lo && vaddr < ww_hi) {
         val = ww_val(info);
         fprintf(stderr, "IP27_WW %s pc=0x%016" PRIx64
-                        " vaddr=0x%016" PRIx64 " pa=0x%016" PRIx64
+                        " asid=%04x vaddr=0x%016" PRIx64 " pa=0x%016" PRIx64
                         " val=0x%016" PRIx64 " size=%u\n",
-                is_store ? "W" : "R", pc, vaddr, pa, val,
+                is_store ? "W" : "R", pc, asid, vaddr, pa, val,
                 1u << qemu_plugin_mem_size_shift(info));
         if (is_store) {
             ww_remember(pa);
@@ -121,9 +122,9 @@ static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
     if (is_store && pa && ww_known(pa)) {
         val = ww_val(info);
         fprintf(stderr, "IP27_WWCLOBBER pc=0x%016" PRIx64
-                        " vaddr=0x%016" PRIx64 " pa=0x%016" PRIx64
+                        " asid=%04x vaddr=0x%016" PRIx64 " pa=0x%016" PRIx64
                         " val=0x%016" PRIx64 " size=%u\n",
-                pc, vaddr, pa, val,
+                pc, asid, vaddr, pa, val,
                 1u << qemu_plugin_mem_size_shift(info));
     }
 }

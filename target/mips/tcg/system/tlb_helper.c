@@ -31,6 +31,23 @@
 #include "trace.h"
 
 /*
+ * Exported to plugins (QEMU_PLUGIN_API in include/plugins/qemu-plugin.h): the
+ * executing CPU's current ASID, so a plugin memory callback can attribute a
+ * store/load to the guest context it ran in.
+ */
+uint32_t qemu_plugin_current_asid(void)
+{
+    CPUState *cs = current_cpu;
+    CPUMIPSState *env;
+
+    if (!cs) {
+        return 0;
+    }
+    env = cpu_env(cs);
+    return env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+}
+
+/*
  * @DIAG@ IP27 TLB/VA watch.  Env-gated -- IP27_TLBWATCH="<lo>:<hi>" as hex VAs
  * -- and off by default, so it is inert on every machine.  The SN0 two-node
  * bring-up uses it to log every guest-TLB install and every softmmu refill for
