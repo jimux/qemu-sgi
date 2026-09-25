@@ -28,6 +28,7 @@
 #define HW_MISC_SGI_GR2_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/sgi_hq.h"
 #include "qom/object.h"
 #include "ui/console.h"
 #include "qemu/timer.h"
@@ -311,11 +312,13 @@ struct SGIGr2State {
     uint8_t regs[SGI_GR2_REG_SIZE];
     bool present;
 
-    /* GE7 instruction storage, addressed by the current gepc: 5 words per
-     * PC (the ge[0].ram0[0xf8..0xfb] window plus the load register). */
-    uint32_t ucode[SGI_GR2_UCODE_PCS][SGI_GR2_UCODE_WORDS];
-    uint32_t gepc;
-    bool hq_ready;
+    /* HQ2 + GE7 instruction storage.  The shared host-queue block carries the
+     * microcode store (an SgiUcode) and the idle/ucode-ready status bits, so
+     * the MGRAS/GE11 work reuses the same download/verify plumbing - see
+     * hw/misc/sgi_hq.h.  The store is addressed by the PC the driver writes
+     * (its GEPC): 5 words per PC (the ge[0].ram0[0xf8..0xfb] window plus the
+     * load register). */
+    SgiHQState hq;
     bool xmap_ready;
 
     /* Scanout (P0.4 step a): a QEMU display surface proving the output stage

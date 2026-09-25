@@ -2254,22 +2254,22 @@ static uint64_t sgi_gr2_read(void *opaque, hwaddr offset, unsigned size)
         offset < SGI_GR2_GE_WIN_OFF + SGI_GR2_GE_WIN_WORDS * 4) {
         unsigned idx = (offset - SGI_GR2_GE_WIN_OFF) / 4;
 
-        val = sgi_gr2_word_read(
-            s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][idx], offset & 3, size);
+        val = sgi_gr2_word_read(sgi_ucode_read(&s->hq.ucode, idx), offset & 3,
+                                size);
     } else if (offset >= SGI_GR2_HQ_UCODELOAD &&
                offset < SGI_GR2_HQ_UCODELOAD + 4) {
-        val = sgi_gr2_word_read(
-            s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][4], offset & 3, size);
+        val = sgi_gr2_word_read(sgi_ucode_read(&s->hq.ucode, 4), offset & 3,
+                                size);
     } else if (offset >= SGI_GR2_HQ_GEPC && offset < SGI_GR2_HQ_GEPC + 4) {
-        val = sgi_gr2_word_read(s->gepc, offset & 3, size);
+        val = sgi_gr2_word_read(sgi_ucode_pc(&s->hq.ucode), offset & 3, size);
     } else if (offset >= SGI_GR2_HQ_FIFOSTAT &&
                offset < SGI_GR2_HQ_FIFOSTAT + 4) {
         /* HQ2 status: bit 0 = HQ2 idle/ready (the X DDX's expInit spins on
          * it — lw 0x6a040; andi 0x1; beqz), bit 1 = ucode ready (the kernel's
          * _Gr2UcodeReady).  Occupancy stays empty. */
         val = sgi_gr2_word_read(
-            SGI_GR2_HQ_IDLE_BIT |
-            (s->hq_ready ? SGI_GR2_HQ_READY_BIT : 0), offset & 3, size);
+            sgi_hq_fifostat(&s->hq, SGI_GR2_HQ_IDLE_BIT,
+                            SGI_GR2_HQ_READY_BIT), offset & 3, size);
     } else if (offset >= SGI_GR2_XMAP_STATUS &&
                offset < SGI_GR2_XMAP_STATUS + 4) {
         /* XMAP status: bit 1 reports "ready"; _Gr2XMAPInit3 spins on it.
@@ -2590,18 +2590,19 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
         offset < SGI_GR2_GE_WIN_OFF + SGI_GR2_GE_WIN_WORDS * 4) {
         unsigned idx = (offset - SGI_GR2_GE_WIN_OFF) / 4;
 
-        s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][idx] =
-            sgi_gr2_word_write(value, offset & 3, size);
+        sgi_ucode_write(&s->hq.ucode, idx,
+                        sgi_gr2_word_write(value, offset & 3, size));
         return;
     }
     if (offset >= SGI_GR2_HQ_UCODELOAD &&
         offset < SGI_GR2_HQ_UCODELOAD + 4) {
-        s->ucode[s->gepc & (SGI_GR2_UCODE_PCS - 1)][4] =
-            sgi_gr2_word_write(value, offset & 3, size);
+        sgi_ucode_write(&s->hq.ucode, 4,
+                        sgi_gr2_word_write(value, offset & 3, size));
         return;
     }
     if (offset >= SGI_GR2_HQ_GEPC && offset < SGI_GR2_HQ_GEPC + 4) {
-        s->gepc = sgi_gr2_word_write(value, offset & 3, size);
+        sgi_ucode_set_pc(&s->hq.ucode,
+                         sgi_gr2_word_write(value, offset & 3, size));
         return;
     }
     /* Gr2Start kicks the HQ2 sequencer by writing the start token to the
@@ -2609,7 +2610,7 @@ static void sgi_gr2_write(void *opaque, hwaddr offset, uint64_t value,
      * ready from that write on.  The token itself is still stored below. */
     if (offset >= SGI_GR2_HQ_TOKEN_START &&
         offset < SGI_GR2_HQ_TOKEN_START + 4) {
-        s->hq_ready = true;
+        s->hq.ucode.ready = true;
     }
     /* Programming the XMAP control registers makes the mode generator ready
      * for the driver's poll. */
@@ -2956,7 +2957,7 @@ static void sgi_gr2_retrace_tick(void *opaque)
     SGIGr2State *s = SGI_GR2(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (s->present && s->hq_ready && !s->retrace_active) {
+    if (s->present && s->hq.ucode.ready && !s->retrace_active) {
         s->retrace_active = true;
         qemu_irq_raise(s->irq);
         timer_mod(s->retrace_lower_timer, now + SGI_GR2_RETRACE_PULSE_NS);
@@ -2977,9 +2978,8 @@ static void sgi_gr2_reset(DeviceState *dev)
     int i;
 
     memset(s->regs, 0, sizeof(s->regs));
-    memset(s->ucode, 0, sizeof(s->ucode));
-    s->gepc = 0;
-    s->hq_ready = false;
+    sgi_hq_reset(&s->hq, SGI_GR2_HQ_MAGIC, 0, 1);
+    s->hq.idle = true; /* the model drains the command queue synchronously */
     s->xmap_ready = false;
     s->retrace_active = false;
     /* Default RAMDAC palette (measured; see the table) and clear the RE3
