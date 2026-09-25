@@ -898,10 +898,29 @@ static void sgi_pvchan_reset(DeviceState *dev)
  * the pv device registers.  The rings themselves live in guest RAM (migrated
  * with RAM); only the MMIO-programmed registers are saved here.  The chardev is
  * re-bound by the destination launcher, so host-transport state is not saved. */
+/* Post-load re-arm (M2 design 03): the IRQ line is HOST state and is not
+ * migrated, while the restored h2g_dbell/irq_enable fields come from the guest.
+ * If a host->guest message was pending at save (doorbell set, IRQs enabled) the
+ * destination must re-raise the line, or a guest driver parked in its blocking
+ * PVCHAN_WAIT would not be woken until the next write.  Reconciling the line
+ * with the restored register state is the whole job; the rings themselves are
+ * guest RAM and their indices are restored above. */
+static int vmstate_sgi_pvchan_post_load(void *opaque, int version_id)
+{
+    SGIPvChanState *s = opaque;
+    if (s->h2g_dbell && s->irq_enable) {
+        qemu_irq_raise(s->irq);
+    } else {
+        qemu_irq_lower(s->irq);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_sgi_pvchan = {
     .name = "sgi-pvchan",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = vmstate_sgi_pvchan_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(status, SGIPvChanState),
         VMSTATE_UINT32(h2g_base, SGIPvChanState),
