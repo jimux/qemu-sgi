@@ -27,6 +27,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGLAccelState, SGI_GLACCEL)
 #define SGI_GLACCEL_DOORBELL 0x28   /* atomic submit: write (ctx<<24)|len -> process ctx's ring */
 #define SGI_GLACCEL_CTX_FREE 0x2C   /* Phase B: write ctx id -> free context (unmap lifecycle) */
 #define SGI_GLACCEL_WINMODEL 0x30   /* R: server-published window-model generation (0 = none) */
+#define SGI_GLACCEL_IRQ_ENABLE 0x34 /* RW: 1 -> raise the pvgpu pv-irq line on DOORBELL
+                                     * completion (guest acks via a STATUS W1C read /
+                                     * IRQ_ENABLE=0); 0 -> no interrupts (old kernels
+                                     * that poll STATUS_DONE are unaffected, default 0) */
 
 /* Execution Commands */
 #define GLACCEL_CMD_RESET   (1 << 0)
@@ -203,6 +207,7 @@ struct SGIGLAccelState {
 
     /* Registers */
     uint32_t status;
+    uint32_t irq_enable;   /* pv-irq opt-in (guest driver writes IRQ_ENABLE) */
     uint32_t width;
     uint32_t height;
     uint32_t cmd_base;

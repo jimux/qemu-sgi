@@ -2006,6 +2006,8 @@ static uint64_t sgi_glaccel_read(void *opaque, hwaddr addr, unsigned size)
         /* generation of the live server-published window model; 0 = nobody is
          * publishing (or the device is not consuming), i.e. "keep guessing". */
         return s->winmodel ? s->wm_gen : 0;
+    case SGI_GLACCEL_IRQ_ENABLE:
+        return s->irq_enable;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad register offset 0x%" HWADDR_PRIx "\n",
@@ -2056,6 +2058,14 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case SGI_GLACCEL_CONTEXT:
         s->cur_ctx = (val < PVGPU_MAXCTX) ? val : 0;   /* select the window for the next EXEC */
+        break;
+    case SGI_GLACCEL_IRQ_ENABLE:
+        /* Guest driver opts into the pvgpu pv-irq line.  Default 0 keeps old
+         * kernels (which poll STATUS_DONE) free of an unexpected INT3 vector. */
+        s->irq_enable = val ? 1 : 0;
+        if (!s->irq_enable) {
+            qemu_irq_lower(s->irq);
+        }
         break;
     case SGI_GLACCEL_EXEC:
         if (val & GLACCEL_CMD_RESET) {
@@ -2119,6 +2129,12 @@ static void sgi_glaccel_write(void *opaque, hwaddr addr, uint64_t val,
             g_free(cmd);
         }
         s->status |= GLACCEL_STATUS_DONE;
+        /* pvgpu pv-irq: a completed submit notifies the guest driver, which
+         * acks by W1C-reading STATUS (that clears GLACCEL_STATUS_DONE and the
+         * read handler lowers the line).  Only when the driver opted in. */
+        if (s->irq_enable) {
+            qemu_irq_raise(s->irq);
+        }
         break;
     }
     case SGI_GLACCEL_CTX_FREE: {
@@ -2522,6 +2538,7 @@ static const VMStateDescription vmstate_sgi_glaccel = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(status, SGIGLAccelState),
+        VMSTATE_UINT32(irq_enable, SGIGLAccelState),
         VMSTATE_UINT32(width, SGIGLAccelState),
         VMSTATE_UINT32(height, SGIGLAccelState),
         VMSTATE_UINT32(cmd_base, SGIGLAccelState),
