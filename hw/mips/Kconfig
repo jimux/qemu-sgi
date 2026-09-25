@@ -95,6 +95,8 @@ config SGI_INDY
     select SGI_HPC1
     select SGI_HPC3
     select SGI_ARCS
+    select SGI_VINO
+    select SGI_GR2
     select SGI_NEWPORT
     select SGI_GR2
     select WD33C93

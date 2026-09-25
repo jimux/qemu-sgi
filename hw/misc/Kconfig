@@ -148,6 +148,9 @@ config SGI_HPC1
 config SGI_ARCS
     bool
 
+config SGI_VINO
+    bool
+
 config SGI_GR2
     bool
 

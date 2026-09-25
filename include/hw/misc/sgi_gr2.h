@@ -28,6 +28,7 @@
 #define HW_MISC_SGI_GR2_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/sgi_hq.h"
 #include "qom/object.h"
 #include "ui/console.h"
 #include "qemu/timer.h"
@@ -133,8 +134,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_GE7_DIFFUSE     0x401e8 /* token 122, RGBA                 */
 #define SGI_GR2_GE7_SPECULAR    0x401f0 /* token 124, RGB                  */
 #define SGI_GR2_GE7_LCOLOR      0x401f8 /* token 126, light colour RGB     */
+#define SGI_GR2_GE7_MAX_LIGHTS  3      /* light slots the shade sums       */
 #define SGI_GR2_GE7_LPOS        0x401fc /* token 127, light position XYZ   */
+#define SGI_GR2_GE7_CULL_FACE   0x40070 /* token 28 = __glExpEnableCullFace/  */
+#define SGI_GR2_GE7_CULL_FACE_CW 0x4006c /* token 27 = the CW half of the pair */
+                                         /* PassCullFace in the guest's own    */
+                                         /* libGLcore (IP22GR2NG1), not a light */
+#define SGI_GR2_GE7_SPEC_LUT    0x401d0 /* token 116: the specular table the   */
+                                         /* guest uploads - __glExpCreateSpecLUT */
+                                         /* builds 128 entries pow(t,shininess)  */
+                                         /* and the GE indexes it with t, so the */
+                                         /* emulator uses the guest's own curve, */
+                                         /* never a guessed exponent.            */
+#define SGI_GR2_GE7_SPOTLIGHT   0x40200 /* token 128, gl_load_spotlight    */
 #define SGI_GR2_GE7_LMCOLOR     0x40204 /* token 129, lighting model       */
+#define SGI_GR2_GE7_DITHER      0x407e8 /* token 506, gl_d_dither(): 0 off */
+#define SGI_GR2_GE7_FREELUT     0x40394 /* token 229, __glExpFreeLightLUT: */
+                                        /* resets all lights as a group    */
 
 #define SGI_GR2_HQ_OFF      0x6a000 /* HQ2 register block (mystery at 0x7c) */
 #define SGI_GR2_HQ_MYSTERY  0x6a07c /* presence magic, read by Gr2Probe */
@@ -226,6 +242,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
 #define SGI_GR2_XMAP_READY_BIT 0x2
 #define SGI_GR2_XMAP_CTL_OFF  0x6c1a0 /* control/data regs written at init */
 #define SGI_GR2_XMAP_CTL_END  0x6c1b8
+#define SGI_GR2_XMAP_MODE     0x6c1a4 /* per-entry MODE: PIXMD + PDMD (CI/RGB) */
 /* RAMDAC colour-map programming, inside the XMAP control window.  The DDX
  * writes each entry as: the INDEX to 0x6c1b0, a control byte to 0x6c1b4, then a
  * sliding byte stream on 0x6c1a8 whose bytes are R,G,B of the addressed entry
@@ -295,11 +312,13 @@ struct SGIGr2State {
     uint8_t regs[SGI_GR2_REG_SIZE];
     bool present;
 
-    /* GE7 instruction storage, addressed by the current gepc: 5 words per
-     * PC (the ge[0].ram0[0xf8..0xfb] window plus the load register). */
-    uint32_t ucode[SGI_GR2_UCODE_PCS][SGI_GR2_UCODE_WORDS];
-    uint32_t gepc;
-    bool hq_ready;
+    /* HQ2 + GE7 instruction storage.  The shared host-queue block carries the
+     * microcode store (an SgiUcode) and the idle/ucode-ready status bits, so
+     * the MGRAS/GE11 work reuses the same download/verify plumbing - see
+     * hw/misc/sgi_hq.h.  The store is addressed by the PC the driver writes
+     * (its GEPC): 5 words per PC (the ge[0].ram0[0xf8..0xfb] window plus the
+     * load register). */
+    SgiHQState hq;
     bool xmap_ready;
 
     /* Scanout (P0.4 step a): a QEMU display surface proving the output stage
@@ -315,6 +334,19 @@ struct SGIGr2State {
      * index.  At scanout a flagged pixel is expanded 3-3-2, an unflagged one
      * goes through ramdac[], so both visual modes coexist on the same screen. */
     uint8_t *scanout332;
+    /* Set by every framebuffer write; the 60 Hz retrace presents and clears it.
+     * The GE7 raster path (put332) never called the display update itself, so a
+     * GL-only client's output was written but only shown when some unrelated
+     * 2D/VC1 op happened to refresh.  Presenting on retrace fixes that. */
+    bool fb_dirty;
+    /* XMAP mode TABLE (xmapall): a MODE word (0x6c1a4) is written into the entry
+     * selected by the address registers addrlo (0x6c1b0) / addrhi (0x6c1b4).
+     * Each pixel's DID should index this table to pick CI vs RGB - the guest
+     * toggles entry 40 (CI <-> RGB) for a GL window while the desktop stays CI.
+     * NOTE: not yet consulted by the display; stored for the DID work. */
+    uint8_t xmap_addrlo;
+    uint8_t xmap_addrhi;
+    uint32_t xmap_mode[256];
     /* Overlay plane (2 bits/pixel; one byte per pixel here).  0 is TRANSPARENT
      * — the main plane shows through — and 1..3 index the 4-entry overlay
      * colormap.  4Dwm menus are depth-2 override-redirect windows: the DDX
@@ -426,23 +458,6 @@ struct SGIGr2State {
      * bar colour (222).  The DDX does not put the text y on the wire, and the
      * label bar is drawn just before its glyphs, so this is the structural link
      * for the glyph baseline. */
-    /* The last solid rect painted.  The DDX clears a terminal's text area with
-     * a bg rect immediately before its glyph strip, and that rect's x1 is the
-     * text origin -- the strip carries only the row y, never an x. */
-    int re3_last_rect_x;
-    int re3_last_rect_y;
-    bool re3_last_rect_valid;
-    /* Bounding box of the overlay-plane menu currently established by its
-     * background fills (mode-3 colour 1).  The overlay's ONLY retire mechanism
-     * is the menu's own overlay clear (a mode-3 colour-0 fill of this same
-     * rect), so any overlay stroke that leaves this box is never erased and
-     * would sit on the screen forever; clip strokes to it.  Cleared by the
-     * colour-0 fill. */
-    int ovl_clip_x1;
-    int ovl_clip_y1;
-    int ovl_clip_x2;
-    int ovl_clip_y2;
-    bool ovl_clip_valid;
     int re3_label_y;
     bool re3_label_valid;
     /* IP20 Xsgi's glyph piece, read straight from the stream (see the token
@@ -547,7 +562,6 @@ struct SGIGr2State {
     int ge_clip_w, ge_clip_h;
     unsigned ge_clip_n;
     bool ge_clip_armed;
-    bool ge_need_clear;            /* a fresh frame: clear the drawable first */
     float ge_poly[SGI_GR2_GE7_MAX_VERTS][3]; /* current polygon, object space  */
     float ge_vnormal[SGI_GR2_GE7_MAX_VERTS][3]; /* its per-vertex normals     */
     unsigned ge_poly_n;
@@ -571,6 +585,21 @@ struct SGIGr2State {
     float ge_lcolor[3];            /* token 126: light colour RGB            */
     float ge_lpos[3];              /* token 127: light position XYZ          */
     float ge_ambient_sum[3];       /* token 117: summed ambient RGB          */
+    /* The guest binds several lights and animates them.  lmbind(LIGHTn) is
+     * token 28, one word whose value is the light number, so each colour and
+     * position run goes to its own light's slot rather than a round-robin
+     * guess.  shade() sums the valid ones. */
+    float ge_lights[SGI_GR2_GE7_MAX_LIGHTS][3];
+    float ge_light_color[SGI_GR2_GE7_MAX_LIGHTS][3];
+    bool ge_light_valid[SGI_GR2_GE7_MAX_LIGHTS];
+    unsigned ge_light_cur;         /* light slot the current run applies to  */
+    bool ge_light_pend;            /* token-128 pair: index is the next word */
+    unsigned ge_lpos_n;            /* words collected for the current light   */
+    bool ge_dither;                /* ordered dither before the 3-3-2 pack   */
+    bool ge_cull_cw;               /* token 27: front face is CW (cull CCW)  */
+    bool ge_cull_ccw;              /* token 28: front face is CCW (cull CW)  */
+    float ge_spec_lut[128];        /* token 116: the guest's specular table  */
+    int ge_spec_lut_n;             /* words collected into it                 */
     hwaddr ge_mat_tok;             /* last material token (run boundary)     */
     unsigned ge_mat_n;             /* components collected in the run        */
     bool ge_mat_valid;

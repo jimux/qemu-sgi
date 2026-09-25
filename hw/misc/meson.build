@@ -165,7 +165,11 @@ system_ss.add(when: 'CONFIG_SGI_HPC1', if_true: files('sgi_hpc1.c'))
 system_ss.add(when: 'CONFIG_SGI_HPC3', if_true: files('sgi_hpc3.c'))
 system_ss.add(when: 'CONFIG_SGI_HPC3_VIRTUIX', if_true: files('sgi_hpc3_virtuix.c'))
 system_ss.add(when: 'CONFIG_SGI_ARCS', if_true: files('sgi_arcs.c'))
+system_ss.add(when: 'CONFIG_SGI_VINO', if_true: files('sgi_vino.c'))
 system_ss.add(when: 'CONFIG_SGI_GR2', if_true: files('sgi_gr2.c'))
+# Shared host-queue/microcode plumbing, usable by any SGI graphics device
+# (GR2 today, MGRAS/GE11 later).  Machine-independent; see sgi_hq.h.
+system_ss.add(files('sgi_hq_common.c'))
 system_ss.add(when: 'CONFIG_SGI_CRIME', if_true: files('sgi_crime.c'))
 system_ss.add(when: 'CONFIG_SGI_CRIME_RE', if_true: files('sgi_crime_re.c'))
 system_ss.add(when: 'CONFIG_SGI_MACE', if_true: files('sgi_mace.c'))
