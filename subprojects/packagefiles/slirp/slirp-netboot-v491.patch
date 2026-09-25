@@ -1,0 +1,73 @@
+diff --git a/src/bootp.c b/src/bootp.c
+index 23e07b67..7e55b4d9 100644
+--- a/src/bootp.c
++++ b/src/bootp.c
+@@ -398,7 +398,18 @@ static void bootp_reply(Slirp *slirp,
+     assert(q < end);
+     *q++ = RFC1533_END;
+ 
+-    daddr.sin_addr.s_addr = 0xffffffffu;
++    /*
++     * RFC 1542: unicast the reply to the client when we know its address --
++     * daddr.sin_addr already carries it (the request's ciaddr, or the yiaddr we
++     * just assigned); it is left 0xffffffff only for the DHCPNAK case above.
++     * Broadcast only if no address is known at all.  The previous unconditional
++     * broadcast here silently dropped the reply for any client that already had
++     * an address and was not in promiscuous mode -- notably the Indy PROM, which
++     * only enables promiscuous receive while ciaddr == 0 ("No server for ...").
++     */
++    if (daddr.sin_addr.s_addr == 0) {
++        daddr.sin_addr.s_addr = 0xffffffffu;
++    }
+ 
+     assert(q <= end);
+ 
+diff --git a/src/tftp.c b/src/tftp.c
+index bba2cf9a..ecca0daa 100644
+--- a/src/tftp.c
++++ b/src/tftp.c
+@@ -377,24 +377,33 @@ static void tftp_handle_rrq(Slirp *slirp, struct sockaddr_storage *srcsas,
+         return;
+     }
+ 
+-    if (tp->x.tp_buf[pktlen - 1] != 0) {
+-        tftp_send_error(spt, 2, "Access violation", tp);
+-        return;
+-    }
+-
++    /*
++     * RFC 2347 options follow the mode as NUL-terminated "key\0value\0" pairs.
++     * Some clients (the Indy PROM) append a non-option trailer after the mode
++     * (observed: 4 bytes 00 00 a8 7f, whose last byte is NOT NUL).  Parse only
++     * real option pairs and ignore any trailing bytes: bound each key/value
++     * scan to the packet and stop -- do not error -- on an empty key or a run
++     * with no NUL terminator.  The old code required the last payload byte to
++     * be NUL and answered EACCES ("Access violation") on that trailer, so the
++     * transfer never started.
++     */
+     while (k < pktlen && nb_options < G_N_ELEMENTS(option_name)) {
+         const char *key, *value;
++        size_t key_len, value_len;
+ 
+         key = &tp->x.tp_buf[k];
+-        k += strlen(key) + 1;
+-
+-        if (k >= pktlen) {
+-            tftp_send_error(spt, 2, "Access violation", tp);
+-            return;
++        key_len = strnlen(key, pktlen - k);
++        if (key_len == 0 || key_len >= (size_t)(pktlen - k)) {
++            break;      /* empty key or unterminated run: the trailer */
+         }
++        k += key_len + 1;
+ 
+         value = &tp->x.tp_buf[k];
+-        k += strlen(value) + 1;
++        value_len = strnlen(value, pktlen - k);
++        if (value_len >= (size_t)(pktlen - k)) {
++            break;      /* truncated option: ignore the rest */
++        }
++        k += value_len + 1;
+ 
+         if (g_ascii_strcasecmp(key, "tsize") == 0) {
+             int tsize = atoi(value);
