@@ -1,7 +1,7 @@
 [wrap-git]
 url = https://gitlab.freedesktop.org/slirp/libslirp.git
 revision = v4.9.1
-patch_directory = slirp
+diff_files = slirp-netboot-v491.patch
 
 [provide]
-slirp = libslirp_dep
+slirp = libslirp_libdep
