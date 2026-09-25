@@ -106,6 +106,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(SGIGr2State, SGI_GR2)
                                      /* rect (x, y_bottom, w, h), re-sent  */
                                      /* by the DDX each frame so it tracks */
                                      /* a window move (note 79)            */
+#define SGI_GR2_GE7_CHARSTR  0x401a4 /* token 105, the charstr font path:  */
+                                     /* __GLgl_outcharmap pushes one glyph  */
+                                     /* bitmap per character (bitmap rows,  */
+                                     /* no position -- see sgi_gr2.c)       */
 #define SGI_GR2_GE7_MAX_VERTS 64     /* vertices buffered per polygon     */
 
 /* Line and triangle-mesh primitives, from the libgl disassembly: gl_i_bgnline
@@ -585,6 +589,16 @@ struct SGIGr2State {
     bool ge_strip;                 /* current run is a triangle mesh (strip)  */
     float ge_line[SGI_GR2_GE7_MAX_LVERTS][2]; /* buffered line vertices      */
     unsigned ge_line_n;
+    /* token 105, the charstr font path: a glyph arrives as a 13-word block
+     * whose payload is the glyph's bitmap rows.  See sgi_gr2_ge7_charstr():
+     * the block does NOT carry the glyph's position (charstr passes none and
+     * the library keeps the cell cursor in GL state), so the glyphs are drawn
+     * as a MONOSPACED run from the drawable origin -- the advance is faithful
+     * (fixed 16-pixel cell rows), the ORIGIN IS AN APPROXIMATION. */
+    uint32_t ge_char[13];
+    unsigned ge_char_n;
+    int ge_char_x, ge_char_y;      /* monospaced cell cursor                  */
+    bool ge_char_run;              /* a charstr run is in progress            */
     float ge_line_pending[2];      /* line vertex coordinates collected       */
     unsigned ge_line_pn;
     float ge_normal[3];            /* current vertex normal                  */

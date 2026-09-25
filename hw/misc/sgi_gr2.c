@@ -2196,6 +2196,75 @@ static void sgi_gr2_ge7_light_word(SGIGr2State *s, float f)
                            s->ge_mv_valid ? 1 : 0);
 }
 
+/* token 105: the charstr font path.  __GLgl_outcharmap pushes one glyph per
+ * character as a 13-word block -- [header, flags, 0x90000 marker, flags, nine
+ * bitmap words] -- whose payload is the glyph's bitmap, 16-bit rows, MSB left.
+ *
+ * The block carries NO position: gl_c_charstr calls the glyph routine with a1=0
+ * and advances only the character pointer, and the cell cursor lives in library
+ * state that never reaches the FIFO (the copier's companion ports 0x421bc..
+ * 0x421cc and the raster-pos port 0x42418 are both silent for this app).  The
+ * ADVANCE is monospaced by construction -- the rows are a fixed 16-pixel cell --
+ * so a monospaced run is FAITHFUL in shape and spacing.  The ORIGIN IS NOT
+ * DERIVED FROM THE STREAM: it starts at the drawable origin plus a small
+ * margin, which is an explicit approximation, not a measurement. */
+static void sgi_gr2_ge7_charstr(SGIGr2State *s)
+{
+    int x0, y0, xlim, x, y, b;
+    unsigned w, row;
+    uint8_t idx = 0;
+    int best = -1;
+
+    if (!s->scanout) {
+        return;
+    }
+    /* The ink is the palette entry with the highest luminance (clear_rect
+     * takes the lowest for the background). */
+    for (b = 0; b < 256; b++) {
+        uint32_t rgb = s->ramdac[b];
+        int lum = (((rgb >> 16) & 0xff) * 77 + ((rgb >> 8) & 0xff) * 150 +
+                   (rgb & 0xff) * 29) >> 8;
+
+        if (lum > best) {
+            best = lum;
+            idx = (uint8_t)b;
+        }
+    }
+    x0 = s->ge_win_x + 4;
+    y0 = s->ge_win_y + 4;
+    xlim = (s->vp_valid && s->vp_w > 0) ? s->ge_win_x + s->vp_w
+                                        : SGI_GR2_SCREEN_W;
+    if (!s->ge_char_run) {
+        s->ge_char_run = true;
+        s->ge_char_x = x0;
+        s->ge_char_y = y0;
+    }
+    if (s->ge_char_x + 16 > xlim) {
+        s->ge_char_x = x0;
+        s->ge_char_y += 12;
+    }
+    for (w = 4; w < 13; w++) {
+        for (row = 0; row < 2; row++) {
+            uint16_t bits = row ? (uint16_t)(s->ge_char[w] & 0xffff)
+                                : (uint16_t)(s->ge_char[w] >> 16);
+
+            y = s->ge_char_y + (int)(w - 4) * 2 + (int)row;
+            if (bits == 0 || y < 0 || y >= SGI_GR2_SCREEN_H) {
+                continue;
+            }
+            for (b = 0; b < 16; b++) {
+                x = s->ge_char_x + b;
+                if ((bits & (1 << (15 - b))) && x >= 0 &&
+                    x < SGI_GR2_SCREEN_W) {
+                    sgi_gr2_put(s, x, y, idx);
+                }
+            }
+        }
+    }
+    s->ge_char_x += 16;
+    s->ge_3d_seen = true;
+}
+
 static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
 {
     uint32_t v = (uint32_t)value;
@@ -2223,6 +2292,12 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
     }
     if (offset != SGI_GR2_GE7_SINGLE) {
         s->ge_single_n = 0;
+    }
+    /* A charstr run is a contiguous burst of glyph blocks: any other token ends
+     * it, so the next block starts a new monospaced run. */
+    if (offset != SGI_GR2_GE7_CHARSTR) {
+        s->ge_char_n = 0;
+        s->ge_char_run = false;
     }
 
     switch (offset) {
@@ -2479,6 +2554,17 @@ static void sgi_gr2_ge7_token(SGIGr2State *s, hwaddr offset, uint64_t value)
         if (s->ge_zbuf) {
             memset(s->ge_zbuf, 0x7f, (size_t)SGI_GR2_SCREEN_W *
                    SGI_GR2_SCREEN_H * sizeof(float));
+        }
+        break;
+    case SGI_GR2_GE7_CHARSTR:
+        /* A glyph is 13 consecutive words on this token; the 13th completes
+         * the block and is blitted. */
+        if (s->ge_char_n < 13) {
+            s->ge_char[s->ge_char_n++] = (uint32_t)value;
+        }
+        if (s->ge_char_n == 13) {
+            s->ge_char_n = 0;
+            sgi_gr2_ge7_charstr(s);
         }
         break;
     default:
@@ -3401,6 +3487,54 @@ static const Property sgi_gr2_properties[] = {
     DEFINE_PROP_UINT8("bdvers3", SGIGr2State, bdvers3, SGI_GR2_BDVERS3),
 };
 
+/* fb-dump: write the GR2 MAIN plane as a PPM, expanded through the RAMDAC.
+ * This is the "VRAM through the pipeline" dump used by the post-merge charstr
+ * pixel check: it deliberately SKIPS the overlay plane, where the 4Dwm menus
+ * are composited, so a charstr blit cannot be occluded the way it is in an
+ * ordinary WM screenshot.  Set with `qom-set /machine/peripheral/sgi-gr2
+ * fb-dump /path/out.ppm`. */
+static void sgi_gr2_dump_main_ppm(SGIGr2State *s, const char *path)
+{
+    FILE *f;
+    int x, y;
+
+    if (!s->scanout) {
+        qemu_log("sgi-gr2: fb-dump: framebuffer not allocated\n");
+        return;
+    }
+    f = fopen(path, "wb");
+    if (!f) {
+        qemu_log("sgi-gr2: fb-dump: cannot open '%s'\n", path);
+        return;
+    }
+    fprintf(f, "P6\n%d %d\n255\n", SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H);
+    for (y = 0; y < SGI_GR2_SCREEN_H; y++) {
+        for (x = 0; x < SGI_GR2_SCREEN_W; x++) {
+            uint32_t c = s->ramdac[s->scanout[(size_t)y * SGI_GR2_SCREEN_W + x]];
+            uint8_t rgb[3] = { (c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff };
+
+            fwrite(rgb, 1, 3, f);
+        }
+    }
+    fclose(f);
+    qemu_log("sgi-gr2: fb-dump: wrote %dx%d main plane to '%s'\n",
+             SGI_GR2_SCREEN_W, SGI_GR2_SCREEN_H, path);
+}
+
+static char *sgi_gr2_get_fb_dump(Object *obj, Error **errp)
+{
+    return g_strdup("");
+}
+
+static void sgi_gr2_set_fb_dump(Object *obj, const char *value, Error **errp)
+{
+    SGIGr2State *s = SGI_GR2(obj);
+
+    if (value && *value) {
+        sgi_gr2_dump_main_ppm(s, value);
+    }
+}
+
 static void sgi_gr2_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -3409,6 +3543,10 @@ static void sgi_gr2_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, sgi_gr2_reset);
     device_class_set_props(dc, sgi_gr2_properties);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
+    /* fb-dump: set to a path to dump the MAIN plane as PPM via `qom-set`.
+     * Mirrors the Newport model's property of the same name. */
+    object_class_property_add_str(klass, "fb-dump", sgi_gr2_get_fb_dump,
+                                  sgi_gr2_set_fb_dump);
 }
 
 static const TypeInfo sgi_gr2_type_info = {
