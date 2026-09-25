@@ -706,6 +706,40 @@ static void sgi_crime_re_put_pixel_mte(SGICRIMEREState *s, uint32_t bufmode,
     uint32_t saved = s->drawmode;
     uint32_t nib = 0;
 
+    /*
+     * @@SEMANTICS@@ — the MTE fgValue is the fill pixel in the DESTINATION's
+     * own format, NOT the canonical RGBA (R=31:24..A=7:0) the pixel-pipe
+     * draw path carries.  For a 16-bit RGB5 (A1_RGB5) destination packed two
+     * per 32-bit word (doublePix), the guest programs fg with the 16-bit
+     * pixel already sitting in the doublePix-selected half: measured live on
+     * solidview's glClear — MTE fgValue 0x00008000 for the lower buffer and
+     * 0x80000000 for the upper, i.e. the SAME A1_RGB5 0x8000 (A=1,R=G=B=0,
+     * opaque black) placed in the half each clear targets.  put_pixel()
+     * instead reads those as canonical RGBA, so 0x00008000 becomes B=0x80
+     * (saturated blue) and 0x80000000 becomes R=0x80 (saturated red) — the
+     * alternating red/blue window background where the demo's cpack(0);
+     * clear() should leave black (Indy/Newport oracle reference:
+     * oracle-bible/demos/08_solidview__indy-gl-ref__default.png).
+     *
+     * Decode the destination-format pixel back to canonical (preserving the
+     * A1_RGB5 alpha bit) so put_pixel round-trips it unchanged.  The 5->8->5
+     * expansion is lossless, and for 32-bit destinations the fg is already
+     * byte-identical to the canonical ABGR pack, so only this 16-bit form
+     * needs the conversion.
+     */
+    uint32_t pix_type = (bufmode >> BM_PIX_TYPE_SHIFT) & 3;
+    uint32_t buf_d = (bufmode >> BM_BUF_DEPTH_SHIFT) & 3;
+    uint32_t pix_d = (bufmode >> BM_PIX_DEPTH_SHIFT) & 3;
+    if (pix_type != 0 && ((bufmode >> 1) & 1) &&
+        (1 << pix_d) == 2 && (1 << buf_d) == 4) {
+        uint32_t v = (bufmode & 1) ? (color >> 16) : (color & 0xffff);
+        uint32_t r5 = (v >> 10) & 0x1f, g5 = (v >> 5) & 0x1f, b5 = v & 0x1f;
+        color = (((r5 << 3) | (r5 >> 2)) << 24)
+              | (((g5 << 3) | (g5 >> 2)) << 16)
+              | (((b5 << 3) | (b5 >> 2)) << 8)
+              | ((v & 0x8000) ? 0x80 : 0);
+    }
+
     for (int k = 0; k < 4; k++) {
         if ((s->mte_bytemask >> (8 * k)) & 0xff) {
             nib |= (1u << k);
