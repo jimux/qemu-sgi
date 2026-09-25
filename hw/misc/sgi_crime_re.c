@@ -898,6 +898,26 @@ static inline uint8_t crim_shade_clamp(int32_t v9_12)
     return (uint8_t)t;
 }
 
+/* Texture application functions (spec CRIME 1.5 Table 7-13, Texture.mode
+ * bits [1:0]): 0 MODULATE, 1 DECAL, 2 BLEND, 3 REPLACE. */
+#define CRM_TEXFUNC_MODULATE 0
+#define CRM_TEXFUNC_DECAL    1
+#define CRM_TEXFUNC_BLEND    2
+#define CRM_TEXFUNC_REPLACE  3
+
+/* MODULATE: component-wise product of two canonical RGBA fragments,
+ * round(a*b/255).  Both the interpolated shade colour and the texel are
+ * canonical (R=31:24..A=7:0), so the product is taken per byte. */
+static inline uint32_t crim_modulate_rgba(uint32_t a, uint32_t b)
+{
+    uint32_t o = 0;
+    for (int s = 0; s < 32; s += 8) {
+        uint32_t ca = (a >> s) & 0xff, cb = (b >> s) & 0xff;
+        o |= ((ca * cb + 127) / 255) << s;
+    }
+    return o;
+}
+
 /*
  * Emit one fragment: shade -> clip -> stipple -> depth test -> ROP/mask
  * write.  depth_enable/z25 carry the triangle's depth-plane test; the
@@ -1241,14 +1261,46 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                 }
                 if (s->drawmode & DM_ENTEXTURE) {
                     /*
-                     * Textured fragment: the texel replaces the shaded
-                     * colour.  Same floored reference vertex as the depth
-                     * and shade planes.
+                     * Textured fragment.  Texture.mode.func (spec CRIME 1.5
+                     * Table 7-13, bits [1:0] of Texture.mode) selects the
+                     * application function: 0 MODULATE, 1 DECAL, 2 BLEND,
+                     * 3 REPLACE.  The previous code always replaced the
+                     * shaded colour with the texel.  That is only correct
+                     * for REPLACE; atlantis (Texture.mode 0x0128dcd4, func 0)
+                     * and every other textured demo here ask for MODULATE,
+                     * i.e. the texel is multiplied by the interpolated
+                     * fragment colour (the lit material).  Replacing threw
+                     * the lighting away: the sharks' sea.rgb sphere-map
+                     * (a light-grey caustic texture) came out white instead
+                     * of the blue-grey lit skin the spec/oracle show (the
+                     * guest uploads shade R0/G0/B0 ~ (111,169,212) for the
+                     * shark faces).  Same floored reference vertex as the
+                     * depth and shade planes.
                      */
                     uint32_t tex;
                     if (sgi_crime_re_tex_sample(s, px, py, refx, refy,
                                                 &tex)) {
-                        color = tex;
+                        switch (s->tex_mode & 3) {
+                        case CRM_TEXFUNC_MODULATE:
+                            color = crim_modulate_rgba(color, tex);
+                            break;
+                        case CRM_TEXFUNC_REPLACE:
+                            color = tex;
+                            break;
+                        default:
+                            /*
+                             * DECAL/BLEND are not exercised by any demo on
+                             * this chain; keep the historical texel-replace
+                             * behaviour rather than inventing an untested
+                             * blend, and say so.
+                             */
+                            qemu_log_mask(LOG_UNIMP,
+                                          "sgi_crime_re: Texture.mode.func=%u "
+                                          "unimplemented, using texel\n",
+                                          s->tex_mode & 3);
+                            color = tex;
+                            break;
+                        }
                     }
                 }
                 int64_t z25 = 0;
