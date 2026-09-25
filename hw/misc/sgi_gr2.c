@@ -1561,6 +1561,48 @@ static uint8_t sgi_gr2_ge7_332(const SGIGr2State *s, const float col[3],
                      sgi_gr2_ge7_lvl(sgi_gr2_ramp_rg, 8, g, thresh));
 }
 
+/* Single-light intensity shading, taken from the IP20 reconcile branch
+ * (sgi_gr2_ge7_inten): one eye-space light and half vector, the guest's
+ * material with ge_lcolor as the light colour, and powf() for the specular
+ * term.  Output as the per-channel colour the (single) light produces rather
+ * than an intensity, so the 3-3-2 direct-colour output path is unchanged.
+ * The multi-light + specular-LUT path stays in sgi_gr2_ge7_shade() for the
+ * line draw. */
+static void sgi_gr2_ge7_inten_rgb(const SGIGr2State *s, const float n[3],
+                                  float lx, float ly, float lz,
+                                  float hx, float hy, float hz,
+                                  float shininess, float col[3])
+{
+    float nn[3], ndl, ndh;
+    float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    int c;
+
+    if (nl > 1e-9f) {
+        nn[0] = n[0] / nl;
+        nn[1] = n[1] / nl;
+        nn[2] = n[2] / nl;
+    } else {
+        nn[0] = 0.0f;
+        nn[1] = 0.0f;
+        nn[2] = 1.0f;
+    }
+    /* Two-sided, as for the triangles: a normal facing away is flipped. */
+    if (nn[2] < 0.0f) {
+        nn[0] = -nn[0];
+        nn[1] = -nn[1];
+        nn[2] = -nn[2];
+    }
+    ndl = MAX(nn[0] * lx + nn[1] * ly + nn[2] * lz, 0.0f);
+    ndh = MAX(nn[0] * hx + nn[1] * hy + nn[2] * hz, 0.0f);
+    for (c = 0; c < 3; c++) {
+        col[c] = s->ge_emission[c] +
+                 s->ge_ambient[c] * s->ge_ambient_sum[c] +
+                 s->ge_lcolor[c] * (s->ge_diffuse[c] * ndl +
+                                    s->ge_specular[c] * powf(ndh, shininess));
+        col[c] = MIN(MAX(col[c], 0.0f), 1.0f);
+    }
+}
+
 static void sgi_gr2_ge7_draw(SGIGr2State *s)
 {
     float sx[SGI_GR2_GE7_MAX_VERTS], sy[SGI_GR2_GE7_MAX_VERTS];
@@ -1587,6 +1629,35 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         return;
     }
     sgi_gr2_ge7_draw_rect(s, &vx, &vy, &vw, &vh);
+    /* Eye-space light and half vectors, as the IP20 reconcile branch computes
+     * them: the guest's light position (token 127), normalized, or a headlight
+     * along +z until a material/light has been seen. */
+    float lx, ly, lz, hx, hy, hz;
+    {
+        float ll = s->ge_lpos[0] * s->ge_lpos[0] +
+                   s->ge_lpos[1] * s->ge_lpos[1] +
+                   s->ge_lpos[2] * s->ge_lpos[2];
+
+        if (s->ge_mat_valid && ll > 1e-6f) {
+            ll = sqrtf(ll);
+            lx = s->ge_lpos[0] / ll;
+            ly = s->ge_lpos[1] / ll;
+            lz = s->ge_lpos[2] / ll;
+        } else {
+            lx = 0.0f;
+            ly = 0.0f;
+            lz = 1.0f;
+        }
+        hx = lx;
+        hy = ly;
+        hz = lz + 1.0f;
+        ll = sqrtf(hx * hx + hy * hy + hz * hz);
+        if (ll > 1e-6f) {
+            hx /= ll;
+            hy /= ll;
+            hz /= ll;
+        }
+    }
     for (i = 0; i < s->ge_poly_n; i++) {
         float cx, cy, cz, ez;
         float px, py;
@@ -1625,7 +1696,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
                     (int)(een[0] * 1000.0f), (int)(een[1] * 1000.0f),
                     (int)(een[2] * 1000.0f));
             }
-            sgi_gr2_ge7_shade(s, een, shininess, vcol[i]);
+            sgi_gr2_ge7_inten_rgb(s, een, lx, ly, lz, hx, hy, hz, shininess,
+                                  vcol[i]);
         }
     }
     for (i = 0; i < s->ge_poly_n; i++) {
