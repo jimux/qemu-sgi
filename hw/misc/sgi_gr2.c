@@ -1341,7 +1341,7 @@ static bool sgi_gr2_ge7_single_active(const SGIGr2State *s)
  * the point is behind the eye (w <= 0) so it is skipped rather than projected
  * through the eye. */
 static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
-                              float *sx, float *sy, float *sz)
+                               float *sx, float *sy, float *sz, float *ez)
 {
     static const float ident[16] = { 1, 0, 0, 0, 0, 1, 0, 0,
                                      0, 0, 1, 0, 0, 0, 0, 1 };
@@ -1377,6 +1377,9 @@ static bool sgi_gr2_ge7_xform(const SGIGr2State *s, const float p[3],
     *sx = clip[0] / clip[3];
     *sy = clip[1] / clip[3];
     *sz = clip[2] / clip[3];
+    if (ez) {
+        *ez = cam[2];
+    }
     return true;
 }
 
@@ -1574,6 +1577,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     unsigned bboxempty = 0; /* triangles whose bbox clipped away entirely */
     int bb_minx = 1 << 20, bb_miny = 1 << 20;
     int bb_maxx = -(1 << 20), bb_maxy = -(1 << 20);
+    float czmin = 1e30f, czmax = -1e30f; /* eye-space Z range (camera dist) */
+    float nzmin = 1e30f, nzmax = -1e30f; /* NDC Z range */
     unsigned px0;
     float zmin = 1e30f, zmax = -1e30f; /* NDC z range this call wrote */
     const float shininess = 8.0f;
@@ -1583,11 +1588,11 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     }
     sgi_gr2_ge7_draw_rect(s, &vx, &vy, &vw, &vh);
     for (i = 0; i < s->ge_poly_n; i++) {
-        float cx, cy, cz;
+        float cx, cy, cz, ez;
         float px, py;
         int c;
 
-        if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz)) {
+        if (!sgi_gr2_ge7_xform(s, s->ge_poly[i], &cx, &cy, &cz, &ez)) {
             /* part of the polygon is behind the eye: skip it whole */
             trace_sgi_gr2_ge7_discard((int)s->ge_poly_n, 1, (int)culled,
                                       (int)poly_zrej, (int)empty,
@@ -1599,6 +1604,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         sx[i] = px;
         sy[i] = py;
         sz[i] = cz;
+        czmin = MIN(czmin, ez);
+        czmax = MAX(czmax, ez);
         /* Rotate this vertex's own normal into eye space (the object-space
          * normal was captured with the vertex, not shared per polygon), then
          * shade it with the guest's material and light. */
@@ -1626,6 +1633,8 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
         bb_miny = MIN(bb_miny, (int)floorf(sy[i]));
         bb_maxx = MAX(bb_maxx, (int)ceilf(sx[i]));
         bb_maxy = MAX(bb_maxy, (int)ceilf(sy[i]));
+        nzmin = MIN(nzmin, sz[i]);
+        nzmax = MAX(nzmax, sz[i]);
     }
     for (i = 1; i + 1 < s->ge_poly_n; i++) {
         unsigned ia = s->ge_strip ? i - 1 : 0; /* fan apex, or strip prev-2 */
@@ -1774,6 +1783,9 @@ static void sgi_gr2_ge7_draw(SGIGr2State *s)
     }
     trace_sgi_gr2_ge7_discard((int)s->ge_poly_n, 0, (int)culled,
                               (int)poly_zrej, (int)empty, (int)poly_px);
+    trace_sgi_gr2_ge7_cam((int)czmin, (int)czmax,
+                          (int)(nzmin * 1000.0f), (int)(nzmax * 1000.0f),
+                          vx, vy, vw, vh);
     trace_sgi_gr2_ge7_tri((int)degen, (int)clipbox, (int)bboxempty,
                           bb_minx, bb_miny, bb_maxx, bb_maxy);
     trace_sgi_gr2_ge7_poly(s->ge_poly_n, (int)poly_px,
@@ -1827,7 +1839,7 @@ static void sgi_gr2_ge7_draw_lines(SGIGr2State *s)
         p[0] = s->ge_line[i][0];
         p[1] = s->ge_line[i][1];
         p[2] = 0.0f;
-        if (!sgi_gr2_ge7_xform(s, p, &cx, &cy, &cz)) {
+        if (!sgi_gr2_ge7_xform(s, p, &cx, &cy, &cz, NULL)) {
             px[i] = -1e9f;
             continue;
         }
