@@ -92,27 +92,23 @@
 #define IP27_PROM_BASE 0x1fc00000ULL
 #define IP27_PROM_SIZE (1 * MiB)
 /*
- * Two-node PROM window size.  The mapped IP27 PROM aperture is
- * [0x1fc00000, base + size); node-0 RAM bank slot 1 begins at
- * 0x20000000 (MD_BANK_SHFT = 29, see ip27_add_ram_banks), so the window
- * MUST NOT extend to or past 0x20000000 or it silently shadows the first
- * bytes of bank 1: a BTE migration copy whose destination falls in that
- * shadow lands in the PROM region instead of RAM, and the tagged TLB
- * alias then reads an empty page (the two-node coredump storm).
+ * The mapped IP27 PROM aperture is [0x1fc00000, 0x1fc00000 + IP27_PROM_SIZE).
+ * IP27_PROM_SIZE is the authentic 1 MB image size (kern/sys/SN/SN0/addrs.h:
+ * IP27PROM_BASE_MAPPED = K2BASE | 0x1fc00000, IP27PROM_SIZE_MAX = 0x100000);
+ * the PROM's data and PCFG live at physical 0x01a00000/0x01b00000 in node RAM,
+ * not above 0x1fc00000.
  *
- * The authentic IP27 map (kern/sys/SN/SN0/addrs.h) is a 1 MB image at
- * 0x1fc00000 (IP27PROM_BASE_MAPPED, IP27PROM_SIZE_MAX = 0x100000) with
- * the PROM's data/PCFG at physical 0x01a00000/0x01b00000 (node RAM), not
- * above 0x1fc00000.  This model instead uses the mapped window as the
- * PROM's code+scratch RAM, and the two-node PROM needs roughly 4 MB of
- * it (a 1 MB window boots single-node but PANICs the two-node kernel;
- * [ASSUMPTION] this model simplification should eventually be replaced
- * by backing the PROM data at its authentic 0x01a00000/0x01b00000
- * addresses).  4 MB is the largest window that ends exactly at
- * 0x20000000 and therefore cannot overlap node RAM.  Single-node keeps
- * its authentic 1 MB window byte-for-byte.
+ * The window size must stay strictly below node-0 RAM bank slot 1 at
+ * 0x20000000 (MD_BANK_SHFT = 29, see ip27_add_ram_banks).  An earlier
+ * two-node value of 8 MB mapped [0x1fc00000, 0x20400000) and so shadowed the
+ * first 4 MB of bank 1: a BTE migration copy whose destination bank-slot
+ * offset fell in that shadow landed in the PROM region instead of RAM, and
+ * the tagged TLB alias then read an empty page -- the two-node coredump
+ * storm.  The authentic 1 MB image keeps the window well clear of bank 1, and
+ * two-node boots with it now that the diagnostic env gates are off by default
+ * (the previously always-on IP27_POISON1 filled node-1 RAM with 0, and
+ * IP27_CMP ran the comparator, either of which could fault the kernel).
  */
-#define IP27_PROM_SIZE_TWO (4 * MiB)
 
 /*
  * LBOOT window: the local hub's boot flash (and other directory-bus devices).
@@ -1514,8 +1510,7 @@ static void sgi_ip27_init(MachineState *machine) {
    * copied in), so it must be writable.
    */
   prom = g_new(MemoryRegion, 1);
-  memory_region_init_ram(prom, NULL, "sgi-ip27.prom",
-                         (nnodes == 2) ? IP27_PROM_SIZE_TWO : IP27_PROM_SIZE,
+  memory_region_init_ram(prom, NULL, "sgi-ip27.prom", IP27_PROM_SIZE,
                          &error_fatal);
   memory_region_add_subregion(system_memory, IP27_PROM_BASE, prom);
 
