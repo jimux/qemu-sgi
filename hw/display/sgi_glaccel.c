@@ -2554,6 +2554,27 @@ static int sgi_glaccel_post_load(void *opaque, int version_id)
     return 0;
 }
 
+/* P-PV-CKPT-RESUME (design-02 fidelity): the per-context RING and PLACEMENT state is
+ * guest-visible and must survive a restore, or every post-restore submit is dropped
+ * (the DOORBELL handler reads ctx[].cmd_base, which is 0 if not migrated) and a
+ * restored animating client can never composite again.  Only the MIGRATABLE scalars
+ * are listed; the host-side members (fwd_fd/conn_fd/rxbuf/frame, and the derived
+ * active/w/h/frame_serial which reference the host renderer's frame) stay host state
+ * — a restored client must re-render its frame, which is exactly what design 03's
+ * GL-state generation tells it. */
+static const VMStateDescription vmstate_pvgpuctx = {
+    .name = "sgi-glaccel-ctx",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(cmd_base, PVGPUCtx),   /* this context's command-ring phys base */
+        VMSTATE_INT32(x, PVGPUCtx),           /* tracked screen placement of the window */
+        VMSTATE_INT32(y, PVGPUCtx),
+        VMSTATE_UINT32(bound_xid, PVGPUCtx),  /* window-model binding (0 = none) */
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_sgi_glaccel = {
     .name = "sgi-glaccel",
     .version_id = 1,
@@ -2563,6 +2584,8 @@ static const VMStateDescription vmstate_sgi_glaccel = {
         VMSTATE_UINT32(status, SGIGLAccelState),
         VMSTATE_UINT32(irq_enable, SGIGLAccelState),
         VMSTATE_UINT32(gl_state_gen, SGIGLAccelState),
+        VMSTATE_STRUCT_ARRAY(ctx, SGIGLAccelState, PVGPU_MAXCTX, 0,
+                             vmstate_pvgpuctx, PVGPUCtx),
         VMSTATE_UINT32(width, SGIGLAccelState),
         VMSTATE_UINT32(height, SGIGLAccelState),
         VMSTATE_UINT32(cmd_base, SGIGLAccelState),
