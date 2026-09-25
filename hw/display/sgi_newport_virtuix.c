@@ -3982,7 +3982,11 @@ static void newport_update_hw_cursor(SGINewportVirtuixState *s)
     QEMUCursor *cur;
 
     if (soft_cursor < 0) {
-        soft_cursor = getenv("PVDISPLAY_SOFT_CURSOR") ? 1 : 0;
+        const char *e = getenv("PVDISPLAY_SOFT_CURSOR");
+        /* M2 (design 05): the software cursor is the DEFAULT while BL-88 (the
+         * hw-cursor path shows no cursor in the GTK window) is open.  Set
+         * PVDISPLAY_SOFT_CURSOR=0 to force the hardware-cursor path. */
+        soft_cursor = (e && e[0] == '0') ? 0 : 1;
     }
     if (soft_cursor) return;
 
@@ -5234,7 +5238,10 @@ static int newport_render_desktop(void *opaque, uint32_t *dst, int w, int h,
 
     {
         static int sc = -1;
-        if (sc < 0) sc = getenv("PVDISPLAY_SOFT_CURSOR") ? 1 : 0;
+        if (sc < 0) {
+            const char *e = getenv("PVDISPLAY_SOFT_CURSOR");
+            sc = (e && e[0] == '0') ? 0 : 1;   /* M2: soft cursor is the default */
+        }
         soft_cursor = sc;
     }
 
