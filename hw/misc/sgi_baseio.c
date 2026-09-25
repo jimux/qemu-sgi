@@ -2072,7 +2072,48 @@ static uint64_t sgi_baseio_dma_xlate(void *arg, uint64_t pci_addr) {
   uint32_t idx, i, w0, w1;
   uint64_t ate;
 
+  /*
+   * IP27 XKPHYS node IO-space dirmap.  The ISP's SN0_PCI_64
+   * get_pci64_dma_addr() yields a 64-bit value whose high word is the node IO
+   * space base (IO_BASE 0x9200000000000000) OR'd with the NASID in bits
+   * [39:32] (sys/SN/SN0/addrs.h: NASID_SHFT 32, NASID_BITMASK 0xff) and whose
+   * low 32 bits are the node-local physical offset.  The fabric routes that to
+   * the *named node's* memory, not node 0: with a 2nd node the loader places
+   * its staging buffers on node 1 (e.g. 0x92000001_00344000), and stripping the
+   * NASID made those DMA writes land on node 0 -- right over the kernel .data
+   * (xfs_vnodeops).  QEMU's system_memory maps node tag n at (n << 32), so
+   * re-tag the translation instead of discarding the high word.  Node 0
+   * addresses are unchanged (0x92000000/0x95000000 -> low offset).
+   */
+  if ((pci_addr >> 56) >= 0x90ULL && (pci_addr >> 56) <= 0x9fULL) {
+    uint64_t nasid = (pci_addr >> 32) & 0xffULL;
+    uint64_t off = pci_addr & 0xffffffffULL;
+
+    if (getenv("SGI_BASEIO_DMADBG")) {
+      qemu_log_mask(LOG_UNIMP,
+                    "sgi-baseio: xlate io pci=0x%016" PRIx64
+                    " nasid=%" PRIu64 " -> 0x%016" PRIx64 "\n",
+                    pci_addr, nasid, (nasid << 32) | off);
+    }
+    return (nasid << 32) | off;
+  }
   if (pci_addr < 0x40000000ULL || pci_addr >= 0x80000000ULL) {
+    /*
+     * Diagnostic (SGI_BASEIO_DMADBG=1): a node-1-tagged (>= 1<<32) or low
+     * (< 0x8000000) address reaches the qlisp xlate hook unchanged.  Log it so
+     * we can tell whether a node-1 alias ever enters the SCSI DMA path.
+     */
+    if (getenv("SGI_BASEIO_DMADBG") &&
+        (pci_addr >= 0x100000000ULL || pci_addr < 0x8000000ULL)) {
+      static unsigned n;
+
+      if (n < 20000) {
+        qemu_log_mask(LOG_UNIMP,
+                      "sgi-baseio: xlate passthru pci=0x%016" PRIx64 "\n",
+                      pci_addr);
+        n++;
+      }
+    }
     return pci_addr;
   }
   idx = (pci_addr - 0x40000000ULL) >> 14;
