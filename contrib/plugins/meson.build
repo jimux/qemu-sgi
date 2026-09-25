@@ -10,6 +10,7 @@ contrib_plugins = [
 'memwatch.c',
 'hwprofile.c',
 'ip27pcring.c',
+'ip27wrwatch.c',
 'ips.c',
 'stoptrigger.c',
 'traps.c',

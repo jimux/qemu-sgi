@@ -85,6 +85,24 @@ void mips_sgi_set_tlb_fill_hook(void (*fn)(uint64_t, uint64_t, int, uint32_t))
     mips_sgi_tlb_fill_hook = fn;
 }
 
+/*
+ * @DIAG@ Invalidate-aware shadow of the last valid mapping per (VPN2, ASID).
+ * The direct old-entry capture above is skipped when the kernel clears an
+ * entry (EHINV) before installing the new one -- one way IRIX performs COW --
+ * so the node-remap comparator could miss the very remap it exists to catch.
+ * The shadow survives an invalidate and still compares when the new mapping
+ * appears.  Per-run diagnostic only (direct-mapped, single vCPU).
+ */
+typedef struct MipsSgiTlbShadow {
+    uint64_t vpn;
+    uint64_t pfn[2];
+    uint32_t asid;
+    bool valid;
+} MipsSgiTlbShadow;
+
+#define MIPS_SGI_SHADOW_N 4096
+static MipsSgiTlbShadow mips_sgi_shadow[MIPS_SGI_SHADOW_N];
+
 /* TLB management */
 static void r4k_mips_tlb_flush_extra(CPUMIPSState *env, int first)
 {
@@ -134,7 +152,14 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
 
     /* XXX: detect conflicting TLBs and raise a MCHECK exception when needed */
     tlb = &env->tlb->mmu.r4k.tlb[idx];
-    if (diag) {
+    /*
+     * Capture the outgoing entry whenever either the TLB-watch printer or the
+     * IP27 node-remap comparator is active.  The comparator must not depend on
+     * IP27_TLBWATCH: arming it used to require that env, so IP27_CMP=1 alone
+     * never ran the hook (measured: zero IP27_CMP lines) -- the diagnostic was
+     * silently void.  Keyed on hook registration so it stays inert elsewhere.
+     */
+    if (diag || mips_sgi_tlb_node_remap_hook) {
         diag_old_asid = tlb->ASID;
         diag_old_pfn0 = tlb->PFN[0];
         diag_old_pfn1 = tlb->PFN[1];
@@ -191,7 +216,7 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
                                        : 0));
     }
 
-    if (diag && mips_sgi_tlb_node_remap_hook && !diag_old_inval &&
+    if (mips_sgi_tlb_node_remap_hook && !diag_old_inval &&
         diag_old_vpn == tlb->VPN && diag_old_asid == tlb->ASID) {
         uint64_t plen = ((uint64_t)mask + 1) * TARGET_PAGE_SIZE;
         int h;
@@ -206,6 +231,37 @@ static void r4k_fill_tlb(CPUMIPSState *env, int idx)
                                              (uint64_t)h * plen);
             }
         }
+    }
+
+    /*
+     * Invalidate-aware shadow comparison (see MipsSgiTlbShadow).  Runs in
+     * addition to the direct capture so a clear-then-install remap is not
+     * lost.
+     */
+    if (mips_sgi_tlb_node_remap_hook) {
+        unsigned si = (unsigned)(((tlb->VPN >> 13) ^ tlb->ASID) &
+                                 (MIPS_SGI_SHADOW_N - 1));
+        MipsSgiTlbShadow *sh = &mips_sgi_shadow[si];
+
+        if (sh->valid && sh->vpn == tlb->VPN && sh->asid == tlb->ASID) {
+            uint64_t shlen = ((uint64_t)mask + 1) * TARGET_PAGE_SIZE;
+            int sh_h;
+
+            for (sh_h = 0; sh_h < 2; sh_h++) {
+                uint64_t sop = sh->pfn[sh_h], snp = tlb->PFN[sh_h];
+
+                if (sop && snp && sop != snp) {
+                    mips_sgi_tlb_node_remap_hook(sop, snp, shlen, tlb->ASID,
+                                                 (uint64_t)tlb->VPN +
+                                                 (uint64_t)sh_h * shlen);
+                }
+            }
+        }
+        sh->vpn = tlb->VPN;
+        sh->asid = tlb->ASID;
+        sh->pfn[0] = tlb->PFN[0];
+        sh->pfn[1] = tlb->PFN[1];
+        sh->valid = true;
     }
 }
 
@@ -815,11 +871,78 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
      */
     if (getenv("IP27_LOWFAULT") && (uint64_t)address < 0x10000ULL &&
         (uint64_t)env->active_tc.PC < 0x80000000ULL) {
+        char regs[32 * 32];
+        size_t roff = 0;
+        int ri;
+
+        /*
+         * Dump the full GPR file: the near-NULL deref's base register and the
+         * caller (ra) name which object/routine is involved, which is what the
+         * PC ring could not recover after the wrong-object mix-up.
+         */
+        for (ri = 0; ri < 32; ri++) {
+            roff += snprintf(regs + roff, sizeof(regs) - roff,
+                             " r%d=%016" PRIx64, ri,
+                             (uint64_t)env->active_tc.gpr[ri]);
+        }
         qemu_log_mask(LOG_GUEST_ERROR,
                       "IP27_LOWFAULT badva=0x%016" PRIx64 " pc=0x%016" PRIx64
-                      " exc=%d access=%d entryhi=0x%016" PRIx64 "\n",
+                      " exc=%d access=%d entryhi=0x%016" PRIx64 "%s\n",
                       (uint64_t)address, (uint64_t)env->active_tc.PC,
-                      exception, (int)access_type, (uint64_t)env->CP0_EntryHi);
+                      exception, (int)access_type, (uint64_t)env->CP0_EntryHi,
+                      regs);
+
+        /*
+         * IP27_POBJ=1: at the known rld N32 crash site (sgi_main+0x88, the
+         * `lw v0,76(v0)` after loading pObj_Head), translate pObj_Head with the
+         * guest's own TLB and read the byte the process actually sees.  A
+         * populated value here means the register read came from a stale
+         * softmmu entry (QEMU-side); a zero means the mapping itself points at
+         * a clobbered cell.  gp-32632 is pObj_Head (verified vs .reginfo gp).
+         */
+        if (getenv("IP27_POBJ") && getenv("IP27_LOWFAULT") &&
+            (uint64_t)env->active_tc.PC == 0x0fb6a3d8ULL) {
+            uint64_t gp = (uint64_t)env->active_tc.gpr[28];
+            uint64_t pobj_va = gp - 32632ULL;
+            hwaddr pobj_pa = 0;
+            int pobj_prot = 0;
+            int pr = get_physical_address(env, &pobj_pa, &pobj_prot,
+                                          pobj_va, MMU_DATA_LOAD, MMU_USER_IDX);
+
+            if (pr == TLBRET_MATCH) {
+                uint64_t off = (uint64_t)pobj_pa & 0xffffffffULL;
+                /* Probe all four node/bank aliases of the same offset: the
+                 * page should hold pObj_Head somewhere; a zero at the mapped
+                 * cell plus the value present at a sibling alias is the
+                 * cross-node/cross-bank losing copy. */
+                uint64_t a_self = off;
+                uint64_t a_n1   = off | (1ULL << 32);
+                uint64_t a_b0   = off & ~(1ULL << 29);
+                uint64_t a_n1b0 = a_b0 | (1ULL << 32);
+
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "IP27_POBJ va=0x%016" PRIx64 " pa=0x%016" PRIx64
+                              " node=%d bank=%d asid=%04x"
+                              " self=%08x n1=%08x b0=%08x n1b0=%08x\n",
+                              pobj_va, (uint64_t)pobj_pa,
+                              (int)((pobj_pa >> 32) & 1),
+                              (int)(((uint64_t)pobj_pa >> 29) & 1),
+                              (unsigned)(env->CP0_EntryHi &
+                                         env->CP0_EntryHi_ASID_mask),
+                              address_space_ldl(env_cpu(env)->as, a_self,
+                                                MEMTXATTRS_UNSPECIFIED, NULL),
+                              address_space_ldl(env_cpu(env)->as, a_n1,
+                                                MEMTXATTRS_UNSPECIFIED, NULL),
+                              address_space_ldl(env_cpu(env)->as, a_b0,
+                                                MEMTXATTRS_UNSPECIFIED, NULL),
+                              address_space_ldl(env_cpu(env)->as, a_n1b0,
+                                                MEMTXATTRS_UNSPECIFIED, NULL));
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "IP27_POBJ va=0x%016" PRIx64 " NOMAP r=%d\n",
+                              pobj_va, pr);
+            }
+        }
     }
 
     /*

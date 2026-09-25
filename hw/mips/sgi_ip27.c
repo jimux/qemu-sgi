@@ -801,6 +801,10 @@ static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
                                     uint64_t page_va) {
   uint8_t *op, *np;
   uint64_t diff = 0, first = len, k;
+  /* Large (4 MB / 16 MB) pages would make a full byte scan pathological; the
+   * pages the fault cluster lives in are 16 KB, and a content loss covers the
+   * whole page, so a 64 KB prefix is decisive. */
+  uint64_t slen = len > 0x10000ULL ? 0x10000ULL : len;
 
   if (!ip27_cmp_ptr(old_pa, &op) || !ip27_cmp_ptr(new_pa, &np)) {
     fprintf(stderr, "IP27_CMP vpn=%016" PRIx64 " asid=%04x UNMAPPED"
@@ -808,7 +812,7 @@ static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
             page_va, asid, old_pa, new_pa);
     return;
   }
-  for (k = 0; k < len; k++) {
+  for (k = 0; k < slen; k++) {
     if (op[k] != np[k]) {
       if (diff == 0) {
         first = k;
@@ -835,7 +839,7 @@ static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
   {
     uint64_t onz = 0, nnz = 0, k2;
 
-    for (k2 = 0; k2 < len; k2++) {
+    for (k2 = 0; k2 < slen; k2++) {
       if (op[k2]) {
         onz++;
       }
@@ -851,7 +855,19 @@ static void ip27_tlb_node_remap_cmp(uint64_t old_pa, uint64_t new_pa,
      * IP27_CMP_SCAN=1 additionally hunts both nodes' RAM for the source page
      * so the destination of a lost copy can be located.  Expensive; opt-in.
      */
-    if (len >= 32 && getenv("IP27_CMP_SCAN")) {
+    /*
+     * User-ASID only and capped: a full two-node scan per remap is very
+     * expensive, and the fault cluster is user memory.  Budget via
+     * IP27_CMP_SCAN_MAX (default 25).
+     */
+    static int cmpscan_used;
+    static int cmpscan_max = -1;
+    if (cmpscan_max < 0) {
+      const char *m = getenv("IP27_CMP_SCAN_MAX");
+      cmpscan_max = m ? atoi(m) : 25;
+    }
+    if (len >= 32 && getenv("IP27_CMP_SCAN") && asid != 0 &&
+        cmpscan_used++ < cmpscan_max) {
       int nd;
       const uint8_t *sig = op + (first + 32 <= len ? first : 0);
       for (nd = 0; nd < 2; nd++) {
