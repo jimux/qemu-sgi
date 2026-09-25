@@ -2238,22 +2238,18 @@ static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned siz
         /*
          * Compose the status word: all idle (crmWaitReIdle spins bits
          * 27|25; libGLcore FlushAndConfirm spins bit 28 — both must
-         * see idle immediately), IB level 0 with the two FIFO pointers
-         * EQUAL (our RE executes synchronously so the FIFO is always
-         * drained), and both pointers mirroring the programmed start
-         * pointer (@0x4008).
+         * see idle immediately), the live ring pointers, and the IB
+         * level = WrPtr - RdPtr.
          *
-         * The pointers MUST be equal: the IRIX CRIME driver's crmSavePP()
-         * computes the pending-entry count as WrPtr - StartPtr (mod 64)
-         * and harvests that many interface-buffer addr/data slots as the
-         * switching-out context's pixel-pipe descriptor list.  If WrPtr
-         * and StartPtr disagree, the range includes never-written (zero)
-         * IB slots; the zero descriptor is saved and, on the next
-         * crmRestorePP(), its 2-bit write mask decodes to 0, which is
-         * neither 1 (low-32), 2 (high-32) nor 3 (64-bit) — the driver
-         * then calls
-         *   cmn_err(CE_PANIC, "pcxswap wmask 0 addr %x (%x) data %x%x")
-         * (seen as "PANIC: pcxswap wmask 0 addr b5000000 (0) data 00").
+         * crmSavePP() harvests pending = WrPtr - StartPtr (mod 64)
+         * interface-buffer addr/data slots as the switching-out
+         * context's pixel-pipe descriptor list, so every slot in
+         * [StartPtr, WrPtr) must hold a real descriptor posted by an RE
+         * register write (a zero slot decodes to wmask 0 and panics
+         * "pcxswap wmask 0").  Our engine retires synchronously, so
+         * RdPtr tracks WrPtr and the level reads 0 — crmWaitReFifo
+         * never spins — while the entries remain in the RAM until
+         * overwritten.
          *
          * NOTE: do NOT derive the start pointer from ib_ctl — bits 5:0
          * of the interface-buffer ctl register are the stall-count field
@@ -2261,9 +2257,15 @@ static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned siz
          * 0x0fefff0a written to 0x400), not the FIFO start pointer.
          */
         uint32_t st = CRMSTAT_ALL_IDLE;
+        uint32_t wr = s->ib_wrptr & CRMSTAT_IB_WRPTR_MASK;
+        uint32_t rd = s->ib_rdptr & CRMSTAT_IB_RDPTR_MASK;
         uint32_t stptr = s->ib_startptr & CRMSTAT_IB_STPTR_MASK;
+        uint32_t level = (s->ib_wrptr - s->ib_rdptr) & CRMSTAT_IB_LEVEL_MASK;
+
+        st |= level << CRMSTAT_IB_LEVEL_SHIFT;
+        st |= rd << CRMSTAT_IB_RDPTR_SHIFT;
+        st |= wr << CRMSTAT_IB_WRPTR_SHIFT;
         st |= stptr << CRMSTAT_IB_STPTR_SHIFT;
-        st |= stptr << CRMSTAT_IB_WRPTR_SHIFT;
         return st;
     }
 
@@ -2271,16 +2273,32 @@ static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned siz
         return s->ib_ctl;
 
     case CRM_RE_INTFBUF_DATA ... CRM_RE_INTFBUF_DATA + 0x1f8:
+        /*
+         * crmSavePP() reads each data slot as two 32-bit words (lw at +0
+         * and +4) — the 64-bit value is big-endian, so the lower address
+         * is the high word.  Returning 0 here saved a zero data payload
+         * for every harvested descriptor and crmRestorePP() replayed
+         * zeros, which is how the earlier unequal-pointer attempt
+         * damaged the switching-out context.
+         */
         if (size == 8) {
             return s->ib_data[(offset - CRM_RE_INTFBUF_DATA) / 8];
         }
-        return 0;
+        if ((offset & 4) == 0) {
+            return (uint32_t)(s->ib_data[(offset - CRM_RE_INTFBUF_DATA) / 8]
+                              >> 32);
+        }
+        return (uint32_t)s->ib_data[(offset - CRM_RE_INTFBUF_DATA) / 8];
 
     case CRM_RE_INTFBUF_ADDR ... CRM_RE_INTFBUF_ADDR + 0x1f8:
         if (size == 8) {
             return s->ib_addr[(offset - CRM_RE_INTFBUF_ADDR) / 8];
         }
-        return 0;
+        if ((offset & 4) == 0) {
+            return (uint32_t)(s->ib_addr[(offset - CRM_RE_INTFBUF_ADDR) / 8]
+                              >> 32);
+        }
+        return (uint32_t)s->ib_addr[(offset - CRM_RE_INTFBUF_ADDR) / 8];
 
     default:
         /*
@@ -2330,6 +2348,67 @@ static uint64_t sgi_crime_re_read_impl(void *opaque, hwaddr offset, unsigned siz
         }
         return 0;
     }
+}
+
+/*
+ * Post a host write to an RE register page into the interface-buffer
+ * ring, exactly as the CRIME RE does for every write to the TLB,
+ * pixel-pipe and MTE pages (spec §7.3.3.1).  The 64-bit descriptor is
+ * CrmIntfBufAddr (sys/crimereg.h):
+ *
+ *   bits 39:32  offset   register byte offset within its 4 KB page, >> 3
+ *   bits 42:40  pageId   TLB = 1, PixelPipe = 2, MTE = 3
+ *   bits 44:43  wmask    write mask: 1 = high 32-bit word (target + 4),
+ *                        2 = low 32-bit word (target), 3 = full 64-bit
+ *   bit  45     start    set on a START_OFFSET (+0x800) commit write
+ *
+ * The field positions are the `#else` macros in crimereg.h
+ * (CRMIBADDR_OFFSET/PAGE/WMASK/START and CRMIBADDR_TO_PHYS), and each is
+ * confirmed by the IRIX kernel's own decoder: crmRestorePP() at VA
+ * 0x8028a1e4..0x8028a238 extracts bits 44:43/42:40/39:32 and
+ * crmFindPP() at VA 0x80299f6c tests bit 45 as the batch-start flag.
+ *
+ * The data slot holds the write value in the word the wmask selects:
+ * crmRestorePP() reads (wmask 2) the low word, (wmask 1) the high word,
+ * or (wmask 3) the whole 64 bits and stores it at the decoded target.
+ */
+static void sgi_crime_re_ib_post(SGICRIMEREState *s, unsigned page,
+                                 hwaddr reg_off, unsigned size,
+                                 uint64_t value, bool start)
+{
+    unsigned wmask;
+    uint64_t data = value;
+    uint64_t desc;
+
+    if (size == 8) {
+        wmask = 3;
+    } else if (reg_off & 4) {
+        /*
+         * High 32-bit register word.  crmRestorePP()'s wmask==1 path reads
+         * the data slot's word at +4 (ld/sd view: the low 32 bits) and
+         * stores it at target+4, so the value must sit in word +4.
+         */
+        wmask = 1;
+        data = (uint32_t)value;
+    } else {
+        /*
+         * Low 32-bit register word.  crmRestorePP()'s wmask==2 path reads
+         * the data slot's word at +0 (the high 32 bits) and stores it at
+         * the target, so the value must sit in word +0.
+         */
+        wmask = 2;
+        data = value << 32;
+    }
+
+    desc = ((uint64_t)((reg_off >> 3) & 0xff) << 32)
+         | ((uint64_t)(page & 7) << 40)
+         | ((uint64_t)wmask << 43)
+         | ((uint64_t)(start ? 1 : 0) << 45);
+
+    s->ib_data[s->ib_wrptr] = data;
+    s->ib_addr[s->ib_wrptr] = desc;
+    s->ib_wrptr = (s->ib_wrptr + 1) & (CRIME_FIFO_DEPTH - 1);
+    s->ib_rdptr = s->ib_wrptr;          /* retired synchronously */
 }
 
 static void sgi_crime_re_write(void *opaque, hwaddr offset,
@@ -2398,6 +2477,7 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
                         (t - CRM_TLB_LINEAR_B_OFFSET) / 8, value);
             }
         }
+        sgi_crime_re_ib_post(s, 1, t, size, value, go);
         return;
     }
 
@@ -2441,6 +2521,14 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
                                         (uint64_t)(current_cpu ? current_cpu->mem_io_pc : 0));
             }
         }
+
+        /*
+         * Post the write to the host command ring before the go runs, so
+         * a context switch between a primitive's parameters and its go
+         * finds the whole batch in [StartPtr, WrPtr) and crmSavePP()
+         * harvests it.
+         */
+        sgi_crime_re_ib_post(s, 2, p, size, value, go);
 
         /*
          * crmSetAndGo ORs 0x800 into the register offset — the kick.
@@ -2487,6 +2575,8 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
             sgi_crime_re_mte_store(s, m, v);
         }
 
+        sgi_crime_re_ib_post(s, 3, m, size, value, go);
+
         /* MTE_SET32_AND_GO(MTE_MODE, op) — the go bit starts it */
         if (go) {
             trace_sgi_crime_re_go(off, s->primitive, s->drawmode,
@@ -2506,7 +2596,17 @@ static void sgi_crime_re_write(void *opaque, hwaddr offset,
          * read-only and absorbed.
          */
         if (off == CRM_RE_SET_STARTPTR) {
+            /*
+             * The host's "consume up to here": move the ring base to the
+             * written index.  crmSavePP() writes 0 after harvesting, and
+             * the driver writes 0 after its own direct register
+             * programming (crmLoadTlbABC, crimeRestore, …); keeping
+             * WrPtr/RdPtr relative to it makes pending = WrPtr - StartPtr
+             * the writes since the last checkpoint.
+             */
             s->ib_startptr = (uint32_t)value & CRMSTAT_IB_STPTR_MASK;
+            s->ib_wrptr = s->ib_startptr;
+            s->ib_rdptr = s->ib_startptr;
         }
         return;
     }
@@ -2555,6 +2655,8 @@ static void sgi_crime_re_reset(DeviceState *dev)
     s->ib_ctl = 0;
     s->ib_count = 0;
     s->ib_startptr = 0;
+    s->ib_wrptr = 0;
+    s->ib_rdptr = 0;
     s->bufmode_src = 0;
     s->bufmode_dst = 0;
     s->clipmode = 0;
@@ -2610,6 +2712,8 @@ static const VMStateDescription vmstate_sgi_crime_re = {
         VMSTATE_UINT32(ib_ctl, SGICRIMEREState),
         VMSTATE_UINT32(ib_count, SGICRIMEREState),
         VMSTATE_UINT32(ib_startptr, SGICRIMEREState),
+        VMSTATE_UINT32(ib_wrptr, SGICRIMEREState),
+        VMSTATE_UINT32(ib_rdptr, SGICRIMEREState),
         VMSTATE_UINT64_2DARRAY(tlb_fb, SGICRIMEREState, 3,
                                CRM_TLB_FB_ENTRIES),
         VMSTATE_UINT64_ARRAY(tlb_tex, SGICRIMEREState, CRM_TLB_TEX_ENTRIES),

@@ -309,23 +309,34 @@ struct SGICRIMEREState {
     uint32_t status;
 
     /*
-     * Interface buffer: 64-deep data/addr RAMs + ctl. Our RE executes
-     * register writes synchronously, so the FIFO never holds entries at
-     * read time (level returns 0 and the ptrs stay equal) — but the
-     * count and ctl watermark fields are tracked so RE3/RE4 have a
-     * level to compare against and the kernel's ibctl programming
-     * round-trips.
+     * Interface buffer (host command ring): 64-deep data/addr RAMs + ctl.
+     *
+     * Spec §7.3.3.1: "host writes to rendering engine registers are
+     * stored in a ring buffer called the host interface buffer ... read
+     * out of the interface buffer in FIFO order."  The RE's own register
+     * pages ARE the ring's data source: every write to the TLB,
+     * pixel-pipe or MTE page posts a {data, CrmIntfBufAddr descriptor}
+     * entry at WrPtr.  Our engine retires synchronously, so RdPtr tracks
+     * WrPtr (IB level stays 0 and crmWaitReFifo never spins), but the
+     * entries survive in the RAM so crmSavePP() can harvest them: it
+     * computes pending = WrPtr - StartPtr (mod 64) from CRM_RE_STATUS_REG
+     * and copies [StartPtr, WrPtr) out of ib_data/ib_addr.
      */
     uint64_t ib_data[CRIME_FIFO_DEPTH];
     uint64_t ib_addr[CRIME_FIFO_DEPTH];
     uint32_t ib_ctl;
     uint32_t ib_count;              /* entries posted since last drain */
     /*
-     * IB start pointer (SetStartPtr register @0x4008).  The status
-     * register's WrPtr/StartPtr fields (bits 11:6 / 5:0) must both
-     * reflect this — see sgi_crime_re_read().
+     * Ring pointers (Status bits: level 24:18, RdPtr 17:12, WrPtr 11:6,
+     * StartPtr 5:0).  SetStartPtr (@0x4008) is the host's "consume up to
+     * here" command: it moves StartPtr (and, since our ring holds the
+     * live entries at the tail, base-relative WrPtr/RdPtr) to the written
+     * index, so pending = WrPtr - StartPtr counts the writes since the
+     * last SetStartPtr.  crmSavePP() clears it to 0 after each harvest.
      */
     uint32_t ib_startptr;
+    uint32_t ib_wrptr;
+    uint32_t ib_rdptr;
 
     /*
      * Framebuffer TLBs — each entry is a u64 packing four 16-bit tile
