@@ -178,6 +178,21 @@ struct SGIHubState {
   uint64_t ii_ilcsr;
   uint64_t ii_scratch[2];
 
+  /*
+   * II block-transfer engine (BTE0/BTE1).  The kernel programs SRC/DEST and
+   * writes IBLS (STAT) with IBLS_BUSY | (len >> 7), then IBCT (CTRL) to start;
+   * the engine copies len bytes and posts the completion status to the NOTIFY
+   * physical address.  bte_wait_for_status() polls ctx->status (the NOTIFY
+   * word) until != -1, so failing to perform the copy/notification silently
+   * loses every migration/page copy (ml/SN/SN0/bte.c, sys/SN/SN0/hubio.h
+   * IIO_IBLS/IBSA/IBDA/IBCT/IBNA_0=0x410000..).
+   */
+  uint64_t bte_src[2];
+  uint64_t bte_dest[2];
+  uint64_t bte_stat[2];
+  uint64_t bte_notify[2];
+  uint64_t bte_int[2];
+
   /* Generic scratch for registers we only need to hold state for. */
   uint64_t calias_size;
   uint64_t region_present;

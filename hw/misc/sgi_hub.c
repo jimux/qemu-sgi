@@ -21,6 +21,7 @@
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "system/runstate.h"
+#include "system/address-spaces.h"
 
 static void sgi_hub_reset_bh(void *opaque);
 #include "target/mips/cpu.h"
@@ -171,6 +172,19 @@ static void sgi_hub_reset_bh(void *opaque);
 #define IIO_ILCSR 0x400128
 #define IIO_SCRATCH_REG0 0x400150
 #define IIO_SCRATCH_REG1 0x400158
+
+/* --- Hub II block-transfer engine (BTE0/BTE1) --- */
+#define IIO_IBLS_0 0x410000 /* length/status */
+#define IIO_IBSA_0 0x410008 /* source address */
+#define IIO_IBDA_0 0x410010 /* destination address */
+#define IIO_IBCT_0 0x410018 /* control/terminate */
+#define IIO_IBNA_0 0x410020 /* notification address */
+#define IIO_IBIA_0 0x410028 /* interrupt address */
+#define IIO_BTE_STRIDE 0x10000
+#define IBLS_BUSY (1ULL << 20)
+#define IBLS_ERROR (1ULL << 16)
+#define IBLS_LENGTH_MASK 0xffffULL
+#define BTE_LEN_SHIFT 7
 
 /* Hub widget identification: part 0xc101 (hub). */
 #define HUB_WIDGET_PART_NUM 0xc101
@@ -1479,7 +1493,100 @@ static void sgi_hub_ni_write(SGIHubState *s, hwaddr off, uint64_t val,
   }
 }
 
+/*
+ * Hub II block-transfer engine.  Per BTE (0/1): IBLS (length/status) at +0,
+ * IBSA (source) +8, IBDA (destination) +0x10, IBCT (control/terminate) +0x18,
+ * IBNA (notification) +0x20, IBIA (interrupt) +0x28 (sys/SN/SN0/hubio.h).
+ * The kernel programs SRC/DEST, writes IBLS=IBLS_BUSY|(len>>7), then IBCT to
+ * start; on completion the engine must (a) have moved the data and (b) post the
+ * status word to the IBNA physical address, because bte_wait_for_status() spins
+ * on ctx->status (the IBNA word) until it is no longer -1.  A model that only
+ * latched the registers would report "busy" forever, or (if it cleared BUSY)
+ * claim success while silently dropping the transfer -- which is exactly how
+ * the page-migration copies were being lost on two-node.
+ */
+static bool sgi_hub_bte_offset(hwaddr off, int *n, hwaddr *reg) {
+  if (off >= IIO_IBLS_0 && off < IIO_IBLS_0 + 6 * 8) {
+    *n = 0;
+    *reg = off - IIO_IBLS_0;
+    return true;
+  }
+  if (off >= IIO_IBLS_0 + IIO_BTE_STRIDE &&
+      off < IIO_IBLS_0 + IIO_BTE_STRIDE + 6 * 8) {
+    *n = 1;
+    *reg = off - (IIO_IBLS_0 + IIO_BTE_STRIDE);
+    return true;
+  }
+  return false;
+}
+
+static void sgi_hub_bte_run(SGIHubState *s, int n) {
+  uint64_t src = s->bte_src[n];
+  uint64_t dest = s->bte_dest[n];
+  uint64_t len = (s->bte_stat[n] & IBLS_LENGTH_MASK) << BTE_LEN_SHIFT;
+  uint64_t status = 0; /* IBLS success */
+
+  /*
+   * Diagnostic (SGI_HUB_BTE_FAIL=1): report the transfer as failed without
+   * copying, so the kernel's bte_pbcopy() falls back to its CPU bcopy.  Lets a
+   * run A/B whether a lost migration copy is the BTE or something else.
+   */
+  if (getenv("SGI_HUB_BTE_FAIL")) {
+    status = IBLS_ERROR;
+    goto complete;
+  }
+
+  if (len) {
+    uint8_t *buf = g_malloc(len);
+
+    address_space_read(&address_space_memory, src, MEMTXATTRS_UNSPECIFIED,
+                       buf, len);
+    address_space_write(&address_space_memory, dest, MEMTXATTRS_UNSPECIFIED,
+                        buf, len);
+    g_free(buf);
+  } else {
+    status = IBLS_ERROR;
+  }
+
+complete:
+  /* Completion: clear busy/length, post the status to the notification word. */
+  s->bte_stat[n] = status;
+  if (s->bte_notify[n]) {
+    uint64_t be = cpu_to_be64(status);
+
+    address_space_write(&address_space_memory, s->bte_notify[n],
+                        MEMTXATTRS_UNSPECIFIED, &be, sizeof(be));
+  }
+
+  if (getenv("SGI_HUB_BTEDBG")) {
+    qemu_log_mask(LOG_UNIMP,
+                  "sgi-hub: BTE%d copy src=0x%016" PRIx64 " dest=0x%016"
+                  PRIx64 " len=%" PRIu64 "\n",
+                  n, src, dest, len);
+  }
+}
+
 static uint64_t sgi_hub_ii_read(SGIHubState *s, hwaddr off) {
+  int n;
+  hwaddr reg;
+
+  if (sgi_hub_bte_offset(off, &n, &reg)) {
+    switch (reg) {
+    case 0x00:
+      return s->bte_stat[n];
+    case 0x08:
+      return s->bte_src[n];
+    case 0x10:
+      return s->bte_dest[n];
+    case 0x18:
+      return 0; /* IBCT reads back 0 */
+    case 0x20:
+      return s->bte_notify[n];
+    case 0x28:
+      return s->bte_int[n];
+    }
+  }
+
   switch (off) {
   case IIO_WID:
     return ((uint64_t)HUB_WIDGET_PART_NUM << 16) |
@@ -1510,6 +1617,35 @@ static uint64_t sgi_hub_ii_read(SGIHubState *s, hwaddr off) {
 }
 
 static void sgi_hub_ii_write(SGIHubState *s, hwaddr off, uint64_t val) {
+  int n;
+  hwaddr reg;
+
+  if (sgi_hub_bte_offset(off, &n, &reg)) {
+    switch (reg) {
+    case 0x00: /* IBLS: length/status (IBLS_BUSY | len>>7) */
+      s->bte_stat[n] = val & (IBLS_BUSY | IBLS_ERROR | IBLS_LENGTH_MASK);
+      break;
+    case 0x08:
+      s->bte_src[n] = val;
+      break;
+    case 0x10:
+      s->bte_dest[n] = val;
+      break;
+    case 0x18: /* IBCT: start the transfer if armed */
+      if (s->bte_stat[n] & IBLS_BUSY) {
+        sgi_hub_bte_run(s, n);
+      }
+      break;
+    case 0x20:
+      s->bte_notify[n] = val;
+      break;
+    case 0x28:
+      s->bte_int[n] = val;
+      break;
+    }
+    return;
+  }
+
   switch (off) {
   case IIO_WSTAT:
   case IIO_WID:
@@ -1710,6 +1846,14 @@ static void sgi_hub_reset(DeviceState *dev) {
   s->ii_ilcsr = s->io_attached ? IIO_ILCSR_LINK_WORKING : 0;
   s->ii_scratch[0] = 0;
   s->ii_scratch[1] = 0;
+
+  for (i = 0; i < 2; i++) {
+    s->bte_src[i] = 0;
+    s->bte_dest[i] = 0;
+    s->bte_stat[i] = 0;
+    s->bte_notify[i] = 0;
+    s->bte_int[i] = 0;
+  }
 
   /*
    * The attached router is machine-owned, not a DeviceState, so it is not
