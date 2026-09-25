@@ -2064,6 +2064,15 @@ static void scsi_disk_emulate_write_data(SCSIRequest *req)
         scsi_req_complete(&r->req, GOOD);
         break;
 
+    case SEND_DIAGNOSTIC:
+    case WRITE_BUFFER:
+        /* The payload (SEND_DIAGNOSTIC: none; WRITE_BUFFER: the boot-region
+         * image) is accepted and DISCARDED: it is outside the emulated
+         * geometry, and the loader only requires the write to be acknowledged
+         * (it prints "Write failed" and aborts on ILLEGAL REQUEST). */
+        scsi_req_complete(&r->req, GOOD);
+        break;
+
     default:
         abort();
     }
@@ -2319,6 +2328,28 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
         break;
     case FORMAT_UNIT:
         trace_scsi_disk_emulate_command_FORMAT_UNIT(r->req.cmd.xfer);
+        break;
+    case SEND_DIAGNOSTIC:
+        /* SGI IRIX probes the disk with SEND_DIAGNOSTIC (self-test, CDB
+         * {1d 04 00 00 00 00}) and needs it to succeed; there is no payload
+         * and nothing to do.  The generic parser already classifies it as a
+         * SCSI_XFER_TO_DEV command of length buf[4]|buf[3]<<8. */
+        break;
+    case WRITE_BUFFER:
+        /* SGI IRIX writes the disk's boot region with WRITE_BUFFER mode 0
+         * (CDB {3b 00 00 00 00 00 00 20 04 00}); the parameter list is
+         * DATA-OUT and is discarded in scsi_disk_emulate_write_data().  The
+         * generic parser already computes xfer = buf[6..8] and mode TO_DEV;
+         * a bare accept without the transfer set up leaves a negative
+         * residual (datalen=-8196) and crashes.  The emulated path has no
+         * request buffer of its own (only the DMA path sizes one), so size it
+         * here -- the tail of this function asserts iov_len == xfer for a
+         * TO_DEV command.  Only mode 0 is supported. */
+        if ((buf[1] & 0x1f) != 0 ||
+            req->cmd.xfer > SCSI_DMA_BUF_SIZE) {
+            goto illegal_request;
+        }
+        scsi_init_iovec(r, req->cmd.xfer);
         break;
     default:
         trace_scsi_disk_emulate_command_UNKNOWN(buf[0],
@@ -2768,6 +2799,10 @@ static const SCSIReqOps *const scsi_disk_reqops_dispatch[256] = {
     [VERIFY_12]                       = &scsi_disk_emulate_reqops,
     [VERIFY_16]                       = &scsi_disk_emulate_reqops,
     [FORMAT_UNIT]                     = &scsi_disk_emulate_reqops,
+    /* SGI IRIX's disk loader: SEND_DIAGNOSTIC must succeed and WRITE_BUFFER
+     * mode 0 (boot-region write) must be accepted and discarded. */
+    [SEND_DIAGNOSTIC]                 = &scsi_disk_emulate_reqops,
+    [WRITE_BUFFER]                    = &scsi_disk_emulate_reqops,
 
     [READ_6]                          = &scsi_disk_dma_reqops,
     [READ_10]                         = &scsi_disk_dma_reqops,
