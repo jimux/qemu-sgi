@@ -898,22 +898,81 @@ static inline uint8_t crim_shade_clamp(int32_t v9_12)
     return (uint8_t)t;
 }
 
-/* Texture application functions (spec CRIME 1.5 Table 7-13, Texture.mode
- * bits [1:0]): 0 MODULATE, 1 DECAL, 2 BLEND, 3 REPLACE. */
+/*
+ * Texture application functions (spec CRIME 1.5 Table 7-13, Texture.mode
+ * bits [1:0]): 0 MODULATE, 1 DECAL, 2 BLEND, 3 REPLACE.
+ *
+ * CRIME 1.5 Table 7-13 names the four functions but does not print the
+ * composition formulas (there is no Table 7-16; §7.3.7.8 "Texture
+ * Application" only says the fragment's RGBA colour "is modulated or
+ * blended with the generated texel's color").  The spec does promise
+ * conformance, though — §7.3.7.2: "supports OpenGL conformant ... texture
+ * application functions" — so the composition is the OpenGL texture
+ * environment function of the same name, OpenGL 1.1 tables 3.10/3.11.
+ * The O2 GL visual is A1_RGB5, whose base internal format is RGBA
+ * (BufMode.pixType = RGBA, spec Fig 7-5), so the RGBA rows apply:
+ *
+ *   MODULATE  Cv = Cf*Ct            Av = Af*At
+ *   DECAL     Cv = (1-At)*Cf + At*Ct  Av = Af
+ *   BLEND     Cv = (1-Ct)*Cf + Ct*Cc  Av = Af*At   (Cc = Texture.envColor)
+ *   REPLACE   Cv = Ct               Av = At
+ *
+ * Cf is the fragment colour after shading (the Gouraud-interpolated shade
+ * or the flat Shade.fgColor), Ct the sampled texel, Cc the texture
+ * environment colour, all canonical RGBA (R=31:24..A=7:0).  Products and
+ * lerps are taken per byte and rounded to nearest.  Every function in the
+ * 2-bit field is implemented; nothing is silently substituted.
+ */
 #define CRM_TEXFUNC_MODULATE 0
 #define CRM_TEXFUNC_DECAL    1
 #define CRM_TEXFUNC_BLEND    2
 #define CRM_TEXFUNC_REPLACE  3
 
-/* MODULATE: component-wise product of two canonical RGBA fragments,
- * round(a*b/255).  Both the interpolated shade colour and the texel are
- * canonical (R=31:24..A=7:0), so the product is taken per byte. */
+/* round(a*b/255) for one 8-bit component. */
+static inline uint32_t crim_mul8(uint32_t a, uint32_t b)
+{
+    return (a * b + 127) / 255;
+}
+
+/* (1 - w/255)*c + (w/255)*t, rounded to nearest. */
+static inline uint32_t crim_lerp8(uint32_t c, uint32_t t, uint32_t w)
+{
+    return ((255 - w) * c + w * t + 127) / 255;
+}
+
+/* MODULATE (RGBA): component-wise product of two canonical RGBA
+ * fragments, round(a*b/255); alpha is included (Av = Af*At). */
 static inline uint32_t crim_modulate_rgba(uint32_t a, uint32_t b)
 {
     uint32_t o = 0;
     for (int s = 0; s < 32; s += 8) {
-        uint32_t ca = (a >> s) & 0xff, cb = (b >> s) & 0xff;
-        o |= ((ca * cb + 127) / 255) << s;
+        o |= crim_mul8((a >> s) & 0xff, (b >> s) & 0xff) << s;
+    }
+    return o;
+}
+
+/* DECAL (RGBA): Cv = (1-At)*Cf + At*Ct, Av = Af.  Where the texel is
+ * opaque (At=255) the texture replaces the fragment; where it is
+ * transparent the fragment shows through. */
+static inline uint32_t crim_decal_rgba(uint32_t cf, uint32_t ct)
+{
+    uint32_t at = ct & 0xff;
+    uint32_t o = cf & 0xff;                 /* Av = Af */
+    for (int s = 8; s < 32; s += 8) {
+        o |= crim_lerp8((cf >> s) & 0xff, (ct >> s) & 0xff, at) << s;
+    }
+    return o;
+}
+
+/* BLEND (RGBA): Cv = (1-Ct)*Cf + Ct*Cc, Av = Af*At.  Each colour
+ * component lerps from the fragment toward the texture environment
+ * colour by the texel's own component (Cc = Texture.envColor). */
+static inline uint32_t crim_blend_rgba(uint32_t cf, uint32_t ct, uint32_t cc)
+{
+    uint32_t o = crim_mul8(cf & 0xff, ct & 0xff);    /* Av = Af*At */
+    for (int s = 8; s < 32; s += 8) {
+        o |= crim_lerp8((cf >> s) & 0xff, (cc >> s) & 0xff,
+                        (ct >> s) & 0xff) << s;
     }
     return o;
 }
@@ -1276,6 +1335,13 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                      * guest uploads shade R0/G0/B0 ~ (111,169,212) for the
                      * shark faces).  Same floored reference vertex as the
                      * depth and shade planes.
+                     *
+                     * All four functions are implemented (see the helpers
+                     * above; DECAL/BLEND are the OpenGL RGBA composition
+                     * with Texture.envColor as Cc).  No demo on this chain
+                     * uses func 1 or 2, so DECAL/BLEND cannot be exercised
+                     * by a gate capture; they are implemented from the
+                     * source-of-truth table rather than substituted.
                      */
                     uint32_t tex;
                     if (sgi_crime_re_tex_sample(s, px, py, refx, refy,
@@ -1284,20 +1350,14 @@ static void sgi_crime_re_draw_tri(SGICRIMEREState *s)
                         case CRM_TEXFUNC_MODULATE:
                             color = crim_modulate_rgba(color, tex);
                             break;
-                        case CRM_TEXFUNC_REPLACE:
-                            color = tex;
+                        case CRM_TEXFUNC_DECAL:
+                            color = crim_decal_rgba(color, tex);
                             break;
+                        case CRM_TEXFUNC_BLEND:
+                            color = crim_blend_rgba(color, tex, s->tex_env);
+                            break;
+                        case CRM_TEXFUNC_REPLACE:
                         default:
-                            /*
-                             * DECAL/BLEND are not exercised by any demo on
-                             * this chain; keep the historical texel-replace
-                             * behaviour rather than inventing an untested
-                             * blend, and say so.
-                             */
-                            qemu_log_mask(LOG_UNIMP,
-                                          "sgi_crime_re: Texture.mode.func=%u "
-                                          "unimplemented, using texel\n",
-                                          s->tex_mode & 3);
                             color = tex;
                             break;
                         }
