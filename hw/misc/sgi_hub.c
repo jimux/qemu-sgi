@@ -1559,10 +1559,12 @@ complete:
   }
 
   if (getenv("SGI_HUB_BTEDBG")) {
-    qemu_log_mask(LOG_UNIMP,
-                  "sgi-hub: BTE%d copy src=0x%016" PRIx64 " dest=0x%016"
-                  PRIx64 " len=%" PRIu64 "\n",
-                  n, src, dest, len);
+    /* fprintf(stderr): keep BTE copies in the same ordered stream as the
+     * IP27_WW plugin and IP27_TLB printer so a store/dest/remap can be
+     * correlated per ASID. */
+    fprintf(stderr, "sgi-hub: BTE%d copy src=0x%016" PRIx64 " dest=0x%016"
+            PRIx64 " len=%" PRIu64 "\n",
+            n, src, dest, len);
   }
 }
 

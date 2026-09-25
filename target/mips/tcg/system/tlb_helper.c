@@ -922,7 +922,7 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
                 uint64_t a_b0   = off & ~(1ULL << 29);
                 uint64_t a_n1b0 = a_b0 | (1ULL << 32);
 
-                qemu_log_mask(LOG_GUEST_ERROR,
+                fprintf(stderr,
                               "IP27_POBJ va=0x%016" PRIx64 " pa=0x%016" PRIx64
                               " node=%d bank=%d asid=%04x"
                               " self=%08x n1=%08x b0=%08x n1b0=%08x\n",
