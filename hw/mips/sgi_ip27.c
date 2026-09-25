@@ -1067,7 +1067,23 @@ static void sgi_ip27_init(MachineState *machine) {
       memory_region_init_alias(ram0, NULL, "sgi-ip27.ram.node0", ram, 0,
                                node_ram);
     }
-    memory_region_add_subregion(system_memory, 0, ram0);
+    /*
+     * Scratch A/B (IP27_FLAT128=1, two-node only): the default maps node0's
+     * full 256 MB flat at 0 *and* bank0 0..128 MB + bank1 512..640 MB (which
+     * aliases ram0 128..256 MB), so flat physical 128..256 MB and bank1
+     * physical 512..640 MB share host cells.  Limit the flat window to the
+     * populated bank0 (128 MB) so 128..512 MB is a real hole; if two-node stops
+     * coredumping the flat/bank overhang was the collision.
+     */
+    if (getenv("IP27_FLAT128") && nnodes == 2) {
+      MemoryRegion *flat = g_new(MemoryRegion, 1);
+
+      memory_region_init_alias(flat, NULL, "sgi-ip27.ram.flat128", ram, 0,
+                               banksz);
+      memory_region_add_subregion(system_memory, 0, flat);
+    } else {
+      memory_region_add_subregion(system_memory, 0, ram0);
+    }
     ip27_add_ram_banks(system_memory, IP27_UNCAC_BASE, ram0, node_ram, banksz,
                        "sgi-ip27.ram.uncac");
     ip27_add_ram_banks(system_memory, IP27_MSPEC_BASE, ram0, node_ram, banksz,
