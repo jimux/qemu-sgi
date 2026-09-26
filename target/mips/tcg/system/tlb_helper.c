@@ -907,6 +907,17 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
         break;
     }
     /* Raise exception */
+    if (getenv("IP27_MMUDBG")) {
+        static int dbg_init, dbg_on;
+        if (!dbg_init) { dbg_init = 1; dbg_on = getenv("IP27_MMUDBG") != NULL; }
+        if (dbg_on) {
+            fprintf(stderr, "IP27_MMUDBG cpu=%d exc=%d pc=%016" PRIx64
+                    " va=%016" PRIx64 " acc=%d\n",
+                    (int)(env_cpu(env)->cpu_index), exception,
+                    (uint64_t)env->active_tc.PC, (uint64_t)address,
+                    (int)access_type);
+        }
+    }
     if (!(env->hflags & MIPS_HFLAG_DM)) {
         env->CP0_BadVAddr = address;
     }
