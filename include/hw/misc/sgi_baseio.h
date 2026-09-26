@@ -22,6 +22,8 @@
 #include "hw/char/serial.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "hw/input/ps2.h"
+#include "hw/misc/sgi_hpc3.h"   /* SGIPs2KbdState / TYPE_SGI_PS2_KBD */
 #include "hw/scsi/sgi_qlisp.h"
 #include "net/net.h"
 #include "qom/object.h"
@@ -212,6 +214,15 @@ struct SGIBaseIOState {
   /* IOC3 SuperIO 16550-compatible UART A (serial console). */
   SerialState ioc3_uart;
   MemoryRegion ioc3_uart_mr;
+
+  /* IOC3 SuperIO PS/2 keyboard/mouse (K_RD/M_RD/K_WD/M_WD, KM_CSR, and the
+   * SIO_IR_KBD_INT interrupt).  Driveable from a local console; with no input
+   * attached the read loop still returns "no data" (headless unchanged). */
+  SGIPs2KbdState ps2kbd;
+  PS2MouseState ps2mouse;
+  bool km_present;        /* PS/2 device realized (IP27_IOC3_KM) */
+  bool km_kbd_irq_level;
+  bool km_mouse_irq_level;
 
   /* On-board QLogic ISP1020 SCSI channels (PCI slots 1,2); widget-8 only. */
   SGIQLispState isp[2];

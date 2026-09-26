@@ -854,6 +854,25 @@ static void sgi_baseio_tod_write(SGIBaseIOState *s, hwaddr off, uint64_t val) {
 #define SGI_BASEIO_SIO_IR_TX_BITS                                          \
   (SGI_BASEIO_SIO_IR_SA_TX_MT | SGI_BASEIO_SIO_IR_SA_TX_EXPLICIT |         \
    SGI_BASEIO_SIO_IR_SB_TX_MT | SGI_BASEIO_SIO_IR_SB_TX_EXPLICIT)
+#define SGI_BASEIO_SIO_IR_KBD_INT 0x00400000u  /* kbd/mouse intr (ioc3.h) */
+
+/*
+ * IOC3 keyboard/mouse (SuperIO) registers.  The guest driver (io/ioc3_pckm.c)
+ * reads PORT0_READ (K_RD) / PORT1_READ (M_RD) for scan bytes packed as
+ * [DATA_0<<16] with VALID_0 (0x80000000); it writes commands to K_WD/M_WD and
+ * acks the SIO_IR_KBD_INT interrupt by writing it back to SIO_IR (0x1c).
+ */
+#define SGI_BASEIO_IOC3_KM_CSR 0x20009cu
+#define SGI_BASEIO_IOC3_K_RD 0x2000a0u
+#define SGI_BASEIO_IOC3_M_RD 0x2000a4u
+#define SGI_BASEIO_IOC3_K_WD 0x2000a8u
+#define SGI_BASEIO_IOC3_M_WD 0x2000acu
+
+#define SGI_BASEIO_KM_RD_VALID_0 0x80000000u  /* first byte valid */
+#define SGI_BASEIO_KM_RD_DATA_0_SHIFT 16
+#define SGI_BASEIO_KM_RD_KBD_MSE 0x08000000u  /* 1 = from mouse */
+/* KM_CSR idle: data/clock lines high, both state machines idle. */
+#define SGI_BASEIO_KM_CSR_IDLE 0x00008330u
 
 /* RX ring SC: this byte of the entry is a valid received data byte. */
 #define SGI_BASEIO_RXSB_DATA_VALID 0x80u
@@ -995,6 +1014,70 @@ static void sgi_baseio_ioc3_irq_sync(SGIBaseIOState *s) {
     s->int_line &= ~(1u << SGI_BASEIO_INT_DEV_IOC3);
   }
   sgi_baseio_int_sync(s);
+}
+
+/*
+ * IOC3 keyboard/mouse interrupt: SIO_IR_KBD_INT is pending while either PS/2
+ * queue holds a byte, and is acked by the driver writing it back to SIO_IR.
+ */
+static void sgi_baseio_km_irq_sync(SGIBaseIOState *s) {
+  bool pending;
+
+  if (!s->km_present) {
+    s->sio_ir_pending &= ~SGI_BASEIO_SIO_IR_KBD_INT;
+    sgi_baseio_ioc3_irq_sync(s);
+    return;
+  }
+  pending = !ps2_queue_empty(PS2_DEVICE(&s->ps2kbd)) ||
+            !ps2_queue_empty(PS2_DEVICE(&s->ps2mouse));
+
+  if (pending) {
+    s->sio_ir_pending |= SGI_BASEIO_SIO_IR_KBD_INT;
+  } else {
+    s->sio_ir_pending &= ~SGI_BASEIO_SIO_IR_KBD_INT;
+  }
+  sgi_baseio_ioc3_irq_sync(s);
+}
+
+static void sgi_baseio_ps2_kbd_irq(void *opaque, int n, int level) {
+  SGIBaseIOState *s = opaque;
+
+  s->km_kbd_irq_level = level;
+  sgi_baseio_km_irq_sync(s);
+}
+
+static void sgi_baseio_ps2_mouse_irq(void *opaque, int n, int level) {
+  SGIBaseIOState *s = opaque;
+
+  s->km_mouse_irq_level = level;
+  sgi_baseio_km_irq_sync(s);
+}
+
+/* Read the IOC3 K_RD/M_RD register: one PS/2 byte packed with VALID_0. */
+static uint32_t sgi_baseio_km_port_read(SGIBaseIOState *s, bool mouse) {
+  PS2State *ps;
+  uint32_t w = 0;
+
+  if (!s->km_present) {
+    return 0;  /* device not realized; do not touch the zeroed PS/2 objects */
+  }
+  ps = mouse ? PS2_DEVICE(&s->ps2mouse) : PS2_DEVICE(&s->ps2kbd);
+
+  if (!ps2_queue_empty(ps)) {
+    uint32_t b = ps2_read_data(ps);
+
+    w = SGI_BASEIO_KM_RD_VALID_0 |
+        (b << SGI_BASEIO_KM_RD_DATA_0_SHIFT);
+    if (mouse) {
+      w |= SGI_BASEIO_KM_RD_KBD_MSE;
+    }
+    if (getenv("SGI_KBD_DEBUG")) {
+      fprintf(stderr, "[ioc3-kbd] %s read 0x%02x -> 0x%08x\n",
+              mouse ? "MOUSE" : "KBD", b, w);
+    }
+  }
+  sgi_baseio_km_irq_sync(s);  /* the queue may have drained */
+  return w;
 }
 
 /*
@@ -1356,6 +1439,16 @@ static uint64_t sgi_baseio_read(void *opaque, hwaddr off, unsigned size) {
   if (off == 0x200020 || off == 0x200024) {
     return s->sio_ienb;
   }
+  /* IOC3 keyboard/mouse: control/status and the read-data FIFOs. */
+  if (s->km_present && off == SGI_BASEIO_IOC3_KM_CSR) {
+    return SGI_BASEIO_KM_CSR_IDLE;
+  }
+  if (off == SGI_BASEIO_IOC3_K_RD) {
+    return sgi_baseio_km_port_read(s, false);
+  }
+  if (off == SGI_BASEIO_IOC3_M_RD) {
+    return sgi_baseio_km_port_read(s, true);
+  }
   /* IOC3 serial DMA ring base (SBBR) and per-port producer/consumer. */
   if (off == 0x2000b0) {
     return s->sbbr_h;
@@ -1676,6 +1769,23 @@ static void sgi_baseio_write(void *opaque, hwaddr off, uint64_t val,
   if (off == 0x200024) {
     s->sio_ienb &= ~val;
     sgi_baseio_ioc3_irq_sync(s);
+    return;
+  }
+  /* IOC3 keyboard/mouse: KM_CSR (pull/state bits) and K_WD/M_WD transmits. */
+  if (off == SGI_BASEIO_IOC3_KM_CSR) {
+    /* Line-pull/state-machine control; no timeout conditions to raise. */
+    return;
+  }
+  if (off == SGI_BASEIO_IOC3_K_WD) {
+    if (s->km_present) {
+      ps2_write_keyboard(&s->ps2kbd.parent_obj, val & 0xff);
+    }
+    return;
+  }
+  if (off == SGI_BASEIO_IOC3_M_WD) {
+    if (s->km_present) {
+      ps2_write_mouse(&s->ps2mouse, val & 0xff);
+    }
     return;
   }
   /*
@@ -2181,6 +2291,32 @@ static void sgi_baseio_realize(DeviceState *dev, Error **errp) {
    */
   qdev_init_gpio_in(dev, sgi_baseio_dev_irq, 8);
   qdev_init_gpio_out(dev, &s->int_out, 1);
+
+  /*
+   * The IOC3 keyboard/mouse live on the IO board (widget 8) and are driven by
+   * the kernel's io/ioc3_pckm.c driver through K_RD/M_RD/K_WD/M_WD and the
+   * SIO_IR_KBD_INT interrupt.  Gated by IP27_IOC3_KM (default off): with the
+   * device absent the read loop returns "no data" and the headless boot is
+   * byte-for-byte unchanged.  When enabled, a local console keyboard/mouse
+   * (and, as on real hardware, the PROM's maintenance menu) becomes available.
+   */
+  if (s->widget == 8 && getenv("IP27_IOC3_KM")) {
+    qdev_init_gpio_in_named(dev, sgi_baseio_ps2_kbd_irq, "ps2-kbd-irq", 1);
+    qdev_init_gpio_in_named(dev, sgi_baseio_ps2_mouse_irq, "ps2-mouse-irq", 1);
+    object_initialize_child(OBJECT(dev), "ps2kbd", &s->ps2kbd,
+                            TYPE_SGI_PS2_KBD);
+    object_initialize_child(OBJECT(dev), "ps2mouse", &s->ps2mouse,
+                            TYPE_PS2_MOUSE_DEVICE);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ps2kbd), errp) ||
+        !sysbus_realize(SYS_BUS_DEVICE(&s->ps2mouse), errp)) {
+      return;
+    }
+    s->km_present = true;
+    qdev_connect_gpio_out(DEVICE(&s->ps2kbd), PS2_DEVICE_IRQ,
+                          qdev_get_gpio_in_named(dev, "ps2-kbd-irq", 0));
+    qdev_connect_gpio_out(DEVICE(&s->ps2mouse), PS2_DEVICE_IRQ,
+                          qdev_get_gpio_in_named(dev, "ps2-mouse-irq", 0));
+  }
 
   memory_region_init_io(&s->iomem, OBJECT(s), &sgi_baseio_ops, s, "sgi-baseio",
                         SGI_BASEIO_WINDOW_SIZE);
