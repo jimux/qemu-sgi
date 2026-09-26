@@ -480,6 +480,7 @@ sgi_mace_ec_rx_packet(uint32_t addr, int len, int skipped, uint32_t rptr) "RX pa
 sgi_mace_ec_frame(int is_tx, uint32_t b0, uint32_t b1, uint32_t b2, uint32_t b3, uint64_t v0, int len) "frame is_tx=%d %08x %08x %08x %08x v0=0x%016"PRIx64" len=%d"
 sgi_mace_ec_rx_drop(int reason) "RX dropped reason=%d"
 sgi_mace_ec_rx_refuse(int where, int len, uint32_t mac_ctrl, uint32_t dma_ctrl) "RX refused where=%d len=%d mac_ctrl=0x%08x dma_ctrl=0x%08x"
+sgi_mace_ec_can_receive_refuse(int nic_present, uint32_t mac_ctrl, uint32_t dma_ctrl) "RX can_receive refused nic_present=%d mac_ctrl=0x%08x dma_ctrl=0x%08x"
 sgi_mace_ec_rx_ip(int proto, int type, int code, int seq, int id) "RX ip proto=%d icmp type=%d code=%d seq=%d id=%d"
 sgi_mace_ec_tx_refuse(int where, uint64_t addr, int len, uint64_t cmd) "TX refused where=%d addr=0x%016"PRIx64" len=%d cmd=0x%016"PRIx64
 sgi_mace_ec_rx_enqueue(int len, int depth) "RX enqueue len=%d depth=%d (deferred 200us per frame)"

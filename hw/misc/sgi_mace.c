@@ -1729,9 +1729,22 @@ static ssize_t sgi_mace_ec_rx_deliver(SGIMACEState *s, const uint8_t *buf,
 static bool sgi_mace_ec_can_receive(NetClientState *nc)
 {
     SGIMACEState *s = qemu_get_nic_opaque(nc);
+    bool ok = s->nic_present && (s->ec_dma_control & DMA_CTRL_RX_DMA_EN)
+              && !(s->ec_mac_control & MAC_CTRL_RESET);
 
-    return s->nic_present && (s->ec_dma_control & DMA_CTRL_RX_DMA_EN)
-           && !(s->ec_mac_control & MAC_CTRL_RESET);
+    if (!ok) {
+        /*
+         * The frame is refused at the net-core interface, so it never reaches
+         * sgi_mace_ec_receive() and none of the RX drop traces can see it.  The
+         * core appends it to the NIC incoming queue; the model flushes that
+         * queue only if it calls qemu_flush_queued_packets().  Trace the
+         * refusal so a frame stranded this way is visible.
+         */
+        trace_sgi_mace_ec_can_receive_refuse(s->nic_present,
+                                             s->ec_mac_control,
+                                             s->ec_dma_control);
+    }
+    return ok;
 }
 
 static NetClientInfo net_sgi_mace_ec_info = {
