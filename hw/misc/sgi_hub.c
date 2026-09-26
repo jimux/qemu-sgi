@@ -435,7 +435,17 @@ static void sgi_hub_pi_write(SGIHubState *s, hwaddr off, uint64_t val,
   case PI_CPU_PRESENT_A:
   case PI_CPU_PRESENT_B:
   case PI_CPU_ENABLE_A:
+    break;
   case PI_CPU_ENABLE_B:
+    /*
+     * Setting ENABLE_B releases CPU slice B on real hardware.  Ask the machine
+     * to power on the secondary CPU (it owns the reset handoff).  The callback
+     * is registered only when more than one CPU exists, so this is inert on a
+     * single-CPU machine; cpu_enable[] reads keep their init values as before.
+     */
+    if ((val & 1) && s->cpu_b_release) {
+      s->cpu_b_release(s->cpu_b_release_opaque);
+    }
     break;
   case PI_CALIAS_SIZE:
     s->calias_size = val;
@@ -988,6 +998,12 @@ void sgi_elsc_init(SGIElscState *e, uint8_t module, uint8_t partition) {
 }
 
 void sgi_hub_set_elsc(SGIHubState *s, SGIElscState *e) { s->elsc = e; }
+
+void sgi_hub_set_cpu_b_release(SGIHubState *s, void (*fn)(void *),
+                               void *opaque) {
+  s->cpu_b_release = fn;
+  s->cpu_b_release_opaque = opaque;
+}
 
 static uint64_t sgi_hub_md_read(SGIHubState *s, hwaddr off) {
   if (off == I2C_A0_OFF) {

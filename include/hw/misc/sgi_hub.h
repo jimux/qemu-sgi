@@ -114,6 +114,14 @@ struct SGIHubState {
   /* PI: CPU presence/enable and per-slice state. */
   uint64_t cpu_present[SGI_HUB_MAX_CPUS];
   uint64_t cpu_enable[SGI_HUB_MAX_CPUS];
+  /*
+   * Setting PI_CPU_ENABLE_B releases the B CPU slice.  On a real IP27 the
+   * secondary CPU then starts executing; the machine registers this callback
+   * to power on and reset that CPU (a raw CPUState cannot be started from here
+   * without the machine's reset handoff).
+   */
+  void (*cpu_b_release)(void *opaque);
+  void *cpu_b_release_opaque;
 
   /* PI: interrupt pending sets (INT_PEND0 / INT_PEND1), 64 bits each. */
   uint64_t int_pend0;
@@ -267,6 +275,9 @@ void sgi_elsc_init(SGIElscState *e, uint8_t module, uint8_t partition);
 /* Attach the module's ELSC to a hub's I2C controller. */
 void sgi_hub_set_elsc(SGIHubState *s, SGIElscState *e);
 
+/* Register the machine's secondary-CPU (slice B) power-on handler, invoked
+ * when the guest sets PI_CPU_ENABLE_B. */
+void sgi_hub_set_cpu_b_release(SGIHubState *s, void (*fn)(void *), void *opaque);
 /*
  * SN0 router (the R-brick crossbar linking hubs).  Only the register file and
  * the port graph are modelled; there is no latency or coherence.

@@ -26,6 +26,7 @@
 #include "cpu.h"
 #include "hw/core/boards.h"
 #include "hw/core/clock.h"
+#include "hw/core/cpu.h"
 #include "hw/core/loader.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
@@ -40,6 +41,7 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
+#include "system/cpus.h"
 #include "system/reset.h"
 #include "system/system.h"
 
@@ -153,9 +155,39 @@ void sgi_ip27_local_reset(void);
  */
 static SGIRouterState *ip27_router;
 
+static void ip27_cpu_bootstrap(MIPSCPU *cpu);
+
 static void main_cpu_reset(void *opaque) {
   MIPSCPU *cpu = opaque;
   cpu_reset(CPU(cpu));
+  ip27_cpu_bootstrap(cpu);
+}
+
+/*
+ * Secondary-CPU (slice B) release: the hub calls this when the guest sets
+ * PI_CPU_ENABLE_B.  CPU 1 is created start_powered_off and would otherwise
+ * never run, so the kernel reports "Processor #1 did not start!" and panics
+ * ("Cannot start without all CPUs").  Power it on at the reset vector with the
+ * same handoff CPU 0 received.
+ */
+static void ip27_release_cpu_b(void *opaque) {
+  CPUState *c = qemu_get_cpu(1);
+
+  if (c && c->start_powered_off) {
+    MIPSCPU *mc = MIPS_CPU(c);
+
+    c->start_powered_off = false;
+    cpu_reset(c);
+    ip27_cpu_bootstrap(mc);
+    if (getenv("IP27_SMPDBG")) {
+      fprintf(stderr, "IP27 SMPDBG release cpu1 pc=0x%016" PRIx64 "\n",
+              (uint64_t)mc->env.active_tc.PC);
+    }
+    qemu_cpu_kick(c);
+  }
+}
+
+static void ip27_cpu_bootstrap(MIPSCPU *cpu) {
   /*
    * The SN0 PROM is entered from the flash sloader, which leaves gp set to
    * the PROM's data pointer and has already mapped the PROM's 1 MB XKSEG
@@ -1059,9 +1091,13 @@ static void sgi_ip27_init(MachineState *machine) {
     cpu_mips_irq_init_cpu(c);
     cpu_mips_clock_init(c);
     qemu_register_reset(main_cpu_reset, c);
-    if (i != 0) {
-      CPU(c)->start_powered_off = true;
-    }
+    /*
+     * Start every CPU at reset, as real IP27 hardware does: the PROM's reset
+     * code reads PI_CPU_NUM and the secondary (slice B) takes the slave path,
+     * spinning until the master publishes its launch address.  (Powering the
+     * secondary off and releasing it on PI_CPU_ENABLE_B was tried and left it
+     * starting mid-run with a stale PC.)
+     */
   }
 
   /*
@@ -1298,6 +1334,11 @@ static void sgi_ip27_init(MachineState *machine) {
     sysbus_mmio_map(SYS_BUS_DEVICE(h), 0, ip27_swin_phys(i, IP27_HUB_WIDGET));
     hubs[i] = SGI_HUB(h);
     sgi_hub_set_elsc(hubs[i], elsc);
+    /* Node 0's hub releases CPU slice B -> start the secondary CPU.  Only
+     * when a second CPU actually exists, so single-CPU stays unchanged. */
+    if (i == 0 && ncpus > 1) {
+      sgi_hub_set_cpu_b_release(hubs[i], ip27_release_cpu_b, NULL);
+    }
     if (i == 1) {
       /*
        * Node 1's PROM never executes here, so seed the two identity registers
