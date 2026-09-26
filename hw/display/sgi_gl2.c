@@ -1795,12 +1795,28 @@ static void gl2_ge_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             }
         }
         /*
-         * The kernel's `im_last_outlong` macro (GETOKEN/LASTGE slot) is
-         * emitted as a store to 0x60000000, not 0x60000800, so commands
-         * arrive at offset 0.  Process both the LASTGE offset and offset 0
-         * through the assembler; the 0x000f token write is still answered by
-         * the hostflag path above and 0xff08 assembles to a harmless no-op.
+         * GETOKEN token kicks are 16-bit writes to offset 0 that carry no
+         * command and never enter the GE command FIFO: fbc_intr writes
+         * `GETOKEN = GEnoop` (0x000f) to force FBC dispatch, and tx_repaint
+         * writes `GETOKEN = GEpassthru|((0-1)<<8)` (0xff08) when it had to
+         * drop a retrace.  They must not be assembled as commands, and in
+         * particular must not be appended as operands of a GE command that
+         * is mid-collection: when fbc_intr fires between two of
+         * restoreeverything()'s sixteen GEloadmm operand longs, the kick
+         * lands inside the operand run, shifts every remaining operand by
+         * one word and spills the true last operand out as a phantom
+         * command (a GEpopmm).  That is the word shift that corrupted the
+         * tracked matrix and the matrix stack.  The hostflag dispatch for
+         * 0x000f has already run above.
+         *
+         * The kernel's `im_last_*` commands also arrive at offset 0
+         * (0x60000000, not 0x60000800), but as size 2/4 writes with other
+         * values, so those still go through the assembler.
          */
+        if (addr == 0 && size == 2 &&
+            ((val & 0xffff) == 0x000f || (val & 0xffff) == 0xff08)) {
+            return;
+        }
         if (addr == 0x800 || addr == 0) {
             if (size == 4) {
                 gl2_ge_word(s, (val >> 16) & 0xffff);
