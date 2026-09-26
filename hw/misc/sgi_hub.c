@@ -364,9 +364,16 @@ static uint64_t sgi_hub_pi_read(SGIHubState *s, hwaddr off) {
     return 0;
   case PI_REGION_PRESENT:
     return s->region_present;
-  case PI_CPU_NUM:
+  case PI_CPU_NUM: {
     /* Slice of the CPU performing this access. */
-    return current_cpu ? (current_cpu->cpu_index & 1) : 0;
+    int ci = current_cpu ? current_cpu->cpu_index : -1;
+    uint64_t v = current_cpu ? (current_cpu->cpu_index & 1) : 0;
+
+    if (getenv("IP27_HUBDBG")) {
+      fprintf(stderr, "HUB PI_CPU_NUM read cpu=%d -> %d\n", ci, (int)v);
+    }
+    return v;
+  }
   case PI_CALIAS_SIZE:
     return s->calias_size;
   case PI_CPU_PRESENT_A:
