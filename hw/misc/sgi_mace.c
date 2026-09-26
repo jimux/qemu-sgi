@@ -1502,6 +1502,9 @@ static ssize_t sgi_mace_ec_receive(NetClientState *nc, const uint8_t *buf,
     int slot;
 
     if (size < 14 || size > MAC_MAX_FRAME) {
+        /* where=0: backend handed us a frame outside the ethernet range */
+        trace_sgi_mace_ec_rx_refuse(0, (int)size, s->ec_mac_control,
+                                    s->ec_dma_control);
         return size;
     }
     if (s->ec_rxq_count >= MACE_EC_RX_FIFO_LEN) {
@@ -1569,10 +1572,21 @@ static ssize_t sgi_mace_ec_rx_deliver(SGIMACEState *s, const uint8_t *buf,
     bool is_broadcast = true, is_multicast = (buf[0] & 1) != 0;
 
     if (size < 14 || size > MAC_MAX_FRAME) {
+        /* where=1: corruption between enqueue and delivery */
+        trace_sgi_mace_ec_rx_refuse(1, (int)size, s->ec_mac_control,
+                                    s->ec_dma_control);
         return size;
     }
     if (!(s->ec_dma_control & DMA_CTRL_RX_DMA_EN) ||
         (s->ec_mac_control & MAC_CTRL_RESET)) {
+        /*
+         * where=2: RX was switched off (or the MAC reset) during the
+         * 200us deferral, so a frame that was legitimately accepted is
+         * discarded.  This is the TOCTOU of the deferred-delivery model
+         * and used to be silent.
+         */
+        trace_sgi_mace_ec_rx_refuse(2, (int)size, s->ec_mac_control,
+                                    s->ec_dma_control);
         return 0;
     }
 
@@ -1633,6 +1647,31 @@ static ssize_t sgi_mace_ec_rx_deliver(SGIMACEState *s, const uint8_t *buf,
     }
     /* 4 trailing FCS bytes (zeros) for the length the vector claims */
     size += 4;
+
+    /*
+     * Diagnostic: decode the ethernet/IP header of every delivered frame so
+     * the log shows exactly which protocol/frame the model handed the guest.
+     * A quiet host can then be compared against the guest's own netstat
+     * counters, rather than inferring delivery from a bare byte count.
+     */
+    {
+        const uint8_t *eth = frame + frame_off;
+
+        if (eth[12] == 0x08 && eth[13] == 0x00) {
+            int proto = eth[14 + 9];
+
+            if (proto == 1 && size >= 14 + 20 + 8) {
+                const uint8_t *icmp = eth + 14 + 20;
+                trace_sgi_mace_ec_rx_ip(proto, icmp[0], icmp[1],
+                                        (icmp[6] << 8) | icmp[7],
+                                        (icmp[4] << 8) | icmp[5]);
+            } else {
+                trace_sgi_mace_ec_rx_ip(proto, -1, -1, -1, -1);
+            }
+        } else {
+            trace_sgi_mace_ec_rx_ip(-1, -1, -1, -1, -1);
+        }
+    }
 
     stats = size & RX_VEC_LENGTH_MASK;
     if (is_multicast) {
@@ -1738,6 +1777,7 @@ static void sgi_mace_ec_tx_drain(SGIMACEState *s)
         if (dma_memory_read(&address_space_memory, a, desc,
                             sizeof(desc), MEMTXATTRS_UNSPECIFIED)
                 != MEMTX_OK) {
+            trace_sgi_mace_ec_tx_refuse(0, a, (int)sizeof(desc), 0);
             return;
         }
         cmd = ldq_be_p(desc);
@@ -1760,22 +1800,16 @@ static void sgi_mace_ec_tx_drain(SGIMACEState *s)
             continue;
         }
 
-        /* Concatenation buffers first (header part of the packet) */
-        for (c = 0; c < 3 && c < (int)cats; c++) {
-            cptr = ldq_be_p(desc + 8 * (c + 1));
-            clen = ((cptr >> 32) & 0xffff) + 1;
-            if (plen + (int)clen > MAC_MAX_FRAME) {
-                clen = MAC_MAX_FRAME - plen;
-            }
-            trace_sgi_mace_ec_tx_concat(c, (uint32_t)(cptr & ~7ULL), clen);
-            if (dma_memory_read(&address_space_memory, cptr & ~7ULL,
-                                pkt + plen, clen,
-                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-                return;
-            }
-            plen += clen;
-        }
-        /* Then the ring data area (the packet's tail bytes) */
+        /*
+         * The packet's leading bytes live in the descriptor's data area
+         * (desc + doff, doff from the command word), the rest in the
+         * concatenation buffers.  The order matters: the descriptor area is
+         * the ethernet/IP header and the concat buffers are the body.
+         * Assembling concat-first reversed every packet whose header was
+         * pre-built in the descriptor (DHCP's DISCOVER came out as a
+         * length-0 802.3 frame starting with the body), so the frame was
+         * malformed and no server could answer it.
+         */
         if (doff >= 8 && doff <= 120) {
             local = MAC_TX_DESC_SIZE - doff;
             if (plen + local > MAC_MAX_FRAME) {
@@ -1783,6 +1817,32 @@ static void sgi_mace_ec_tx_drain(SGIMACEState *s)
             }
             memcpy(pkt + plen, desc + doff, local);
             plen += local;
+        }
+        /* Then the concatenation buffers (the packet's body) */
+        for (c = 0; c < 3 && c < (int)cats; c++) {
+            hwaddr caddr;
+
+            cptr = ldq_be_p(desc + 8 * (c + 1));
+            clen = ((cptr >> 32) & 0xffff) + 1;
+            /*
+             * The concat word is [length:32][address:32] (spec §4.4.3): the
+             * high half is the byte count, the low half the 32-bit DMA
+             * address.  Masking the whole 64-bit word with ~7ULL left the
+             * length in the address, so every concatenated packet was read
+             * from an unmapped address and silently dropped.
+             */
+            caddr = cptr & 0xffffffffULL;
+            if (plen + (int)clen > MAC_MAX_FRAME) {
+                clen = MAC_MAX_FRAME - plen;
+            }
+            trace_sgi_mace_ec_tx_concat(c, (uint32_t)(caddr & ~7ULL), clen);
+            if (dma_memory_read(&address_space_memory, caddr & ~7ULL,
+                                pkt + plen, clen,
+                                MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                trace_sgi_mace_ec_tx_refuse(1, caddr & ~7ULL, (int)clen, cmd);
+                return;
+            }
+            plen += clen;
         }
 
         if (s->nic_present) {
