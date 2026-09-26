@@ -164,7 +164,8 @@ qtests_microblazeel = qtests_microblaze
 qtests_mips = \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) +            \
-  (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : [])
+  (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : []) +                   \
+  ['sgi-wd33c93-test']
 
 qtests_mipsel = qtests_mips
 qtests_mips64 = qtests_mips
@@ -324,6 +325,7 @@ qos_test_ss.add(
   'igb-test.c',
   'ufs-test.c',
   'riscv-iommu-test.c',
+  'sgi-wd33c93-test.c',
 )
 
 if config_all_devices.has_key('CONFIG_VIRTIO_SERIAL')
